@@ -1,20 +1,20 @@
 [package]
 name = "oxideav-webp"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-webp"
+authors = ["Mark Karpeles"]
 description = "Pure-Rust WebP image decoder for oxideav (RIFF VP8 lossy + VP8L lossless + VP8X extended + ALPH + animation)"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-webp"
 keywords = ["multimedia", "image", "webp", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
-oxideav-container = { workspace = true }
-oxideav-vp8 = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
+oxideav-container = "0.0"
+oxideav-vp8 = "0.0"

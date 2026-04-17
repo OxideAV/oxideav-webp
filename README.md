@@ -10,9 +10,9 @@ wrappers, no `*-sys` crates.
 
 ```toml
 [dependencies]
-oxideav-webp = "0.0.1"
+oxideav-webp = "0.0"
 ```
 
 ## License
 
-MIT — see [LICENSE](https://github.com/OxideAV/oxideav-workspace/blob/master/LICENSE).
+MIT — see [LICENSE](LICENSE).
