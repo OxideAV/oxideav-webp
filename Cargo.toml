@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-webp"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust WebP image decoder for oxideav (RIFF VP8 lossy + VP8L lossless + VP8X extended + ALPH + animation)"
+description = "Pure-Rust WebP image codec for oxideav — RIFF VP8 lossy + VP8L lossless + VP8X extended + ALPH + animation decode, plus VP8 lossy and VP8L lossless single-frame encode"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-webp"
