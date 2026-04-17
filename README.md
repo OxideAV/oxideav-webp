@@ -118,8 +118,13 @@ Feeding RGBA into this encoder is rejected with `Error::Unsupported`
 
 Encoder scope (current):
 
-- VP8L lossless from RGBA, single frame, no transforms / no colour
-  cache — correct but unoptimised vs libwebp ratios.
+- VP8L lossless from RGBA, single frame. Emits subtract-green +
+  tile-based predictor transforms plus a 256-entry colour cache, which
+  gets the ratio close to libwebp on smooth/photographic content.
+  Still missing vs libwebp: the colour (G↔R/B decorrelation) transform,
+  the palette (colour-indexing) transform, meta-Huffman grouping, and a
+  wider predictor-mode pool (the encoder currently picks between modes
+  0/1/2/11 per tile rather than probing all 14).
 - VP8 lossy from YUV420P, single frame at the `oxideav-vp8` default
   qindex (or a caller-supplied one via `encoder_vp8::make_encoder_with_qindex`).
 - No `VP8X` extended header from either encoder. No `ALPH` sidecar on

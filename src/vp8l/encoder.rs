@@ -1,31 +1,45 @@
 //! VP8L lossless encoder.
 //!
-//! First-cut pure-Rust VP8L encoder. The output is a valid VP8L bitstream
-//! (decodable by the in-crate [`super::decode`]), but intentionally
-//! unoptimised compared to libwebp:
+//! Pure-Rust VP8L encoder emitting a valid bitstream decodable by the
+//! in-crate [`super::decode`]. Compared to libwebp the output is coarser
+//! — the compression ratio gap is documented below — but we cover the
+//! bits that matter most in practice:
 //!
-//! * **No transforms.** Predictor / colour / subtract-green / colour-
-//!   indexing are scoped non-goals for this first cut. Files therefore
-//!   carry every pixel's raw ARGB value through the entropy coder, which
-//!   hurts ratio but keeps the encoder simple. The `0` transform-present
-//!   flag is written directly after the header.
-//! * **No colour cache.** Cache codes would bloat the green alphabet and
-//!   complicate the match search; we skip them.
-//! * **No meta-Huffman image.** A single Huffman group covers the whole
-//!   picture.
+//! * **Subtract-green transform** (always on). Removes the common
+//!   photographic correlation between the G/R and G/B channels by
+//!   sending `r-g` and `b-g` instead of `r` and `b`.
+//! * **Predictor transform** (always on, tile-based). Each 16×16 tile
+//!   picks one of a small set of VP8L predictor modes (0 = opaque
+//!   black, 1 = left, 2 = top, 11 = select) by forward-pass cost
+//!   estimation; the tile modes ride in a sub-image pixel stream.
+//! * **Colour cache** (always on, 256 entries). Every literal pixel is
+//!   also addressable by its hashed cache index, which shortens the
+//!   green alphabet on repeat colours.
 //!
-//! What *is* implemented:
+//! What we still don't do (compared to libwebp):
+//!
+//! * **No colour transform** (G↔R/B decorrelation). The entropy win is
+//!   modest for most inputs and a full coefficient search is outside
+//!   this crate's scope.
+//! * **No colour-indexing (palette) transform.** Palette images still
+//!   go through the full ARGB path — inefficient for palettised art but
+//!   correct.
+//! * **No meta-Huffman image.** A single Huffman group covers the
+//!   whole picture.
+//! * **Single predictor-mode pool** (0/1/2/11). libwebp probes all 14.
+//!
+//! What *is* implemented end-to-end:
 //!
 //! * Length-limited canonical Huffman tree builder (≤15 bits per code,
 //!   matching the VP8L spec's §5 limit) using a frequency-driven sort +
 //!   depth-capping redistribution pass.
 //! * Canonical-Huffman code-length tree emission, reusing the 19-symbol
 //!   meta-alphabet + run-length codes 16/17/18 expected by the decoder.
-//! * A 4 KB sliding-window, hash-chain LZ77 matcher over the ARGB pixel
-//!   sequence. Matches of length ≥ 3 are emitted as (length, distance)
-//!   pairs using the VP8L length-or-distance symbol scheme. Distances are
-//!   always emitted in the `code = d + 120` form, so the short-distance
-//!   diamond table isn't consulted on the encoder side.
+//! * A 4 KB sliding-window, hash-chain LZ77 matcher over the residual
+//!   pixel sequence. Matches of length ≥ 3 are emitted as (length,
+//!   distance) pairs using the VP8L length-or-distance symbol scheme.
+//!   Distances are always emitted in the `code = d + 120` form, so the
+//!   short-distance diamond table isn't consulted on the encoder side.
 //!
 //! The entry point is [`encode_vp8l_argb`]: a bare VP8L bitstream (no
 //! RIFF wrapper) sized for a given `width × height` ARGB pixel buffer.
@@ -49,6 +63,30 @@ const MIN_MATCH: usize = 3;
 /// above this but long runs are rare in ARGB data and short-chain hash
 /// searches get expensive past a few hundred pixels.
 const MAX_MATCH: usize = 4096;
+
+/// Colour-cache bit width. 8 bits = 256-entry cache — small enough to
+/// keep the green alphabet compact (256 + 24 + 256 = 536 symbols) yet
+/// large enough to pay for itself on most natural images. Always on;
+/// degenerate images still compress correctly because the cache-index
+/// alphabet's Huffman tree collapses to a handful of symbols.
+const COLOR_CACHE_BITS: u32 = 8;
+
+/// Side length (in pixels) of a predictor tile. VP8L carries `tile_bits
+/// = 2..=9`, i.e. 4..=512 pixels per side. 16 is the libwebp default
+/// and strikes a reasonable balance between side-image overhead and
+/// per-block mode accuracy.
+const PREDICTOR_TILE_BITS: u32 = 4; // 16-pixel tiles
+
+/// Predictor modes we're willing to pick between on the encoder side.
+/// Limiting the pool keeps the per-tile mode search cheap (a linear
+/// sum-of-abs-residuals pass per candidate) and still hits the common
+/// correlations for photographic + flat content:
+///
+/// * 0 — opaque black (good for the top-left tile, alpha-only rows).
+/// * 1 — left.
+/// * 2 — top.
+/// * 11 — "select" (libwebp's workhorse for natural images).
+const PREDICTOR_MODES: &[u32] = &[0, 1, 2, 11];
 
 /// LSB-first bit writer matching the VP8L decoder's bit-reader convention.
 struct BitWriter {
@@ -103,6 +141,49 @@ pub fn encode_vp8l_argb(
     pixels: &[u32],
     has_alpha: bool,
 ) -> Result<Vec<u8>> {
+    encode_vp8l_argb_with(width, height, pixels, has_alpha, EncoderOptions::default())
+}
+
+/// Encoder tuning knobs. Hidden from the public docs — primarily a
+/// testing surface for sizing transforms on/off against each other.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct EncoderOptions {
+    pub use_subtract_green: bool,
+    pub use_predictor: bool,
+    pub use_color_cache: bool,
+}
+
+impl Default for EncoderOptions {
+    fn default() -> Self {
+        Self {
+            use_subtract_green: true,
+            use_predictor: true,
+            use_color_cache: true,
+        }
+    }
+}
+
+impl EncoderOptions {
+    /// All transforms off — the pre-transform "literals only" baseline.
+    #[doc(hidden)]
+    pub fn bare() -> Self {
+        Self {
+            use_subtract_green: false,
+            use_predictor: false,
+            use_color_cache: false,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn encode_vp8l_argb_with(
+    width: u32,
+    height: u32,
+    pixels: &[u32],
+    has_alpha: bool,
+    opts: EncoderOptions,
+) -> Result<Vec<u8>> {
     if width == 0 || height == 0 {
         return Err(Error::invalid("VP8L encoder: zero-size image"));
     }
@@ -123,19 +204,106 @@ pub fn encode_vp8l_argb(
     bw.write(if has_alpha { 1 } else { 0 }, 1);
     bw.write(0, 3); // version
 
-    // No transforms (scoped non-goal for v1).
+    // ── Transform chain ──────────────────────────────────────────────
+    //
+    // Transforms are written in the order the encoder applies them;
+    // the decoder iterates them front-to-back and applies in reverse,
+    // so the LAST transform we write is the FIRST the decoder inverts.
+    // Subtract-green is written before predictor so the predictor works
+    // on the already green-decorrelated residuals (matching libwebp).
+
+    let mut working = pixels.to_vec();
+
+    if opts.use_subtract_green {
+        // Transform header: present + type 2 (SubtractGreen).
+        bw.write(1, 1);
+        bw.write(2, 2);
+        apply_subtract_green_forward(&mut working);
+    }
+
+    if opts.use_predictor {
+        // Forward predictor: pick a mode per tile, then subtract
+        // predictions. The sub-image we ship carries one mode per
+        // tile — stored in the green channel's low 4 bits per spec.
+        let tile_bits = PREDICTOR_TILE_BITS;
+        let tile_side = 1u32 << tile_bits;
+        let sub_w = (width + tile_side - 1) / tile_side;
+        let sub_h = (height + tile_side - 1) / tile_side;
+        let modes = choose_predictor_modes(&working, width, height, tile_bits, sub_w, sub_h);
+
+        // Transform header: present + type 0 (Predictor) + tile_bits-2.
+        bw.write(1, 1);
+        bw.write(0, 2);
+        bw.write(tile_bits - 2, 3);
+
+        // Emit the mode sub-image as an ARGB image stream (alpha 0xff,
+        // red/blue 0, green = mode). No cache, no meta-huffman — the
+        // sub-image is tiny and the decoder reads it with main_image=false.
+        let sub_pixels: Vec<u32> = modes
+            .iter()
+            .map(|&m| 0xff00_0000 | ((m & 0xff) << 8))
+            .collect();
+        encode_image_stream(&mut bw, &sub_pixels, sub_w, sub_h, false, 0)?;
+
+        // Residuals (main image payload): pixel - predicted-from-decoded-
+        // neighbours. The decode side recomputes the same prediction
+        // from its own already-decoded neighbourhood and re-adds the
+        // residual modulo 256 per channel.
+        working = apply_predictor_forward(&working, width, height, tile_bits, &modes, sub_w);
+    }
+
+    // No more transforms.
     bw.write(0, 1);
 
-    // ── Main image stream ─────────────────────────────────────────────
-    // No colour cache, no meta-Huffman image.
-    bw.write(0, 1); // no colour cache
-    bw.write(0, 1); // no meta-Huffman image (single group)
+    // ── Main image stream ────────────────────────────────────────────
+    let cache_bits = if opts.use_color_cache {
+        COLOR_CACHE_BITS
+    } else {
+        0
+    };
+    encode_image_stream(&mut bw, &working, width, height, true, cache_bits)?;
 
-    // Step 1: build the LZ77-parsed symbol stream over the pixel array.
-    let stream = build_symbol_stream(pixels);
+    Ok(bw.finish())
+}
 
-    // Step 2: tally histograms for the five Huffman trees.
-    let mut green_freq = vec![0u32; 256 + 24]; // 256 literals + 24 length codes
+/// Encode a `width × height` VP8L image stream (post-transform residuals)
+/// into `bw`. Used both for the main picture and for the tiny predictor/
+/// colour sub-images. Sub-images always pass `main_image = false` + zero
+/// cache bits; the decoder-side parse at [`super::decode_image_stream`]
+/// matches that calling convention.
+fn encode_image_stream(
+    bw: &mut BitWriter,
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    main_image: bool,
+    cache_bits: u32,
+) -> Result<()> {
+    if cache_bits > 0 {
+        bw.write(1, 1);
+        bw.write(cache_bits, 4);
+    } else {
+        bw.write(0, 1);
+    }
+
+    // Meta-Huffman "present" bit is only read by the decoder on the
+    // outermost (main) image; sub-images (predictor mode map, colour
+    // sub-image) skip this entirely. We always emit 0 (single group)
+    // when we do write it.
+    if main_image {
+        bw.write(0, 1);
+    }
+
+    let cache_size = if cache_bits == 0 {
+        0u32
+    } else {
+        1u32 << cache_bits
+    };
+
+    let stream = build_symbol_stream(pixels, width, height, cache_bits);
+
+    let green_alpha = 256 + 24 + cache_size as usize;
+    let mut green_freq = vec![0u32; green_alpha];
     let mut red_freq = vec![0u32; 256];
     let mut blue_freq = vec![0u32; 256];
     let mut alpha_freq = vec![0u32; 256];
@@ -155,12 +323,12 @@ pub fn encode_vp8l_argb(
                 green_freq[256 + len_sym as usize] += 1;
                 dist_freq[dist_sym as usize] += 1;
             }
+            StreamSym::CacheRef { index } => {
+                green_freq[256 + 24 + index as usize] += 1;
+            }
         }
     }
 
-    // Step 3: build canonical Huffman code lengths for each tree. The
-    // decoder requires at least one non-zero length per tree; if the
-    // stream never used (e.g.) red, we still have to emit a valid tree.
     let green_lens = build_limited_lengths(&green_freq, MAX_CODE_LENGTH)?;
     let red_lens = build_limited_lengths(&red_freq, MAX_CODE_LENGTH)?;
     let blue_lens = build_limited_lengths(&blue_freq, MAX_CODE_LENGTH)?;
@@ -173,21 +341,19 @@ pub fn encode_vp8l_argb(
     let alpha_codes = canonical_codes(&alpha_lens);
     let dist_codes = canonical_codes(&dist_lens);
 
-    // Step 4: emit the Huffman trees in the order the decoder expects.
-    emit_huffman_tree(&mut bw, &green_lens)?;
-    emit_huffman_tree(&mut bw, &red_lens)?;
-    emit_huffman_tree(&mut bw, &blue_lens)?;
-    emit_huffman_tree(&mut bw, &alpha_lens)?;
-    emit_huffman_tree(&mut bw, &dist_lens)?;
+    emit_huffman_tree(bw, &green_lens)?;
+    emit_huffman_tree(bw, &red_lens)?;
+    emit_huffman_tree(bw, &blue_lens)?;
+    emit_huffman_tree(bw, &alpha_lens)?;
+    emit_huffman_tree(bw, &dist_lens)?;
 
-    // Step 5: emit the symbol stream.
     for sym in &stream {
         match *sym {
             StreamSym::Literal { a, r, g, b } => {
-                write_code(&mut bw, &green_codes, &green_lens, g as usize);
-                write_code(&mut bw, &red_codes, &red_lens, r as usize);
-                write_code(&mut bw, &blue_codes, &blue_lens, b as usize);
-                write_code(&mut bw, &alpha_codes, &alpha_lens, a as usize);
+                write_code(bw, &green_codes, &green_lens, g as usize);
+                write_code(bw, &red_codes, &red_lens, r as usize);
+                write_code(bw, &blue_codes, &blue_lens, b as usize);
+                write_code(bw, &alpha_codes, &alpha_lens, a as usize);
             }
             StreamSym::Backref {
                 len_sym,
@@ -197,24 +363,26 @@ pub fn encode_vp8l_argb(
                 dist_extra_bits,
                 dist_extra,
             } => {
-                write_code(&mut bw, &green_codes, &green_lens, 256 + len_sym as usize);
+                write_code(bw, &green_codes, &green_lens, 256 + len_sym as usize);
                 if len_extra_bits > 0 {
                     bw.write(len_extra, len_extra_bits);
                 }
-                write_code(&mut bw, &dist_codes, &dist_lens, dist_sym as usize);
+                write_code(bw, &dist_codes, &dist_lens, dist_sym as usize);
                 if dist_extra_bits > 0 {
                     bw.write(dist_extra, dist_extra_bits);
                 }
             }
+            StreamSym::CacheRef { index } => {
+                write_code(bw, &green_codes, &green_lens, 256 + 24 + index as usize);
+            }
         }
     }
-
-    Ok(bw.finish())
+    Ok(())
 }
 
-/// Parsed-pixel symbol. Either a literal ARGB quadruplet or an LZ77
+/// Parsed-pixel symbol. Either a literal ARGB quadruplet, an LZ77
 /// backreference (length + distance with their extra-bit fields already
-/// factored out).
+/// factored out), or a colour-cache reference by index.
 #[derive(Clone, Copy)]
 enum StreamSym {
     Literal {
@@ -230,6 +398,9 @@ enum StreamSym {
         dist_sym: u32,
         dist_extra_bits: u32,
         dist_extra: u32,
+    },
+    CacheRef {
+        index: u32,
     },
 }
 
@@ -251,10 +422,15 @@ fn encode_len_or_dist_value(value: u32) -> (u32, u32, u32) {
     (symbol, extra_bits, extra)
 }
 
-/// Walk `pixels` and emit literals + LZ77 backreferences. Uses a simple
-/// prefix-hash chain with head + next-pointer arrays; the chain is
-/// bounded by [`LZ_WINDOW`].
-fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
+/// Walk `pixels` and emit literals + LZ77 backreferences + colour-cache
+/// refs. Uses a simple prefix-hash chain with head + next-pointer arrays;
+/// the chain is bounded by [`LZ_WINDOW`].
+fn build_symbol_stream(
+    pixels: &[u32],
+    _width: u32,
+    _height: u32,
+    cache_bits: u32,
+) -> Vec<StreamSym> {
     let mut out: Vec<StreamSym> = Vec::with_capacity(pixels.len());
     let n = pixels.len();
     // Hash table: 12-bit table, heads index into `pixels`. `next` is a
@@ -273,6 +449,17 @@ fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
         (k >> (32 - HASH_BITS)) as usize
     };
 
+    // Colour-cache mirror. The decoder updates the cache on every
+    // emitted/decoded pixel, so we maintain the same state during
+    // parsing and can emit cache-index codes when a literal's hash
+    // slot already holds that exact colour.
+    let cache_size = if cache_bits == 0 {
+        0usize
+    } else {
+        1usize << cache_bits
+    };
+    let mut cache: Vec<u32> = vec![0u32; cache_size];
+
     let mut i = 0usize;
     while i < n {
         // Find best match starting at i, if at least MIN_MATCH pixels
@@ -281,15 +468,13 @@ fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
         let mut best_dist = 0usize;
         if i + MIN_MATCH <= n {
             let h = hash3(pixels[i], pixels[i + 1], pixels[i + 2]);
-            // Walk the chain.
             let mut candidate = head[h];
-            let mut tries = 64usize; // chain length cap
+            let mut tries = 64usize;
             while candidate != usize::MAX && tries > 0 {
                 let dist = i - candidate;
                 if dist == 0 || dist > LZ_WINDOW {
                     break;
                 }
-                // Measure the match length.
                 let max_len = (n - i).min(MAX_MATCH);
                 let mut l = 0usize;
                 while l < max_len && pixels[candidate + l] == pixels[i + l] {
@@ -298,7 +483,6 @@ fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
                 if l >= MIN_MATCH && l > best_len {
                     best_len = l;
                     best_dist = dist;
-                    // Good enough heuristic: stop at 64 pixels.
                     if l >= 64 {
                         break;
                     }
@@ -309,9 +493,6 @@ fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
         }
 
         if best_len >= MIN_MATCH {
-            // Emit a backreference. Length value = best_len, distance
-            // value = best_dist. Distances use `code = d + 120` form so
-            // we never touch the short-distance plane table.
             let (len_sym, len_eb, len_ex) = encode_len_or_dist_value(best_len as u32);
             let (dist_sym, dist_eb, dist_ex) = encode_len_or_dist_value((best_dist as u32) + 120);
             out.push(StreamSym::Backref {
@@ -322,8 +503,6 @@ fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
                 dist_extra_bits: dist_eb,
                 dist_extra: dist_ex,
             });
-            // Insert every covered pixel into the hash (but stop inserts
-            // a hair before the end so we don't touch past the buffer).
             for k in 0..best_len {
                 let pos = i + k;
                 if pos + 2 < n {
@@ -331,18 +510,38 @@ fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
                     next[pos] = head[h];
                     head[h] = pos;
                 }
+                if cache_size > 0 {
+                    cache_add(&mut cache, cache_bits, pixels[pos]);
+                }
             }
             i += best_len;
         } else {
-            // Literal: emit as ARGB quadruplet in green/red/blue/alpha
-            // order (matching the decoder's per-channel tree layout).
             let p = pixels[i];
-            out.push(StreamSym::Literal {
-                a: ((p >> 24) & 0xff) as u8,
-                r: ((p >> 16) & 0xff) as u8,
-                g: ((p >> 8) & 0xff) as u8,
-                b: (p & 0xff) as u8,
-            });
+            // Try a cache hit first. The decoder's hash is deterministic
+            // (`0x1e35a7bd * argb >> (32 - cache_bits)`), so we can look
+            // up the current slot and emit a cache-index code if it
+            // already holds this exact colour. A hit saves the R/B/A
+            // literal codes entirely (only the green symbol is written).
+            let mut emitted_cache = false;
+            if cache_size > 0 {
+                let idx =
+                    (0x1e35_a7bd_u32.wrapping_mul(p) >> (32 - cache_bits)) as usize;
+                if idx < cache.len() && cache[idx] == p {
+                    out.push(StreamSym::CacheRef { index: idx as u32 });
+                    emitted_cache = true;
+                }
+            }
+            if !emitted_cache {
+                out.push(StreamSym::Literal {
+                    a: ((p >> 24) & 0xff) as u8,
+                    r: ((p >> 16) & 0xff) as u8,
+                    g: ((p >> 8) & 0xff) as u8,
+                    b: (p & 0xff) as u8,
+                });
+            }
+            if cache_size > 0 {
+                cache_add(&mut cache, cache_bits, p);
+            }
             if i + 2 < n {
                 let h = hash3(pixels[i], pixels[i + 1], pixels[i + 2]);
                 next[i] = head[h];
@@ -354,26 +553,275 @@ fn build_symbol_stream(pixels: &[u32]) -> Vec<StreamSym> {
     out
 }
 
+fn cache_add(cache: &mut [u32], cache_bits: u32, argb: u32) {
+    if cache.is_empty() {
+        return;
+    }
+    let idx = (0x1e35_a7bd_u32.wrapping_mul(argb) >> (32 - cache_bits)) as usize;
+    if idx < cache.len() {
+        cache[idx] = argb;
+    }
+}
+
+// ── Transforms (encoder side) ─────────────────────────────────────────
+
+/// Subtract the green channel from R and B in-place. Mirrors
+/// `apply_subtract_green` in [`super::transform`] (the decoder reverses
+/// this by adding G back).
+fn apply_subtract_green_forward(pixels: &mut [u32]) {
+    for p in pixels.iter_mut() {
+        let a = (*p >> 24) & 0xff;
+        let r = (*p >> 16) & 0xff;
+        let g = (*p >> 8) & 0xff;
+        let b = *p & 0xff;
+        let nr = r.wrapping_sub(g) & 0xff;
+        let nb = b.wrapping_sub(g) & 0xff;
+        *p = (a << 24) | (nr << 16) | (g << 8) | nb;
+    }
+}
+
+/// Compute the per-channel prediction used by the VP8L predictor
+/// transform. Mirrors the decoder's `predict_argb` — kept in sync here
+/// because we need the exact same prediction on both ends.
+fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
+    let l = out[y * w + x - 1];
+    let t = out[(y - 1) * w + x];
+    let tl = out[(y - 1) * w + x - 1];
+    let tr = if x + 1 < w {
+        out[(y - 1) * w + x + 1]
+    } else {
+        out[y * w + x - 1]
+    };
+    match mode {
+        0 => 0xff00_0000,
+        1 => l,
+        2 => t,
+        3 => tr,
+        4 => tl,
+        5 => avg3(l, tr, t),
+        6 => avg2(l, tl),
+        7 => avg2(l, t),
+        8 => avg2(tl, t),
+        9 => avg2(t, tr),
+        10 => avg2(avg2(l, tl), avg2(t, tr)),
+        11 => select_argb(l, t, tl),
+        12 => clamp_add_sub_argb(l, t, tl),
+        13 => clamp_add_sub_half_argb(avg2(l, t), tl),
+        _ => 0xff00_0000,
+    }
+}
+
+fn avg2(a: u32, b: u32) -> u32 {
+    let mut out = 0u32;
+    for c in 0..4 {
+        let sh = c * 8;
+        let av = (a >> sh) & 0xff;
+        let bv = (b >> sh) & 0xff;
+        out |= ((av + bv) >> 1) << sh;
+    }
+    out
+}
+
+fn avg3(a: u32, b: u32, c: u32) -> u32 {
+    avg2(a, avg2(b, c))
+}
+
+fn select_argb(l: u32, t: u32, tl: u32) -> u32 {
+    let mut out = 0u32;
+    let mut dl = 0i32;
+    let mut dt = 0i32;
+    for c in 0..4 {
+        let sh = c * 8;
+        let lv = ((l >> sh) & 0xff) as i32;
+        let tv = ((t >> sh) & 0xff) as i32;
+        let tlv = ((tl >> sh) & 0xff) as i32;
+        dl += (tv - tlv).abs();
+        dt += (lv - tlv).abs();
+    }
+    for c in 0..4 {
+        let sh = c * 8;
+        let lv = (l >> sh) & 0xff;
+        let tv = (t >> sh) & 0xff;
+        let v = if dl < dt { lv } else { tv };
+        out |= v << sh;
+    }
+    out
+}
+
+fn clamp_add_sub_argb(l: u32, t: u32, tl: u32) -> u32 {
+    let mut out = 0u32;
+    for c in 0..4 {
+        let sh = c * 8;
+        let lv = ((l >> sh) & 0xff) as i32;
+        let tv = ((t >> sh) & 0xff) as i32;
+        let tlv = ((tl >> sh) & 0xff) as i32;
+        let v = (lv + tv - tlv).clamp(0, 255) as u32;
+        out |= v << sh;
+    }
+    out
+}
+
+fn clamp_add_sub_half_argb(a: u32, b: u32) -> u32 {
+    let mut out = 0u32;
+    for c in 0..4 {
+        let sh = c * 8;
+        let av = ((a >> sh) & 0xff) as i32;
+        let bv = ((b >> sh) & 0xff) as i32;
+        let v = (av + (av - bv) / 2).clamp(0, 255) as u32;
+        out |= v << sh;
+    }
+    out
+}
+
+/// Per-channel ARGB subtraction modulo 256 — inverse of `add_argb` in
+/// the decoder.
+fn sub_argb(a: u32, b: u32) -> u32 {
+    let aa = (a >> 24) & 0xff;
+    let ar = (a >> 16) & 0xff;
+    let ag = (a >> 8) & 0xff;
+    let ab = a & 0xff;
+    let ba = (b >> 24) & 0xff;
+    let br = (b >> 16) & 0xff;
+    let bg = (b >> 8) & 0xff;
+    let bb = b & 0xff;
+    (((aa.wrapping_sub(ba)) & 0xff) << 24)
+        | (((ar.wrapping_sub(br)) & 0xff) << 16)
+        | (((ag.wrapping_sub(bg)) & 0xff) << 8)
+        | ((ab.wrapping_sub(bb)) & 0xff)
+}
+
+/// Score a predictor mode on a tile. The "cost" is sum-of-abs per-
+/// channel residuals over the tile: a crude but monotonic proxy for
+/// entropy that doesn't require building a second Huffman pass. Chooses
+/// between modes purely by residual magnitude, which correlates well
+/// enough with final code length on natural images.
+fn score_predictor_on_tile(
+    originals: &[u32],
+    decoded: &[u32],
+    width: usize,
+    tile_x0: usize,
+    tile_y0: usize,
+    tile_x1: usize,
+    tile_y1: usize,
+    mode: u32,
+) -> u64 {
+    let mut cost = 0u64;
+    for y in tile_y0..tile_y1 {
+        for x in tile_x0..tile_x1 {
+            let idx = y * width + x;
+            let pred = if x == 0 && y == 0 {
+                0xff00_0000
+            } else if y == 0 {
+                decoded[idx - 1]
+            } else if x == 0 {
+                decoded[idx - width]
+            } else {
+                predict_argb(decoded, width, x, y, mode)
+            };
+            let p = originals[idx];
+            for c in 0..4 {
+                let sh = c * 8;
+                let pv = ((p >> sh) & 0xff) as i32;
+                let prv = ((pred >> sh) & 0xff) as i32;
+                let d = (pv - prv).unsigned_abs() as u64;
+                // Fold the wrap-around: residual is mod 256, so the
+                // "real" magnitude is min(d, 256-d) — that matches what
+                // the Huffman alphabet will see.
+                cost += d.min(256 - d);
+            }
+        }
+    }
+    cost
+}
+
+/// Pick one predictor mode per tile by minimising sum-of-abs residuals
+/// over the [`PREDICTOR_MODES`] pool. Returns one entry per tile in
+/// row-major order.
+fn choose_predictor_modes(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    tile_bits: u32,
+    sub_w: u32,
+    sub_h: u32,
+) -> Vec<u32> {
+    let tile_side = 1usize << tile_bits;
+    let w = width as usize;
+    let h = height as usize;
+    let mut modes = Vec::with_capacity((sub_w * sub_h) as usize);
+    // The predictor lookup on the decoder side references already-decoded
+    // pixels, not the residuals. Since we're forward-computing, we use
+    // the original pixel buffer here — the causal neighbourhood is
+    // identical pre- and post-inversion because residual + prediction =
+    // original mod 256.
+    for ty in 0..sub_h as usize {
+        for tx in 0..sub_w as usize {
+            let x0 = tx * tile_side;
+            let y0 = ty * tile_side;
+            let x1 = (x0 + tile_side).min(w);
+            let y1 = (y0 + tile_side).min(h);
+            let mut best = PREDICTOR_MODES[0];
+            let mut best_cost = u64::MAX;
+            for &m in PREDICTOR_MODES {
+                let c = score_predictor_on_tile(pixels, pixels, w, x0, y0, x1, y1, m);
+                if c < best_cost {
+                    best_cost = c;
+                    best = m;
+                }
+            }
+            modes.push(best);
+        }
+    }
+    modes
+}
+
+/// Apply the predictor transform in the forward (encoder) direction:
+/// produce residuals such that the decoder's `apply_predictor` pass
+/// recovers the original pixels. The decoder's causal neighbourhood
+/// uses *already decoded* pixels (post-residual-add), which by the
+/// reconstruction identity equals the original pixel buffer. So we can
+/// compute predictions from the originals directly.
+fn apply_predictor_forward(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    tile_bits: u32,
+    modes: &[u32],
+    sub_w: u32,
+) -> Vec<u32> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let pred = if x == 0 && y == 0 {
+                0xff00_0000
+            } else if y == 0 {
+                pixels[idx - 1]
+            } else if x == 0 {
+                pixels[idx - w]
+            } else {
+                let tx = x >> tile_bits;
+                let ty = y >> tile_bits;
+                let mode = modes[ty * sub_w as usize + tx];
+                predict_argb(pixels, w, x, y, mode)
+            };
+            out[idx] = sub_argb(pixels[idx], pred);
+        }
+    }
+    out
+}
+
+// ── Huffman tree plumbing (unchanged from the pre-transform encoder) ──
+
 /// Canonical Huffman code length builder with a 15-bit length cap.
-///
-/// Algorithm:
-/// 1. Build a standard heap-based Huffman tree from `freqs`.
-/// 2. If the deepest symbol exceeds `max_len`, redistribute code lengths
-///    by borrowing from shorter codes (the classic "length-limited
-///    Huffman" trick by Kraft-sum repair).
-/// 3. Always return a valid tree — if only 0 or 1 symbols are live, we
-///    add a synthetic second symbol so the decoder builds a branching
-///    tree (VP8L's simple-code path is also valid but the decoder in
-///    this crate handles both).
 fn build_limited_lengths(freqs: &[u32], max_len: u8) -> Result<Vec<u8>> {
     let n = freqs.len();
     let mut lens = vec![0u8; n];
     let nonzero: Vec<usize> = (0..n).filter(|&i| freqs[i] > 0).collect();
 
     if nonzero.is_empty() {
-        // No symbols used — give symbol 0 a length-of-1 code to keep the
-        // tree well-formed. Also give symbol 1 (or `n-1` if n==1) so the
-        // decoder's canonical builder sees two leaves.
         if n >= 2 {
             lens[0] = 1;
             lens[1] = 1;
@@ -383,24 +831,19 @@ fn build_limited_lengths(freqs: &[u32], max_len: u8) -> Result<Vec<u8>> {
         return Ok(lens);
     }
     if nonzero.len() == 1 {
-        // A single real symbol — pair it with a dummy to make the tree
-        // non-degenerate. Both at length 1.
         let s = nonzero[0];
         lens[s] = 1;
-        // Pick a different symbol for the dummy.
         let d = if s == 0 { 1.min(n - 1) } else { 0 };
         lens[d] = 1;
         return Ok(lens);
     }
 
-    // Build the tree using a simple priority queue on (freq, node_id).
-    // Nodes: leaves 0..n, internal nodes n..
     #[derive(Clone)]
     struct Node {
         freq: u64,
         left: i32,
         right: i32,
-        symbol: i32, // leaves only
+        symbol: i32,
     }
     let mut nodes: Vec<Node> = Vec::with_capacity(n * 2);
     for (i, &f) in freqs.iter().enumerate() {
@@ -411,7 +854,6 @@ fn build_limited_lengths(freqs: &[u32], max_len: u8) -> Result<Vec<u8>> {
             symbol: i as i32,
         });
     }
-    // Min-heap of live node indices keyed by freq.
     let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>> =
         std::collections::BinaryHeap::new();
     for &i in &nonzero {
@@ -431,7 +873,6 @@ fn build_limited_lengths(freqs: &[u32], max_len: u8) -> Result<Vec<u8>> {
     }
     let root = heap.pop().unwrap().0 .1;
 
-    // Assign lengths via DFS.
     fn walk(nodes: &[Node], idx: usize, depth: u8, lens: &mut [u8]) {
         let n = &nodes[idx];
         if n.symbol >= 0 {
@@ -443,16 +884,11 @@ fn build_limited_lengths(freqs: &[u32], max_len: u8) -> Result<Vec<u8>> {
     }
     walk(&nodes, root, 0, &mut lens);
 
-    // Length-limit the lengths.
     limit_code_lengths(&mut lens, max_len);
     Ok(lens)
 }
 
-/// Cap every non-zero code length at `max_len` by redistributing "Kraft
-/// budget" from the deepest leaves up into shallower slots. This is the
-/// classic post-hoc fix that works well enough for small alphabets.
 fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
-    // Count symbols per length.
     let max_observed = *lens.iter().max().unwrap_or(&0);
     if max_observed <= max_len {
         return;
@@ -463,26 +899,13 @@ fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
             bl_count[l as usize] += 1;
         }
     }
-    // Move anything past max_len down to max_len — overflow causes
-    // Kraft > 1, which we then repair by promoting lower-depth leaves.
     let mut overflow: u64 = 0;
     for l in (max_len as usize + 1)..bl_count.len() {
-        // Each code at depth l counts for 2^(max_len - l) of Kraft
-        // budget when collapsed to max_len (which is bigger than its
-        // original slot since l > max_len → shift is negative → treat
-        // as scaling up). We use a fixed-point budget of 2^max_len for
-        // the full codespace.
         overflow += (bl_count[l] as u64) * ((1u64 << (l - max_len as usize)) - 1);
         bl_count[max_len as usize] += bl_count[l];
         bl_count[l] = 0;
     }
 
-    // Now redistribute by borrowing from lengths < max_len.
-    // overflow is expressed as multiples of 2^0 at depth max_len (i.e.,
-    // each overflow unit = one extra leaf at max_len beyond what fits).
-    // Repairing: take a leaf from depth d (d < max_len), move it to
-    // depth max_len. That frees 2^(max_len - d) slots at max_len minus
-    // 1 for the new leaf there = net gain of 2^(max_len - d) - 1 slots.
     while overflow > 0 {
         let mut d = max_len as i32 - 1;
         while d > 0 && bl_count[d as usize] == 0 {
@@ -493,13 +916,6 @@ fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
         }
         bl_count[d as usize] -= 1;
         bl_count[(d + 1) as usize] += 1;
-        // Net change: split a leaf (counts for 2^(max_len - d) Kraft
-        // units) into a leaf at d+1 (counts for 2^(max_len - d - 1))
-        // + a free slot at d+1 (also 2^(max_len - d - 1)). The free
-        // slot absorbs 1 unit of overflow.
-        //
-        // Overflow is tracked in "units of the max_len slot", so the
-        // free slot at d+1 absorbs 2^(max_len - d - 1) units.
         let freed = 1u64 << ((max_len as i32 - d - 1).max(0) as u32);
         if freed >= overflow {
             overflow = 0;
@@ -508,24 +924,17 @@ fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
         }
     }
 
-    // Rewrite lens by assigning new per-length counts, preserving
-    // original symbol→length mapping as much as possible. We walk
-    // symbols sorted by original depth and reassign them to the new
-    // bl_count distribution.
     let mut by_depth: Vec<(u8, usize)> = lens
         .iter()
         .enumerate()
         .filter(|(_, &l)| l > 0)
         .map(|(i, &l)| (l, i))
         .collect();
-    // Sort deepest-first so leaves that used to be deepest land at the
-    // longest code lengths in the new distribution too.
     by_depth.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     for l in lens.iter_mut() {
         *l = 0;
     }
     let mut idx = 0usize;
-    // Fill from longest to shortest.
     for l in (1..=max_len as usize).rev() {
         let cnt = bl_count[l] as usize;
         for _ in 0..cnt {
@@ -537,8 +946,6 @@ fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
             idx += 1;
         }
     }
-    // Any leftover symbols (shouldn't happen if bl_count is consistent
-    // with nonzero count) get the max length.
     while idx < by_depth.len() {
         let (_, sym) = by_depth[idx];
         lens[sym] = max_len;
@@ -546,7 +953,6 @@ fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
     }
 }
 
-/// Assign canonical codes from code lengths, MSB-first within each code.
 fn canonical_codes(lens: &[u8]) -> Vec<u32> {
     let max_len = *lens.iter().max().unwrap_or(&0);
     let mut codes = vec![0u32; lens.len()];
@@ -574,14 +980,9 @@ fn canonical_codes(lens: &[u8]) -> Vec<u32> {
     codes
 }
 
-/// Write a canonical code for symbol `sym`, MSB first (matches the
-/// decoder's walk through internal nodes). `codes[sym]` is the code value
-/// with the most-significant bit at bit position `lens[sym]-1`.
 fn write_code(bw: &mut BitWriter, codes: &[u32], lens: &[u8], sym: usize) {
     let l = lens[sym];
     let code = codes[sym];
-    // Emit MSB first. VP8L packs LSB-first, so we bit-reverse the code
-    // into a left-to-right LSB-first sequence.
     let mut rev = 0u32;
     for i in 0..l {
         if (code >> i) & 1 != 0 {
@@ -591,29 +992,15 @@ fn write_code(bw: &mut BitWriter, codes: &[u32], lens: &[u8], sym: usize) {
     bw.write(rev, l as u32);
 }
 
-/// Emit a Huffman tree in VP8L "normal" form: fixed CODE_LENGTH_ORDER
-/// header + per-symbol lengths via the meta-tree. Run-length codes
-/// 16/17/18 are used for consecutive zeros and repeats.
 fn emit_huffman_tree(bw: &mut BitWriter, lens: &[u8]) -> Result<()> {
-    // simple-code = 0 (we always use the normal form).
-    bw.write(0, 1);
+    bw.write(0, 1); // simple-code = 0
 
-    // Build the "code-length code lengths" — lengths for the 19-symbol
-    // meta-alphabet used to encode `lens`.
     const CODE_LENGTH_ORDER: [usize; 19] = [
         17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ];
 
-    // Compress `lens` into a sequence of meta-symbols (0..15 for direct
-    // lengths, 16 = copy previous length 3-6×, 17 = zero-run 3-10, 18 =
-    // zero-run 11-138). For v1 we keep the RLE simple and only collapse
-    // long zero runs (the common case) into code 17/18. Repeat-previous
-    // (code 16) is left out — a handful of redundant bits on repeated
-    // small-length plateaus is fine for a first cut.
     let meta_stream = compress_lengths(lens);
 
-    // Tally meta-alphabet frequencies and build a (≤7-bit) tree for it.
-    // The code-length alphabet limit is 7 bits per spec.
     let mut meta_freq = vec![0u32; 19];
     for (code, _extra) in &meta_stream {
         meta_freq[*code as usize] += 1;
@@ -621,9 +1008,6 @@ fn emit_huffman_tree(bw: &mut BitWriter, lens: &[u8]) -> Result<()> {
     let meta_lens = build_limited_lengths(&meta_freq, 7)?;
     let meta_codes = canonical_codes(&meta_lens);
 
-    // Write the meta-alphabet lengths. num_code_lengths must cover
-    // every *used* slot per CODE_LENGTH_ORDER, but we keep it simple and
-    // always emit all 19 (num_code_lengths - 4 = 15, 4 bits).
     let mut last_used = 0usize;
     for i in 0..19 {
         let sym = CODE_LENGTH_ORDER[i];
@@ -638,39 +1022,31 @@ fn emit_huffman_tree(bw: &mut BitWriter, lens: &[u8]) -> Result<()> {
         bw.write(meta_lens[sym] as u32, 3);
     }
 
-    // No truncation mode (bit = 0 → decode the entire `lens` alphabet).
     bw.write(0, 1);
 
-    // Emit the meta stream.
     for (code, extra) in &meta_stream {
         write_code(bw, &meta_codes, &meta_lens, *code as usize);
         match *code {
-            16 => bw.write(*extra, 2), // 3 + 2-bit extra
-            17 => bw.write(*extra, 3), // 3 + 3-bit extra
-            18 => bw.write(*extra, 7), // 11 + 7-bit extra
+            16 => bw.write(*extra, 2),
+            17 => bw.write(*extra, 3),
+            18 => bw.write(*extra, 7),
             _ => {}
         }
     }
     Ok(())
 }
 
-/// RLE-compress code lengths into a (meta_symbol, extra_bits) stream.
-/// Zero runs collapse into codes 17 / 18; non-zero values emit code 0..15
-/// verbatim. Code 16 (repeat-previous-length) is currently unused for
-/// simplicity.
 fn compress_lengths(lens: &[u8]) -> Vec<(u8, u32)> {
     let mut out: Vec<(u8, u32)> = Vec::new();
     let mut i = 0usize;
     while i < lens.len() {
         let v = lens[i];
         if v == 0 {
-            // Count zero run.
             let mut j = i;
             while j < lens.len() && lens[j] == 0 {
                 j += 1;
             }
             let mut run = j - i;
-            // Fold with code 17 (run 3..10) and 18 (run 11..138).
             while run >= 11 {
                 let take = run.min(138);
                 out.push((18, (take - 11) as u32));
@@ -701,7 +1077,6 @@ mod tests {
     fn encode_len_dist_roundtrip_small() {
         for value in 1u32..=200 {
             let (sym, eb, extra) = encode_len_or_dist_value(value);
-            // Re-derive via the decoder's formula.
             let decoded = if sym < 4 {
                 sym + 1
             } else {
@@ -720,11 +1095,6 @@ mod tests {
     fn canonical_codes_match_decoder_shape() {
         let lens = [2u8, 1u8, 3u8, 3u8];
         let codes = canonical_codes(&lens);
-        // Canonical assignment: shortest first. Expected (MSB-first):
-        //   sym1 (len 1): 0
-        //   sym0 (len 2): 10
-        //   sym2 (len 3): 110
-        //   sym3 (len 3): 111
         assert_eq!(codes[1], 0b0);
         assert_eq!(codes[0], 0b10);
         assert_eq!(codes[2], 0b110);

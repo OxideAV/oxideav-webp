@@ -20,9 +20,10 @@
 //!   blending modes are honoured against an internal RGBA canvas.
 //!
 //! VP8L lossless encoding is supported through [`encoder::make_encoder`]
-//! — a minimal-but-correct pure-Rust encoder (length-limited Huffman +
-//! 4 KB-window LZ77, no transforms). VP8 lossy encoding is still out of
-//! scope.
+//! — length-limited Huffman + 4 KB-window LZ77 + subtract-green and
+//! tile-based predictor transforms + a 256-entry colour cache. The
+//! colour (G↔R/B) and palette (colour-indexing) transforms and
+//! meta-Huffman groups are still scoped non-goals.
 
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]

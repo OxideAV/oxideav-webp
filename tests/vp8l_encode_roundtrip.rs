@@ -8,6 +8,7 @@
 
 use oxideav_webp::encode_vp8l_argb;
 use oxideav_webp::vp8l;
+use oxideav_webp::vp8l::encoder::{encode_vp8l_argb_with, EncoderOptions};
 
 /// Pack an R,G,B,A byte slice into ARGB u32 pixels (the layout the VP8L
 /// encoder expects).
@@ -121,4 +122,38 @@ fn vp8l_encode_two_pixel_wide() {
     // 2×1 image — LZ77 min-match is 3 pixels, so this is pure literals.
     let rgba = [0x01u8, 0x02, 0x03, 0xff, 0x04, 0x05, 0x06, 0xff];
     roundtrip(2, 1, &rgba, false);
+}
+
+#[test]
+fn vp8l_encode_transforms_shrink_non_trivial_image() {
+    // Build a 64×64 RGBA gradient that has real spatial correlation in
+    // all three colour channels + a constant alpha plane. Predictor,
+    // subtract-green, and colour-cache should all pay off here; the
+    // "bare" (no-transform) encoder is known to be strictly larger.
+    let w = 64u32;
+    let h = 64u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i] = (x * 3) as u8;
+            rgba[i + 1] = (y * 3) as u8;
+            rgba[i + 2] = ((x + y) * 3) as u8;
+            rgba[i + 3] = 0xff;
+        }
+    }
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+    let bare = encode_vp8l_argb_with(w, h, &pixels, false, EncoderOptions::bare())
+        .expect("bare encode");
+    let full = encode_vp8l_argb(w, h, &pixels, false).expect("full encode");
+    assert!(
+        full.len() < bare.len(),
+        "transforms did not shrink output: bare={} bytes, with-transforms={} bytes",
+        bare.len(),
+        full.len()
+    );
+    // Round-trip the full version so the test also covers the decode
+    // side of every enabled transform.
+    let decoded = vp8l::decode(&full).expect("full decode");
+    assert_eq!(decoded.to_rgba(), rgba, "full-transform round-trip lost data");
 }
