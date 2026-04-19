@@ -89,46 +89,58 @@ params.height = Some(h);
 params.pixel_format = Some(PixelFormat::Rgba);
 let mut enc = codecs.make_encoder(&params)?;
 enc.send_frame(&Frame::Video(rgba_frame))?;
-let pkt = enc.receive_packet()?; // bare VP8L bitstream (no RIFF wrapper)
+let pkt = enc.receive_packet()?; // complete .webp file
 ```
 
-The emitted bytes are a bare VP8L bitstream — decodable directly by
-`oxideav_webp::vp8l::decode`. Wrap them in a `RIFF`/`WEBP`/`VP8L`
-container if you need an on-disk `.webp` file.
+The registered `webp_vp8l` encoder returns a complete RIFF-wrapped
+`.webp` file. Fully-opaque frames use the simple `RIFF/WEBP/VP8L`
+layout; frames with any transparent pixel switch to the extended
+`RIFF/WEBP/VP8X + VP8L` layout so the VP8X header advertises the
+alpha flag (required by any spec-compliant reader).
 
-### Encoder — VP8 (lossy, YUV420P in)
+If you need a bare VP8L bitstream (for embedding in another container,
+say), call `oxideav_webp::encode_vp8l_argb` directly — that entry
+point still returns the header-to-data bytes with no RIFF wrapper.
+
+### Encoder — VP8 (lossy)
 
 ```rust
 let mut params = CodecParameters::video(CodecId::new(oxideav_webp::CODEC_ID_VP8));
 params.width = Some(w);
 params.height = Some(h);
-params.pixel_format = Some(PixelFormat::Yuv420P);
+params.pixel_format = Some(PixelFormat::Yuv420P); // or PixelFormat::Rgba
 let mut enc = codecs.make_encoder(&params)?;
-enc.send_frame(&Frame::Video(yuv420_frame))?;
-let pkt = enc.receive_packet()?; // complete `.webp` file, RIFF/WEBP/VP8  wrapped
+enc.send_frame(&Frame::Video(frame))?;
+let pkt = enc.receive_packet()?; // complete .webp file
 ```
 
-The VP8 lossy encoder writes a complete simple-format `.webp` file
-(RIFF header + `WEBP` form + one `VP8 ` chunk holding a single VP8
-keyframe) so the output is directly consumable by any WebP reader.
-Feeding RGBA into this encoder is rejected with `Error::Unsupported`
-— convert to YUV420P first, or use the VP8L path for RGBA.
+Two input pixel formats are accepted:
+
+* **`Yuv420P`** — emits the simple `RIFF/WEBP/VP8 ` layout.
+* **`Rgba`** — converts RGB to YUV 4:2:0 (BT.601 limited range) for
+  the VP8 keyframe and compresses the alpha plane into an `ALPH`
+  sidecar chunk. Emits the extended `RIFF/WEBP/VP8X + ALPH + VP8 `
+  layout with the VP8X `ALPHA` flag set.
 
 ### Scope
 
 Encoder scope (current):
 
 - VP8L lossless from RGBA, single frame. Emits subtract-green +
-  tile-based predictor transforms plus a 256-entry colour cache, which
-  gets the ratio close to libwebp on smooth/photographic content.
-  Still missing vs libwebp: the colour (G↔R/B decorrelation) transform,
-  the palette (colour-indexing) transform, meta-Huffman grouping, and a
-  wider predictor-mode pool (the encoder currently picks between modes
-  0/1/2/11 per tile rather than probing all 14).
-- VP8 lossy from YUV420P, single frame at the `oxideav-vp8` default
-  qindex (or a caller-supplied one via `encoder_vp8::make_encoder_with_qindex`).
-- No `VP8X` extended header from either encoder. No `ALPH` sidecar on
-  VP8 output. No animated (`ANMF`) output.
+  colour (G↔R/B decorrelation) + tile-based predictor transforms plus
+  a 256-entry colour cache, which puts the ratio in the neighbourhood
+  of libwebp on smooth/photographic content. Still missing vs libwebp:
+  the palette (colour-indexing) transform, meta-Huffman grouping, and
+  a wider predictor-mode pool (the encoder currently picks between
+  modes 0/1/2/11 per tile rather than probing all 14).
+- VP8 lossy from YUV420P or RGBA, single frame. When given RGBA the
+  alpha plane is emitted as a VP8L-compressed `ALPH` chunk inside the
+  extended (`VP8X`) container. Default qindex from `oxideav-vp8` is
+  used unless the caller selects a specific one via
+  `encoder_vp8::make_encoder_with_qindex`.
+- `VP8X` extended header is emitted automatically whenever the output
+  carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
+  the `riff::WebpMetadata` helper. No animated (`ANMF`) output yet.
 
 Decoder scope:
 

@@ -20,10 +20,17 @@
 //!   blending modes are honoured against an internal RGBA canvas.
 //!
 //! VP8L lossless encoding is supported through [`encoder::make_encoder`]
-//! — length-limited Huffman + 4 KB-window LZ77 + subtract-green and
-//! tile-based predictor transforms + a 256-entry colour cache. The
-//! colour (G↔R/B) and palette (colour-indexing) transforms and
-//! meta-Huffman groups are still scoped non-goals.
+//! — length-limited Huffman + 4 KB-window LZ77 + subtract-green,
+//! colour (G↔R/B), and tile-based predictor transforms + a 256-entry
+//! colour cache. The encoder output is a full RIFF `.webp` file (with
+//! the extended `VP8X` header whenever the frame carries alpha or
+//! metadata).
+//!
+//! The VP8 lossy path also emits a full RIFF file. YUV420P frames use
+//! the simple `VP8 ` layout; RGBA frames split the alpha plane into an
+//! `ALPH` sidecar chunk and emit the extended `VP8X` layout. The
+//! palette (colour-indexing) transform and meta-Huffman grouping are
+//! still scoped non-goals on the lossless side.
 
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
