@@ -37,7 +37,7 @@ pub mod encoder;
 pub mod encoder_vp8;
 pub mod vp8l;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_container::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
 
@@ -54,22 +54,29 @@ pub const CODEC_ID_VP8: &str = "webp_vp8";
 
 /// Register every codec implementation this crate provides.
 pub fn register_codecs(reg: &mut CodecRegistry) {
-    let cid = CodecId::new(CODEC_ID_VP8L);
     let caps = CodecCapabilities::video("webp_vp8l_sw")
         .with_intra_only(true)
         .with_lossless(true)
         .with_max_size(16384, 16384);
-    reg.register_both(cid, caps, make_vp8l_decoder, make_vp8l_encoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_VP8L))
+            .capabilities(caps)
+            .decoder(make_vp8l_decoder)
+            .encoder(make_vp8l_encoder),
+    );
 
     // VP8 lossy — encoder only for now. The decode side of a `.webp`
     // file goes through the WebP container demuxer, which already
     // dispatches VP8 chunks into `oxideav-vp8`.
-    let vp8_cid = CodecId::new(CODEC_ID_VP8);
     let vp8_caps = CodecCapabilities::video("webp_vp8_sw_enc")
         .with_intra_only(true)
         .with_lossy(true)
         .with_max_size(16383, 16383);
-    reg.register_encoder_impl(vp8_cid, vp8_caps, make_vp8_encoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_VP8))
+            .capabilities(vp8_caps)
+            .encoder(make_vp8_encoder),
+    );
 }
 
 /// Register the WebP container demuxer + the `.webp` extension + its probe.
