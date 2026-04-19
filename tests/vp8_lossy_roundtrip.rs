@@ -162,26 +162,106 @@ fn vp8_lossy_webp_roundtrip_psnr_above_30() {
 }
 
 #[test]
-fn vp8_encoder_rejects_rgba_input() {
-    use oxideav_core::Error;
-
-    // An Rgba input should bounce out of the VP8 lossy path with an
-    // Error::Unsupported — callers are expected to use the webp_vp8l
-    // (lossless) encoder for Rgba frames.
+fn vp8_encoder_accepts_rgba_and_emits_alph_sidecar() {
+    // With the ALPH sidecar path in place, the VP8 lossy encoder now
+    // accepts RGBA input directly. The resulting file uses the extended
+    // layout (VP8X), contains both a VP8 (colour) and an ALPH (alpha)
+    // chunk, and round-trips through `decode_webp` with the alpha plane
+    // preserved.
     let mut p = make_encoder_params();
     p.pixel_format = Some(PixelFormat::Rgba);
-    let err = encoder_vp8::make_encoder(&p)
-        .err()
-        .expect("rgba params should be rejected at construction");
-    match err {
-        Error::Unsupported(msg) => {
-            assert!(
-                msg.to_lowercase().contains("yuv420p") || msg.to_lowercase().contains("rgba"),
-                "unexpected Unsupported message: {msg}"
-            );
-        }
-        other => panic!("expected Error::Unsupported, got {other:?}"),
+    let mut enc =
+        encoder_vp8::make_encoder(&p).expect("rgba params should build a VP8-lossy encoder");
+    let rgba = build_rgba_with_alpha_gradient();
+    let frame = VideoFrame {
+        format: PixelFormat::Rgba,
+        width: W,
+        height: H,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 1000),
+        planes: vec![VideoPlane {
+            stride: (W as usize) * 4,
+            data: rgba.clone(),
+        }],
+    };
+    enc.send_frame(&Frame::Video(frame)).expect("send rgba");
+    enc.flush().expect("flush");
+    let pkt = enc.receive_packet().expect("receive packet");
+    let out = pkt.data;
+
+    // Container shape: RIFF + WEBP + VP8X as the first chunk.
+    assert_eq!(&out[0..4], b"RIFF");
+    assert_eq!(&out[8..12], b"WEBP");
+    assert_eq!(&out[12..16], b"VP8X", "expected VP8X marker at offset 12");
+    // ALPHA flag (0x10) must be set in the VP8X flags byte.
+    assert!(
+        out[20] & 0x10 != 0,
+        "VP8X ALPHA flag not set (flags = {:#x})",
+        out[20]
+    );
+
+    // Scan chunks: the file must contain both a `VP8 ` and an `ALPH`
+    // chunk alongside the VP8X header.
+    let (has_vp8, has_alph) = find_chunks(&out);
+    assert!(has_vp8, "output is missing the VP8 chunk");
+    assert!(has_alph, "output is missing the ALPH sidecar chunk");
+
+    // Round-trip through the decoder and confirm the alpha plane is
+    // preserved (values are lossless because the ALPH is VP8L-compressed).
+    let img = decode_webp(&out).expect("decode");
+    assert_eq!(img.frames.len(), 1);
+    let decoded = &img.frames[0].rgba;
+    assert_eq!(decoded.len(), (W * H * 4) as usize);
+    for (i, (a_in, a_out)) in rgba
+        .iter()
+        .skip(3)
+        .step_by(4)
+        .zip(decoded.iter().skip(3).step_by(4))
+        .enumerate()
+    {
+        assert_eq!(
+            a_in, a_out,
+            "alpha byte {i} did not round-trip: in={a_in}, out={a_out}"
+        );
     }
+}
+
+/// 128×128 RGBA buffer with a known alpha gradient. The colour plane is
+/// a smooth diagonal ramp to keep VP8's lossy PSNR reasonable.
+fn build_rgba_with_alpha_gradient() -> Vec<u8> {
+    let mut rgba = vec![0u8; (W * H * 4) as usize];
+    for y in 0..H {
+        for x in 0..W {
+            let i = ((y * W + x) * 4) as usize;
+            rgba[i] = (x * 2) as u8;
+            rgba[i + 1] = (y * 2) as u8;
+            rgba[i + 2] = (x + y) as u8;
+            // Alpha: diagonal ramp 0..=255.
+            rgba[i + 3] = ((x + y) * 255 / (W + H - 2)) as u8;
+        }
+    }
+    rgba
+}
+
+/// Walk the chunk list of a WebP file and report whether it has a `VP8 `
+/// and an `ALPH` chunk. Assumes a well-formed RIFF/WEBP header.
+fn find_chunks(buf: &[u8]) -> (bool, bool) {
+    let mut has_vp8 = false;
+    let mut has_alph = false;
+    let mut pos = 12; // skip "RIFF" size "WEBP"
+    while pos + 8 <= buf.len() {
+        let fourcc = &buf[pos..pos + 4];
+        let size =
+            u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as usize;
+        match fourcc {
+            b"VP8 " => has_vp8 = true,
+            b"ALPH" => has_alph = true,
+            _ => {}
+        }
+        let padded = size + (size & 1);
+        pos += 8 + padded;
+    }
+    (has_vp8, has_alph)
 }
 
 #[test]
