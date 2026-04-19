@@ -2,12 +2,17 @@
 //! in [`crate::vp8l::encoder`].
 //!
 //! The encoder accepts a single `Rgba` video frame per `send_frame` and
-//! emits a bare VP8L bitstream (no RIFF wrapper) on `receive_packet`. The
-//! corresponding decoder, registered under the same `webp_vp8l` codec id,
-//! is [`crate::decoder::make_vp8l_decoder`]'s `Vp8lStandalone`. Callers
-//! that want a full `.webp` file should wrap the output in a RIFF/WEBP
-//! container themselves (or go through the `webp` container muxer — which
-//! is a separate feature not tackled here).
+//! emits a RIFF-wrapped `.webp` file on `receive_packet`. Frames whose
+//! alpha is uniformly opaque go into a simple `RIFF/WEBP/VP8L` layout;
+//! frames that carry alpha information get an extended `RIFF/WEBP/VP8X +
+//! VP8L` layout so the VP8X header can advertise the alpha flag and the
+//! canvas size — required for any WebP reader that honours the extended
+//! format spec.
+//!
+//! Callers that want to stay on the bare-bitstream path (decodable
+//! directly by [`crate::vp8l::decode`]) should call
+//! [`crate::vp8l::encode_vp8l_argb`] themselves — that entry point
+//! remains unchanged.
 
 use std::collections::VecDeque;
 
@@ -17,6 +22,7 @@ use oxideav_core::{
     VideoFrame,
 };
 
+use crate::riff::{build_webp_file, ImageKind, WebpMetadata};
 use crate::vp8l::encode_vp8l_argb;
 use crate::CODEC_ID_VP8L;
 
@@ -113,6 +119,8 @@ impl Encoder for Vp8lEncoder {
 }
 
 /// Pack an Rgba `VideoFrame` into ARGB u32 pixels and run the VP8L encoder.
+/// Returns a full `.webp` file — simple-layout when the frame is fully
+/// opaque, extended (VP8X + VP8L) when alpha carries data.
 fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
     let w = v.width as usize;
     let h = v.height as usize;
@@ -138,5 +146,30 @@ fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
             pixels.push((a << 24) | (r << 16) | (g << 8) | b);
         }
     }
-    encode_vp8l_argb(v.width, v.height, &pixels, has_alpha)
+    let bitstream = encode_vp8l_argb(v.width, v.height, &pixels, has_alpha)?;
+    // When the frame carries alpha we *must* emit the extended layout
+    // (VP8X) per the RIFF container spec — readers that parse only the
+    // simple form would otherwise miss the alpha flag. A fully-opaque
+    // frame takes the cheaper simple layout.
+    let meta = WebpMetadata::default();
+    if has_alpha {
+        // Force VP8X path by going through `build_extended` via the
+        // metadata helper: we re-use `icc`/`exif`/`xmp` == None but
+        // still want VP8X. The `riff` module switches to extended when
+        // we pass a sentinel ALPH or any metadata; for VP8L-with-alpha
+        // we need a third trigger — the alpha flag itself. Expose that
+        // through a dedicated helper.
+        Ok(crate::riff::build_vp8l_with_alpha(
+            &bitstream, v.width, v.height, &meta,
+        ))
+    } else {
+        Ok(build_webp_file(
+            ImageKind::Vp8lLossless,
+            &bitstream,
+            v.width,
+            v.height,
+            None,
+            &meta,
+        ))
+    }
 }

@@ -35,6 +35,7 @@ pub mod decoder;
 pub mod demux;
 pub mod encoder;
 pub mod encoder_vp8;
+pub mod riff;
 pub mod vp8l;
 
 use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
