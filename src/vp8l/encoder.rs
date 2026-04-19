@@ -8,6 +8,13 @@
 //! * **Subtract-green transform** (always on). Removes the common
 //!   photographic correlation between the G/R and G/B channels by
 //!   sending `r-g` and `b-g` instead of `r` and `b`.
+//! * **Colour transform** (always on, tile-based G↔R/B decorrelation).
+//!   For each 32×32 tile we search a coarse grid of 256 coefficient
+//!   combinations (16 × 16 over the `g→r` / `g→b` pair with a
+//!   post-optimisation pass on `r→b`) and keep the one that minimises
+//!   sum-of-abs residuals. Runs after subtract-green, so the inverse
+//!   order on decode is predictor → colour → add-green — matching
+//!   libwebp.
 //! * **Predictor transform** (always on, tile-based). Each 16×16 tile
 //!   picks one of a small set of VP8L predictor modes (0 = opaque
 //!   black, 1 = left, 2 = top, 11 = select) by forward-pass cost
@@ -18,9 +25,6 @@
 //!
 //! What we still don't do (compared to libwebp):
 //!
-//! * **No colour transform** (G↔R/B decorrelation). The entropy win is
-//!   modest for most inputs and a full coefficient search is outside
-//!   this crate's scope.
 //! * **No colour-indexing (palette) transform.** Palette images still
 //!   go through the full ARGB path — inefficient for palettised art but
 //!   correct.
@@ -76,6 +80,28 @@ const COLOR_CACHE_BITS: u32 = 8;
 /// and strikes a reasonable balance between side-image overhead and
 /// per-block mode accuracy.
 const PREDICTOR_TILE_BITS: u32 = 4; // 16-pixel tiles
+
+/// Side length (in pixels) of a colour-transform tile. The spec allows
+/// 2..=9 (4..=512). 32 is libwebp's default for the colour transform:
+/// large enough that the 256-combo per-tile search stays cheap (one scan
+/// per candidate over 1 K pixels) yet small enough that coefficient
+/// choice can track real spatial variation.
+const COLOR_TRANSFORM_TILE_BITS: u32 = 5; // 32-pixel tiles
+
+/// Candidate values for the `g→r` and `g→b` colour-transform
+/// coefficients. Spec §3.6.6 stores each coefficient as a signed int8
+/// and weights the per-pixel delta by `>> 5`, so every step of 1 is a
+/// ~3 % correction — the grid below covers the useful range with
+/// 16 entries (-24..=21, step 3). 16 × 16 = 256 per tile, matching the
+/// per-tile search budget set by the colour-transform design note.
+const COLOR_COEFF_GRID: [i8; 16] = [
+    -24, -21, -18, -15, -12, -9, -6, -3, 0, 3, 6, 9, 12, 15, 18, 21,
+];
+
+/// Coarse sweep for the `r→b` coefficient, run once per tile *after*
+/// the (g→r, g→b) grid has picked a best pair. Five values are enough
+/// in practice — `r→b` wins are smaller than the green-axis ones.
+const COLOR_R2B_GRID: [i8; 5] = [-12, -6, 0, 6, 12];
 
 /// Predictor modes we're willing to pick between on the encoder side.
 /// Limiting the pool keeps the per-tile mode search cheap (a linear
@@ -150,6 +176,7 @@ pub fn encode_vp8l_argb(
 #[derive(Clone, Copy)]
 pub struct EncoderOptions {
     pub use_subtract_green: bool,
+    pub use_color_transform: bool,
     pub use_predictor: bool,
     pub use_color_cache: bool,
 }
@@ -158,6 +185,7 @@ impl Default for EncoderOptions {
     fn default() -> Self {
         Self {
             use_subtract_green: true,
+            use_color_transform: true,
             use_predictor: true,
             use_color_cache: true,
         }
@@ -170,6 +198,20 @@ impl EncoderOptions {
     pub fn bare() -> Self {
         Self {
             use_subtract_green: false,
+            use_color_transform: false,
+            use_predictor: false,
+            use_color_cache: false,
+        }
+    }
+
+    /// Subtract-green only. Used by the per-transform shrinkage tests so
+    /// the colour-transform contribution can be isolated from the other
+    /// passes.
+    #[doc(hidden)]
+    pub fn subtract_green_only() -> Self {
+        Self {
+            use_subtract_green: true,
+            use_color_transform: false,
             use_predictor: false,
             use_color_cache: false,
         }
@@ -219,6 +261,41 @@ pub fn encode_vp8l_argb_with(
         bw.write(1, 1);
         bw.write(2, 2);
         apply_subtract_green_forward(&mut working);
+    }
+
+    if opts.use_color_transform {
+        // Forward colour transform: per-tile search over the
+        // [`COLOR_COEFF_GRID`] × [`COLOR_COEFF_GRID`] grid (256 combos)
+        // plus a follow-up `r→b` sweep. Emits a predictor-shaped
+        // sub-image (one ARGB pixel per tile, coeffs packed as
+        // R = g2r, G = g2b, B = r2b, A = 0xff).
+        let tile_bits = COLOR_TRANSFORM_TILE_BITS;
+        let tile_side = 1u32 << tile_bits;
+        let sub_w = (width + tile_side - 1) / tile_side;
+        let sub_h = (height + tile_side - 1) / tile_side;
+        let coeffs = choose_color_transform(&working, width, height, tile_bits, sub_w, sub_h);
+
+        // Transform header: present + type 1 (ColorTransform) + tile_bits-2.
+        bw.write(1, 1);
+        bw.write(1, 2);
+        bw.write(tile_bits - 2, 3);
+
+        // Sub-image: 0xff alpha so the decoder's generic ARGB decode
+        // matches what the decoder's `apply_color_transform` then reads
+        // out of `(coeffs >> 16) / (coeffs >> 8) / coeffs`.
+        let sub_pixels: Vec<u32> = coeffs
+            .iter()
+            .map(|c| {
+                let g2r = (c.g2r as u8) as u32;
+                let g2b = (c.g2b as u8) as u32;
+                let r2b = (c.r2b as u8) as u32;
+                0xff00_0000 | (g2r << 16) | (g2b << 8) | r2b
+            })
+            .collect();
+        encode_image_stream(&mut bw, &sub_pixels, sub_w, sub_h, false, 0)?;
+
+        // Apply the forward colour transform to the working pixels.
+        working = apply_color_transform_forward(&working, width, height, tile_bits, &coeffs, sub_w);
     }
 
     if opts.use_predictor {
@@ -772,6 +849,176 @@ fn choose_predictor_modes(
         }
     }
     modes
+}
+
+// ── Colour transform (encoder side) ────────────────────────────────────
+//
+// Spec §3.6.6. Each tile carries three signed int8 coefficients:
+//
+//   * `g→r`  — pulled out of red:   r_enc = r - ((g2r * sext(g)) >> 5)
+//   * `g→b`  — pulled out of blue:  b_enc = b - ((g2b * sext(g)) >> 5)
+//   * `r→b`  — pulled out of blue *after* the green correction, using
+//              the ORIGINAL (un-encoded) red: b_enc2 = b_enc - ((r2b * sext(r_orig)) >> 5).
+//
+// The decoder inverts this by first adding the `g2r` / `g2b` corrections
+// back (using the already-decoded green), then adding the `r2b`
+// correction (using the already-decoded red). Forward and inverse are
+// strict inverses per channel modulo 256.
+
+/// Per-tile colour-transform coefficients. Stored as signed int8 — the
+/// decoder sign-extends the same way.
+#[derive(Clone, Copy, Default)]
+struct ColorCoeffs {
+    g2r: i8,
+    g2b: i8,
+    r2b: i8,
+}
+
+/// Cost of a single (pixel, coeffs) pair: sum-of-abs residual over the
+/// three mutable channels (green is unchanged). Wrap-around is folded so
+/// a large positive residual matches its negative equivalent — tracks
+/// Huffman-alphabet magnitude.
+fn residual_cost(r: i32, g: i32, b: i32, c: ColorCoeffs) -> u64 {
+    let nr = r - (((c.g2r as i32) * sign_extend_i8(g)) >> 5);
+    let nb1 = b - (((c.g2b as i32) * sign_extend_i8(g)) >> 5);
+    let nb2 = nb1 - (((c.r2b as i32) * sign_extend_i8(r)) >> 5);
+    let rr = nr.rem_euclid(256) as u64;
+    let bb = nb2.rem_euclid(256) as u64;
+    rr.min(256 - rr) + bb.min(256 - bb)
+}
+
+/// Sign-extend the low 8 bits of `v` to a signed i32. Mirrors the
+/// `coeff as i8 as i32` trick the decoder uses; kept as a function so
+/// unit tests can lean on it.
+fn sign_extend_i8(v: i32) -> i32 {
+    ((v & 0xff) as i8) as i32
+}
+
+/// Pick a colour-transform coefficient triple per tile by scanning the
+/// [`COLOR_COEFF_GRID`] × [`COLOR_COEFF_GRID`] grid with `r2b=0`, then
+/// refining `r2b` around the best (g2r, g2b).
+fn choose_color_transform(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    tile_bits: u32,
+    sub_w: u32,
+    sub_h: u32,
+) -> Vec<ColorCoeffs> {
+    let tile_side = 1usize << tile_bits;
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = Vec::with_capacity((sub_w * sub_h) as usize);
+    for ty in 0..sub_h as usize {
+        for tx in 0..sub_w as usize {
+            let x0 = tx * tile_side;
+            let y0 = ty * tile_side;
+            let x1 = (x0 + tile_side).min(w);
+            let y1 = (y0 + tile_side).min(h);
+
+            // Materialise the tile's (r, g, b) triplets — we'll reuse
+            // them across every candidate coefficient tuple.
+            let mut tile: Vec<(i32, i32, i32)> = Vec::with_capacity((x1 - x0) * (y1 - y0));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = pixels[y * w + x];
+                    let r = ((p >> 16) & 0xff) as i32;
+                    let g = ((p >> 8) & 0xff) as i32;
+                    let b = (p & 0xff) as i32;
+                    tile.push((r, g, b));
+                }
+            }
+
+            let baseline_score = tile.iter().fold(0u64, |acc, &(r, _g, b)| {
+                let rr = r.rem_euclid(256) as u64;
+                let bb = b.rem_euclid(256) as u64;
+                acc + rr.min(256 - rr) + bb.min(256 - bb)
+            });
+
+            let mut best = ColorCoeffs::default();
+            let mut best_cost = baseline_score;
+            // 16 × 16 grid over (g2r, g2b) with r2b = 0.
+            for &g2r in COLOR_COEFF_GRID.iter() {
+                for &g2b in COLOR_COEFF_GRID.iter() {
+                    let c = ColorCoeffs { g2r, g2b, r2b: 0 };
+                    let mut total = 0u64;
+                    for &(r, g, b) in &tile {
+                        total += residual_cost(r, g, b, c);
+                        // Early-abort: if we're already past the best,
+                        // further pixels can only make it worse.
+                        if total >= best_cost {
+                            break;
+                        }
+                    }
+                    if total < best_cost {
+                        best_cost = total;
+                        best = c;
+                    }
+                }
+            }
+            // Second pass: sweep r2b around the best (g2r, g2b).
+            for &r2b in COLOR_R2B_GRID.iter() {
+                let c = ColorCoeffs {
+                    g2r: best.g2r,
+                    g2b: best.g2b,
+                    r2b,
+                };
+                let mut total = 0u64;
+                for &(r, g, b) in &tile {
+                    total += residual_cost(r, g, b, c);
+                    if total >= best_cost {
+                        break;
+                    }
+                }
+                if total < best_cost {
+                    best_cost = total;
+                    best = c;
+                }
+            }
+            out.push(best);
+        }
+    }
+    out
+}
+
+/// Apply the forward colour transform using per-tile coefficients.
+/// Inverse of [`super::transform::apply_color_transform`].
+fn apply_color_transform_forward(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    tile_bits: u32,
+    coeffs: &[ColorCoeffs],
+    sub_w: u32,
+) -> Vec<u32> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let p = pixels[idx];
+            let tx = x >> tile_bits;
+            let ty = y >> tile_bits;
+            let c = coeffs[ty * sub_w as usize + tx];
+            let a = (p >> 24) & 0xff;
+            let r_orig = ((p >> 16) & 0xff) as i32;
+            let g = ((p >> 8) & 0xff) as i32;
+            let b_orig = (p & 0xff) as i32;
+
+            // Forward: undo the decoder's green additions, then the
+            // `r2b` addition — using the *pre-transform* r as the
+            // decoder-side "decoded r" (because forward + inverse
+            // cancel out mod 256).
+            let new_r = (r_orig - (((c.g2r as i32) * sign_extend_i8(g)) >> 5)).rem_euclid(256);
+            let b_after_g = (b_orig - (((c.g2b as i32) * sign_extend_i8(g)) >> 5)).rem_euclid(256);
+            let new_b =
+                (b_after_g - (((c.r2b as i32) * sign_extend_i8(r_orig)) >> 5)).rem_euclid(256);
+
+            out[idx] = (a << 24) | ((new_r as u32) << 16) | ((g as u32) << 8) | (new_b as u32);
+        }
+    }
+    out
 }
 
 /// Apply the predictor transform in the forward (encoder) direction:

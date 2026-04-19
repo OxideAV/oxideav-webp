@@ -125,6 +125,66 @@ fn vp8l_encode_two_pixel_wide() {
 }
 
 #[test]
+fn vp8l_encode_color_transform_beats_subtract_green_on_bgr_gradient() {
+    // Build a 128×128 BGR-gradient image: R tracks B with a known
+    // offset, G varies independently. This is the correlation the
+    // colour transform is designed to exploit — once subtract-green has
+    // taken care of the green axis, the `g→r` / `g→b` coefficients
+    // should pull out the remaining B ↔ R correlation and shrink the
+    // encoded size vs a subtract-green-only pass.
+    let w = 128u32;
+    let h = 128u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            // B: diagonal ramp.
+            let b = ((x + y) & 0xff) as u8;
+            // R: shifted version of B (strong R↔B correlation, weak
+            // correlation with G).
+            let r = b.wrapping_add(37);
+            // G: independent horizontal ramp.
+            let g = ((x * 2) & 0xff) as u8;
+            rgba[i] = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = 0xff;
+        }
+    }
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+
+    let sg_only =
+        encode_vp8l_argb_with(w, h, &pixels, false, EncoderOptions::subtract_green_only())
+            .expect("subtract-green-only encode");
+    let mut sg_plus_color = EncoderOptions::subtract_green_only();
+    sg_plus_color.use_color_transform = true;
+    let with_color = encode_vp8l_argb_with(w, h, &pixels, false, sg_plus_color)
+        .expect("subtract-green + colour-transform encode");
+
+    eprintln!(
+        "BGR gradient 128×128: sg_only={} bytes, sg+colour_transform={} bytes ({:+.1}%)",
+        sg_only.len(),
+        with_color.len(),
+        100.0 * (with_color.len() as f64 - sg_only.len() as f64) / sg_only.len() as f64,
+    );
+    assert!(
+        with_color.len() < sg_only.len(),
+        "colour transform failed to shrink output on a correlated-BGR gradient: \
+         sg_only={} bytes, with_colour={} bytes",
+        sg_only.len(),
+        with_color.len(),
+    );
+
+    // And the decoded pixels must still match bit-for-bit (lossless).
+    let decoded = vp8l::decode(&with_color).expect("decode sg+colour_transform");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "colour transform round-trip lost data"
+    );
+}
+
+#[test]
 fn vp8l_encode_transforms_shrink_non_trivial_image() {
     // Build a 64×64 RGBA gradient that has real spatial correlation in
     // all three colour channels + a constant alpha plane. Predictor,
