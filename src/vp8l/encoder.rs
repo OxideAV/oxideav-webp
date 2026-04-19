@@ -524,8 +524,7 @@ fn build_symbol_stream(
             // literal codes entirely (only the green symbol is written).
             let mut emitted_cache = false;
             if cache_size > 0 {
-                let idx =
-                    (0x1e35_a7bd_u32.wrapping_mul(p) >> (32 - cache_bits)) as usize;
+                let idx = (0x1e35_a7bd_u32.wrapping_mul(p) >> (32 - cache_bits)) as usize;
                 if idx < cache.len() && cache[idx] == p {
                     out.push(StreamSym::CacheRef { index: idx as u32 });
                     emitted_cache = true;

@@ -23,7 +23,8 @@ use std::io::{Read, SeekFrom};
 
 use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, PixelFormat, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Result,
+    StreamInfo, TimeBase,
 };
 
 /// Codec id we attach to every packet emitted by this demuxer. The decoder
@@ -54,10 +55,10 @@ fn probe(p: &ProbeData) -> u8 {
 /// Public wrapper over `open` so the decoder-side convenience API can
 /// instantiate a demuxer without duplicating the boxing dance.
 pub fn open_boxed(input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
-    open(input)
+    open(input, &oxideav_core::NullCodecResolver)
 }
 
-fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Read the whole file into memory. WebP stills are inherently small
     // (max 16384x16384 lossless / 16383x16383 VP8) and a full-buffer pass
     // simplifies chunk iteration + random access over the `ANMF` loop.

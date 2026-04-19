@@ -143,8 +143,8 @@ fn vp8l_encode_transforms_shrink_non_trivial_image() {
         }
     }
     let pixels = rgba_bytes_to_argb_pixels(&rgba);
-    let bare = encode_vp8l_argb_with(w, h, &pixels, false, EncoderOptions::bare())
-        .expect("bare encode");
+    let bare =
+        encode_vp8l_argb_with(w, h, &pixels, false, EncoderOptions::bare()).expect("bare encode");
     let full = encode_vp8l_argb(w, h, &pixels, false).expect("full encode");
     assert!(
         full.len() < bare.len(),
@@ -155,5 +155,9 @@ fn vp8l_encode_transforms_shrink_non_trivial_image() {
     // Round-trip the full version so the test also covers the decode
     // side of every enabled transform.
     let decoded = vp8l::decode(&full).expect("full decode");
-    assert_eq!(decoded.to_rgba(), rgba, "full-transform round-trip lost data");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "full-transform round-trip lost data"
+    );
 }
