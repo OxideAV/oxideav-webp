@@ -14,7 +14,7 @@ keywords = ["multimedia", "image", "webp", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-container = "0.0"
 oxideav-vp8 = "0.0"
