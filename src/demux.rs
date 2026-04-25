@@ -21,11 +21,11 @@
 
 use std::io::{Read, SeekFrom};
 
-use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Result,
     StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, ProbeData, ReadSeek};
 
 /// Codec id we attach to every packet emitted by this demuxer. The decoder
 /// registered under the same id dispatches to the VP8, VP8L, or extended

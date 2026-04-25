@@ -45,9 +45,9 @@ pub mod encoder_vp8;
 pub mod riff;
 pub mod vp8l;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 /// Codec id string for the VP8L lossless still-image bitstream. Registered
 /// so the codec registry reports it alongside other image codecs.

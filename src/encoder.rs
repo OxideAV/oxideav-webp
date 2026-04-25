@@ -1,4 +1,4 @@
-//! `oxideav_codec::Encoder` adapter around the bare VP8L bitstream encoder
+//! `oxideav_core::Encoder` adapter around the bare VP8L bitstream encoder
 //! in [`crate::vp8l::encoder`].
 //!
 //! The encoder accepts a single `Rgba` video frame per `send_frame` and
@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, TimeBase,
     VideoFrame,

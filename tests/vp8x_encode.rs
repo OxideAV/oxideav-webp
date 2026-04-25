@@ -14,11 +14,11 @@
 //! Both paths also round-trip through `decode_webp` to make sure the
 //! emitted file is parseable by our own decoder.
 
-use oxideav_codec::{CodecRegistry, Encoder};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };
+use oxideav_core::{CodecRegistry, Encoder};
 use oxideav_webp::{decode_webp, CODEC_ID_VP8L};
 
 const W: u32 = 32;

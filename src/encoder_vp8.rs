@@ -1,4 +1,4 @@
-//! `oxideav_codec::Encoder` adapter that produces a full `.webp` file
+//! `oxideav_core::Encoder` adapter that produces a full `.webp` file
 //! using the VP8 lossy path.
 //!
 //! Two input pixel formats are accepted:
@@ -32,7 +32,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
     TimeBase, VideoFrame, VideoPlane,
