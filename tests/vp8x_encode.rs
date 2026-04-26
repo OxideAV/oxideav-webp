@@ -16,7 +16,7 @@
 
 use oxideav_core::ContainerRegistry;
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, PixelFormat, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, PixelFormat, VideoFrame, VideoPlane,
 };
 use oxideav_core::{CodecRegistry, Encoder};
 use oxideav_webp::{decode_webp, CODEC_ID_VP8L};
