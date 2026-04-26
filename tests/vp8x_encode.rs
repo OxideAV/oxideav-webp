@@ -43,11 +43,7 @@ fn make_rgba_frame(with_alpha: bool) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Rgba,
-        width: W,
-        height: H,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1000),
         planes: vec![VideoPlane {
             stride: (W as usize) * 4,
             data,

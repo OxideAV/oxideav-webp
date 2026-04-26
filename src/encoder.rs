@@ -82,18 +82,9 @@ impl Encoder for Vp8lEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("VP8L encoder: video frames only")),
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(
-                "VP8L encoder: frame dimensions must match encoder config",
-            ));
-        }
-        if v.format != PixelFormat::Rgba {
-            return Err(Error::invalid(format!(
-                "VP8L encoder: frame format {:?} must be Rgba",
-                v.format
-            )));
-        }
-        let bytes = encode_frame(v)?;
+        // Frame dimensions and pixel format are now stream-level — the
+        // pipeline upstream is responsible for matching `output_params`.
+        let bytes = encode_frame(v, self.width, self.height)?;
         let mut pkt = Packet::new(0, self.time_base, bytes);
         pkt.pts = v.pts;
         pkt.dts = pkt.pts;
@@ -121,9 +112,9 @@ impl Encoder for Vp8lEncoder {
 /// Pack an Rgba `VideoFrame` into ARGB u32 pixels and run the VP8L encoder.
 /// Returns a full `.webp` file — simple-layout when the frame is fully
 /// opaque, extended (VP8X + VP8L) when alpha carries data.
-fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
-    let w = v.width as usize;
-    let h = v.height as usize;
+fn encode_frame(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
     if v.planes.is_empty() {
         return Err(Error::invalid("VP8L encoder: frame has no planes"));
     }
@@ -146,7 +137,7 @@ fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
             pixels.push((a << 24) | (r << 16) | (g << 8) | b);
         }
     }
-    let bitstream = encode_vp8l_argb(v.width, v.height, &pixels, has_alpha)?;
+    let bitstream = encode_vp8l_argb(width, height, &pixels, has_alpha)?;
     // When the frame carries alpha we *must* emit the extended layout
     // (VP8X) per the RIFF container spec — readers that parse only the
     // simple form would otherwise miss the alpha flag. A fully-opaque
@@ -160,14 +151,14 @@ fn encode_frame(v: &VideoFrame) -> Result<Vec<u8>> {
         // we need a third trigger — the alpha flag itself. Expose that
         // through a dedicated helper.
         Ok(crate::riff::build_vp8l_with_alpha(
-            &bitstream, v.width, v.height, &meta,
+            &bitstream, width, height, &meta,
         ))
     } else {
         Ok(build_webp_file(
             ImageKind::Vp8lLossless,
             &bitstream,
-            v.width,
-            v.height,
+            width,
+            height,
             None,
             &meta,
         ))

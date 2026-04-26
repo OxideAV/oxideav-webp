@@ -19,8 +19,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
-    VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
 };
 use oxideav_vp8::decode_frame as decode_vp8_frame;
 
@@ -46,8 +45,8 @@ pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
                 loop {
                     match dec.receive_frame() {
                         Ok(Frame::Video(vf)) => frames.push(WebpFrame {
-                            width: vf.width,
-                            height: vf.height,
+                            width: w,
+                            height: h,
                             duration_ms: dur,
                             rgba: vf.planes[0].data.clone(),
                         }),
@@ -126,11 +125,7 @@ impl Decoder for Vp8lStandalone {
         }
         let rgba = img.to_rgba();
         let vf = VideoFrame {
-            format: PixelFormat::Rgba,
-            width: img.width,
-            height: img.height,
             pts: self.pending_pts,
-            time_base: self.pending_tb,
             planes: vec![VideoPlane {
                 stride: (img.width as usize) * 4,
                 data: rgba,
@@ -227,11 +222,7 @@ impl Decoder for WebpDecoder {
         );
 
         let vf = VideoFrame {
-            format: PixelFormat::Rgba,
-            width: self.canvas_w,
-            height: self.canvas_h,
             pts: self.pending_pts,
-            time_base: self.pending_tb,
             planes: vec![VideoPlane {
                 stride: (self.canvas_w as usize) * 4,
                 data: self.canvas.clone(),
@@ -293,9 +284,8 @@ impl Decoder for WebpDecoder {
 
 fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8>> {
     let vf = decode_vp8_frame(bytes)?;
-    if vf.format != PixelFormat::Yuv420P {
-        return Err(Error::invalid("WebP: VP8 frame is not 4:2:0"));
-    }
+    // VP8 always produces Yuv420P; pixel format is no longer carried per
+    // frame and is asserted at the codec-parameters level upstream.
     let w = frame_w as usize;
     let h = frame_h as usize;
     // VP8 produces MB-aligned strides; take the top-left w×h region.

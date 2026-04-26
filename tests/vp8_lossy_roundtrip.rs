@@ -52,11 +52,7 @@ fn build_test_pattern() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 fn make_yuv420_frame(y: &[u8], u: &[u8], v: &[u8]) -> VideoFrame {
     let cw = (W / 2) as usize;
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: W,
-        height: H,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1000),
         planes: vec![
             VideoPlane {
                 stride: W as usize,
@@ -174,11 +170,7 @@ fn vp8_encoder_accepts_rgba_and_emits_alph_sidecar() {
         encoder_vp8::make_encoder(&p).expect("rgba params should build a VP8-lossy encoder");
     let rgba = build_rgba_with_alpha_gradient();
     let frame = VideoFrame {
-        format: PixelFormat::Rgba,
-        width: W,
-        height: H,
         pts: Some(0),
-        time_base: TimeBase::new(1, 1000),
         planes: vec![VideoPlane {
             stride: (W as usize) * 4,
             data: rgba.clone(),
@@ -264,36 +256,7 @@ fn find_chunks(buf: &[u8]) -> (bool, bool) {
     (has_vp8, has_alph)
 }
 
-#[test]
-fn vp8_encoder_rejects_rgba_frame_at_send_time() {
-    use oxideav_core::Error;
-
-    // If the encoder was built with Yuv420P params but fed an Rgba frame,
-    // send_frame must reject it (not silently corrupt).
-    let params = make_encoder_params();
-    let mut enc = encoder_vp8::make_encoder(&params).expect("make vp8 encoder");
-    let rgba = vec![0u8; (W * H * 4) as usize];
-    let rgba_frame = VideoFrame {
-        format: PixelFormat::Rgba,
-        width: W,
-        height: H,
-        pts: Some(0),
-        time_base: TimeBase::new(1, 1000),
-        planes: vec![VideoPlane {
-            stride: (W as usize) * 4,
-            data: rgba,
-        }],
-    };
-    let err = enc
-        .send_frame(&Frame::Video(rgba_frame))
-        .expect_err("rgba frame should be rejected by a VP8 encoder");
-    match err {
-        Error::Unsupported(msg) => {
-            assert!(
-                msg.to_lowercase().contains("yuv420p") || msg.to_lowercase().contains("rgba"),
-                "unexpected Unsupported message: {msg}"
-            );
-        }
-        other => panic!("expected Error::Unsupported, got {other:?}"),
-    }
-}
+// `vp8_encoder_rejects_rgba_frame_at_send_time` was removed because pixel
+// format is no longer carried per-frame — input format is fixed at encoder
+// construction via `CodecParameters` and the pipeline upstream is
+// responsible for not feeding a mismatching frame.

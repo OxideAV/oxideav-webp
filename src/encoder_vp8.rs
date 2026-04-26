@@ -118,20 +118,11 @@ impl Encoder for Vp8WebpEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("VP8 WebP encoder: video frames only")),
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(format!(
-                "VP8 WebP encoder: frame dims {}x{} do not match encoder {}x{}",
-                v.width, v.height, self.width, self.height
-            )));
-        }
-        if v.format != self.input_format {
-            return Err(Error::unsupported(format!(
-                "VP8 WebP encoder: frame format {:?} must match encoder input \
-                 {:?} — rebuild the encoder with the correct pixel format",
-                v.format, self.input_format
-            )));
-        }
-        let bytes = match v.format {
+        // Frame dims and pixel format are stream-level (set on the
+        // encoder at construction); the pipeline upstream is responsible
+        // for matching `output_params`. Dispatch on the encoder's
+        // configured input format.
+        let bytes = match self.input_format {
             PixelFormat::Yuv420P => {
                 let vp8 = encode_keyframe(self.width, self.height, self.qindex, v)?;
                 build_webp_file(
@@ -195,11 +186,7 @@ fn encode_rgba_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Res
     let mut alpha = Vec::with_capacity(w * h);
     let (y, u, v_chroma) = rgba_rows_to_yuv420(w, h, plane.stride, &plane.data, &mut alpha);
     let yuv_frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width,
-        height,
         pts: v.pts,
-        time_base: v.time_base,
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
