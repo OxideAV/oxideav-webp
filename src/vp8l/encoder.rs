@@ -161,17 +161,27 @@ impl BitWriter {
 ///
 /// `has_alpha` sets the `alpha_is_used` header bit. It's purely advisory
 /// — the alpha channel is transmitted either way.
+///
+/// Internally runs a 32-trial RDO sweep over the four optional VP8L
+/// transforms × four colour-cache widths and keeps the smallest
+/// encoded variant. Callers who need fully deterministic behaviour for
+/// a fixed transform configuration should use
+/// [`encode_vp8l_argb_with`].
 pub fn encode_vp8l_argb(
     width: u32,
     height: u32,
     pixels: &[u32],
     has_alpha: bool,
 ) -> Result<Vec<u8>> {
-    encode_vp8l_argb_with(width, height, pixels, has_alpha, EncoderOptions::default())
+    encode_vp8l_argb_rdo(width, height, pixels, has_alpha)
 }
 
 /// Encoder tuning knobs. Hidden from the public docs — primarily a
 /// testing surface for sizing transforms on/off against each other.
+///
+/// `cache_bits` is honoured only when `use_color_cache` is `true`. Valid
+/// values are 1..=11 per the VP8L spec; the encoder's
+/// [`COLOR_CACHE_BITS`] default lands on 8 (256-entry cache).
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct EncoderOptions {
@@ -179,6 +189,10 @@ pub struct EncoderOptions {
     pub use_color_transform: bool,
     pub use_predictor: bool,
     pub use_color_cache: bool,
+    /// Width of the colour-cache index in bits. Ignored when
+    /// `use_color_cache == false`. Outside 1..=11 falls back to
+    /// [`COLOR_CACHE_BITS`].
+    pub cache_bits: u32,
 }
 
 impl Default for EncoderOptions {
@@ -188,6 +202,7 @@ impl Default for EncoderOptions {
             use_color_transform: true,
             use_predictor: true,
             use_color_cache: true,
+            cache_bits: COLOR_CACHE_BITS,
         }
     }
 }
@@ -201,6 +216,7 @@ impl EncoderOptions {
             use_color_transform: false,
             use_predictor: false,
             use_color_cache: false,
+            cache_bits: COLOR_CACHE_BITS,
         }
     }
 
@@ -214,6 +230,7 @@ impl EncoderOptions {
             use_color_transform: false,
             use_predictor: false,
             use_color_cache: false,
+            cache_bits: COLOR_CACHE_BITS,
         }
     }
 }
@@ -334,13 +351,75 @@ pub fn encode_vp8l_argb_with(
 
     // ── Main image stream ────────────────────────────────────────────
     let cache_bits = if opts.use_color_cache {
-        COLOR_CACHE_BITS
+        if (1..=11).contains(&opts.cache_bits) {
+            opts.cache_bits
+        } else {
+            COLOR_CACHE_BITS
+        }
     } else {
         0
     };
     encode_image_stream(&mut bw, &working, width, height, true, cache_bits)?;
 
     Ok(bw.finish())
+}
+
+/// Encode `pixels` via the smallest of a coarse parameter grid: each
+/// trial flips the four optional VP8L transforms on/off and tries a
+/// short list of colour-cache widths. Returns the smallest encoded
+/// bitstream — bit-identical lossless behaviour, just tuned for size.
+///
+/// Search space (per spec §3 transforms + §5 colour cache):
+///
+/// | knob               | values                |
+/// |--------------------|----------------------|
+/// | subtract-green     | off, on               |
+/// | colour-transform   | off, on               |
+/// | predictor          | off, on               |
+/// | colour-cache       | off, 6 bits, 8 bits, 10 bits |
+///
+/// 2 × 2 × 2 × 4 = 32 trials. Each trial runs the existing per-transform
+/// pipeline so the cost is one full-image encode per candidate. Trials
+/// are independent and small, so we encode all of them and then pick.
+///
+/// Used as the production path under [`encode_vp8l_argb`] — callers that
+/// want a single fixed configuration should still use
+/// [`encode_vp8l_argb_with`].
+fn encode_vp8l_argb_rdo(
+    width: u32,
+    height: u32,
+    pixels: &[u32],
+    has_alpha: bool,
+) -> Result<Vec<u8>> {
+    // Cache widths to probe. 0 means "no cache". 6/8/10 cover the
+    // useful spread: 6 for very small palettes, 8 (the previous fixed
+    // default) for typical photos, 10 for highly-repeated colour
+    // images. Wider than 10 rarely pays for the extra header overhead.
+    const CACHE_BITS_GRID: [u32; 4] = [0, 6, 8, 10];
+
+    let mut best: Option<Vec<u8>> = None;
+
+    for &use_sg in &[true, false] {
+        for &use_ct in &[true, false] {
+            for &use_pr in &[true, false] {
+                for &cb in CACHE_BITS_GRID.iter() {
+                    let opts = EncoderOptions {
+                        use_subtract_green: use_sg,
+                        use_color_transform: use_ct,
+                        use_predictor: use_pr,
+                        use_color_cache: cb > 0,
+                        cache_bits: if cb > 0 { cb } else { COLOR_CACHE_BITS },
+                    };
+                    let bytes = encode_vp8l_argb_with(width, height, pixels, has_alpha, opts)?;
+                    if best.as_ref().map(|b| bytes.len() < b.len()).unwrap_or(true) {
+                        best = Some(bytes);
+                    }
+                }
+            }
+        }
+    }
+    // `best` is always Some — we ran at least one trial above.
+    Ok(best.expect("RDO produced at least one candidate"))
 }
 
 /// Encode a `width × height` VP8L image stream (post-transform residuals)

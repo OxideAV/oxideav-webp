@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AnimFrame` entries, each carrying duration_ms + offset + blend +
   disposal flags. Per-frame data is encoded losslessly through the
   existing VP8L pipeline.
+- VP8L encoder RDO loop. `encode_vp8l_argb` now probes 32 candidate
+  configurations (predictor on/off × colour-transform on/off ×
+  subtract-green on/off × colour-cache size in {off, 6, 8, 10}) and
+  keeps the smallest encoded variant. Callers wanting a deterministic
+  fixed configuration can still use `encode_vp8l_argb_with`.
 
 ### Fixed
 

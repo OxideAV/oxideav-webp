@@ -128,8 +128,13 @@ Encoder scope (current):
 
 - VP8L lossless from RGBA, single frame. Emits subtract-green +
   colour (G↔R/B decorrelation) + tile-based predictor transforms plus
-  a 256-entry colour cache, which puts the ratio in the neighbourhood
-  of libwebp on smooth/photographic content. Still missing vs libwebp:
+  a tunable colour cache, which puts the ratio in the neighbourhood
+  of libwebp on smooth/photographic content. The default `encode_vp8l_argb`
+  entry point now runs a 32-trial RDO sweep over every combination of
+  the four optional transforms × four colour-cache widths
+  ({off, 6, 8, 10} bits) and keeps the smallest encoded variant —
+  callers that want a fixed configuration can still call
+  `encode_vp8l_argb_with` directly. Still missing vs libwebp:
   the palette (colour-indexing) transform, meta-Huffman grouping, and
   a wider predictor-mode pool (the encoder currently picks between
   modes 0/1/2/11 per tile rather than probing all 14).
