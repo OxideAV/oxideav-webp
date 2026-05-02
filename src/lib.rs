@@ -41,6 +41,7 @@
 pub mod decoder;
 pub mod demux;
 pub mod encoder;
+pub mod encoder_anim;
 pub mod encoder_vp8;
 pub mod riff;
 pub mod vp8l;
@@ -112,4 +113,5 @@ fn make_vp8_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 }
 
 pub use decoder::{decode_webp, WebpFrame, WebpImage};
+pub use encoder_anim::{build_animated_webp, AnimFrame};
 pub use vp8l::encode_vp8l_argb;

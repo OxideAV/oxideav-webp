@@ -140,7 +140,12 @@ Encoder scope (current):
   `encoder_vp8::make_encoder_with_qindex`.
 - `VP8X` extended header is emitted automatically whenever the output
   carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
-  the `riff::WebpMetadata` helper. No animated (`ANMF`) output yet.
+  the `riff::WebpMetadata` helper.
+- Animated WebP encode via [`build_animated_webp`] — emits a
+  `VP8X + ANIM + ANMF...ANMF` file from a slice of `AnimFrame`s with
+  per-frame durations, x/y offsets, blend, and disposal flags. Each
+  ANMF wraps a `VP8L` lossless sub-chunk (mixed lossy + lossless
+  animations are not yet produced; the decoder accepts both shapes).
 
 Decoder scope:
 

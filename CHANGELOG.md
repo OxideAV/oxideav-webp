@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Animated WebP encode via `build_animated_webp` — emits a
+  `RIFF/WEBP/VP8X + ANIM + ANMF...ANMF` file from a slice of
+  `AnimFrame` entries, each carrying duration_ms + offset + blend +
+  disposal flags. Per-frame data is encoded losslessly through the
+  existing VP8L pipeline.
+
+### Fixed
+
+- ANMF flags decoder swapped the disposal/blending bits relative to
+  the WebP container spec. Bit 0 is now correctly read as the
+  blending method (0 = blend, 1 = overwrite) and bit 1 as the
+  disposal method (0 = none, 1 = dispose-to-background).
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-webp/compare/v0.0.4...v0.0.5) - 2026-04-25
 
 ### Other

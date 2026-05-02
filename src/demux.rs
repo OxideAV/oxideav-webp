@@ -494,10 +494,15 @@ fn parse_anmf(data: &[u8]) -> Result<AnmfBundle> {
     let h = (u32::from_le_bytes([data[9], data[10], data[11], 0]) & 0x00FF_FFFF) + 1;
     let dur = u32::from_le_bytes([data[12], data[13], data[14], 0]) & 0x00FF_FFFF;
     let flags = data[15];
-    // Spec: bit0 = blending_method (1 = "no blend" = overwrite),
-    //       bit1 = disposal_method (1 = dispose to BG).
-    let blend_with_previous = flags & 0x02 == 0;
-    let dispose_to_background = flags & 0x01 != 0;
+    // Spec (WebP container, ANMF flags byte):
+    //   bit 0 = blending_method (0 = alpha-blend with canvas,
+    //                            1 = no blend / overwrite)
+    //   bit 1 = disposal_method (0 = do nothing,
+    //                            1 = dispose to background after rendering)
+    // The flag we keep internally is the *positive* sense — true means
+    // "blend onto the canvas using the source alpha". So invert bit 0.
+    let blend_with_previous = flags & 0x01 == 0;
+    let dispose_to_background = flags & 0x02 != 0;
 
     let mut chunks = RiffChunks::new(&data[16..]);
     let mut image: Option<ImagePayload> = None;
