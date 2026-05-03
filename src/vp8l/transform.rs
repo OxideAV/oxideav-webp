@@ -536,29 +536,98 @@ fn apply_color_index(
     bits_per_pixel: u32,
     orig_xsize: u32,
 ) -> Result<Vec<u32>> {
-    let num_colors = colors.len() as u32;
-    let pack = 8 / bits_per_pixel;
-    let mask = (1u32 << bits_per_pixel) - 1;
+    // Specialise per `bits_per_pixel` ∈ {1, 2, 4, 8} so `pack` (the
+    // number of indices packed into one byte) and `mask` are
+    // compile-time constants in each branch — eliminating the per-pixel
+    // `8 / bits_per_pixel` divide, the dynamic mask construction, and
+    // the runtime shift count. With pack known at compile time the
+    // inner loop also unrolls into straight-line per-sub-index code.
     let rows = packed.len() / width as usize;
     let mut out = Vec::with_capacity((orig_xsize as usize) * rows.max(1));
+    let w = width as usize;
+    let ox_end = orig_xsize as usize;
+    match bits_per_pixel {
+        8 => apply_color_index_pack1(&mut out, packed, w, rows, colors, ox_end),
+        4 => apply_color_index_packed::<2, 4, 0x0f>(&mut out, packed, w, rows, colors, ox_end),
+        2 => apply_color_index_packed::<4, 2, 0x03>(&mut out, packed, w, rows, colors, ox_end),
+        1 => apply_color_index_packed::<8, 1, 0x01>(&mut out, packed, w, rows, colors, ox_end),
+        _ => return Err(Error::invalid("VP8L: invalid bits_per_pixel")),
+    }
+    Ok(out)
+}
+
+/// Unpacked colour-index path: `bits_per_pixel == 8`, exactly one
+/// palette index per packed pixel. The boundary check disappears
+/// entirely (every packed pixel produces exactly one output, so
+/// `width == orig_xsize` always).
+#[inline]
+fn apply_color_index_pack1(
+    out: &mut Vec<u32>,
+    packed: &[u32],
+    width: usize,
+    rows: usize,
+    colors: &[u32],
+    _ox_end: usize,
+) {
+    let num_colors = colors.len();
     for y in 0..rows {
-        for xp in 0..width as usize {
-            let p = packed[y * width as usize + xp];
-            let g = (p >> 8) & 0xff;
-            for sub in 0..pack {
-                let ox = xp * pack as usize + sub as usize;
-                if ox >= orig_xsize as usize {
+        let row_base = y * width;
+        for xp in 0..width {
+            let p = packed[row_base + xp];
+            let idx = ((p >> 8) & 0xff) as usize;
+            let color = if idx < num_colors { colors[idx] } else { 0 };
+            out.push(color);
+        }
+    }
+}
+
+/// Bit-packed colour-index path: `bits_per_pixel ∈ {1, 2, 4}`,
+/// `PACK = 8 / bits_per_pixel`, `BITS = bits_per_pixel`, `MASK =
+/// (1 << bits_per_pixel) - 1`. Const generics make `PACK` /
+/// `MASK` literal constants in each monomorphisation so the inner
+/// loop unrolls cleanly. The right-edge boundary check is lifted
+/// out of the inner sub-loop: only the final packed column of each
+/// row may contain partial output, so we split into a fast bulk
+/// path (`xp < bulk_end`) and a tail handler.
+#[inline]
+fn apply_color_index_packed<const PACK: usize, const BITS: u32, const MASK: u32>(
+    out: &mut Vec<u32>,
+    packed: &[u32],
+    width: usize,
+    rows: usize,
+    colors: &[u32],
+    ox_end: usize,
+) {
+    let num_colors = colors.len();
+    // Floor division: number of packed columns that produce a full
+    // PACK-pixel output span. Anything past `bulk_end` may be a
+    // partial span at the right edge of the row.
+    let bulk_end = ox_end / PACK;
+    for y in 0..rows {
+        let row_base = y * width;
+        // Bulk path: PACK outputs per packed pixel, no boundary check.
+        for xp in 0..bulk_end {
+            let g = (packed[row_base + xp] >> 8) & 0xff;
+            for sub in 0..PACK {
+                let idx = ((g >> (BITS * sub as u32)) & MASK) as usize;
+                let color = if idx < num_colors { colors[idx] } else { 0 };
+                out.push(color);
+            }
+        }
+        // Tail path: at most one partial packed pixel at the right
+        // edge of the row. Skip entirely on rows where the width
+        // divides evenly.
+        for xp in bulk_end..width {
+            let g = (packed[row_base + xp] >> 8) & 0xff;
+            for sub in 0..PACK {
+                let ox = xp * PACK + sub;
+                if ox >= ox_end {
                     break;
                 }
-                let idx = (g >> (bits_per_pixel * sub)) & mask;
-                let color = if idx < num_colors {
-                    colors[idx as usize]
-                } else {
-                    0
-                };
+                let idx = ((g >> (BITS * sub as u32)) & MASK) as usize;
+                let color = if idx < num_colors { colors[idx] } else { 0 };
                 out.push(color);
             }
         }
     }
-    Ok(out)
 }
