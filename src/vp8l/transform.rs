@@ -200,32 +200,111 @@ fn apply_predictor(
     // indices strictly less than `idx` in raster order), `Vec::push`
     // works directly: at the moment we compute pixel `idx`, every
     // earlier slot is filled and every later slot is logically untouched.
+    //
+    // Tile hoisting: the predictor `mode` only varies between tiles
+    // (`1 << tile_bits` pixels wide/tall, typically 4..32). Iterating
+    // column-tile-by-column-tile lets us look up `mode` once per tile
+    // row segment instead of once per pixel — eliminating two shifts +
+    // a multiply + a sub-image load from the hot inner loop.
     let pixel_count = residual.len();
     let mut out: Vec<u32> = Vec::with_capacity(pixel_count);
     let w_usize = width as usize;
-    for y in 0..height {
-        for x in 0..width {
-            let idx = (y * width + x) as usize;
-            let pred = if x == 0 && y == 0 {
-                // Top-left: special-case to opaque black + implicit
-                // alpha 0xff (per spec).
-                0xff00_0000
-            } else if y == 0 {
-                // First row → use left neighbour.
-                out[idx - 1]
-            } else if x == 0 {
-                // First column → use top neighbour.
-                out[idx - w_usize]
-            } else {
-                let tx = (x >> tile_bits) as usize;
-                let ty = (y >> tile_bits) as usize;
-                let mode = (sub_image[ty * sub_w as usize + tx] >> 8) & 0x0f;
-                predict_argb(&out, w_usize, x as usize, y as usize, mode)
-            };
-            out.push(add_argb(residual[idx], pred));
+    let sub_w_usize = sub_w as usize;
+
+    // ── Row 0 (top row): predictor is `out[idx-1]` for x>0 and
+    // 0xff00_0000 for the top-left pixel. No tile lookup needed.
+    if height > 0 {
+        out.push(add_argb(residual[0], 0xff00_0000));
+        for x in 1..width as usize {
+            let pred = out[x - 1];
+            out.push(add_argb(residual[x], pred));
+        }
+    }
+
+    // ── Rows 1..height: column 0 uses the top neighbour, columns
+    // 1..width walk through tiles using a fixed `mode` per tile.
+    for y in 1..height {
+        let ty = (y >> tile_bits) as usize;
+        let row_base = (y * width) as usize;
+        // Column 0 — top-only predictor.
+        let pred0 = out[row_base - w_usize];
+        out.push(add_argb(residual[row_base], pred0));
+
+        // Columns 1..width: walk in tile-sized spans so `mode` is
+        // only loaded when crossing a tile boundary.
+        let mut x: u32 = 1;
+        while x < width {
+            let tx = (x >> tile_bits) as usize;
+            let mode = (sub_image[ty * sub_w_usize + tx] >> 8) & 0x0f;
+            // End of this tile column: next multiple of `tile_size`
+            // strictly greater than `x`. Capped at `width`.
+            let tile_end = (((x >> tile_bits) + 1) << tile_bits).min(width);
+            // Per-mode specialisation: dispatch once per tile-row
+            // span, not once per pixel.
+            apply_predictor_tile_row(&mut out, residual, w_usize, y as usize, x, tile_end, mode);
+            x = tile_end;
         }
     }
     out
+}
+
+/// Apply the predictor for one tile-row span — pixels `(x..x_end, y)` —
+/// with a fixed `mode`. The mode dispatch is hoisted out of the per-pixel
+/// loop so each mode's inner body sees only one branch.
+#[inline]
+fn apply_predictor_tile_row(
+    out: &mut Vec<u32>,
+    residual: &[u32],
+    w: usize,
+    y: usize,
+    x_start: u32,
+    x_end: u32,
+    mode: u32,
+) {
+    // y >= 1 and x_start >= 1 by construction (caller handles the
+    // first-row + first-column special cases). All four neighbours
+    // (L, T, TL, TR) are therefore in-bounds.
+    let row_base = y * w;
+    match mode {
+        0 => {
+            // Constant 0xff00_0000 — no neighbour reads.
+            for x in x_start..x_end {
+                let idx = row_base + x as usize;
+                out.push(add_argb(residual[idx], 0xff00_0000));
+            }
+        }
+        1 => {
+            for x in x_start..x_end {
+                let idx = row_base + x as usize;
+                let pred = out[idx - 1];
+                out.push(add_argb(residual[idx], pred));
+            }
+        }
+        2 => {
+            for x in x_start..x_end {
+                let idx = row_base + x as usize;
+                let pred = out[idx - w];
+                out.push(add_argb(residual[idx], pred));
+            }
+        }
+        4 => {
+            for x in x_start..x_end {
+                let idx = row_base + x as usize;
+                let pred = out[idx - w - 1];
+                out.push(add_argb(residual[idx], pred));
+            }
+        }
+        _ => {
+            // Modes 3, 5..13 all need TR which is column-boundary
+            // sensitive (the "leftmost pixel on the same row" wrap),
+            // so keep them on the generic path.
+            for x in x_start..x_end {
+                let idx = row_base + x as usize;
+                let pred = predict_argb(out, w, x as usize, y, mode);
+                out.push(add_argb(residual[idx], pred));
+            }
+        }
+    }
 }
 
 fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
@@ -369,14 +448,21 @@ fn apply_color_transform(
     sub_image: &[u32],
     sub_w: u32,
 ) -> Vec<u32> {
+    // Tile hoisting: `coeffs` (and therefore the unpacked r2b / g2b /
+    // g2r values + their sign-extends) only changes between tiles. The
+    // previous shape did `(x >> tile_bits)` + `(y >> tile_bits)` + a
+    // sub-image load + three byte-extracts + three sign-extends per
+    // pixel; tiling lifts all of that to once per tile-row span (≥ 4
+    // pixels at minimum tile_bits=2, typically 16-32).
     let mut out = Vec::with_capacity(pixels.len());
+    let sub_w_usize = sub_w as usize;
     for y in 0..height {
-        for x in 0..width {
-            let idx = (y * width + x) as usize;
-            let p = pixels[idx];
+        let ty = (y >> tile_bits) as usize;
+        let row_base = (y * width) as usize;
+        let mut x: u32 = 0;
+        while x < width {
             let tx = (x >> tile_bits) as usize;
-            let ty = (y >> tile_bits) as usize;
-            let coeffs = sub_image[ty * sub_w as usize + tx];
+            let coeffs = sub_image[ty * sub_w_usize + tx];
             // Coeff packing per WebP lossless spec §4.2 (the "Color
             // Transform" section): each `ColorTransformElement` is
             // stored as an ARGB pixel where
@@ -384,32 +470,30 @@ fn apply_color_transform(
             //   R = red_to_blue
             //   G = green_to_blue
             //   B = green_to_red
-            // The previous version had R and B swapped (g2r read from
-            // bits 16-23 / r2b from bits 0-7). That's the cross-color
-            // bug surfaced by the lossy-near-lossless-q40 fixture in
-            // lossy_corpus.rs (R% ≈ 1.7%, B% ≈ 0.5%, G% ≈ 43%, PSNR
-            // 8.85 dB). G was partially correct because it's not
-            // touched by the cross-color transform.
             let r2b = ((coeffs >> 16) & 0xff) as i8 as i32;
             let g2b = ((coeffs >> 8) & 0xff) as i8 as i32;
             let g2r = (coeffs & 0xff) as i8 as i32;
+            let tile_end = (((x >> tile_bits) + 1) << tile_bits).min(width);
+            for xi in x..tile_end {
+                let p = pixels[row_base + xi as usize];
+                let a = (p >> 24) & 0xff;
+                let mut r = ((p >> 16) & 0xff) as i32;
+                let g = ((p >> 8) & 0xff) as i32;
+                let mut b = (p & 0xff) as i32;
 
-            let a = (p >> 24) & 0xff;
-            let mut r = ((p >> 16) & 0xff) as i32;
-            let g = ((p >> 8) & 0xff) as i32;
-            let mut b = (p & 0xff) as i32;
+                // g2r / g2b / r2b are sign-extended 8-bit values; per
+                // spec the correction is `((coeff * sign_extend(green)) >> 5)`.
+                r = (r + ((g2r * (g as i8 as i32)) >> 5)) & 0xff;
+                b = (b + ((g2b * (g as i8 as i32)) >> 5)) & 0xff;
+                b = (b + ((r2b * (r as i8 as i32)) >> 5)) & 0xff;
 
-            // g2r / g2b / r2b are sign-extended 8-bit values; per spec the
-            // correction is `((coeff * sign_extend(green)) >> 5)`.
-            r = (r + ((g2r * (g as i8 as i32)) >> 5)) & 0xff;
-            b = (b + ((g2b * (g as i8 as i32)) >> 5)) & 0xff;
-            b = (b + ((r2b * (r as i8 as i32)) >> 5)) & 0xff;
-
-            let argb = (a << 24)
-                | ((r as u32 & 0xff) << 16)
-                | ((g as u32 & 0xff) << 8)
-                | (b as u32 & 0xff);
-            out.push(argb);
+                let argb = (a << 24)
+                    | ((r as u32 & 0xff) << 16)
+                    | ((g as u32 & 0xff) << 8)
+                    | (b as u32 & 0xff);
+                out.push(argb);
+            }
+            x = tile_end;
         }
     }
     out
