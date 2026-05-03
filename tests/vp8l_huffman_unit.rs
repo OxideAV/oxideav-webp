@@ -37,7 +37,11 @@ impl BitWriter {
     /// Append `n` (≤24) bits of `value` LSB-first to the stream.
     pub fn write(&mut self, value: u32, n: u32) {
         debug_assert!(n <= 24);
-        let mask = if n == 0 { 0u32 } else { ((1u64 << n) - 1) as u32 };
+        let mask = if n == 0 {
+            0u32
+        } else {
+            ((1u64 << n) - 1) as u32
+        };
         self.cur |= (value & mask) << self.nbits;
         self.nbits += n;
         while self.nbits >= 8 {
@@ -212,8 +216,7 @@ fn normal_max_symbol_with_run_code_17_first() {
     // and a tree that decodes to symbol 3 only.
     let mut meta_lens = [0u8; 19];
     meta_lens[17] = 1;
-    meta_lens[1] = 1; // literal-code-length 1 — produces a 1-bit code
-                     // for symbol 3.
+    meta_lens[1] = 1; // literal-code-length 1 — produces a 1-bit code for symbol 3.
     let meta_codes = canonical_codes(&meta_lens);
 
     let alphabet = 8usize;
@@ -382,7 +385,10 @@ fn normal_run_code_17_overshooting_alphabet_errors() {
     let mut br = BitReader::new(&blob);
     let err = HuffmanTree::read(&mut br, alphabet).unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.to_lowercase().contains("zero-run") || msg.contains("past"), "got {msg}");
+    assert!(
+        msg.to_lowercase().contains("zero-run") || msg.contains("past"),
+        "got {msg}"
+    );
 }
 
 #[test]
@@ -578,9 +584,6 @@ fn normal_max_symbol_count_runs_for_each_code() {
     bw.write(0, 3);
     // meta4: literal 2 → lens[5] = 2
     write_meta_code(&mut bw, &meta_lens, &meta_codes, 2);
-    let blob = bw.finish();
-    let mut br = BitReader::new(&blob);
-    let tree = HuffmanTree::read(&mut br, alphabet).expect("normal tree should build");
     // Verify the tree decodes the three live symbols (0, 1, 5) using
     // their canonical codes.
     //   sym0 length 1 → code "0"

@@ -36,7 +36,11 @@ impl BitWriter {
 
     fn write(&mut self, value: u32, n: u32) {
         debug_assert!(n <= 24);
-        let mask = if n == 0 { 0u32 } else { ((1u64 << n) - 1) as u32 };
+        let mask = if n == 0 {
+            0u32
+        } else {
+            ((1u64 << n) - 1) as u32
+        };
         self.cur |= (value & mask) << self.nbits;
         self.nbits += n;
         while self.nbits >= 8 {
@@ -478,7 +482,12 @@ fn write_meta_lens_local(bw: &mut BitWriter, meta_lens: &[u8; 19]) {
     }
 }
 
-fn write_meta_code_local(bw: &mut BitWriter, meta_lens: &[u8; 19], meta_codes: &[u32], code: usize) {
+fn write_meta_code_local(
+    bw: &mut BitWriter,
+    meta_lens: &[u8; 19],
+    meta_codes: &[u32],
+    code: usize,
+) {
     let l = meta_lens[code];
     let v = meta_codes[code];
     assert!(l > 0);
@@ -523,7 +532,7 @@ fn write_normal_huffman_with_max_symbol(
     bw.write(1, 1); // use_length = 1
     let raw = (length_nbits - 2) / 2;
     bw.write(raw, 3);
-    bw.write((max_symbol - 2) as u32, length_nbits as u8);
+    bw.write((max_symbol - 2) as u32, length_nbits);
     for i in 0..max_symbol.min(lens.len()) {
         write_meta_code_local(bw, &meta_lens, &meta_codes, lens[i] as usize);
     }
@@ -579,8 +588,7 @@ fn vp8l_meta_image_with_normal_huffman_use_length() {
     write_simple_one_symbol_tree_1bit(&mut bw, 0); // distance
 
     let blob = bw.finish();
-    let img = decode_webp(&wrap_in_riff(&blob))
-        .expect("decode 4x4 with meta-Huffman normal-tree");
+    let img = decode_webp(&wrap_in_riff(&blob)).expect("decode 4x4 with meta-Huffman normal-tree");
     assert_eq!(img.width, 4);
     assert_eq!(img.height, 4);
     let f = &img.frames[0];
@@ -626,8 +634,8 @@ fn vp8l_meta_image_with_normal_huffman_no_length_bound() {
     write_simple_one_symbol_tree_1bit(&mut bw, 0);
 
     let blob = bw.finish();
-    let img = decode_webp(&wrap_in_riff(&blob))
-        .expect("decode 4x4 with meta-Huffman no-length-bound");
+    let img =
+        decode_webp(&wrap_in_riff(&blob)).expect("decode 4x4 with meta-Huffman no-length-bound");
     assert_eq!(img.width, 4);
     assert_eq!(img.height, 4);
 }

@@ -30,6 +30,7 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
 pub type HuffmanCode = u16;
 
 /// A Huffman tree ready for bit-by-bit decode.
+#[derive(Debug)]
 pub struct HuffmanTree {
     /// Single-symbol shortcut: if present, every read emits this symbol
     /// (consumes no bits).
@@ -426,18 +427,14 @@ mod tests {
 
     #[test]
     fn build_kraft_over_equality_errors() {
-        // Lengths 1, 1, 2 → bl_count[1]=2, bl_count[2]=1; canonical
-        // next_code[2]=4, but only codes 0..=3 fit in 2 bits at this
-        // depth (the two length-1 codes consume the entire codespace).
-        // Sym 2 walks node 0 → node 1 (Leaf(0)) → tries to assign a
-        // leaf where there's already a leaf → "self-collides" error.
+        // Lengths 1, 1, 2 → Kraft = 1/2 + 1/4 = 1.25 > 1. The two
+        // length-1 codes fill both root children with leaves; the
+        // length-2 code's first bit walks into one of those leaves
+        // (where build_from_lengths expects an Internal) and the
+        // intermediate-walk match-arm raises "self-collides".
         //
-        // Note: not every Kraft-over case is caught (e.g. [1,1,1] gets
-        // silently overwritten because all assignments happen at the
-        // root's two children with only leaf-overwrite, no leaf-vs-
-        // internal collision). Catching the broader Kraft-violation
-        // class is a TODO — the current detector flags any case where
-        // the tree path actually crosses an existing leaf.
+        // Note: not every Kraft-over case is caught — see
+        // `build_kraft_over_equality_three_length_one_silently_truncates`.
         let err = build_from_lengths(&[1, 1, 2]).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
