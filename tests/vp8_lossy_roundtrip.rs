@@ -260,3 +260,52 @@ fn find_chunks(buf: &[u8]) -> (bool, bool) {
 // format is no longer carried per-frame — input format is fixed at encoder
 // construction via `CodecParameters` and the pipeline upstream is
 // responsible for not feeding a mismatching frame.
+
+/// Encode the same YUV420P frame at three libwebp-style quality levels
+/// (0, 50, 100) via [`encoder_vp8::make_encoder_with_quality`] and
+/// verify the resulting file sizes are monotonically increasing with
+/// quality. This is the cheapest end-to-end check that the new
+/// `quality` knob actually feeds through to the underlying VP8 qindex
+/// (a non-monotone result would mean the mapping or wiring is broken).
+#[test]
+fn vp8_quality_knob_produces_monotonic_sizes() {
+    let (y, u, v) = build_test_pattern();
+    let frame = make_yuv420_frame(&y, &u, &v);
+    let params = make_encoder_params();
+
+    let encode_at = |quality: f32| -> usize {
+        let mut enc = encoder_vp8::make_encoder_with_quality(&params, quality)
+            .expect("make_encoder_with_quality");
+        enc.send_frame(&Frame::Video(frame.clone()))
+            .expect("send_frame");
+        enc.flush().expect("flush");
+        let pkt = enc.receive_packet().expect("receive_packet");
+        pkt.data.len()
+    };
+
+    let size_q0 = encode_at(0.0); // worst quality → smallest file.
+    let size_q50 = encode_at(50.0);
+    let size_q100 = encode_at(100.0); // best quality → largest file.
+
+    eprintln!("VP8 lossy WebP sizes: q0={size_q0} q50={size_q50} q100={size_q100}");
+    assert!(
+        size_q0 < size_q50,
+        "expected q=0 ({size_q0}) < q=50 ({size_q50}) — qindex wiring broken?"
+    );
+    assert!(
+        size_q50 < size_q100,
+        "expected q=50 ({size_q50}) < q=100 ({size_q100}) — qindex wiring broken?"
+    );
+
+    // Sanity: the q=100 build still produces a valid .webp file.
+    let mut enc = encoder_vp8::make_encoder_with_quality(&params, 100.0).expect("rebuild q=100");
+    enc.send_frame(&Frame::Video(frame.clone())).expect("send");
+    enc.flush().expect("flush");
+    let pkt = enc.receive_packet().expect("receive");
+    assert_eq!(&pkt.data[0..4], b"RIFF");
+    assert_eq!(&pkt.data[8..12], b"WEBP");
+    assert_eq!(&pkt.data[12..16], b"VP8 ");
+    let img = decode_webp(&pkt.data).expect("decode q=100");
+    assert_eq!(img.width, W);
+    assert_eq!(img.height, H);
+}

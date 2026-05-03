@@ -29,6 +29,25 @@
 //!   * ALPH compression is always VP8L-based (type 1, no filtering,
 //!     no pre-processing). Uncompressed / filtered raw alpha (type 0)
 //!     is decodable but not produced here.
+//!
+//! ## Quality knob
+//!
+//! Three factory entry points are exposed:
+//!
+//! * [`make_encoder`] — builds an encoder at the `oxideav-vp8`
+//!   `DEFAULT_QINDEX`.
+//! * [`make_encoder_with_quality`] — libwebp-compatible API surface,
+//!   takes a `quality: f32` in `0.0..=100.0` (higher = better, `75.0`
+//!   is the typical default).
+//! * [`make_encoder_with_qindex`] — direct access to the underlying
+//!   VP8 qindex in `0..=127` (lower = better).
+//!
+//! The quality→qindex mapping is the linear inversion
+//! `qindex = round((100 - quality) * 1.27)`. This matches libwebp's
+//! API surface but is **not** a perceptual match — libwebp also
+//! adjusts the quantizer matrices, AC/DC deltas, and segment-level QP
+//! based on quality, none of which we do yet. Round-2 work would tune
+//! the quantizer matrix to track libwebp's perceptual targets.
 
 use std::collections::VecDeque;
 
@@ -49,8 +68,51 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     make_encoder_with_qindex(params, DEFAULT_QINDEX)
 }
 
+/// Build a VP8-lossy WebP encoder using a libwebp-style `quality`
+/// scalar in `0.0..=100.0` (higher = better quality / larger file).
+///
+/// `0.0` maps to maximum compression (qindex 127), `100.0` maps to
+/// maximum quality (qindex 0); values are clamped to that range. The
+/// mapping is the linear inversion
+/// `qindex = round((100 - quality) * 1.27)`, which lines up with
+/// libwebp's API surface but is **not** a perceptual match: libwebp
+/// also adjusts its quantizer matrices, AC/DC deltas, and segment-level
+/// QP based on quality, none of which we do here. Treat the knob as a
+/// drop-in replacement for the libwebp parameter name only — round-2
+/// work would tune the quantizer matrix and segment QPs to track
+/// libwebp's perceptual targets at matching quality values.
+///
+/// The libwebp default of `75.0` corresponds to qindex ≈ 32 here.
+pub fn make_encoder_with_quality(
+    params: &CodecParameters,
+    quality: f32,
+) -> Result<Box<dyn Encoder>> {
+    make_encoder_with_qindex(params, quality_to_qindex(quality))
+}
+
+/// Convert a libwebp-style `0.0..=100.0` quality value to the VP8
+/// qindex (`0..=127`) the lower-level encoder consumes. Values outside
+/// the range are clamped before mapping; `NaN` falls through to the
+/// max-compression / lowest-quality endpoint (qindex 127).
+///
+/// Mapping: `qindex = round((100 - clamp(q, 0, 100)) * 1.27)`. This is
+/// a pure linear inversion — see [`make_encoder_with_quality`] for the
+/// caveat that this matches libwebp's *API surface* only, not its
+/// perceptual quality model.
+pub fn quality_to_qindex(quality: f32) -> u8 {
+    if quality.is_nan() {
+        return 127;
+    }
+    let q = quality.clamp(0.0, 100.0);
+    ((100.0 - q) * 1.27).round().clamp(0.0, 127.0) as u8
+}
+
 /// Build a VP8-lossy WebP encoder with an explicit qindex (0..=127).
 /// Lower values produce higher quality at the cost of file size.
+///
+/// Most callers should prefer [`make_encoder_with_quality`], which
+/// takes the libwebp-style `0..=100` scale (higher = better) and is
+/// the more familiar knob across image-encoding libraries.
 pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -366,5 +428,37 @@ mod tests {
         assert_eq!(riff_size, 24);
         assert_eq!(out.len(), 32);
         assert_eq!(out[31], 0x00);
+    }
+
+    #[test]
+    fn quality_to_qindex_endpoints_and_clamp() {
+        // 0   → max compression / lowest quality → qindex 127.
+        // 100 → min compression / best quality   → qindex 0.
+        // 50  → midpoint, rounds to 64 (50 * 1.27 = 63.5 → 64).
+        // Values outside [0, 100] are clamped before mapping.
+        assert_eq!(quality_to_qindex(0.0), 127);
+        assert_eq!(quality_to_qindex(100.0), 0);
+        assert_eq!(quality_to_qindex(50.0), 64);
+        assert_eq!(quality_to_qindex(75.0), 32); // libwebp's default ≈ 32.
+        assert_eq!(quality_to_qindex(-10.0), 127);
+        assert_eq!(quality_to_qindex(150.0), 0);
+        assert_eq!(quality_to_qindex(f32::NAN), 127);
+    }
+
+    #[test]
+    fn quality_to_qindex_is_monotonically_decreasing() {
+        // Sweep the full range and verify the mapping is non-increasing
+        // (each step up in quality must yield a qindex ≤ the previous one).
+        let mut prev = quality_to_qindex(0.0);
+        let mut q = 0.0_f32;
+        while q <= 100.0 {
+            let cur = quality_to_qindex(q);
+            assert!(
+                cur <= prev,
+                "quality {q} produced qindex {cur} > previous {prev} — mapping not monotone"
+            );
+            prev = cur;
+            q += 1.0;
+        }
     }
 }

@@ -122,6 +122,24 @@ Two input pixel formats are accepted:
   sidecar chunk. Emits the extended `RIFF/WEBP/VP8X + ALPH + VP8 `
   layout with the VP8X `ALPHA` flag set.
 
+Quality control: the VP8 lossy encoder exposes two equivalent factory
+entry points for picking a target compression level —
+
+* `encoder_vp8::make_encoder_with_quality(&params, quality)` — takes
+  a libwebp-style `quality: f32` in `0.0..=100.0` (higher = better
+  quality / larger file; the libwebp default is `75.0`).
+* `encoder_vp8::make_encoder_with_qindex(&params, qindex)` — takes
+  the underlying VP8 qindex in `0..=127` (lower = better) for callers
+  that already speak the libvpx scale.
+
+The `quality → qindex` mapping is the linear inversion
+`qindex = round((100 - quality) * 1.27)`, so the API surface lines up
+with libwebp but the **perceptual** behaviour does not: libwebp also
+adjusts its quantizer matrices, AC/DC deltas, and segment-level QP
+based on quality, none of which we currently do. Round-2 work would
+tune the quantizer matrix and segment QPs to track libwebp's
+perceptual targets at matching `quality` values.
+
 ### Scope
 
 Encoder scope (current):
@@ -142,7 +160,11 @@ Encoder scope (current):
   alpha plane is emitted as a VP8L-compressed `ALPH` chunk inside the
   extended (`VP8X`) container. Default qindex from `oxideav-vp8` is
   used unless the caller selects a specific one via
-  `encoder_vp8::make_encoder_with_qindex`.
+  `encoder_vp8::make_encoder_with_qindex` (VP8 qindex `0..=127`,
+  lower = better) or the libwebp-style
+  `encoder_vp8::make_encoder_with_quality` (`0.0..=100.0`,
+  higher = better) — see the encoder section above for the mapping
+  caveat.
 - `VP8X` extended header is emitted automatically whenever the output
   carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
   the `riff::WebpMetadata` helper.
