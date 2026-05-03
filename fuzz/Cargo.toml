@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 oxideav-core = "0.1"
+webp = "0.3.1"
 
 [dependencies.oxideav-webp]
 path = ".."
@@ -24,5 +25,17 @@ debug = 1
 [[bin]]
 name = "vp8l_lossless_roundtrip"
 path = "fuzz_targets/vp8l_lossless_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "webp_encode_oxideav_decode"
+path = "fuzz_targets/webp_encode_oxideav_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oxideav_encode_webp_decode"
+path = "fuzz_targets/oxideav_encode_webp_decode.rs"
 test = false
 doc = false
