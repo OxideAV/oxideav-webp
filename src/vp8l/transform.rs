@@ -323,10 +323,10 @@ fn select_argb(l: u32, t: u32, tl: u32) -> u32 {
 
 /// Predictor mode 12: per-channel `clamp(l + t - tl, 0, 255)`. Lane
 /// arithmetic is a signed sum-then-clamp; the previous shape did this
-/// with explicit shift/and/sign-extend per channel + one `i32::clamp`
-/// + a re-pack `or-shift`. The byte-array variant lets LLVM hoist the
-/// per-byte unpack/repack and saturate instructions on platforms that
-/// have them.
+/// with explicit shift/and/sign-extend per channel plus one `i32::clamp`
+/// then a re-pack `or-shift`. The byte-array variant lets LLVM hoist
+/// the per-byte unpack/repack and saturate instructions on platforms
+/// that have them.
 #[inline]
 fn clamp_add_sub_argb(l: u32, t: u32, tl: u32) -> u32 {
     let lb = l.to_le_bytes();

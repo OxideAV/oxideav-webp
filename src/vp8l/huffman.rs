@@ -384,7 +384,7 @@ fn build_from_lengths(lengths: &[u8]) -> Result<HuffmanTree> {
         // Populate the LUT for short codes. (Long codes are served by
         // the tree walk; their LUT slots stay at length=0, the
         // fall-back marker.)
-        if len as u8 <= LUT_BITS {
+        if len <= LUT_BITS {
             // bit-reverse code_val over `len` bits to get the LSB-first prefix.
             let mut prefix = 0u32;
             for b in 0..len {
