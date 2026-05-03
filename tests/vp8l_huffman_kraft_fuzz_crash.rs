@@ -1,3 +1,12 @@
+// Regression test mirrors the spec's per-symbol bit-walk verbatim;
+// the lints below would otherwise demand stylistic rewrites that
+// drift away from RFC 9649 §3.7.2.1's algorithm shape.
+#![allow(
+    clippy::manual_div_ceil,
+    clippy::type_complexity,
+    clippy::same_item_push
+)]
+
 //! Regression for the Huffman-meta-tree Kraft bug surfaced by the
 //! `oxideav_encode_webp_decode_lossless` fuzz harness on commit 815a780.
 //!
