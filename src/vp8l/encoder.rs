@@ -164,9 +164,11 @@ impl BitWriter {
 ///
 /// Internally runs a 32-trial RDO sweep over the four optional VP8L
 /// transforms × four colour-cache widths and keeps the smallest
-/// encoded variant. Callers who need fully deterministic behaviour for
-/// a fixed transform configuration should use
-/// [`encode_vp8l_argb_with`].
+/// encoded variant. Pixels with `alpha == 0` get their RGB stripped to
+/// zero by default (visually identical, compresses better — matches
+/// libwebp's default). Callers who need fully deterministic behaviour
+/// for a fixed transform configuration or who need to preserve the RGB
+/// bytes of fully-transparent pixels should use [`encode_vp8l_argb_with`].
 pub fn encode_vp8l_argb(
     width: u32,
     height: u32,
@@ -174,6 +176,23 @@ pub fn encode_vp8l_argb(
     has_alpha: bool,
 ) -> Result<Vec<u8>> {
     encode_vp8l_argb_rdo(width, height, pixels, has_alpha)
+}
+
+/// Replace the RGB bytes of every alpha-zero pixel with `0`. The ARGB
+/// layout puts alpha in the top 8 bits and the masked region (RGB) in
+/// the bottom 24, so a single `& 0xff00_0000` per such pixel does it.
+///
+/// Choosing `0` is the simplest deterministic fill: the predictor +
+/// LZ77 + colour cache then collapse runs of fully-transparent pixels
+/// into a handful of cache hits or backreferences. libwebp uses a more
+/// elaborate "predict from neighbours" heuristic for marginally better
+/// compression; that's a future enhancement.
+fn strip_transparent_rgb(pixels: &mut [u32]) {
+    for p in pixels.iter_mut() {
+        if (*p >> 24) & 0xff == 0 {
+            *p &= 0xff00_0000;
+        }
+    }
 }
 
 /// Encoder tuning knobs. Hidden from the public docs — primarily a
@@ -193,6 +212,15 @@ pub struct EncoderOptions {
     /// `use_color_cache == false`. Outside 1..=11 falls back to
     /// [`COLOR_CACHE_BITS`].
     pub cache_bits: u32,
+    /// When `true`, every pixel whose alpha channel is zero has its
+    /// RGB bytes replaced with `0` before encoding. Fully transparent
+    /// pixels are visually invisible, so the RGB component is free —
+    /// collapsing it to a constant lets the predictor + entropy coder
+    /// pack the alpha-zero regions much more tightly. Mirrors libwebp's
+    /// `WebPConfig::exact == false` default; set to `false` to preserve
+    /// the input bytes exactly (raises file size, useful for callers
+    /// that round-trip RGB out-of-band of the alpha channel).
+    pub strip_transparent_color: bool,
 }
 
 impl Default for EncoderOptions {
@@ -203,6 +231,7 @@ impl Default for EncoderOptions {
             use_predictor: true,
             use_color_cache: true,
             cache_bits: COLOR_CACHE_BITS,
+            strip_transparent_color: true,
         }
     }
 }
@@ -217,6 +246,7 @@ impl EncoderOptions {
             use_predictor: false,
             use_color_cache: false,
             cache_bits: COLOR_CACHE_BITS,
+            strip_transparent_color: true,
         }
     }
 
@@ -231,6 +261,7 @@ impl EncoderOptions {
             use_predictor: false,
             use_color_cache: false,
             cache_bits: COLOR_CACHE_BITS,
+            strip_transparent_color: true,
         }
     }
 }
@@ -272,6 +303,13 @@ pub fn encode_vp8l_argb_with(
     // on the already green-decorrelated residuals (matching libwebp).
 
     let mut working = pixels.to_vec();
+
+    // Optional pre-transform pass: collapse the RGB of fully-transparent
+    // pixels to `0`. Lossless from the consumer's point of view (alpha=0
+    // hides the colour anyway) and a clear win for the entropy coder.
+    if opts.strip_transparent_color {
+        strip_transparent_rgb(&mut working);
+    }
 
     if opts.use_subtract_green {
         // Transform header: present + type 2 (SubtractGreen).
@@ -397,6 +435,14 @@ fn encode_vp8l_argb_rdo(
     // images. Wider than 10 rarely pays for the extra header overhead.
     const CACHE_BITS_GRID: [u32; 4] = [0, 6, 8, 10];
 
+    // Apply the alpha-zero RGB strip once up front (default-on, matches
+    // libwebp). Each per-trial encode then runs with
+    // `strip_transparent_color: false` so we don't pay for the pass
+    // 32 times — the result is identical to letting the per-trial
+    // encoder do its own strip.
+    let mut stripped: Vec<u32> = pixels.to_vec();
+    strip_transparent_rgb(&mut stripped);
+
     let mut best: Option<Vec<u8>> = None;
 
     for &use_sg in &[true, false] {
@@ -409,8 +455,10 @@ fn encode_vp8l_argb_rdo(
                         use_predictor: use_pr,
                         use_color_cache: cb > 0,
                         cache_bits: if cb > 0 { cb } else { COLOR_CACHE_BITS },
+                        // Strip already applied above on `stripped`.
+                        strip_transparent_color: false,
                     };
-                    let bytes = encode_vp8l_argb_with(width, height, pixels, has_alpha, opts)?;
+                    let bytes = encode_vp8l_argb_with(width, height, &stripped, has_alpha, opts)?;
                     if best.as_ref().map(|b| bytes.len() < b.len()).unwrap_or(true) {
                         best = Some(bytes);
                     }

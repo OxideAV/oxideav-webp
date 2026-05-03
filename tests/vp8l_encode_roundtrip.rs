@@ -104,6 +104,18 @@ fn vp8l_encode_random_64x64() {
         s ^= s << 5;
         *b = (s & 0xff) as u8;
     }
+    // The default encoder strips RGB from alpha-zero pixels (matches
+    // libwebp's `exact = false` default), which would break the
+    // byte-identical round-trip for any alpha-zero pixel here. Force
+    // every alpha byte to be non-zero so this stays a pure-roundtrip
+    // test of Huffman / LZ77 / transforms — see
+    // `vp8l_encode_strip_transparent_color_shrinks_output` for the
+    // dedicated coverage of the alpha-zero strip path.
+    for chunk in rgba.chunks_exact_mut(4) {
+        if chunk[3] == 0 {
+            chunk[3] = 1;
+        }
+    }
     // Round-trip; `has_alpha=true` because random bytes will include
     // alpha != 0xff — we want the header flag to reflect reality.
     roundtrip(w, h, &rgba, true);
@@ -182,6 +194,102 @@ fn vp8l_encode_color_transform_beats_subtract_green_on_bgr_gradient() {
         rgba,
         "colour transform round-trip lost data"
     );
+}
+
+#[test]
+fn vp8l_encode_strip_transparent_color_shrinks_output() {
+    // Build a 64×64 RGBA buffer where exactly half the pixels are
+    // fully transparent (alpha=0) and carry pseudo-random RGB. The
+    // other half are opaque with the same pseudo-random RGB (so the
+    // visible-pixel entropy is the same in both encodes — the only
+    // delta comes from how the encoder treats the alpha-zero pixels).
+    //
+    // With `strip_transparent_color = true` (the default) the encoder
+    // collapses the transparent half to RGB=0, which the predictor +
+    // colour cache + LZ77 then compress aggressively. With the option
+    // off, the transparent half carries full-entropy RGB, which
+    // bloats the bitstream.
+    let w = 64u32;
+    let h = 64u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let mut s: u32 = 0xC0DE_F00D;
+    for y in 0..h {
+        for x in 0..w {
+            // Cheap xorshift32 for deterministic "random" RGB.
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let r = (s & 0xff) as u8;
+            let g = ((s >> 8) & 0xff) as u8;
+            let b = ((s >> 16) & 0xff) as u8;
+            // Half the pixels (a checkerboard tile pattern at 8-pixel
+            // granularity) are fully transparent; the rest are opaque.
+            let transparent = ((x / 8) + (y / 8)) % 2 == 0;
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i] = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = if transparent { 0 } else { 0xff };
+        }
+    }
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+
+    // RDO is hard-wired strip-on; sidestep the RDO loop and pin both
+    // trials to the same transform configuration so the only knob that
+    // moves is `strip_transparent_color`.
+    let mut on = EncoderOptions::default();
+    on.strip_transparent_color = true;
+    let mut off = EncoderOptions::default();
+    off.strip_transparent_color = false;
+
+    let with_strip = encode_vp8l_argb_with(w, h, &pixels, true, on).expect("strip-on encode");
+    let without_strip = encode_vp8l_argb_with(w, h, &pixels, true, off).expect("strip-off encode");
+
+    eprintln!(
+        "alpha-zero half random RGB 64×64: strip_on={} bytes, strip_off={} bytes ({:+.1}%)",
+        with_strip.len(),
+        without_strip.len(),
+        100.0 * (with_strip.len() as f64 - without_strip.len() as f64) / without_strip.len() as f64,
+    );
+
+    assert!(
+        with_strip.len() < without_strip.len(),
+        "strip_transparent_color = true did not shrink output: \
+         strip_on={} bytes, strip_off={} bytes",
+        with_strip.len(),
+        without_strip.len(),
+    );
+
+    // Both bitstreams must round-trip — strip-on changes the RGB of
+    // alpha-zero pixels but those are visually identical (alpha hides
+    // them); strip-off must be byte-identical to the input.
+    let decoded_off = vp8l::decode(&without_strip).expect("strip-off decode");
+    assert_eq!(
+        decoded_off.to_rgba(),
+        rgba,
+        "strip-off encode must preserve every input byte"
+    );
+    // Strip-on side: alpha plane preserved exactly, RGB preserved on
+    // visible pixels, alpha-zero pixels' RGB collapsed to 0.
+    let decoded_on = vp8l::decode(&with_strip).expect("strip-on decode");
+    let out_on = decoded_on.to_rgba();
+    for (i, chunk) in rgba.chunks_exact(4).enumerate() {
+        let oi = i * 4;
+        assert_eq!(out_on[oi + 3], chunk[3], "alpha must round-trip exactly");
+        if chunk[3] == 0 {
+            assert_eq!(
+                &out_on[oi..oi + 3],
+                &[0, 0, 0],
+                "strip-on must zero RGB of alpha-zero pixel #{i}"
+            );
+        } else {
+            assert_eq!(
+                &out_on[oi..oi + 3],
+                &chunk[..3],
+                "visible pixel #{i} RGB must round-trip exactly"
+            );
+        }
+    }
 }
 
 #[test]
