@@ -377,10 +377,22 @@ fn apply_color_transform(
             let tx = (x >> tile_bits) as usize;
             let ty = (y >> tile_bits) as usize;
             let coeffs = sub_image[ty * sub_w as usize + tx];
-            // Coeff packing: A=0, R=green_to_red, G=green_to_blue, B=red_to_blue.
-            let g2r = ((coeffs >> 16) & 0xff) as i8 as i32;
+            // Coeff packing per WebP lossless spec §4.2 (the "Color
+            // Transform" section): each `ColorTransformElement` is
+            // stored as an ARGB pixel where
+            //   A = 255 (unused)
+            //   R = red_to_blue
+            //   G = green_to_blue
+            //   B = green_to_red
+            // The previous version had R and B swapped (g2r read from
+            // bits 16-23 / r2b from bits 0-7). That's the cross-color
+            // bug surfaced by the lossy-near-lossless-q40 fixture in
+            // lossy_corpus.rs (R% ≈ 1.7%, B% ≈ 0.5%, G% ≈ 43%, PSNR
+            // 8.85 dB). G was partially correct because it's not
+            // touched by the cross-color transform.
+            let r2b = ((coeffs >> 16) & 0xff) as i8 as i32;
             let g2b = ((coeffs >> 8) & 0xff) as i8 as i32;
-            let r2b = (coeffs & 0xff) as i8 as i32;
+            let g2r = (coeffs & 0xff) as i8 as i32;
 
             let a = (p >> 24) & 0xff;
             let mut r = ((p >> 16) & 0xff) as i32;

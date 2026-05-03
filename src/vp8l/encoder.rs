@@ -322,8 +322,15 @@ pub fn encode_vp8l_argb_with(
         // Forward colour transform: per-tile search over the
         // [`COLOR_COEFF_GRID`] × [`COLOR_COEFF_GRID`] grid (256 combos)
         // plus a follow-up `r→b` sweep. Emits a predictor-shaped
-        // sub-image (one ARGB pixel per tile, coeffs packed as
-        // R = g2r, G = g2b, B = r2b, A = 0xff).
+        // sub-image with one ARGB pixel per tile.
+        //
+        // Coefficient packing per WebP lossless spec §4.2:
+        //   A = 255 (unused), R = red_to_blue, G = green_to_blue,
+        //   B = green_to_red.
+        // The previous version had R and B swapped (g2r in R, r2b in
+        // B); rust round-tripped fine but libwebp couldn't decode the
+        // result. Fixed in lockstep with the matching decoder change
+        // — see transform.rs::apply_color_transform.
         let tile_bits = COLOR_TRANSFORM_TILE_BITS;
         let tile_side = 1u32 << tile_bits;
         let sub_w = (width + tile_side - 1) / tile_side;
@@ -344,7 +351,7 @@ pub fn encode_vp8l_argb_with(
                 let g2r = (c.g2r as u8) as u32;
                 let g2b = (c.g2b as u8) as u32;
                 let r2b = (c.r2b as u8) as u32;
-                0xff00_0000 | (g2r << 16) | (g2b << 8) | r2b
+                0xff00_0000 | (r2b << 16) | (g2b << 8) | g2r
             })
             .collect();
         encode_image_stream(&mut bw, &sub_pixels, sub_w, sub_h, false, 0)?;

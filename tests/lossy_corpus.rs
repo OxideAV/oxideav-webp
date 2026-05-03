@@ -437,9 +437,14 @@ fn lossy_corpus_pixel_correctness() {
 //    NOTE: the fourcc on this fixture is actually `VP8L`, not `VP8 `
 //    (the workspace `notes.md` is wrong; the trace.txt + bytes both
 //    show VP8L). cwebp's `-near_lossless` mode preprocesses pixel
-//    values then encodes via the lossless VP8L codec. The bug is
-//    therefore in `oxideav-webp/src/vp8l/`, not in oxideav-vp8 — the
-//    R/B scramble pattern (G partially correct) suggests a
-//    cross_color or predictor-transform bug specific to the
-//    near-lossless preprocessing pattern.
+//    values then encodes via the lossless VP8L codec. The R/B
+//    scramble + G-partial signature is a textbook cross-color
+//    coefficient-packing bug: the WebP lossless spec §4.2 says the
+//    ColorTransformElement stores `red_to_blue` in the R component,
+//    `green_to_blue` in the G component, and `green_to_red` in the B
+//    component — but our decoder (and matching encoder) had R and B
+//    swapped. Fixed in `oxideav-webp/src/vp8l/transform.rs::
+//    apply_color_transform` + `encoder.rs::encode_vp8l_argb_with`.
+//    Self-roundtrip tests still pass (encoder + decoder agreed on
+//    the wrong layout); libwebp interop is what surfaced it.
 // ----------------------------------------------------------------------
