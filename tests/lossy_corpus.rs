@@ -12,14 +12,14 @@
 //! that trace to localise the bug.
 //!
 //! Tiers:
-//!   * `BitExact`   — every channel of every pixel must match.
-//!   * `ReportOnly` — divergences are recorded and printed but do NOT
-//!                    fail the test. Used for fixtures we know exercise
-//!                    paths still under construction (loop filter,
-//!                    quantizer extremes, ALPH overlay, …).
-//!   * `Ignored`    — fixture is loaded and reported but no comparison
-//!                    is performed (e.g. our decoder errors out and we
-//!                    just want a categorised log line).
+//!
+//! * `BitExact` — every channel of every pixel must match.
+//! * `ReportOnly` — divergences are recorded and printed but do NOT fail
+//!   the test. Used for fixtures we know exercise paths still under
+//!   construction (loop filter, quantizer extremes, ALPH overlay, …).
+//! * `Ignored` — fixture is loaded and reported but no comparison is
+//!   performed (e.g. our decoder errors out and we just want a
+//!   categorised log line).
 //!
 //! The test deliberately does NOT modify the decoder. Bugs surfaced here
 //! become separate follow-up tasks.
@@ -352,11 +352,12 @@ fn run_one(fix: &Fixture) -> String {
     line
 }
 
-fn first_mismatch(
-    actual: &[u8],
-    expected: &[u8],
-    w: usize,
-) -> Option<(usize, usize, usize, [u8; 4], [u8; 4])> {
+/// `(linear_pixel_index, x, y, actual_rgba, expected_rgba)`. Boxed
+/// into a type alias so clippy doesn't complain about a "very complex"
+/// return tuple.
+type FirstMismatch = (usize, usize, usize, [u8; 4], [u8; 4]);
+
+fn first_mismatch(actual: &[u8], expected: &[u8], w: usize) -> Option<FirstMismatch> {
     for (idx, (a, e)) in actual
         .chunks_exact(4)
         .zip(expected.chunks_exact(4))
