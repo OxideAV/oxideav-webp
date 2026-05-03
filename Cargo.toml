@@ -26,6 +26,13 @@ oxideav-png = "0.1"
 # the 0.5 line to track the current major; no other criterion users in
 # the workspace yet so the lockfile picks the latest 0.5.x.
 criterion = "0.5"
+# `external_roundtrip` integration test `dlopen`s libwebp at runtime
+# to roundtrip oxideav-encoded → libwebp-decoded → libwebp-encoded →
+# oxideav-decoded. Mirrors the fuzz crate's `libwebp` shim shape but
+# kept private to the test file so the main crate doesn't grow a
+# dev-dep on the fuzz crate. Test skips silently when libwebp isn't
+# installed.
+libloading = "0.8"
 
 # Criterion's own runner. `harness = false` opts out of the default libtest
 # harness so criterion's CLI (`cargo bench -- --measurement-time …`) works.
