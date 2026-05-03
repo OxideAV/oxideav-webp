@@ -162,19 +162,19 @@ fn subsampled_size(size: u32, bits: u32) -> u32 {
 
 /// ARGB addition per-component (modulo 256). Used by transforms that
 /// encode residuals.
+///
+/// Implemented with the standard SWAR trick: mask out bit 7 of every
+/// byte, add (which can no longer carry into the next byte because the
+/// per-byte sum is ≤ 0x7f+0x7f = 0xfe), then re-derive bit 7 of each
+/// result byte from `a ^ b` masked to the bit-7 lane. The previous
+/// per-byte unpack/add/repack cost ~12 shifts + 8 masks + 4 adds + 4
+/// shifts + 3 ORs per call; the SWAR version is 3 ANDs + 1 add + 1
+/// XOR + 1 XOR. Called per pixel in the predictor transform inner
+/// loop and per palette entry during colour-index delta-decode.
+#[inline]
 fn add_argb(a: u32, b: u32) -> u32 {
-    let aa = (a >> 24) & 0xff;
-    let ar = (a >> 16) & 0xff;
-    let ag = (a >> 8) & 0xff;
-    let ab = a & 0xff;
-    let ba = (b >> 24) & 0xff;
-    let br_ = (b >> 16) & 0xff;
-    let bg = (b >> 8) & 0xff;
-    let bb = b & 0xff;
-    (((aa + ba) & 0xff) << 24)
-        | (((ar + br_) & 0xff) << 16)
-        | (((ag + bg) & 0xff) << 8)
-        | ((ab + bb) & 0xff)
+    let masked_sum = (a & 0x7f7f_7f7f).wrapping_add(b & 0x7f7f_7f7f);
+    masked_sum ^ ((a ^ b) & 0x8080_8080)
 }
 
 // ── Predictor transform ───────────────────────────────────────────────
@@ -253,15 +253,20 @@ fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
     }
 }
 
+/// Per-byte floor-average of two ARGB pixels: result_byte = (a_byte +
+/// b_byte) >> 1 per channel. Used by predictor modes 5..10 which mix
+/// neighbour pixels; called multiple times per output pixel for those
+/// modes (mode 10 nests two `avg2` calls under another `avg2`).
+///
+/// SWAR identity: `(a + b) / 2 = (a^b)/2 + (a&b)`. Masking `a^b` with
+/// 0xfefefefe before the right-shift drops bit 0 of every byte (which
+/// would otherwise be the LSB of the next byte after `>> 1`), keeping
+/// the half-shift inside its lane. Lane sums are bounded by 0xff —
+/// floor((0xff + 0xff) / 2) — so the wrapping_add can't carry into the
+/// next byte.
+#[inline]
 fn avg2(a: u32, b: u32) -> u32 {
-    let mut out = 0u32;
-    for c in 0..4 {
-        let sh = c * 8;
-        let av = (a >> sh) & 0xff;
-        let bv = (b >> sh) & 0xff;
-        out |= ((av + bv) >> 1) << sh;
-    }
-    out
+    (a & b).wrapping_add(((a ^ b) & 0xfefe_fefe) >> 1)
 }
 
 fn avg3(a: u32, b: u32, c: u32) -> u32 {
@@ -364,15 +369,23 @@ fn apply_color_transform(
 
 // ── Subtract-green transform ──────────────────────────────────────────
 
+/// Inverse of the encoder's "subtract green" — re-adds the green
+/// channel into R and B (per-byte mod 256), leaving A and G untouched.
+///
+/// SWAR form: broadcast G into the R and B byte lanes (the A and G
+/// lanes stay zero), then SWAR-add to the original pixel via the same
+/// bit-7-XOR trick as `add_argb`. This collapses the per-byte
+/// unpack/add/repack to roughly 5 bitwise ops + 1 add per pixel.
 fn apply_subtract_green(pixels: &[u32]) -> Vec<u32> {
     pixels
         .iter()
         .map(|&p| {
-            let a = (p >> 24) & 0xff;
-            let r = (p >> 16) & 0xff;
             let g = (p >> 8) & 0xff;
-            let b = p & 0xff;
-            (a << 24) | (((r + g) & 0xff) << 16) | (g << 8) | ((b + g) & 0xff)
+            // Broadcast G into the R (bits 16..24) and B (bits 0..8) lanes.
+            let g_rb = (g << 16) | g;
+            // Per-byte add mod 256 — same SWAR identity as add_argb.
+            let masked_sum = (p & 0x7f7f_7f7f).wrapping_add(g_rb & 0x7f7f_7f7f);
+            masked_sum ^ ((p ^ g_rb) & 0x8080_8080)
         })
         .collect()
 }
