@@ -237,10 +237,14 @@ fn vp8l_encode_strip_transparent_color_shrinks_output() {
     // RDO is hard-wired strip-on; sidestep the RDO loop and pin both
     // trials to the same transform configuration so the only knob that
     // moves is `strip_transparent_color`.
-    let mut on = EncoderOptions::default();
-    on.strip_transparent_color = true;
-    let mut off = EncoderOptions::default();
-    off.strip_transparent_color = false;
+    let on = EncoderOptions {
+        strip_transparent_color: true,
+        ..EncoderOptions::default()
+    };
+    let off = EncoderOptions {
+        strip_transparent_color: false,
+        ..EncoderOptions::default()
+    };
 
     let with_strip = encode_vp8l_argb_with(w, h, &pixels, true, on).expect("strip-on encode");
     let without_strip = encode_vp8l_argb_with(w, h, &pixels, true, off).expect("strip-off encode");
