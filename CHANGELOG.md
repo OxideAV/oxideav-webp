@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- VP8L predictor: top-right (TR) neighbour at the rightmost column now
+  uses the leftmost pixel of the current row (column 0 of row y), as
+  specified by RFC 9649 §4.1, instead of the LEFT neighbour. The wrong
+  TR caused libwebp-encoded streams to decode with cascading per-row
+  errors that surfaced as off-by-channel pixel mismatches. Closes #8.
+  Both the decoder (`apply_predictor`) and the encoder
+  (`predict_argb` mirror) were corrected; pure self-roundtrips were
+  bit-exact under both definitions, so the bug only showed up against
+  spec-conformant encoders like libwebp.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-webp/compare/v0.0.5...v0.0.6) - 2026-05-03
 
 ### Other

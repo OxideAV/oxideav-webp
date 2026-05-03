@@ -790,10 +790,15 @@ fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
     let l = out[y * w + x - 1];
     let t = out[(y - 1) * w + x];
     let tl = out[(y - 1) * w + x - 1];
+    // RFC 9649 §4.1: TR for the rightmost column is the LEFTMOST pixel of
+    // the current row (column 0 of row y), not the LEFT neighbour. Kept
+    // in sync with the decoder's `predict_argb` — they must produce the
+    // exact same prediction or our self-roundtrip would diverge from a
+    // libwebp-encoded stream's predictor sub-image. (See issue #8.)
     let tr = if x + 1 < w {
         out[(y - 1) * w + x + 1]
     } else {
-        out[y * w + x - 1]
+        out[y * w]
     };
     match mode {
         0 => 0xff00_0000,

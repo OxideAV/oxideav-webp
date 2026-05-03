@@ -224,8 +224,15 @@ fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
     let tr = if x + 1 < w {
         out[(y - 1) * w + x + 1]
     } else {
-        // Spec: TR defaults to the left neighbour at image edge.
-        out[y * w + x - 1]
+        // RFC 9649 §4.1: "Addressing the TR-pixel for pixels on the
+        // rightmost column is exceptional. … the leftmost pixel on the
+        // same row as the current pixel is instead used as the TR-pixel."
+        // (Note: that is column 0 of the *current* row — NOT the LEFT
+        // neighbour at column x-1, which is what we previously had and
+        // which produced the issue-#8 regression where pixel (1, 53) of
+        // a libwebp-encoded 5×78 image cascaded a wrong TR through every
+        // row's column-4 predictor into adjacent columns' L/T/TL/TR.)
+        out[y * w]
     };
     match mode {
         0 => 0xff00_0000, // opaque black
