@@ -216,7 +216,10 @@ fn compare(actual_rgba: &[u8], expected_rgba: &[u8]) -> Stats {
         pixels: actual_rgba.len() / 4,
         ..Default::default()
     };
-    for (a, e) in actual_rgba.chunks_exact(4).zip(expected_rgba.chunks_exact(4)) {
+    for (a, e) in actual_rgba
+        .chunks_exact(4)
+        .zip(expected_rgba.chunks_exact(4))
+    {
         if a[0] == e[0] {
             s.r_match += 1;
         }
@@ -275,7 +278,10 @@ fn run_one(fix: &Fixture) -> String {
             "{:30}  size-mismatch: webp={}×{} png={}×{}",
             fix.name, img.width, img.height, w, h
         );
-        eprintln!("    SIZE MISMATCH: webp={}×{} png={}×{}", img.width, img.height, w, h);
+        eprintln!(
+            "    SIZE MISMATCH: webp={}×{} png={}×{}",
+            img.width, img.height, w, h
+        );
         if fix.tier == Tier::BitExact {
             panic!("{}: BitExact tier but size mismatched", fix.name);
         }
@@ -351,7 +357,11 @@ fn first_mismatch(
     expected: &[u8],
     w: usize,
 ) -> Option<(usize, usize, usize, [u8; 4], [u8; 4])> {
-    for (idx, (a, e)) in actual.chunks_exact(4).zip(expected.chunks_exact(4)).enumerate() {
+    for (idx, (a, e)) in actual
+        .chunks_exact(4)
+        .zip(expected.chunks_exact(4))
+        .enumerate()
+    {
         if a != e {
             let x = idx % w;
             let y = idx / w;
@@ -382,4 +392,14 @@ fn lossy_corpus_pixel_correctness() {
         eprintln!("{line}");
     }
     eprintln!("========================================================================");
+
+    // TEMPORARY (removed in the immediately-following commit) — panic
+    // with the summary as the message so the per-fixture numbers
+    // surface in the CI failure log. cargo test captures stderr from
+    // passing tests and we have no way to flip `--nocapture` from
+    // inside the reusable workflow. The panic is the agreed-upon way
+    // to surface a one-time data dump; the next commit reverts this
+    // block back to a quiet pass.
+    let body = summary.join("\n");
+    panic!("ONE-TIME DATA DUMP — reverted in next commit. Per-fixture results:\n{body}");
 }
