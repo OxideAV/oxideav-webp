@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-webp/compare/v0.0.5...v0.0.6) - 2026-05-03
+
+### Other
+
+- count run codes toward max_symbol when use_length=1
+- use struct-update syntax for EncoderOptions in strip-color test
+- strip RGB from fully-transparent pixels by default
+- add libwebp-style quality knob (0..=100) alongside qindex
+- replace `webp` crate with libloading-based libwebp shim
+- Add roundtrip harnesses that ensure compatibility with libwebp for lossy WebP. Does not assert the contents stayed the same, we cannot do that for lossy data.
+- Add roundtrip harnesses that ensure compatibility with libwebp
+- Add a roundtrip fuzzing harness to verify lossless encoding/decoding correctness
+- drop unused TimeBase import in vp8_lossy_roundtrip
+- replace never-match regex with semver_check = false
+- encoder RDO sweep over transforms + colour-cache widths
+- add animated WebP encode + fix ANMF bit order
+- migrate to centralized OxideAV/.github reusable workflows
+- adopt slim VideoFrame shape
+- adopt slim VideoFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Animated WebP encode via `build_animated_webp` — emits a
