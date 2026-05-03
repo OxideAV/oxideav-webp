@@ -117,4 +117,4 @@ fn make_vp8_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
 pub use decoder::{decode_webp, WebpFrame, WebpImage};
 pub use encoder_anim::{build_animated_webp, AnimFrame};
-pub use vp8l::encode_vp8l_argb;
+pub use vp8l::{encode_vp8l_argb, encode_vp8l_argb_with, EncoderOptions};

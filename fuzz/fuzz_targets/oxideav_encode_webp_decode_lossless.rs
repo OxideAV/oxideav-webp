@@ -1,8 +1,6 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, VideoFrame, VideoPlane};
-use oxideav_webp::CODEC_ID_VP8L;
 use oxideav_webp_fuzz::libwebp;
 
 const MAX_WIDTH: usize = 64;
@@ -44,26 +42,18 @@ fn image_from_fuzz_input(data: &[u8]) -> Option<(u32, u32, &[u8])> {
 }
 
 fn encode_webp_losslessly(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
-    let mut params = CodecParameters::video(CodecId::new(CODEC_ID_VP8L));
-    params.width = Some(width);
-    params.height = Some(height);
-    params.pixel_format = Some(PixelFormat::Rgba);
-
-    let mut encoder = oxideav_webp::encoder::make_encoder(&params).expect("make VP8L encoder");
-    let frame = VideoFrame {
-        pts: Some(0),
-        planes: vec![VideoPlane {
-            stride: (width as usize) * 4,
-            data: rgba.to_vec(),
-        }],
+    // Pack RGBA bytes into u32 ARGB (the encoder's native input).
+    let argb: Vec<u32> = rgba
+        .chunks_exact(4)
+        .map(|p| ((p[3] as u32) << 24) | ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+        .collect();
+    // Disable strip_transparent_color: the harness asserts decoded RGBA
+    // matches the original input byte-for-byte, but the default-on strip
+    // zeros RGB on alpha=0 pixels, which would falsely fail the assert.
+    let opts = oxideav_webp::EncoderOptions {
+        strip_transparent_color: false,
+        ..Default::default()
     };
-
-    encoder
-        .send_frame(&Frame::Video(frame))
-        .expect("oxideav-webp VP8L encoding failed");
-    encoder.flush().expect("oxideav-webp encoder flush failed");
-    encoder
-        .receive_packet()
-        .expect("oxideav-webp encoder did not emit a packet")
-        .data
+    oxideav_webp::encode_vp8l_argb_with(width, height, &argb, true, opts)
+        .expect("oxideav-webp VP8L encoding failed")
 }

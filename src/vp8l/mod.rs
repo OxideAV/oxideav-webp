@@ -27,7 +27,7 @@ pub mod encoder;
 pub mod huffman;
 pub mod transform;
 
-pub use encoder::encode_vp8l_argb;
+pub use encoder::{encode_vp8l_argb, encode_vp8l_argb_with, EncoderOptions};
 
 use oxideav_core::{Error, Result};
 
