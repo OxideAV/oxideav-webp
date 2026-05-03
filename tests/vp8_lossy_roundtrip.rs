@@ -16,7 +16,7 @@
 //!    PSNR > 30 dB on the Y plane.
 
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, MediaType, PixelFormat, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, MediaType, PixelFormat, VideoFrame, VideoPlane,
 };
 use oxideav_webp::{decode_webp, encoder_vp8, CODEC_ID_VP8};
 
