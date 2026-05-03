@@ -54,6 +54,17 @@ fn encode_webp_losslessly(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         strip_transparent_color: false,
         ..Default::default()
     };
-    oxideav_webp::encode_vp8l_argb_with(width, height, &argb, true, opts)
-        .expect("oxideav-webp VP8L encoding failed")
+    let bitstream = oxideav_webp::encode_vp8l_argb_with(width, height, &argb, true, opts)
+        .expect("oxideav-webp VP8L encoding failed");
+    // `encode_vp8l_argb_with` returns a bare VP8L bitstream (no RIFF
+    // wrapper). libwebp's `WebPGetInfo` requires a full RIFF/WEBP
+    // container, so wrap the bitstream in the extended (VP8X) layout —
+    // we pass `has_alpha=true` so the alpha-flagged extended layout
+    // mirrors the production `finalize_vp8l_file` path in encoder.rs.
+    oxideav_webp::riff::build_vp8l_with_alpha(
+        &bitstream,
+        width,
+        height,
+        &oxideav_webp::riff::WebpMetadata::default(),
+    )
 }
