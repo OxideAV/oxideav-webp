@@ -1,0 +1,28 @@
+[package]
+name = "oxideav-webp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-webp]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "vp8l_lossless_roundtrip"
+path = "fuzz_targets/vp8l_lossless_roundtrip.rs"
+test = false
+doc = false
