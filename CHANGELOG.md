@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-webp/compare/v0.0.6...v0.0.7) - 2026-05-03
+
+### Other
+
+- rustfmt — collapse short assert_eq! line in issue #8 test
+- predictor TR at rightmost column uses leftmost pixel of current row
+- drop trait imports redundant on Box<dyn …>
+- silence clippy unnecessary_unwrap + unused ch
+- rustfmt — wrap long arg lists
+- accept Rgb24 (VP8L + VP8) and Yuva420P (VP8+ALPH) input
+- rustfmt — wrap long expect_err line
+- replace .err().expect() with .expect_err() for clippy::err_expect
+- silence clippy::needless_range_loop in test helpers
+- fix CI compile + rustfmt issues from new test files
+- ~57 unit tests for Huffman parser + simple/normal/build edge cases
+
 ### Fixed
 
 - VP8L predictor: top-right (TR) neighbour at the rightmost column now
