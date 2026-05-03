@@ -258,7 +258,6 @@ fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> 
         ));
     }
     let cw = w / 2 + (w & 1);
-    let ch = h / 2 + (h & 1);
     if v.planes[0].stride < w
         || v.planes[1].stride < cw
         || v.planes[2].stride < cw

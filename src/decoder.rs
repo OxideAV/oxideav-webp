@@ -230,23 +230,23 @@ impl Decoder for WebpDecoder {
         // `prefer_yuva420p` for the reasoning.
         if self.prefer_yuva420p
             && !payload.is_vp8l
-            && payload.alph.is_some()
             && payload.x_offset == 0
             && payload.y_offset == 0
             && payload.width == self.canvas_w
             && payload.height == self.canvas_h
         {
-            let alph = payload.alph.as_ref().unwrap();
-            let yuva = decode_vp8_alph_to_yuva420p(
-                payload.image,
-                payload.width,
-                payload.height,
-                alph,
-                self.pending_pts,
-            )?;
-            self.queued.push_back(yuva);
-            self.first_frame = false;
-            return Ok(());
+            if let Some(alph) = payload.alph.as_ref() {
+                let yuva = decode_vp8_alph_to_yuva420p(
+                    payload.image,
+                    payload.width,
+                    payload.height,
+                    alph,
+                    self.pending_pts,
+                )?;
+                self.queued.push_back(yuva);
+                self.first_frame = false;
+                return Ok(());
+            }
         }
 
         // Decode the image chunk.
