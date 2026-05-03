@@ -16,3 +16,9 @@ categories = ["multimedia::encoding", "multimedia::images"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-vp8 = "0.1"
+
+[dev-dependencies]
+# `lossy_corpus` integration test compares our VP8-lossy decode of the
+# libwebp-encoded `tests/fixtures/lossy_corpus/*` corpus against the
+# matching `expected.png` ground truth, so it needs a PNG decoder.
+oxideav-png = "0.1"
