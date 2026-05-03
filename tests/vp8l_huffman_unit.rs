@@ -82,8 +82,7 @@ pub(crate) fn write_meta_lens(bw: &mut BitWriter, meta_lens: &[u8; 19]) {
     }
     let num_code_lengths = last_used.max(4);
     bw.write((num_code_lengths - 4) as u32, 4);
-    for slot in 0..num_code_lengths {
-        let meta_code = CODE_LENGTH_ORDER[slot];
+    for &meta_code in CODE_LENGTH_ORDER.iter().take(num_code_lengths) {
         bw.write(meta_lens[meta_code] as u32, 3);
     }
 }
@@ -149,9 +148,7 @@ fn build_normal_with_decode_bits(lens: &[u8], decode_bits: &[u32]) -> Vec<u8> {
     // easy to encode without thinking about per-test code-length
     // assignment. build_from_lengths accepts under-Kraft tables.
     let mut meta_lens = [0u8; 19];
-    for v in 0..16 {
-        meta_lens[v] = 6;
-    }
+    meta_lens[..16].fill(6);
     let meta_codes = canonical_codes(&meta_lens);
     let mut bw = BitWriter::new();
     bw.write(0, 1); // not simple
@@ -430,9 +427,7 @@ fn normal_use_length_max_symbol_equals_alphabet() {
     // identically to use_length=0. Build the bit stream directly so the
     // decode bits are bit-aligned with the tree body.
     let mut meta_lens = [0u8; 19];
-    for v in 0..16 {
-        meta_lens[v] = 6;
-    }
+    meta_lens[..16].fill(6);
     let meta_codes = canonical_codes(&meta_lens);
 
     let mut bw = BitWriter::new();

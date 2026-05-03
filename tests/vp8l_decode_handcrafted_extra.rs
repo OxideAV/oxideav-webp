@@ -476,8 +476,7 @@ fn write_meta_lens_local(bw: &mut BitWriter, meta_lens: &[u8; 19]) {
     }
     let num_code_lengths = last_used.max(4);
     bw.write((num_code_lengths - 4) as u32, 4);
-    for slot in 0..num_code_lengths {
-        let meta_code = CODE_LENGTH_ORDER[slot];
+    for &meta_code in CODE_LENGTH_ORDER.iter().take(num_code_lengths) {
         bw.write(meta_lens[meta_code] as u32, 3);
     }
 }
@@ -501,9 +500,7 @@ fn write_meta_code_local(
 /// meta-tree for codes 0..15 (no run codes).
 fn write_normal_huffman_no_runs(bw: &mut BitWriter, lens: &[u8]) {
     let mut meta_lens = [0u8; 19];
-    for v in 0..16 {
-        meta_lens[v] = 6;
-    }
+    meta_lens[..16].fill(6);
     let meta_codes = canon_codes(&meta_lens);
     bw.write(0, 1); // not simple
     write_meta_lens_local(bw, &meta_lens);
@@ -523,9 +520,7 @@ fn write_normal_huffman_with_max_symbol(
     length_nbits: u32,
 ) {
     let mut meta_lens = [0u8; 19];
-    for v in 0..16 {
-        meta_lens[v] = 6;
-    }
+    meta_lens[..16].fill(6);
     let meta_codes = canon_codes(&meta_lens);
     bw.write(0, 1);
     write_meta_lens_local(bw, &meta_lens);
@@ -533,8 +528,8 @@ fn write_normal_huffman_with_max_symbol(
     let raw = (length_nbits - 2) / 2;
     bw.write(raw, 3);
     bw.write((max_symbol - 2) as u32, length_nbits);
-    for i in 0..max_symbol.min(lens.len()) {
-        write_meta_code_local(bw, &meta_lens, &meta_codes, lens[i] as usize);
+    for &l in lens.iter().take(max_symbol) {
+        write_meta_code_local(bw, &meta_lens, &meta_codes, l as usize);
     }
 }
 
