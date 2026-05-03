@@ -62,10 +62,7 @@ fn issue_8_predictor_tr_at_rightmost_column() {
     {
         // Mirror the fuzz harness's leniency for transparent pixels.
         if e[3] == 0 {
-            assert_eq!(
-                a[3], 0,
-                "decoded alpha differs for transparent pixel {idx}"
-            );
+            assert_eq!(a[3], 0, "decoded alpha differs for transparent pixel {idx}");
         } else {
             assert_eq!(a, e, "decoded RGBA differs at pixel {idx}");
         }
