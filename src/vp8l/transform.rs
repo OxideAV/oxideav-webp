@@ -284,51 +284,76 @@ fn avg3(a: u32, b: u32, c: u32) -> u32 {
     avg2(a, avg2(b, c))
 }
 
+/// Predictor mode 11 ("select"): a Paeth-like decision that picks the
+/// pixel whose per-channel L1 distance to TL is smaller. The decision is
+/// global to the pixel — the result is *either* `l` or `t` whole, never
+/// a per-channel mix — so we only need the channel-summed L1 distances.
+///
+/// Re-shaped from the previous double-loop into:
+///   1. Unpack the three pixels into byte arrays once. LLVM lowers this
+///      to a single 4-byte load; the compiler then vectorises the
+///      summed-abs-diffs into SAD-style instructions on x86 (PSADBW)
+///      and the equivalent on aarch64.
+///   2. Compute `dl` (summed |t-tl|) and `dt` (summed |l-tl|) in one
+///      pass over the four channel positions.
+///   3. Branch once on `dl < dt` and return `l` or `t` directly — no
+///      per-channel re-pack.
+///
+/// Avoids 8 shifts + 8 ands + 8 sign-extends + 4 `i32::abs()` + 4
+/// shifts + 4 ors that the previous shape forced on every call.
+#[inline]
 fn select_argb(l: u32, t: u32, tl: u32) -> u32 {
-    let mut out = 0u32;
-    let mut dl = 0i32;
-    let mut dt = 0i32;
+    let lb = l.to_le_bytes();
+    let tb = t.to_le_bytes();
+    let tlb = tl.to_le_bytes();
+    let mut dl: u32 = 0;
+    let mut dt: u32 = 0;
     for c in 0..4 {
-        let sh = c * 8;
-        let lv = ((l >> sh) & 0xff) as i32;
-        let tv = ((t >> sh) & 0xff) as i32;
-        let tlv = ((tl >> sh) & 0xff) as i32;
-        dl += (tv - tlv).abs();
-        dt += (lv - tlv).abs();
+        // |a - b| on u8 lanes via the unsigned `abs_diff` intrinsic
+        // (one instruction on most targets).
+        dl += tb[c].abs_diff(tlb[c]) as u32;
+        dt += lb[c].abs_diff(tlb[c]) as u32;
     }
-    for c in 0..4 {
-        let sh = c * 8;
-        let lv = (l >> sh) & 0xff;
-        let tv = (t >> sh) & 0xff;
-        let v = if dl < dt { lv } else { tv };
-        out |= v << sh;
+    if dl < dt {
+        l
+    } else {
+        t
     }
-    out
 }
 
+/// Predictor mode 12: per-channel `clamp(l + t - tl, 0, 255)`. Lane
+/// arithmetic is a signed sum-then-clamp; the previous shape did this
+/// with explicit shift/and/sign-extend per channel + one `i32::clamp`
+/// + a re-pack `or-shift`. The byte-array variant lets LLVM hoist the
+/// per-byte unpack/repack and saturate instructions on platforms that
+/// have them.
+#[inline]
 fn clamp_add_sub_argb(l: u32, t: u32, tl: u32) -> u32 {
-    let mut out = 0u32;
+    let lb = l.to_le_bytes();
+    let tb = t.to_le_bytes();
+    let tlb = tl.to_le_bytes();
+    let mut out = [0u8; 4];
     for c in 0..4 {
-        let sh = c * 8;
-        let lv = ((l >> sh) & 0xff) as i32;
-        let tv = ((t >> sh) & 0xff) as i32;
-        let tlv = ((tl >> sh) & 0xff) as i32;
-        let v = (lv + tv - tlv).clamp(0, 255) as u32;
-        out |= v << sh;
+        let v = (lb[c] as i32) + (tb[c] as i32) - (tlb[c] as i32);
+        out[c] = v.clamp(0, 255) as u8;
     }
-    out
+    u32::from_le_bytes(out)
 }
 
+/// Predictor mode 13: `clamp(a + (a - b) / 2, 0, 255)` per channel.
+/// Same byte-array re-shape as `clamp_add_sub_argb` for the same reason.
+#[inline]
 fn clamp_add_sub_half_argb(a: u32, b: u32) -> u32 {
-    let mut out = 0u32;
+    let ab = a.to_le_bytes();
+    let bb = b.to_le_bytes();
+    let mut out = [0u8; 4];
     for c in 0..4 {
-        let sh = c * 8;
-        let av = ((a >> sh) & 0xff) as i32;
-        let bv = ((b >> sh) & 0xff) as i32;
-        let v = (av + (av - bv) / 2).clamp(0, 255) as u32;
-        out |= v << sh;
+        let av = ab[c] as i32;
+        let bv = bb[c] as i32;
+        let v = av + (av - bv) / 2;
+        out[c] = v.clamp(0, 255) as u8;
     }
-    out
+    u32::from_le_bytes(out)
 }
 
 // ── Colour transform ──────────────────────────────────────────────────
