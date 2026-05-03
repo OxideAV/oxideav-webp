@@ -115,6 +115,73 @@ pub(crate) struct ParsedContainer {
     /// info for animations. Static files produce exactly one entry.
     pub frames: Vec<ParsedFrame>,
     pub total_duration_ms: u32,
+    /// Optional auxiliary metadata chunks (ICCP / EXIF / XMP). Empty for
+    /// simple-layout files that omitted them; populated whenever the
+    /// container carries the matching FourCC.
+    pub metadata: WebpFileMetadata,
+}
+
+/// Auxiliary `.webp` file-level metadata chunks. Values are the raw
+/// chunk payloads — ICC profile bytes, EXIF binary blob, XMP UTF-8
+/// XML — exactly as written by the encoder. Per the WebP container
+/// spec §3 these are file-global (not per-frame) and may appear in
+/// any order after the `VP8X` header.
+#[derive(Debug, Clone, Default)]
+pub struct WebpFileMetadata {
+    /// Raw `ICCP` chunk payload (an ICC colour profile). `None` when the
+    /// file omitted the chunk.
+    pub icc: Option<Vec<u8>>,
+    /// Raw `EXIF` chunk payload. `None` when absent.
+    pub exif: Option<Vec<u8>>,
+    /// Raw `XMP ` chunk payload (UTF-8 XML, typically). `None` when absent.
+    pub xmp: Option<Vec<u8>>,
+}
+
+impl WebpFileMetadata {
+    /// True if any of the three metadata fields is populated. Useful for
+    /// `decode_webp` callers that want to skip work when the file is
+    /// metadata-free.
+    pub fn any(&self) -> bool {
+        self.icc.is_some() || self.exif.is_some() || self.xmp.is_some()
+    }
+}
+
+/// Parse only the auxiliary metadata chunks (`ICCP`, `EXIF`, `XMP `)
+/// out of a complete `.webp` file. Useful for callers that want to
+/// inspect the colour profile or sidecar metadata without decoding any
+/// pixels.
+///
+/// Returns `Ok(default)` (all fields `None`) for simple-layout files
+/// that don't carry a `VP8X` header — those layouts can't carry
+/// metadata by definition. Returns an error only for malformed
+/// containers (bad RIFF header, truncated chunks); unknown auxiliary
+/// chunks are skipped silently per the WebP container spec.
+pub fn extract_metadata(buf: &[u8]) -> Result<WebpFileMetadata> {
+    if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WEBP" {
+        return Err(Error::invalid("WebP: bad RIFF/WEBP magic"));
+    }
+    let riff_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let end = (8 + riff_size).min(buf.len());
+    let body = &buf[12..end];
+    let mut chunks = RiffChunks::new(body);
+    // Peek the first chunk: only VP8X-extended layouts can carry metadata.
+    let Some(first) = chunks.next().transpose()? else {
+        return Ok(WebpFileMetadata::default());
+    };
+    if &first.id != b"VP8X" {
+        // Simple lossy/lossless layout — no metadata possible.
+        return Ok(WebpFileMetadata::default());
+    }
+    let mut meta = WebpFileMetadata::default();
+    while let Some(c) = chunks.next().transpose()? {
+        match &c.id {
+            b"ICCP" => meta.icc = Some(c.data.to_vec()),
+            b"EXIF" => meta.exif = Some(c.data.to_vec()),
+            b"XMP " => meta.xmp = Some(c.data.to_vec()),
+            _ => {}
+        }
+    }
+    Ok(meta)
 }
 
 #[derive(Debug)]
@@ -341,6 +408,7 @@ fn parse_webp_body(body: &[u8]) -> Result<ParsedContainer> {
                 canvas: (w, h),
                 frames: vec![frame],
                 total_duration_ms: 0,
+                metadata: WebpFileMetadata::default(),
             })
         }
         b"VP8L" => {
@@ -360,6 +428,7 @@ fn parse_webp_body(body: &[u8]) -> Result<ParsedContainer> {
                 canvas: (w, h),
                 frames: vec![frame],
                 total_duration_ms: 0,
+                metadata: WebpFileMetadata::default(),
             })
         }
         b"VP8X" => parse_extended(first.data, &mut chunks),
@@ -385,6 +454,7 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
     // optional ALPH, and emit one frame when we've seen an image.
     let mut pending_alph: Option<AlphChunk> = None;
     let mut pending_image: Option<ImagePayload> = None;
+    let mut metadata = WebpFileMetadata::default();
 
     let mut total_duration = 0u32;
 
@@ -417,8 +487,15 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
                 total_duration = total_duration.saturating_add(f.duration_ms);
                 frames.push(f);
             }
-            // Ignored auxiliary chunks:
-            b"ANIM" | b"ICCP" | b"EXIF" | b"XMP " => {}
+            // Auxiliary metadata chunks — captured into `metadata` so
+            // callers can read them off `WebpImage::metadata` after
+            // decode. Unknown auxiliary FourCCs (and `ANIM` whose flags
+            // are already represented in the per-frame state) are
+            // skipped silently per the WebP container spec.
+            b"ICCP" => metadata.icc = Some(c.data.to_vec()),
+            b"EXIF" => metadata.exif = Some(c.data.to_vec()),
+            b"XMP " => metadata.xmp = Some(c.data.to_vec()),
+            b"ANIM" => {}
             _ => {
                 // Unknown chunk — skip silently per the spec.
             }
@@ -450,6 +527,7 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
         canvas: (canvas_w, canvas_h),
         frames,
         total_duration_ms: total_duration,
+        metadata,
     })
 }
 

@@ -210,8 +210,11 @@ Decoder scope:
   `VP8X` extended with `ALPH` (raw / filtered / VP8L-compressed alpha
   plane), and `ANIM`/`ANMF` animation with per-frame disposal + blend
   modes composited onto an internal RGBA canvas.
-- `ICCP` / `EXIF` / `XMP ` chunks are recognised and skipped; their
-  payloads are not surfaced on the public API.
+- `ICCP` / `EXIF` / `XMP ` chunks are surfaced on
+  `WebpImage::metadata` (a `WebpFileMetadata` struct with optional
+  `icc` / `exif` / `xmp` byte vectors). For metadata-only access
+  without decoding any pixels, call `oxideav_webp::extract_metadata`
+  on the file bytes directly.
 - Default output pixel format is `Rgba`. For single-frame VP8+ALPH
   input, `WebpDecoder::new_yuva420p(w, h)` (or
   `set_prefer_yuva420p(true)` after construction) flips the output

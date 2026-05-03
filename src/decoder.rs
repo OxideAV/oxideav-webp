@@ -23,12 +23,20 @@ use oxideav_core::{
 };
 use oxideav_vp8::decode_frame as decode_vp8_frame;
 
-use crate::demux::{decode_frame_payload, DecodedAlph};
+use crate::demux::{decode_frame_payload, extract_metadata, DecodedAlph, WebpFileMetadata};
 use crate::vp8l;
 
 /// Public helper — decode an entire `.webp` file sitting in `buf` and
-/// return all frames as RGBA `WebpFrame`s.
+/// return all frames as RGBA `WebpFrame`s plus any auxiliary metadata
+/// (`ICCP` / `EXIF` / `XMP `) carried by the container.
 pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
+    // Pull metadata directly from the buffer first — the demuxer
+    // currently doesn't expose metadata via the `Demuxer` trait, so the
+    // simplest end-to-end shape is one extra parse pass over the
+    // container header (cheap; metadata extraction never decodes
+    // pixels). For metadata-only callers, [`crate::demux::extract_metadata`]
+    // is the standalone entry point.
+    let metadata = extract_metadata(buf).unwrap_or_default();
     let cursor = std::io::Cursor::new(buf.to_vec());
     let mut demuxer = crate::demux::open_boxed(Box::new(cursor))?;
     let mut frames = Vec::new();
@@ -64,6 +72,7 @@ pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
         width: w,
         height: h,
         frames,
+        metadata,
     })
 }
 
@@ -73,6 +82,10 @@ pub struct WebpImage {
     pub width: u32,
     pub height: u32,
     pub frames: Vec<WebpFrame>,
+    /// Auxiliary container-level metadata (ICC / EXIF / XMP). All three
+    /// fields are `None` for files that don't carry the matching chunk
+    /// — including every simple-layout (no `VP8X` header) `.webp`.
+    pub metadata: WebpFileMetadata,
 }
 
 #[derive(Debug, Clone)]
