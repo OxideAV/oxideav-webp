@@ -401,3 +401,204 @@ fn vp8l_encode_widened_predictor_pool_shrinks_diagonal() {
         widened.len(),
     );
 }
+
+/// Walk the first few transform headers of a VP8L bitstream and return
+/// `true` if a colour-indexing (palette) transform is present. Used by
+/// the palette test below to confirm the encoder picked the palette
+/// path on a small-palette fixture (rather than just shrinking via the
+/// regular ARGB path's LZ77 + colour cache).
+///
+/// Header layout (per RFC 9649 §3.2 + §3.6):
+///   * 1 byte   — VP8L signature (0x2f)
+///   * 14 bits  — width-1
+///   * 14 bits  — height-1
+///   * 1 bit    — alpha_is_used
+///   * 3 bits   — version (= 0)
+///   * Then a chain of "transform present" + 2-bit transform-type bits
+///     terminated by a 0 "transform present" bit. Type 3 = ColorIndex.
+fn has_color_index_transform(bitstream: &[u8]) -> bool {
+    use oxideav_webp::vp8l::bit_reader::BitReader;
+    let mut br = BitReader::new(bitstream);
+    let _sig = br.read_bits(8).expect("signature");
+    let _w_minus_1 = br.read_bits(14).expect("width");
+    let _h_minus_1 = br.read_bits(14).expect("height");
+    let _alpha = br.read_bits(1).expect("alpha");
+    let _version = br.read_bits(3).expect("version");
+    // Walk the transform chain (capped at 4 — VP8L spec).
+    for _ in 0..4 {
+        let present = br.read_bits(1).expect("transform present bit");
+        if present == 0 {
+            return false;
+        }
+        let ty = br.read_bits(2).expect("transform type");
+        if ty == 3 {
+            return true;
+        }
+        // Skip the per-transform parameters. Predictor/colour each
+        // carry a 3-bit tile_bits and a sub-image; subtract-green has
+        // no params. We don't need to fully parse — we'd only need to
+        // for a transform after a ColorIndex, which we'd have detected
+        // already. So: bail out as soon as we see anything other than
+        // SubtractGreen (which has no payload + lets us continue).
+        if ty != 2 {
+            // Predictor / colour have a sub-image that we'd need to
+            // decode to advance the bit pointer. Easier to give up and
+            // return "false (so far)" — for the test below we always
+            // emit ColorIndex first when active, so a prefix scan is
+            // sufficient.
+            return false;
+        }
+    }
+    false
+}
+
+#[test]
+fn vp8l_encode_palette_transform_detects_small_palette() {
+    // 8-colour image — well under the 256-entry palette limit. The
+    // encoder should pick the colour-indexing transform on the
+    // RDO sweep and emit a packed (4-bits-per-pixel) index image
+    // instead of the full ARGB stream. Both: (a) the bitstream must
+    // carry a ColorIndex transform header, and (b) it must round-trip
+    // bit-for-bit through the in-crate decoder.
+    //
+    // We use 8 distinct ARGB colours — exercises the bits_per_pixel=4
+    // branch (8 ≤ 16 → 4 bits per pixel → 2 indices per packed byte).
+    let w = 64u32;
+    let h = 64u32;
+    let palette: [[u8; 4]; 8] = [
+        [0xff, 0x00, 0x00, 0xff],
+        [0x00, 0xff, 0x00, 0xff],
+        [0x00, 0x00, 0xff, 0xff],
+        [0xff, 0xff, 0x00, 0xff],
+        [0xff, 0x00, 0xff, 0xff],
+        [0x00, 0xff, 0xff, 0xff],
+        [0xff, 0xff, 0xff, 0xff],
+        [0x00, 0x00, 0x00, 0xff],
+    ];
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            // Pick an index that varies enough to test packing
+            // boundaries (every 4-pixel run shifts to a new colour,
+            // exercising both sub-positions of the packed byte).
+            let idx = ((x / 4 + y / 4) % 8) as usize;
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i..i + 4].copy_from_slice(&palette[idx]);
+        }
+    }
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+
+    // Encode with the default RDO sweep — palette must win on this
+    // fixture (a few colours + spatial regularity = small palette
+    // index image dominates).
+    let bitstream = encode_vp8l_argb(w, h, &pixels, false).expect("RDO encode");
+    assert!(
+        has_color_index_transform(&bitstream),
+        "RDO sweep should pick the palette transform on an 8-colour image"
+    );
+
+    // Round-trip via the in-crate decoder.
+    let decoded = vp8l::decode(&bitstream).expect("palette decode");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "palette transform round-trip lost data"
+    );
+
+    // Compare to the explicit no-palette encode — palette must shrink
+    // the bitstream measurably (at least 1.5×) on this fixture.
+    let no_palette = EncoderOptions {
+        use_color_index: false,
+        ..EncoderOptions::default()
+    };
+    let no_palette_bitstream =
+        encode_vp8l_argb_with(w, h, &pixels, false, no_palette).expect("no-palette encode");
+    eprintln!(
+        "8-colour 64×64: rdo={} bytes, no_palette={} bytes ({:+.1}%)",
+        bitstream.len(),
+        no_palette_bitstream.len(),
+        100.0 * (bitstream.len() as f64 - no_palette_bitstream.len() as f64)
+            / no_palette_bitstream.len() as f64,
+    );
+    assert!(
+        bitstream.len() * 2 < no_palette_bitstream.len() * 3,
+        "palette encode should beat the no-palette path by at least 1.5×: \
+         palette={} bytes, no_palette={} bytes",
+        bitstream.len(),
+        no_palette_bitstream.len(),
+    );
+}
+
+#[test]
+fn vp8l_encode_palette_two_colours_packs_to_one_bit_per_pixel() {
+    // Edge case: exactly 2 colours → bits_per_pixel = 1 → 8 indices
+    // per packed pixel. Stresses the smallest packing factor.
+    let w = 32u32;
+    let h = 32u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let on = (x + y) % 2 == 0;
+            let i = ((y * w + x) * 4) as usize;
+            if on {
+                rgba[i..i + 4].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+            } else {
+                rgba[i..i + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0xff]);
+            }
+        }
+    }
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+
+    let bitstream = encode_vp8l_argb(w, h, &pixels, false).expect("checkerboard encode");
+    assert!(
+        has_color_index_transform(&bitstream),
+        "RDO sweep should pick palette on a 2-colour checkerboard"
+    );
+    let decoded = vp8l::decode(&bitstream).expect("checkerboard decode");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "2-colour palette round-trip lost data"
+    );
+}
+
+#[test]
+fn vp8l_encode_palette_skipped_on_non_palettable_image() {
+    // Photographic-like content with > 256 unique colours — the
+    // palette path must be auto-skipped (build_palette returns None)
+    // and the encoder must still produce a valid round-trippable
+    // bitstream via the regular ARGB path.
+    let w = 32u32;
+    let h = 32u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let mut s: u32 = 0x9e37_79b1;
+    for chunk in rgba.chunks_exact_mut(4) {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        chunk[0] = (s & 0xff) as u8;
+        chunk[1] = ((s >> 8) & 0xff) as u8;
+        chunk[2] = ((s >> 16) & 0xff) as u8;
+        chunk[3] = 0xff;
+    }
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+
+    // Force palette on; the auto-fallback should engage because the
+    // unique-colour count exceeds 256.
+    let opts = EncoderOptions {
+        use_color_index: true,
+        ..EncoderOptions::default()
+    };
+    let bitstream =
+        encode_vp8l_argb_with(w, h, &pixels, false, opts).expect("force-palette encode");
+    assert!(
+        !has_color_index_transform(&bitstream),
+        "force-palette must auto-skip on > 256 unique colours"
+    );
+    let decoded = vp8l::decode(&bitstream).expect("non-palettable decode");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "non-palettable round-trip lost data"
+    );
+}

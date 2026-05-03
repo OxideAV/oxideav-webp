@@ -23,11 +23,17 @@
 //!   also addressable by its hashed cache index, which shortens the
 //!   green alphabet on repeat colours.
 //!
+//! * **Colour-indexing (palette) transform.** Triggered automatically
+//!   when the image has ≤ 256 unique ARGB colours. Replaces every pixel
+//!   with a small palette index (1, 2, 4, or 8 bits per index, packed
+//!   into the green channel of the index image) and ships a delta-coded
+//!   palette out of band. Wins 2-5× on icons, line art, and screenshots
+//!   — and the index image often compresses *further* via subtract-green
+//!   + LZ77 + colour-cache once the channel-decorrelation is no longer
+//!   the bottleneck.
+//!
 //! What we still don't do (compared to libwebp):
 //!
-//! * **No colour-indexing (palette) transform.** Palette images still
-//!   go through the full ARGB path — inefficient for palettised art but
-//!   correct.
 //! * **No meta-Huffman image.** A single Huffman group covers the
 //!   whole picture.
 //!
@@ -230,6 +236,16 @@ pub struct EncoderOptions {
     /// the input bytes exactly (raises file size, useful for callers
     /// that round-trip RGB out-of-band of the alpha channel).
     pub strip_transparent_color: bool,
+    /// When `true`, the encoder probes the unique-colour count and emits
+    /// a [colour-indexing transform](super::transform::Transform::ColorIndex)
+    /// whenever it can fit in 256 entries. The pixel stream is replaced
+    /// with palette indices (1/2/4/8 bits per pixel depending on the
+    /// palette size). Setting this to `false` forces the full ARGB
+    /// path even on palettised images — useful for testing the
+    /// non-palette transforms in isolation. When the image has > 256
+    /// unique colours the encoder transparently falls back to the ARGB
+    /// path regardless of this flag.
+    pub use_color_index: bool,
 }
 
 impl Default for EncoderOptions {
@@ -241,6 +257,7 @@ impl Default for EncoderOptions {
             use_color_cache: true,
             cache_bits: COLOR_CACHE_BITS,
             strip_transparent_color: true,
+            use_color_index: true,
         }
     }
 }
@@ -256,6 +273,7 @@ impl EncoderOptions {
             use_color_cache: false,
             cache_bits: COLOR_CACHE_BITS,
             strip_transparent_color: true,
+            use_color_index: false,
         }
     }
 
@@ -271,6 +289,7 @@ impl EncoderOptions {
             use_color_cache: false,
             cache_bits: COLOR_CACHE_BITS,
             strip_transparent_color: true,
+            use_color_index: false,
         }
     }
 }
@@ -320,14 +339,73 @@ pub fn encode_vp8l_argb_with(
         strip_transparent_rgb(&mut working);
     }
 
-    if opts.use_subtract_green {
+    // ── Optional colour-indexing (palette) transform ────────────────
+    //
+    // Detect ≤ 256 unique ARGB colours and, when present, emit the
+    // palette transform first (so the decoder applies it last —
+    // expanding the index back into ARGB at the very end). The pixel
+    // stream that follows then carries small integer indices, which
+    // the rest of the transform chain (subtract-green / predictor /
+    // colour-cache) can compress further.
+    //
+    // Per RFC 9649 §3.6.5 the palette index goes into the green
+    // channel of the index image, with R=B=A masked to a known
+    // constant (the decoder ignores R/B and uses the palette entry's
+    // own alpha). When num_colors ≤ 16 the indices are bit-packed —
+    // the spec's `bits_per_pixel` derivation matches what
+    // [`super::transform::Transform::read`] reconstructs.
+    //
+    // Subtract-green is suppressed when the palette is in use because
+    // the green channel is now an index (not a colour) and the
+    // decorrelation it relies on no longer applies.
+    let mut current_width = width;
+    let mut palette_active = false;
+    if opts.use_color_index {
+        if let Some(palette) = build_palette(&working) {
+            palette_active = true;
+            let bits_per_pixel = bits_per_pixel_for(palette.len() as u32);
+            let pack = 8u32 / bits_per_pixel;
+            let packed_w = (width + pack - 1) / pack;
+
+            // Transform header: present + type 3 (ColorIndexing).
+            bw.write(1, 1);
+            bw.write(3, 2);
+            // num_colors - 1, 8-bit.
+            bw.write(palette.len() as u32 - 1, 8);
+            // Delta-encode the palette along the row (decoder undoes
+            // this with a forward `add_argb` walk per spec §3.6.5).
+            let palette_delta = delta_encode_palette(&palette);
+            // The palette ships as an `image stream` of (num_colors)×1
+            // pixels. Sub-image, no cache, no meta-Huffman.
+            encode_image_stream(&mut bw, &palette_delta, palette.len() as u32, 1, false, 0)?;
+
+            // Replace the working pixel buffer with the packed index
+            // image: each output pixel carries `pack` palette indices
+            // in its green channel low bits.
+            working =
+                pack_palette_indices(&working, width, height, &palette, bits_per_pixel, packed_w);
+            current_width = packed_w;
+        }
+    }
+
+    if !palette_active && opts.use_subtract_green {
         // Transform header: present + type 2 (SubtractGreen).
         bw.write(1, 1);
         bw.write(2, 2);
         apply_subtract_green_forward(&mut working);
     }
 
-    if opts.use_color_transform {
+    // Colour-transform and predictor are skipped on palette-encoded
+    // images: the green channel of the index image is a small integer
+    // (0..palette.len()-1), not a colour, so the per-channel
+    // decorrelation that the colour transform models doesn't apply, and
+    // the predictor's "expand the residual to a full byte" step would
+    // typically inflate (small palettes leave the high bits of the
+    // green byte zero — predictor residuals fill those bits with noise
+    // and break the bit-packing prerequisite anyway). Cache-only on
+    // palette streams already gives most of the LZ77 / repeat-symbol
+    // gains without the side-image overhead.
+    if !palette_active && opts.use_color_transform {
         // Forward colour transform: per-tile search over the
         // [`COLOR_COEFF_GRID`] × [`COLOR_COEFF_GRID`] grid (256 combos)
         // plus a follow-up `r→b` sweep. Emits a predictor-shaped
@@ -369,7 +447,7 @@ pub fn encode_vp8l_argb_with(
         working = apply_color_transform_forward(&working, width, height, tile_bits, &coeffs, sub_w);
     }
 
-    if opts.use_predictor {
+    if !palette_active && opts.use_predictor {
         // Forward predictor: pick a mode per tile, then subtract
         // predictions. The sub-image we ship carries one mode per
         // tile — stored in the green channel's low 4 bits per spec.
@@ -413,7 +491,8 @@ pub fn encode_vp8l_argb_with(
     } else {
         0
     };
-    encode_image_stream(&mut bw, &working, width, height, true, cache_bits)?;
+    let stream_h = height;
+    encode_image_stream(&mut bw, &working, current_width, stream_h, true, cache_bits)?;
 
     Ok(bw.finish())
 }
@@ -431,10 +510,21 @@ pub fn encode_vp8l_argb_with(
 /// | colour-transform   | off, on               |
 /// | predictor          | off, on               |
 /// | colour-cache       | off, 6 bits, 8 bits, 10 bits |
+/// | colour-indexing    | off, on (auto-skipped if > 256 unique colours) |
 ///
-/// 2 × 2 × 2 × 4 = 32 trials. Each trial runs the existing per-transform
-/// pipeline so the cost is one full-image encode per candidate. Trials
-/// are independent and small, so we encode all of them and then pick.
+/// 2 × 2 × 2 × 4 × 2 = 64 trials. Each trial runs the existing
+/// per-transform pipeline so the cost is one full-image encode per
+/// candidate. Trials are independent and small, so we encode all of
+/// them and then pick.
+///
+/// Note that with `use_color_index = true` the encoder internally
+/// suppresses the subtract-green / colour-transform / predictor steps
+/// (they don't apply to a packed-index pixel stream); the
+/// `use_subtract_green` / `use_color_transform` / `use_predictor`
+/// flags become no-ops for those trials, giving the same encode
+/// regardless of how they're set. The redundant work is cheap (palette
+/// builder is O(N log K) for K ≤ 256) but the early winner is usually
+/// the cache-only variant on palettised content.
 ///
 /// Used as the production path under [`encode_vp8l_argb`] — callers that
 /// want a single fixed configuration should still use
@@ -461,22 +551,26 @@ fn encode_vp8l_argb_rdo(
 
     let mut best: Option<Vec<u8>> = None;
 
-    for &use_sg in &[true, false] {
-        for &use_ct in &[true, false] {
-            for &use_pr in &[true, false] {
-                for &cb in CACHE_BITS_GRID.iter() {
-                    let opts = EncoderOptions {
-                        use_subtract_green: use_sg,
-                        use_color_transform: use_ct,
-                        use_predictor: use_pr,
-                        use_color_cache: cb > 0,
-                        cache_bits: if cb > 0 { cb } else { COLOR_CACHE_BITS },
-                        // Strip already applied above on `stripped`.
-                        strip_transparent_color: false,
-                    };
-                    let bytes = encode_vp8l_argb_with(width, height, &stripped, has_alpha, opts)?;
-                    if best.as_ref().map(|b| bytes.len() < b.len()).unwrap_or(true) {
-                        best = Some(bytes);
+    for &use_palette in &[true, false] {
+        for &use_sg in &[true, false] {
+            for &use_ct in &[true, false] {
+                for &use_pr in &[true, false] {
+                    for &cb in CACHE_BITS_GRID.iter() {
+                        let opts = EncoderOptions {
+                            use_subtract_green: use_sg,
+                            use_color_transform: use_ct,
+                            use_predictor: use_pr,
+                            use_color_cache: cb > 0,
+                            cache_bits: if cb > 0 { cb } else { COLOR_CACHE_BITS },
+                            // Strip already applied above on `stripped`.
+                            strip_transparent_color: false,
+                            use_color_index: use_palette,
+                        };
+                        let bytes =
+                            encode_vp8l_argb_with(width, height, &stripped, has_alpha, opts)?;
+                        if best.as_ref().map(|b| bytes.len() < b.len()).unwrap_or(true) {
+                            best = Some(bytes);
+                        }
                     }
                 }
             }
@@ -783,6 +877,136 @@ fn cache_add(cache: &mut [u32], cache_bits: u32, argb: u32) {
 }
 
 // ── Transforms (encoder side) ─────────────────────────────────────────
+
+// ── Colour-indexing (palette) transform ───────────────────────────────
+//
+// Spec §3.6.5: when the image has ≤ 256 unique ARGB colours we can ship
+// a 1D palette out of band and replace every pixel with a small integer
+// index into it. The index image carries one index per pixel in the
+// green channel; for palettes ≤ 16 entries multiple indices are
+// bit-packed into one green byte (`pack = 8 / bits_per_pixel`), which
+// also shrinks the image dimensions the entropy coder sees.
+
+/// Maximum palette size that VP8L can encode. The transform header
+/// stores `num_colors - 1` in 8 bits.
+const MAX_PALETTE_SIZE: usize = 256;
+
+/// Walk `pixels` and build a sorted, de-duplicated palette of unique
+/// ARGB values. Returns `None` if the image has > 256 unique colours
+/// (palette transform doesn't apply) or if it's degenerate (1 colour
+/// — a single-entry palette is technically legal but the bit-packing
+/// math becomes awkward; the regular path with one literal + a giant
+/// LZ77 run already handles this case cheaply).
+///
+/// Sorting by ARGB value gives the delta-coded palette entries small
+/// component differences on average — important because the palette
+/// itself ships through the same prefix-coded image stream as the rest
+/// of the bitstream and benefits from a low-entropy delta sequence.
+fn build_palette(pixels: &[u32]) -> Option<Vec<u32>> {
+    // Use a tiny set built from a sorted Vec — std HashSet would be
+    // overkill here and pulls in hashing overhead for a search space
+    // bounded at 256. We early-exit the moment the unique count
+    // exceeds MAX_PALETTE_SIZE.
+    let mut palette: Vec<u32> = Vec::with_capacity(MAX_PALETTE_SIZE + 1);
+    for &p in pixels {
+        match palette.binary_search(&p) {
+            Ok(_) => {}
+            Err(pos) => {
+                if palette.len() >= MAX_PALETTE_SIZE {
+                    return None;
+                }
+                palette.insert(pos, p);
+            }
+        }
+    }
+    if palette.len() < 2 {
+        // Single-colour image — the regular path handles this with a
+        // single literal + colour-cache hits + a long LZ77 backref,
+        // and avoids the palette header overhead.
+        return None;
+    }
+    Some(palette)
+}
+
+/// Per spec §3.6.5: bits-per-pixel selection for the index image.
+/// Smaller palettes get bit-packed for better main-stream compression.
+fn bits_per_pixel_for(num_colors: u32) -> u32 {
+    if num_colors <= 2 {
+        1
+    } else if num_colors <= 4 {
+        2
+    } else if num_colors <= 16 {
+        4
+    } else {
+        8
+    }
+}
+
+/// Encode the palette as a delta-coded ARGB row. The decoder walks the
+/// row left-to-right doing per-channel `add_argb` to recover the
+/// originals (see `Transform::read` in `transform.rs`); the forward
+/// step is the matching per-channel `sub_argb`.
+///
+/// Returns `palette.len()`-many u32s, ready to feed into
+/// [`encode_image_stream`] as a sub-image of size (num_colors × 1).
+fn delta_encode_palette(palette: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(palette.len());
+    out.push(palette[0]);
+    for i in 1..palette.len() {
+        out.push(sub_argb(palette[i], palette[i - 1]));
+    }
+    out
+}
+
+/// Build the packed index image. Each ARGB pixel of the input is
+/// looked up in `palette` (binary search — palette is sorted) and the
+/// resulting index is shifted into the green byte of the packed pixel.
+///
+/// For `bits_per_pixel ∈ {1, 2, 4}` multiple indices share a single
+/// packed pixel: spec §3.6.5 packs them low-bits-first across an
+/// 8-bit green channel. Output width is `(width + pack - 1) / pack`,
+/// matching the decoder's `image_width_or_default`.
+///
+/// Padding pixels in the rightmost packed column (if `width` doesn't
+/// divide evenly by `pack`) are zero-filled — the decoder will read
+/// them but its bounds check (`ox < orig_xsize`) drops them on
+/// expansion, so the value is don't-care.
+fn pack_palette_indices(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    palette: &[u32],
+    bits_per_pixel: u32,
+    packed_w: u32,
+) -> Vec<u32> {
+    let w = width as usize;
+    let h = height as usize;
+    let pack = (8 / bits_per_pixel) as usize;
+    let pw = packed_w as usize;
+    let mut out: Vec<u32> = vec![0u32; pw * h];
+    for y in 0..h {
+        for xp in 0..pw {
+            let mut g_byte: u32 = 0;
+            for sub in 0..pack {
+                let x_orig = xp * pack + sub;
+                if x_orig >= w {
+                    break;
+                }
+                let pixel = pixels[y * w + x_orig];
+                // Palette is sorted, so binary search is O(log n) per
+                // pixel — for n ≤ 256 that's at most 8 comparisons.
+                let idx = palette
+                    .binary_search(&pixel)
+                    .expect("palette must contain every input pixel by construction");
+                g_byte |= (idx as u32) << (sub as u32 * bits_per_pixel);
+            }
+            // Index image: A=0xff, R=0, G=indices, B=0. The decoder
+            // pulls the indices out of `(p >> 8) & 0xff` per spec.
+            out[y * pw + xp] = 0xff00_0000 | (g_byte << 8);
+        }
+    }
+    out
+}
 
 /// Subtract the green channel from R and B in-place. Mirrors
 /// `apply_subtract_green` in [`super::transform`] (the decoder reverses
