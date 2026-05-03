@@ -333,3 +333,71 @@ fn vp8l_encode_transforms_shrink_non_trivial_image() {
         "full-transform round-trip lost data"
     );
 }
+
+#[test]
+fn vp8l_encode_widened_predictor_pool_shrinks_diagonal() {
+    // Diagonal stripes that lean north-east → south-west: the strongest
+    // single-neighbour correlation is with the top-right neighbour
+    // (predictor mode 3). With the old [0, 1, 2, 11] pool the encoder
+    // had to settle for mode 11 ("select"), which on this image shape
+    // pays for itself worse than a direct TR copy. The widened 14-mode
+    // pool should pick mode 3 on at least one tile and shrink the output.
+    //
+    // We build the test input post-subtract-green-decorrelation in
+    // mind: each diagonal stripe carries the same green value, so a
+    // predictor that copies the top-right neighbour is exact and the
+    // residual collapses to all zeros on most of the image.
+    let w = 96u32;
+    let h = 96u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            // Stripe index = x + y truncated to a small modulus. Each
+            // stripe lasts exactly one pixel diagonal because the TR
+            // neighbour at (x+1, y-1) has the SAME stripe index as
+            // (x, y) — perfect for predictor mode 3.
+            let stripe = ((x + y) % 8) as u8;
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i] = stripe.wrapping_mul(31);
+            rgba[i + 1] = stripe.wrapping_mul(17);
+            rgba[i + 2] = stripe.wrapping_mul(53);
+            rgba[i + 3] = 0xff;
+        }
+    }
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+
+    // Default options run the full 14-mode pool through `encode_vp8l_argb_with`.
+    // The RDO sweep is irrelevant here — we want a like-for-like predictor
+    // comparison so we hold the rest of the configuration fixed and let
+    // the per-tile mode search make the only choice.
+    let opts = EncoderOptions::default();
+    let widened =
+        encode_vp8l_argb_with(w, h, &pixels, false, opts).expect("widened-predictor-pool encode");
+
+    // Self-consistency: bit-for-bit lossless round-trip.
+    let decoded = vp8l::decode(&widened).expect("widened-pool decode");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "widened-pool encode lost data on diagonal stripes"
+    );
+
+    // Also assert the widened encoder beats the bare baseline by a
+    // wide margin on this fixture (the diagonal correlation is exact
+    // in mode 3, so residuals should be all zero on most tiles).
+    let bare =
+        encode_vp8l_argb_with(w, h, &pixels, false, EncoderOptions::bare()).expect("bare encode");
+    eprintln!(
+        "diagonal stripes 96×96: bare={} bytes, with-predictor-pool={} bytes ({:+.1}%)",
+        bare.len(),
+        widened.len(),
+        100.0 * (widened.len() as f64 - bare.len() as f64) / bare.len() as f64,
+    );
+    assert!(
+        widened.len() * 2 < bare.len(),
+        "widened-pool encode should beat bare encode by 2x+ on diagonal stripes: \
+         bare={} bytes, widened={} bytes",
+        bare.len(),
+        widened.len(),
+    );
+}

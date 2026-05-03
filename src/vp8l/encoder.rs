@@ -16,9 +16,9 @@
 //!   order on decode is predictor → colour → add-green — matching
 //!   libwebp.
 //! * **Predictor transform** (always on, tile-based). Each 16×16 tile
-//!   picks one of a small set of VP8L predictor modes (0 = opaque
-//!   black, 1 = left, 2 = top, 11 = select) by forward-pass cost
-//!   estimation; the tile modes ride in a sub-image pixel stream.
+//!   picks the best of all 14 VP8L predictor modes (RFC 9649 §4.1) by
+//!   forward-pass sum-of-abs-residuals cost; the tile modes ride in a
+//!   sub-image pixel stream.
 //! * **Colour cache** (always on, 256 entries). Every literal pixel is
 //!   also addressable by its hashed cache index, which shortens the
 //!   green alphabet on repeat colours.
@@ -30,7 +30,6 @@
 //!   correct.
 //! * **No meta-Huffman image.** A single Huffman group covers the
 //!   whole picture.
-//! * **Single predictor-mode pool** (0/1/2/11). libwebp probes all 14.
 //!
 //! What *is* implemented end-to-end:
 //!
@@ -104,15 +103,25 @@ const COLOR_COEFF_GRID: [i8; 16] = [
 const COLOR_R2B_GRID: [i8; 5] = [-12, -6, 0, 6, 12];
 
 /// Predictor modes we're willing to pick between on the encoder side.
-/// Limiting the pool keeps the per-tile mode search cheap (a linear
-/// sum-of-abs-residuals pass per candidate) and still hits the common
-/// correlations for photographic + flat content:
+/// We probe all 14 VP8L predictor modes (RFC 9649 §4.1) and let the
+/// per-tile sum-of-abs-residuals scan pick the cheapest. The earlier
+/// pool was `[0, 1, 2, 11]` — fine on flat / left-correlated / top-
+/// correlated / "select"-friendly content but blind to:
 ///
-/// * 0 — opaque black (good for the top-left tile, alpha-only rows).
-/// * 1 — left.
-/// * 2 — top.
-/// * 11 — "select" (libwebp's workhorse for natural images).
-const PREDICTOR_MODES: &[u32] = &[0, 1, 2, 11];
+/// * 3 — top-right (handles diagonal stripes leaning the wrong way).
+/// * 4 — top-left (catches strong NW-SE correlation).
+/// * 5..10 — neighbour averages (smooth content where mean-of-2 or
+///   mean-of-3 beats every single-neighbour mode, especially on the
+///   green-decorrelated residual stream).
+/// * 12 — clamped L+T-TL (Paeth-like; another natural-image staple).
+/// * 13 — clamped (avg(L,T)) + half delta (handles content that's
+///   "almost an average" of two neighbours but with a slight bias).
+///
+/// Cost per tile is one residual-sum scan per candidate, so the budget
+/// scales linearly with the pool size — going from 4 modes to 14 is a
+/// 3.5× per-tile cost which still amortises cheaply against entropy
+/// coding (the sub-image is one byte per tile per the spec).
+const PREDICTOR_MODES: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 /// LSB-first bit writer matching the VP8L decoder's bit-reader convention.
 struct BitWriter {
