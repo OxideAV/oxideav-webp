@@ -137,7 +137,7 @@ fn bench_huffman(c: &mut Criterion) {
     let tree = build_skewed_tree();
     // 64 KiB of pseudo-random bits — long enough that the loop dominates
     // the bench, short enough to fit in L2.
-    let bits = xorshift_bytes(0xC0FFEE_DEAD_BEEFu64, 64 * 1024);
+    let bits = xorshift_bytes(0x00C0_FFEE_DEAD_BEEF_u64, 64 * 1024);
     // Number of symbols to decode per iteration. With the skewed tree the
     // average symbol length sits around 4 bits, so 64 KiB ≈ 130 K symbols.
     // We cap at 100 K and stop early on EOF (bit-reader returns zeros
