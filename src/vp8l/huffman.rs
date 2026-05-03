@@ -29,7 +29,59 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
 /// comfortably in 16 bits (largest is ~2072 = 256 + 24 + cache).
 pub type HuffmanCode = u16;
 
+/// Bits used to index the primary lookup table in `HuffmanTree`. Larger
+/// values trade memory (and one-time build cost) for fewer fall-back
+/// tree walks. 8 bits ⇒ a 256-entry × 4-byte = 1 KiB table per tree,
+/// which decodes any code of length ≤ 8 in a single load + shift.
+///
+/// VP8L permits codes up to length 15, so codes of length 9..15 still
+/// fall back to the bit-by-bit tree walk. In practice the tree walks
+/// are rare: the most-frequent literal-green and length codes nearly
+/// always land at lengths ≤ 7, and a 2× bigger LUT (LUT_BITS = 9, 2 KiB
+/// per tree) doesn't hit deep enough into the tail to pay back its
+/// build cost on small frames.
+const LUT_BITS: u8 = 8;
+const LUT_SIZE: usize = 1 << LUT_BITS;
+
+/// One LUT entry. Packs (length, symbol) into a u32 to keep the table
+/// dense (cache-line friendly):
+///   * bits  0..16 — symbol (HuffmanCode = u16, alphabets fit in 16 bits)
+///   * bits 16..24 — code length in bits (0 ⇒ "fall back to tree walk")
+///
+/// Encoding length=0 as the fall-back marker is safe because canonical-
+/// Huffman codes always have length ≥ 1.
+type LutEntry = u32;
+
+#[inline]
+fn lut_pack(symbol: HuffmanCode, length: u8) -> LutEntry {
+    ((length as u32) << 16) | (symbol as u32)
+}
+
+#[inline]
+fn lut_length(e: LutEntry) -> u8 {
+    ((e >> 16) & 0xff) as u8
+}
+
+#[inline]
+fn lut_symbol(e: LutEntry) -> HuffmanCode {
+    (e & 0xffff) as HuffmanCode
+}
+
 /// A Huffman tree ready for bit-by-bit decode.
+///
+/// Decode strategy is two-tier:
+///
+/// 1. **Primary LUT** (`lut`) indexed by `LUT_BITS` peeked bits — one
+///    load + shift covers every code of length ≤ `LUT_BITS`. This is
+///    the textbook canonical-Huffman speedup; for an alphabet whose
+///    most-frequent codes are short (the literal-green / length /
+///    cache codes typically are) it eliminates the per-bit branch in
+///    the hot path entirely.
+/// 2. **Fall-back tree walk** for the rare ≥`LUT_BITS+1`-bit codes —
+///    the same flat `nodes` array the original bit-by-bit decoder
+///    used. Correctness is verified by the existing 50+ Huffman edge-
+///    case tests in `tests/vp8l_huffman_unit.rs` plus the in-module
+///    `tests` suite below.
 #[derive(Debug)]
 pub struct HuffmanTree {
     /// Single-symbol shortcut: if present, every read emits this symbol
@@ -37,8 +89,13 @@ pub struct HuffmanTree {
     only_symbol: Option<HuffmanCode>,
     /// Flat node array. The root is node 0. Each non-leaf `Node::Internal`
     /// stores indices to its 0/1 children. Leaves store the decoded
-    /// symbol.
+    /// symbol. Only consulted when the LUT entry has length 0
+    /// (fall-back path).
     nodes: Vec<Node>,
+    /// Primary lookup table — indexed by `LUT_BITS` peeked bits in the
+    /// bit-reader's LSB-first order. Each entry packs (symbol, length)
+    /// per `lut_pack`. Empty for the single-symbol shortcut path.
+    lut: Vec<LutEntry>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,13 +133,24 @@ impl HuffmanTree {
             return Ok(Self {
                 only_symbol: Some(sym0),
                 nodes: vec![Node::Leaf(sym0)],
+                lut: Vec::new(),
             });
         }
         let sym1 = br.read_bits(8)? as HuffmanCode;
         if (sym1 as usize) >= alphabet {
             return Err(Error::invalid("VP8L: simple huffman symbol out of range"));
         }
-        // 1-bit: 0 -> sym0, 1 -> sym1.
+        // 1-bit: 0 -> sym0, 1 -> sym1. Build the LUT explicitly here
+        // rather than going through `build_from_lengths` — the simple
+        // 2-symbol shape is already canonical and a length table over
+        // the alphabet would be sparse and wasteful (alphabet can be
+        // 256+ for a green tree).
+        let mut lut = vec![0 as LutEntry; LUT_SIZE];
+        let entry0 = lut_pack(sym0, 1);
+        let entry1 = lut_pack(sym1, 1);
+        for (i, slot) in lut.iter_mut().enumerate() {
+            *slot = if i & 1 == 0 { entry0 } else { entry1 };
+        }
         Ok(Self {
             only_symbol: None,
             nodes: vec![
@@ -90,6 +158,7 @@ impl HuffmanTree {
                 Node::Leaf(sym0),
                 Node::Leaf(sym1),
             ],
+            lut,
         })
     }
 
@@ -198,10 +267,41 @@ impl HuffmanTree {
     }
 
     /// Decode a single symbol.
+    ///
+    /// Two-tier strategy:
+    ///   1. Refill so ≥ `LUT_BITS` bits are buffered, peek them, and
+    ///      look up the (symbol, length) pair in O(1). Consume `length`
+    ///      bits and return — covers every code of length ≤ `LUT_BITS`.
+    ///   2. If the LUT entry has length 0 (the "fall-back" sentinel —
+    ///      the prefix is consistent with multiple distinct codes,
+    ///      i.e. the actual code length exceeds `LUT_BITS`), fall back
+    ///      to the original bit-by-bit tree walk over `nodes`.
+    ///
+    /// Past end-of-buffer the bit-reader injects zero bits (libwebp
+    /// trailing-zero contract), so peek/refill never errors on EOF —
+    /// we just keep decoding into well-defined zero-bit territory and
+    /// rely on the outer pixel-loop's pixel count to terminate.
+    #[inline]
     pub fn decode(&self, br: &mut BitReader<'_>) -> Result<HuffmanCode> {
         if let Some(s) = self.only_symbol {
             return Ok(s);
         }
+        // Primary LUT fast-path. The bit-reader's `read_bits` would also
+        // refill, but inlining the refill+peek+consume pair here avoids
+        // the conditional-on-n branch and keeps the symbol load close
+        // to the bit-shift in the generated code.
+        br.refill(LUT_BITS);
+        let key = br.peek_bits(LUT_BITS) as usize;
+        let entry = self.lut[key];
+        let length = lut_length(entry);
+        if length != 0 {
+            br.consume(length);
+            return Ok(lut_symbol(entry));
+        }
+        // Fall-back: the actual code is longer than LUT_BITS bits.
+        // Walk the tree from the root one bit at a time. (We can't
+        // start from where the LUT prefix points without storing
+        // sub-tree roots in the LUT — a possible future refinement.)
         let mut node = 0u32;
         loop {
             match self.nodes[node as usize] {
@@ -235,6 +335,7 @@ fn build_from_lengths(lengths: &[u8]) -> Result<HuffmanTree> {
         return Ok(HuffmanTree {
             only_symbol: Some(0),
             nodes: vec![Node::Leaf(0)],
+            lut: Vec::new(),
         });
     }
     if total_nonzero == 1 {
@@ -242,6 +343,7 @@ fn build_from_lengths(lengths: &[u8]) -> Result<HuffmanTree> {
         return Ok(HuffmanTree {
             only_symbol: Some(s),
             nodes: vec![Node::Leaf(s)],
+            lut: Vec::new(),
         });
     }
 
@@ -259,15 +361,47 @@ fn build_from_lengths(lengths: &[u8]) -> Result<HuffmanTree> {
         next_code[bits] = code;
     }
 
-    // Insert each symbol into a flat tree. Walk the canonical code MSB-
+    // Insert each symbol into a flat tree AND populate the primary LUT
+    // for codes of length ≤ LUT_BITS. Walk the canonical code MSB-
     // first, allocating internal nodes on demand and then a final leaf.
+    //
+    // LUT population: the bit-reader returns bits LSB-first (the first
+    // emitted bit ends up in bit 0 of the peek). The encoder emits the
+    // MSB of `code_val` first, so the LSB-first key prefix is the
+    // bit-reverse of `code_val` over `len` bits. We pre-compute that
+    // prefix here, then stride through every LUT slot whose low `len`
+    // bits match — `1 << (LUT_BITS - len)` slots in total per symbol,
+    // each one representing all possible "bits beyond the code" suffixes.
     let mut nodes: Vec<Node> = vec![Node::Internal { zero: 0, one: 0 }];
+    let mut lut: Vec<LutEntry> = vec![0 as LutEntry; LUT_SIZE];
     for (sym, &len) in lengths.iter().enumerate() {
         if len == 0 {
             continue;
         }
         let code_val = next_code[len as usize];
         next_code[len as usize] += 1;
+
+        // Populate the LUT for short codes. (Long codes are served by
+        // the tree walk; their LUT slots stay at length=0, the
+        // fall-back marker.)
+        if len as u8 <= LUT_BITS {
+            // bit-reverse code_val over `len` bits to get the LSB-first prefix.
+            let mut prefix = 0u32;
+            for b in 0..len {
+                if ((code_val >> b) & 1) != 0 {
+                    prefix |= 1u32 << (len - 1 - b);
+                }
+            }
+            let stride = 1usize << len;
+            let entry = lut_pack(sym as u16, len);
+            let mut k = prefix as usize;
+            while k < LUT_SIZE {
+                lut[k] = entry;
+                k += stride;
+            }
+        }
+
+        // Build the fall-back tree node-by-node, bit-by-bit MSB-first.
         let mut node = 0u32;
         for b in (0..len).rev() {
             let bit = (code_val >> b) & 1;
@@ -327,6 +461,7 @@ fn build_from_lengths(lengths: &[u8]) -> Result<HuffmanTree> {
     Ok(HuffmanTree {
         only_symbol: None,
         nodes,
+        lut,
     })
 }
 

@@ -55,6 +55,55 @@ impl<'a> BitReader<'a> {
         self.read_bits(1)
     }
 
+    /// Refill the accumulator so it has at least `n` bits available
+    /// (assuming `n <= 32`). Past end-of-buffer, zero bytes are injected
+    /// to mirror libwebp's trailing-zero behaviour and keep callers from
+    /// having to special-case truncation. Used by the Huffman LUT
+    /// decoder to peek the next `n` bits cheaply (peek + consume in two
+    /// steps avoids the conditional refill on every probe).
+    #[inline]
+    pub fn refill(&mut self, n: u8) {
+        debug_assert!(n <= 32);
+        while self.nbits < n as u32 {
+            if self.byte_pos >= self.buf.len() {
+                self.nbits += 8;
+                continue;
+            }
+            self.bits |= (self.buf[self.byte_pos] as u64) << self.nbits;
+            self.byte_pos += 1;
+            self.nbits += 8;
+        }
+    }
+
+    /// Number of bits currently buffered (after a `refill`, this is at
+    /// least the value last passed to `refill`). Cheap; just a field
+    /// read.
+    #[inline]
+    pub fn buffered_bits(&self) -> u32 {
+        self.nbits
+    }
+
+    /// Return the low `n` bits of the buffered accumulator without
+    /// consuming. Caller must have already ensured (via `refill`) that
+    /// at least `n` bits are buffered.
+    #[inline]
+    pub fn peek_bits(&self, n: u8) -> u32 {
+        debug_assert!((n as u32) <= self.nbits);
+        let mask = if n == 0 { 0u64 } else { (1u64 << n) - 1 };
+        (self.bits & mask) as u32
+    }
+
+    /// Discard `n` bits from the buffered accumulator. Caller must have
+    /// already ensured (via `refill`) that at least `n` bits are
+    /// buffered. Pairs with `peek_bits` for the LUT-driven Huffman
+    /// fast-path.
+    #[inline]
+    pub fn consume(&mut self, n: u8) {
+        debug_assert!((n as u32) <= self.nbits);
+        self.bits >>= n;
+        self.nbits -= n as u32;
+    }
+
     /// True if we've read past the physical end of the underlying buffer.
     pub fn at_end(&self) -> bool {
         self.byte_pos >= self.buf.len()
