@@ -191,7 +191,18 @@ fn apply_predictor(
     sub_image: &[u32],
     sub_w: u32,
 ) -> Vec<u32> {
-    let mut out = residual.to_vec();
+    // Build the decoded image into a fresh buffer in raster order. The
+    // previous implementation `to_vec()`'d `residual` up-front so it could
+    // index `out[idx] = ...` cheaply, but that's a wasted memcpy of the
+    // entire residual image (~64 KiB on the 128×128-natural fixture) plus
+    // a write-then-overwrite of every cell. Since `predict_argb` only
+    // reads the already-decoded neighbourhood (L / T / TL / TR — all at
+    // indices strictly less than `idx` in raster order), `Vec::push`
+    // works directly: at the moment we compute pixel `idx`, every
+    // earlier slot is filled and every later slot is logically untouched.
+    let pixel_count = residual.len();
+    let mut out: Vec<u32> = Vec::with_capacity(pixel_count);
+    let w_usize = width as usize;
     for y in 0..height {
         for x in 0..width {
             let idx = (y * width + x) as usize;
@@ -204,14 +215,14 @@ fn apply_predictor(
                 out[idx - 1]
             } else if x == 0 {
                 // First column → use top neighbour.
-                out[idx - width as usize]
+                out[idx - w_usize]
             } else {
                 let tx = (x >> tile_bits) as usize;
                 let ty = (y >> tile_bits) as usize;
                 let mode = (sub_image[ty * sub_w as usize + tx] >> 8) & 0x0f;
-                predict_argb(&out, width as usize, x as usize, y as usize, mode)
+                predict_argb(&out, w_usize, x as usize, y as usize, mode)
             };
-            out[idx] = add_argb(residual[idx], pred);
+            out.push(add_argb(residual[idx], pred));
         }
     }
     out
