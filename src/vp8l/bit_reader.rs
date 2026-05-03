@@ -5,7 +5,7 @@
 //! is a straightforward buffered shift accumulator: whenever fewer than 32
 //! bits remain in the buffer we pull one more byte in.
 
-use oxideav_core::Result;
+use crate::error::Result;
 
 pub struct BitReader<'a> {
     buf: &'a [u8],

@@ -6,7 +6,7 @@
 //! transform parameters); colour-indexing carries a 1D palette; subtract-
 //! green has no parameters.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Result, WebpError as Error};
 
 use super::bit_reader::BitReader;
 use super::decode_image_stream;

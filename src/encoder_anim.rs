@@ -40,8 +40,7 @@
 //! The nested chunk is a single `VP8L` (lossless) sub-chunk produced by
 //! the existing per-frame VP8L encoder.
 
-use oxideav_core::{Error, Result};
-
+use crate::error::{Result, WebpError as Error};
 use crate::vp8l::encode_vp8l_argb;
 
 /// One frame of an animation: an RGBA tile sized `width × height` rendered

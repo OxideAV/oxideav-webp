@@ -21,28 +21,35 @@
 //! [`crate::vp8l::encode_vp8l_argb`] themselves — that entry point
 //! remains unchanged.
 
+#[cfg(feature = "registry")]
 use std::collections::VecDeque;
 
+#[cfg(feature = "registry")]
 use oxideav_core::Encoder;
+#[cfg(feature = "registry")]
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, TimeBase,
-    VideoFrame,
+    CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, TimeBase, VideoFrame,
 };
 
+use crate::error::Result;
+#[cfg(feature = "registry")]
+use crate::error::WebpError as Error;
 use crate::riff::{build_webp_file, ImageKind, WebpMetadata};
 use crate::vp8l::encode_vp8l_argb;
+#[cfg(feature = "registry")]
 use crate::CODEC_ID_VP8L;
 
-pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+#[cfg(feature = "registry")]
+pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
-        .ok_or_else(|| Error::invalid("VP8L encoder: missing width"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("VP8L encoder: missing width"))?;
     let height = params
         .height
-        .ok_or_else(|| Error::invalid("VP8L encoder: missing height"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("VP8L encoder: missing height"))?;
     let pix = params.pixel_format.unwrap_or(PixelFormat::Rgba);
     if pix != PixelFormat::Rgba && pix != PixelFormat::Rgb24 {
-        return Err(Error::unsupported(format!(
+        return Err(oxideav_core::Error::unsupported(format!(
             "VP8L encoder: pixel format {pix:?} not supported — feed Rgba or Rgb24"
         )));
     }
@@ -67,6 +74,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     }))
 }
 
+#[cfg(feature = "registry")]
 struct Vp8lEncoder {
     output_params: CodecParameters,
     width: u32,
@@ -77,6 +85,7 @@ struct Vp8lEncoder {
     eof: bool,
 }
 
+#[cfg(feature = "registry")]
 impl Encoder for Vp8lEncoder {
     fn codec_id(&self) -> &CodecId {
         &self.output_params.codec_id
@@ -86,10 +95,14 @@ impl Encoder for Vp8lEncoder {
         &self.output_params
     }
 
-    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+    fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {
         let v = match frame {
             Frame::Video(v) => v,
-            _ => return Err(Error::invalid("VP8L encoder: video frames only")),
+            _ => {
+                return Err(oxideav_core::Error::invalid(
+                    "VP8L encoder: video frames only",
+                ))
+            }
         };
         // Frame dimensions and pixel format are now stream-level — the
         // pipeline upstream is responsible for matching `output_params`.
@@ -97,7 +110,7 @@ impl Encoder for Vp8lEncoder {
             PixelFormat::Rgba => encode_frame_rgba(v, self.width, self.height)?,
             PixelFormat::Rgb24 => encode_frame_rgb24(v, self.width, self.height)?,
             other => {
-                return Err(Error::unsupported(format!(
+                return Err(oxideav_core::Error::unsupported(format!(
                     "VP8L encoder: pixel format {other:?} not supported"
                 )))
             }
@@ -110,17 +123,17 @@ impl Encoder for Vp8lEncoder {
         Ok(())
     }
 
-    fn receive_packet(&mut self) -> Result<Packet> {
+    fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
         if let Some(p) = self.pending.pop_front() {
             return Ok(p);
         }
         if self.eof {
-            return Err(Error::Eof);
+            return Err(oxideav_core::Error::Eof);
         }
-        Err(Error::NeedMore)
+        Err(oxideav_core::Error::NeedMore)
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> oxideav_core::Result<()> {
         self.eof = true;
         Ok(())
     }
@@ -129,6 +142,7 @@ impl Encoder for Vp8lEncoder {
 /// Pack an Rgba `VideoFrame` into ARGB u32 pixels and run the VP8L encoder.
 /// Returns a full `.webp` file — simple-layout when the frame is fully
 /// opaque, extended (VP8X + VP8L) when alpha carries data.
+#[cfg(feature = "registry")]
 fn encode_frame_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
@@ -169,6 +183,7 @@ fn encode_frame_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>>
 /// Returns a full `.webp` file in the simple `RIFF/WEBP/VP8L` layout —
 /// Rgb24 input is implicitly opaque, so we never need the VP8X+ALPHA
 /// extension.
+#[cfg(feature = "registry")]
 fn encode_frame_rgb24(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;

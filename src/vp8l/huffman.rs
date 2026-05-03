@@ -15,7 +15,7 @@
 //! walk — this is plenty fast for still-image sized alphabets and keeps
 //! the code short.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Result, WebpError as Error};
 
 use super::bit_reader::BitReader;
 

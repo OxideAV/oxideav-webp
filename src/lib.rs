@@ -35,6 +35,11 @@
 //! (colour-indexing) transform and meta-Huffman grouping are still
 //! scoped non-goals on the lossless side.
 
+// Many helpers live in registry-gated trait-impl land — when built
+// without `registry`, the unconditional API doesn't exercise them and
+// the dead-code warning would fire on every wrapper. Suppress
+// crate-wide rather than gating each individually.
+#![cfg_attr(not(feature = "registry"), allow(dead_code))]
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::identity_op)]
@@ -46,12 +51,11 @@ pub mod demux;
 pub mod encoder;
 pub mod encoder_anim;
 pub mod encoder_vp8;
+pub mod error;
+#[cfg(feature = "registry")]
+pub mod registry;
 pub mod riff;
 pub mod vp8l;
-
-use oxideav_core::ContainerRegistry;
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
-use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 /// Codec id string for the VP8L lossless still-image bitstream. Registered
 /// so the codec registry reports it alongside other image codecs.
@@ -64,58 +68,19 @@ pub const CODEC_ID_VP8L: &str = "webp_vp8l";
 /// `VP8 ` chunk inside a WebP container.
 pub const CODEC_ID_VP8: &str = "webp_vp8";
 
-/// Register every codec implementation this crate provides.
-pub fn register_codecs(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("webp_vp8l_sw")
-        .with_intra_only(true)
-        .with_lossless(true)
-        .with_max_size(16384, 16384);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_VP8L))
-            .capabilities(caps)
-            .decoder(make_vp8l_decoder)
-            .encoder(make_vp8l_encoder),
-    );
-
-    // VP8 lossy — encoder only for now. The decode side of a `.webp`
-    // file goes through the WebP container demuxer, which already
-    // dispatches VP8 chunks into `oxideav-vp8`.
-    let vp8_caps = CodecCapabilities::video("webp_vp8_sw_enc")
-        .with_intra_only(true)
-        .with_lossy(true)
-        .with_max_size(16383, 16383);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_VP8))
-            .capabilities(vp8_caps)
-            .encoder(make_vp8_encoder),
-    );
-}
-
-/// Register the WebP container demuxer + the `.webp` extension + its probe.
-pub fn register_containers(reg: &mut ContainerRegistry) {
-    demux::register(reg);
-}
-
-/// Combined registration for callers that want codecs + containers in one
-/// call (matches the pattern used elsewhere in the workspace).
-pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) {
-    register_codecs(codecs);
-    register_containers(containers);
-}
-
-fn make_vp8l_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    decoder::make_vp8l_decoder(params)
-}
-
-fn make_vp8l_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    encoder::make_encoder(params)
-}
-
-fn make_vp8_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    encoder_vp8::make_encoder(params)
-}
-
+// Public unconditional API — works whether or not `registry` is enabled.
 pub use decoder::{decode_webp, WebpFrame, WebpImage};
 pub use demux::{extract_metadata, WebpFileMetadata};
 pub use encoder_anim::{build_animated_webp, AnimFrame};
+pub use error::{Result, WebpError};
 pub use vp8l::{encode_vp8l_argb, encode_vp8l_argb_with, EncoderOptions};
+
+// Public registry-gated API — keeps the framework integration surface
+// (Decoder/Encoder/Demuxer trait impls, `register*` helpers,
+// `WebpDecoder` streaming type) behind the default-on `registry`
+// feature so image-library callers can build the crate without
+// dragging in `oxideav-core`.
+#[cfg(feature = "registry")]
+pub use decoder::WebpDecoder;
+#[cfg(feature = "registry")]
+pub use registry::{register, register_codecs, register_containers};

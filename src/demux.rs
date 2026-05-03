@@ -19,25 +19,31 @@
 //! (a synthetic codec id local to this crate — the decoder handles all
 //! three flavours transparently).
 
+#[cfg(feature = "registry")]
 use std::io::{Read, SeekFrom};
 
+#[cfg(feature = "registry")]
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Result,
-    StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, MediaType, Packet, PixelFormat, StreamInfo, TimeBase,
 };
+#[cfg(feature = "registry")]
 use oxideav_core::{ContainerRegistry, Demuxer, ProbeData, ReadSeek};
+
+use crate::error::{Result, WebpError as Error};
 
 /// Codec id we attach to every packet emitted by this demuxer. The decoder
 /// registered under the same id dispatches to the VP8, VP8L, or extended
 /// path based on the chunk layout.
 pub const WEBP_CODEC_ID: &str = "webp";
 
+#[cfg(feature = "registry")]
 pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("webp", open);
     reg.register_extension("webp", "webp");
     reg.register_probe("webp", probe);
 }
 
+#[cfg(feature = "registry")]
 fn probe(p: &ProbeData) -> u8 {
     if p.buf.len() < 12 {
         return 0;
@@ -54,11 +60,16 @@ fn probe(p: &ProbeData) -> u8 {
 
 /// Public wrapper over `open` so the decoder-side convenience API can
 /// instantiate a demuxer without duplicating the boxing dance.
-pub fn open_boxed(input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+#[cfg(feature = "registry")]
+pub fn open_boxed(input: Box<dyn ReadSeek>) -> oxideav_core::Result<Box<dyn Demuxer>> {
     open(input, &oxideav_core::NullCodecResolver)
 }
 
-fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+#[cfg(feature = "registry")]
+fn open(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> oxideav_core::Result<Box<dyn Demuxer>> {
     // Read the whole file into memory. WebP stills are inherently small
     // (max 16384x16384 lossless / 16383x16383 VP8) and a full-buffer pass
     // simplifies chunk iteration + random access over the `ANMF` loop.
@@ -68,7 +79,7 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     drop(input);
 
     if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WEBP" {
-        return Err(Error::invalid("WebP: bad RIFF/WEBP magic"));
+        return Err(oxideav_core::Error::invalid("WebP: bad RIFF/WEBP magic"));
     }
     let riff_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
     // `riff_size` excludes the "RIFF" FourCC + the 4-byte size field, so
@@ -215,6 +226,7 @@ pub(crate) struct AlphChunk {
     pub data: Vec<u8>,
 }
 
+#[cfg(feature = "registry")]
 impl ParsedContainer {
     fn into_packets(self, tb: TimeBase) -> Vec<Packet> {
         let mut pkts = Vec::with_capacity(self.frames.len());
@@ -381,7 +393,7 @@ pub(crate) struct DecodedAlph<'a> {
     pub data: &'a [u8],
 }
 
-fn parse_webp_body(body: &[u8]) -> Result<ParsedContainer> {
+pub(crate) fn parse_webp_body(body: &[u8]) -> Result<ParsedContainer> {
     let mut chunks = RiffChunks::new(body);
     // Peek the first chunk to distinguish simple vs extended layout.
     let first = chunks
@@ -691,12 +703,14 @@ impl<'a> Iterator for RiffChunks<'a> {
     }
 }
 
+#[cfg(feature = "registry")]
 struct WebpDemuxer {
     stream: StreamInfo,
     packets: Vec<Packet>,
     pos: usize,
 }
 
+#[cfg(feature = "registry")]
 impl Demuxer for WebpDemuxer {
     fn format_name(&self) -> &str {
         "webp"
@@ -706,9 +720,9 @@ impl Demuxer for WebpDemuxer {
         std::slice::from_ref(&self.stream)
     }
 
-    fn next_packet(&mut self) -> Result<Packet> {
+    fn next_packet(&mut self) -> oxideav_core::Result<Packet> {
         if self.pos >= self.packets.len() {
-            return Err(Error::Eof);
+            return Err(oxideav_core::Error::Eof);
         }
         let pkt = self.packets[self.pos].clone();
         self.pos += 1;
@@ -720,7 +734,7 @@ impl Demuxer for WebpDemuxer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "registry"))]
 mod tests {
     use super::*;
 

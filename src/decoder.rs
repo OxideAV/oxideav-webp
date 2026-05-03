@@ -15,65 +15,146 @@
 //! 4. Emits one `VideoFrame` per packet with the canvas state at that
 //!    point in the animation.
 
+#[cfg(feature = "registry")]
 use std::collections::VecDeque;
 
+#[cfg(feature = "registry")]
 use oxideav_core::Decoder;
-use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
-};
-use oxideav_vp8::decode_frame as decode_vp8_frame;
+#[cfg(feature = "registry")]
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase, VideoFrame, VideoPlane};
+use oxideav_vp8::decode_vp8 as decode_vp8_frame;
 
-use crate::demux::{decode_frame_payload, extract_metadata, DecodedAlph, WebpFileMetadata};
+#[cfg(feature = "registry")]
+use crate::demux::{decode_frame_payload, DecodedAlph};
+use crate::demux::{AlphChunk, ImagePayload, ParsedFrame, WebpFileMetadata};
+use crate::error::{Result, WebpError as Error};
 use crate::vp8l;
 
 /// Public helper — decode an entire `.webp` file sitting in `buf` and
 /// return all frames as RGBA `WebpFrame`s plus any auxiliary metadata
 /// (`ICCP` / `EXIF` / `XMP `) carried by the container.
+///
+/// Standalone (no `oxideav-core`) entry point: walks the parsed
+/// container directly without going through the framework's
+/// `Demuxer` / `Decoder` traits, so it works whether or not the
+/// `registry` feature is enabled.
 pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
-    // Pull metadata directly from the buffer first — the demuxer
-    // currently doesn't expose metadata via the `Demuxer` trait, so the
-    // simplest end-to-end shape is one extra parse pass over the
-    // container header (cheap; metadata extraction never decodes
-    // pixels). For metadata-only callers, [`crate::demux::extract_metadata`]
-    // is the standalone entry point.
-    let metadata = extract_metadata(buf).unwrap_or_default();
-    let cursor = std::io::Cursor::new(buf.to_vec());
-    let mut demuxer = crate::demux::open_boxed(Box::new(cursor))?;
-    let mut frames = Vec::new();
-    let streams = demuxer.streams().to_vec();
-    let params = &streams[0].params;
-    let w = params.width.unwrap_or(0);
-    let h = params.height.unwrap_or(0);
-    let mut dec = WebpDecoder::new(w, h);
-    loop {
-        match demuxer.next_packet() {
-            Ok(pkt) => {
-                let dur = pkt.duration.unwrap_or(0) as u32;
-                dec.send_packet(&pkt)?;
-                loop {
-                    match dec.receive_frame() {
-                        Ok(Frame::Video(vf)) => frames.push(WebpFrame {
-                            width: w,
-                            height: h,
-                            duration_ms: dur,
-                            rgba: vf.planes[0].data.clone(),
-                        }),
-                        Ok(_) => {}
-                        Err(Error::NeedMore) => break,
-                        Err(e) => return Err(e),
-                    }
+    if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WEBP" {
+        return Err(Error::invalid("WebP: bad RIFF/WEBP magic"));
+    }
+    let riff_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let end = (8 + riff_size).min(buf.len());
+    let body = &buf[12..end];
+    let parsed = crate::demux::parse_webp_body(body)?;
+    let (canvas_w, canvas_h) = parsed.canvas;
+    let mut canvas = vec![0u8; (canvas_w as usize) * (canvas_h as usize) * 4];
+    let mut frames = Vec::with_capacity(parsed.frames.len());
+    for f in &parsed.frames {
+        let tile_rgba = decode_parsed_frame_to_rgba(f)?;
+        composite(
+            &mut canvas,
+            canvas_w,
+            canvas_h,
+            &tile_rgba,
+            f.x_offset,
+            f.y_offset,
+            f.width,
+            f.height,
+            f.blend_with_previous,
+        );
+        frames.push(WebpFrame {
+            width: canvas_w,
+            height: canvas_h,
+            duration_ms: f.duration_ms,
+            rgba: canvas.clone(),
+        });
+        if f.dispose_to_background {
+            let x0 = f.x_offset as usize;
+            let y0 = f.y_offset as usize;
+            let x1 = (x0 + f.width as usize).min(canvas_w as usize);
+            let y1 = (y0 + f.height as usize).min(canvas_h as usize);
+            let w = canvas_w as usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * w + x) * 4;
+                    canvas[i] = 0;
+                    canvas[i + 1] = 0;
+                    canvas[i + 2] = 0;
+                    canvas[i + 3] = 0;
                 }
             }
-            Err(Error::Eof) => break,
-            Err(e) => return Err(e),
         }
     }
     Ok(WebpImage {
-        width: w,
-        height: h,
+        width: canvas_w,
+        height: canvas_h,
         frames,
-        metadata,
+        metadata: parsed.metadata,
     })
+}
+
+/// Decode one `ParsedFrame` (image + optional ALPH) into a tightly-
+/// packed RGBA tile sized `frame.width * frame.height * 4`. Used by
+/// the standalone [`decode_webp`] path, which never sees the framework
+/// `Decoder` / `Packet` envelope.
+fn decode_parsed_frame_to_rgba(f: &ParsedFrame) -> Result<Vec<u8>> {
+    let (image_bytes, is_vp8l) = match &f.image {
+        ImagePayload::Vp8(b) => (b.as_slice(), false),
+        ImagePayload::Vp8l(b) => (b.as_slice(), true),
+    };
+    let tile_rgba = if is_vp8l {
+        let img = vp8l::decode(image_bytes)?;
+        img.to_rgba()
+    } else {
+        decode_vp8_to_rgba(image_bytes, f.width, f.height)?
+    };
+    let tile_rgba = if let Some(alph) = &f.alph {
+        overlay_alpha_chunk(tile_rgba, f.width, f.height, alph)?
+    } else if !is_vp8l {
+        set_alpha_opaque(tile_rgba)
+    } else {
+        tile_rgba
+    };
+    Ok(tile_rgba)
+}
+
+/// Variant of [`overlay_alpha`] that takes the owned [`AlphChunk`]
+/// (used by the standalone walk over [`ParsedFrame`]) instead of the
+/// [`DecodedAlph`] borrow the Decoder-trait path uses. Same result.
+fn overlay_alpha_chunk(
+    mut rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    alph: &AlphChunk,
+) -> Result<Vec<u8>> {
+    let alpha = decode_alpha_plane_chunk(width, height, alph)?;
+    if alpha.len() != (width as usize) * (height as usize) {
+        return Err(Error::invalid("WebP: alpha plane size mismatch"));
+    }
+    for (i, &a) in alpha.iter().enumerate() {
+        rgba[i * 4 + 3] = a;
+    }
+    Ok(rgba)
+}
+
+fn decode_alpha_plane_chunk(width: u32, height: u32, alph: &AlphChunk) -> Result<Vec<u8>> {
+    let mut plane = match alph.compression {
+        0 => alph.data.clone(),
+        1 => {
+            let mut synth = Vec::with_capacity(alph.data.len() + 5);
+            synth.push(0x2f);
+            let w = width.saturating_sub(1) & 0x3fff;
+            let h = height.saturating_sub(1) & 0x3fff;
+            let packed = w | (h << 14);
+            synth.extend_from_slice(&packed.to_le_bytes());
+            synth.extend_from_slice(&alph.data);
+            let img = vp8l::decode(&synth)?;
+            img.pixels.iter().map(|p| ((p >> 8) & 0xff) as u8).collect()
+        }
+        _ => return Err(Error::invalid("WebP: unknown ALPH compression")),
+    };
+    unfilter_alpha(&mut plane, width as usize, height as usize, alph.filtering);
+    Ok(plane)
 }
 
 /// Convenience struct returned by [`decode_webp`].
@@ -100,7 +181,8 @@ pub struct WebpFrame {
 /// bitstream (no RIFF/WebP wrapper). Useful for consumers that have
 /// already stripped the container and want the codec registry to give
 /// them a standalone decoder.
-pub fn make_vp8l_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+#[cfg(feature = "registry")]
+pub fn make_vp8l_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     let w = params.width.unwrap_or(0);
     let h = params.height.unwrap_or(0);
     Ok(Box::new(Vp8lStandalone {
@@ -113,6 +195,7 @@ pub fn make_vp8l_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
+#[cfg(feature = "registry")]
 struct Vp8lStandalone {
     codec_id: CodecId,
     width: u32,
@@ -122,11 +205,12 @@ struct Vp8lStandalone {
     pending_tb: TimeBase,
 }
 
+#[cfg(feature = "registry")]
 impl Decoder for Vp8lStandalone {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+    fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
         self.pending_pts = packet.pts;
         self.pending_tb = packet.time_base;
         let img = vp8l::decode(&packet.data)?;
@@ -147,17 +231,18 @@ impl Decoder for Vp8lStandalone {
         self.queued.push_back(vf);
         Ok(())
     }
-    fn receive_frame(&mut self) -> Result<Frame> {
+    fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
         self.queued
             .pop_front()
             .map(Frame::Video)
-            .ok_or(Error::NeedMore)
+            .ok_or(oxideav_core::Error::NeedMore)
     }
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> oxideav_core::Result<()> {
         Ok(())
     }
 }
 
+#[cfg(feature = "registry")]
 pub struct WebpDecoder {
     codec_id: CodecId,
     canvas_w: u32,
@@ -178,6 +263,7 @@ pub struct WebpDecoder {
     prefer_yuva420p: bool,
 }
 
+#[cfg(feature = "registry")]
 impl WebpDecoder {
     pub fn new(w: u32, h: u32) -> Self {
         Self {
@@ -217,12 +303,13 @@ impl WebpDecoder {
     }
 }
 
+#[cfg(feature = "registry")]
 impl Decoder for WebpDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+    fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
         self.pending_pts = packet.pts;
         self.pending_tb = packet.time_base;
         let payload = decode_frame_payload(&packet.data)?;
@@ -326,18 +413,18 @@ impl Decoder for WebpDecoder {
         Ok(())
     }
 
-    fn receive_frame(&mut self) -> Result<Frame> {
+    fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
         self.queued
             .pop_front()
             .map(Frame::Video)
-            .ok_or(Error::NeedMore)
+            .ok_or(oxideav_core::Error::NeedMore)
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> oxideav_core::Result<()> {
         Ok(())
     }
 
-    fn reset(&mut self) -> Result<()> {
+    fn reset(&mut self) -> oxideav_core::Result<()> {
         // WebP animation composites each ANMF frame onto a persistent RGBA
         // canvas — that canvas IS the cross-frame state. Wiping it forces
         // the next frame to composite onto a clean background, matching
@@ -408,17 +495,18 @@ fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8
     // frame and is asserted at the codec-parameters level upstream.
     let w = frame_w as usize;
     let h = frame_h as usize;
-    // VP8 produces MB-aligned strides; take the top-left w×h region.
-    let y = &vf.planes[0];
-    let u = &vf.planes[1];
-    let v = &vf.planes[2];
+    // VP8's standalone `Vp8Frame` already returns tight-stride cropped
+    // planes (stride == width / chroma-width), so the top-left region
+    // is the whole plane.
+    let y_stride = vf.y_stride as usize;
+    let uv_stride = vf.uv_stride as usize;
     let mut out = vec![0u8; w * h * 4];
     for j in 0..h {
         for i in 0..w {
             // 4:2:0 chroma subsampling — one (u, v) sample per 2×2 luma.
-            let y_val = y.data[j * y.stride + i] as i32;
-            let u_val = u.data[(j / 2) * u.stride + (i / 2)] as i32;
-            let v_val = v.data[(j / 2) * v.stride + (i / 2)] as i32;
+            let y_val = vf.y[j * y_stride + i] as i32;
+            let u_val = vf.u[(j / 2) * uv_stride + (i / 2)] as i32;
+            let v_val = vf.v[(j / 2) * uv_stride + (i / 2)] as i32;
             let idx = (j * w + i) * 4;
             out[idx] = yuv_to_r(y_val, v_val);
             out[idx + 1] = yuv_to_g(y_val, u_val, v_val);
@@ -431,13 +519,14 @@ fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8
 
 /// Decode a VP8 chunk + ALPH sidecar into a 4-plane `Yuva420P`
 /// `VideoFrame`. The Y/U/V planes come from the VP8 decoder verbatim
-/// (cropped to the frame's logical size — VP8 produces MB-aligned
-/// strides so the raw planes can be wider than `frame_w`/`frame_h`),
+/// (cropped to the frame's logical size — `Vp8Frame` already returns
+/// tight-stride cropped planes, so this path is a straight clone),
 /// and the alpha plane is a fresh full-resolution byte buffer.
 ///
 /// Used only for non-animated single-frame VP8+ALPH inputs when the
 /// decoder is in [`WebpDecoder::new_yuva420p`] mode. Skips the
 /// YUV→RGB→consumer roundtrip the default RGBA path forces.
+#[cfg(feature = "registry")]
 fn decode_vp8_alph_to_yuva420p(
     bytes: &[u8],
     frame_w: u32,
@@ -449,31 +538,13 @@ fn decode_vp8_alph_to_yuva420p(
     let w = frame_w as usize;
     let h = frame_h as usize;
     let cw = w / 2 + (w & 1);
-    let ch = h / 2 + (h & 1);
+    let _ch = h / 2 + (h & 1);
 
-    // VP8 produces MB-aligned (16-pixel) Y plane and 8-pixel chroma
-    // strides; copy out the top-left frame_w × frame_h (and chroma
-    // half-resolution) into tightly-packed planes so callers can rely on
-    // `stride == w` / `stride == cw`.
-    let y_in = &vf.planes[0];
-    let u_in = &vf.planes[1];
-    let v_in = &vf.planes[2];
-
-    let mut y_plane = Vec::with_capacity(w * h);
-    for j in 0..h {
-        let row_start = j * y_in.stride;
-        y_plane.extend_from_slice(&y_in.data[row_start..row_start + w]);
-    }
-    let mut u_plane = Vec::with_capacity(cw * ch);
-    for j in 0..ch {
-        let row_start = j * u_in.stride;
-        u_plane.extend_from_slice(&u_in.data[row_start..row_start + cw]);
-    }
-    let mut v_plane = Vec::with_capacity(cw * ch);
-    for j in 0..ch {
-        let row_start = j * v_in.stride;
-        v_plane.extend_from_slice(&v_in.data[row_start..row_start + cw]);
-    }
+    // `Vp8Frame` already carries tight-stride cropped planes, so we
+    // can move the Vec buffers straight through without a re-pack.
+    let y_plane = vf.y;
+    let u_plane = vf.u;
+    let v_plane = vf.v;
 
     let alpha = decode_alpha_plane(frame_w, frame_h, alph)?;
     if alpha.len() != w * h {
@@ -515,6 +586,7 @@ fn set_alpha_opaque(mut rgba: Vec<u8>) -> Vec<u8> {
 /// Spec §5.2.3: the alpha plane can be raw (`compression=0`), filtered,
 /// or VP8L-compressed (`compression=1`, carrying a stripped single-green
 /// VP8L bitstream whose green channel holds the alpha values).
+#[cfg(feature = "registry")]
 fn overlay_alpha(
     mut rgba: Vec<u8>,
     width: u32,
@@ -531,6 +603,7 @@ fn overlay_alpha(
     Ok(rgba)
 }
 
+#[cfg(feature = "registry")]
 fn decode_alpha_plane(width: u32, height: u32, alph: &DecodedAlph<'_>) -> Result<Vec<u8>> {
     let mut plane = match alph.compression {
         0 => alph.data.to_vec(),

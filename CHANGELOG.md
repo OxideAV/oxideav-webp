@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New default-on `registry` feature. With `default-features = false`
+  the crate compiles without `oxideav-core` (and pulls `oxideav-vp8`
+  in with its `registry` feature also off) and exposes a free-standing
+  decode/encode API: `decode_webp(buf) -> Result<WebpImage, WebpError>`,
+  `encode_vp8l_argb` / `encode_vp8l_argb_with`, `build_animated_webp`,
+  `extract_metadata`. The standalone `decode_webp` walks the parsed
+  RIFF container directly without going through the framework's
+  `Demuxer` / `Decoder` traits. `WebpImage` / `WebpFrame` /
+  `WebpFileMetadata` already used std-primitive fields; `WebpError`
+  is a new local enum (`InvalidData` / `Unsupported` / `Eof` /
+  `NeedMore`) plus `From<oxideav_vp8::Vp8Error>` so the VP8 path
+  composes cleanly. The default-feature path keeps the existing
+  `Decoder` / `Encoder` / `Demuxer` trait implementations + the
+  `register` helpers + `WebpDecoder` streaming type — every current
+  consumer (`oxideav` umbrella, `oxideav-pipeline`, mp4 + mkv WebP
+  extraction) keeps working unchanged. (#358)
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-webp/compare/v0.0.8...v0.0.9) - 2026-05-03
 
 ### Fixed

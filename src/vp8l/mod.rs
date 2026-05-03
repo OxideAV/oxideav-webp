@@ -29,7 +29,7 @@ pub mod transform;
 
 pub use encoder::{encode_vp8l_argb, encode_vp8l_argb_with, EncoderOptions};
 
-use oxideav_core::{Error, Result};
+use crate::error::{Result, WebpError as Error};
 
 use bit_reader::BitReader;
 use huffman::{HuffmanCode, HuffmanTree};

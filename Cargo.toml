@@ -14,8 +14,28 @@ keywords = ["multimedia", "image", "webp", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = "0.1"
-oxideav-vp8 = "0.1"
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-webp` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes a free-standing
+# `decode_webp` / `encode_vp8l_argb` API plus local `WebpImage`,
+# `WebpFrame`, `WebpError` types and never references `oxideav-core`.
+oxideav-core = { version = "0.1", optional = true }
+# Cascade the registry-vs-standalone choice through to `oxideav-vp8`:
+# when our `registry` feature is on we also pull in vp8's `registry`
+# feature (so its `Decoder`/`Encoder`/IVF surface is available);
+# when ours is off, vp8 is built without `oxideav-core` too.
+oxideav-vp8 = { version = "0.1", default-features = false }
+
+[features]
+default = ["registry"]
+
+# Wires up the codec / decoder / encoder / demuxer trait
+# implementations against `oxideav-core` so the crate can plug into
+# the `oxideav` framework registry. Cascades `registry` through to
+# `oxideav-vp8`. Default-on; turn off for image-library use-cases that
+# just want the standalone `decode_webp` API.
+registry = ["dep:oxideav-core", "oxideav-vp8/registry"]
 
 [dev-dependencies]
 # `lossy_corpus` integration test compares our VP8-lossy decode of the

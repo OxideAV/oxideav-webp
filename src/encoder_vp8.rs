@@ -58,22 +58,31 @@
 //! based on quality, none of which we do yet. Round-2 work would tune
 //! the quantizer matrix to track libwebp's perceptual targets.
 
+#[cfg(feature = "registry")]
 use std::collections::VecDeque;
 
+#[cfg(feature = "registry")]
 use oxideav_core::Encoder;
+#[cfg(feature = "registry")]
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
-    TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, Rational, TimeBase,
+    VideoFrame, VideoPlane,
 };
 
+#[cfg(feature = "registry")]
 use oxideav_vp8::encoder::{encode_keyframe, DEFAULT_QINDEX};
 
-use crate::riff::{build_webp_file, AlphChunkBytes, ImageKind, WebpMetadata};
+use crate::error::{Result, WebpError as Error};
+use crate::riff::AlphChunkBytes;
+#[cfg(feature = "registry")]
+use crate::riff::{build_webp_file, ImageKind, WebpMetadata};
 use crate::vp8l::encode_vp8l_argb;
+#[cfg(feature = "registry")]
 use crate::CODEC_ID_VP8;
 
 /// Factory used by [`crate::register_codecs`] for the `webp_vp8` codec id.
-pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+#[cfg(feature = "registry")]
+pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     make_encoder_with_qindex(params, DEFAULT_QINDEX)
 }
 
@@ -92,10 +101,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 /// libwebp's perceptual targets at matching quality values.
 ///
 /// The libwebp default of `75.0` corresponds to qindex ≈ 32 here.
+#[cfg(feature = "registry")]
 pub fn make_encoder_with_quality(
     params: &CodecParameters,
     quality: f32,
-) -> Result<Box<dyn Encoder>> {
+) -> oxideav_core::Result<Box<dyn Encoder>> {
     make_encoder_with_qindex(params, quality_to_qindex(quality))
 }
 
@@ -122,15 +132,19 @@ pub fn quality_to_qindex(quality: f32) -> u8 {
 /// Most callers should prefer [`make_encoder_with_quality`], which
 /// takes the libwebp-style `0..=100` scale (higher = better) and is
 /// the more familiar knob across image-encoding libraries.
-pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<Box<dyn Encoder>> {
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_qindex(
+    params: &CodecParameters,
+    qindex: u8,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
-        .ok_or_else(|| Error::invalid("VP8 WebP encoder: missing width"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("VP8 WebP encoder: missing width"))?;
     let height = params
         .height
-        .ok_or_else(|| Error::invalid("VP8 WebP encoder: missing height"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("VP8 WebP encoder: missing height"))?;
     if width == 0 || height == 0 || width > 16383 || height > 16383 {
-        return Err(Error::invalid(format!(
+        return Err(oxideav_core::Error::invalid(format!(
             "VP8 WebP encoder: dimensions {width}x{height} out of range (1..=16383)"
         )));
     }
@@ -139,7 +153,7 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
         pix,
         PixelFormat::Yuv420P | PixelFormat::Yuva420P | PixelFormat::Rgba | PixelFormat::Rgb24
     ) {
-        return Err(Error::unsupported(format!(
+        return Err(oxideav_core::Error::unsupported(format!(
             "VP8 WebP encoder: pixel format {pix:?} not supported — \
              feed Yuv420P / Yuva420P / Rgba / Rgb24"
         )));
@@ -168,6 +182,7 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
     }))
 }
 
+#[cfg(feature = "registry")]
 struct Vp8WebpEncoder {
     output_params: CodecParameters,
     width: u32,
@@ -179,6 +194,7 @@ struct Vp8WebpEncoder {
     eof: bool,
 }
 
+#[cfg(feature = "registry")]
 impl Encoder for Vp8WebpEncoder {
     fn codec_id(&self) -> &CodecId {
         &self.output_params.codec_id
@@ -188,10 +204,14 @@ impl Encoder for Vp8WebpEncoder {
         &self.output_params
     }
 
-    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+    fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {
         let v = match frame {
             Frame::Video(v) => v,
-            _ => return Err(Error::invalid("VP8 WebP encoder: video frames only")),
+            _ => {
+                return Err(oxideav_core::Error::invalid(
+                    "VP8 WebP encoder: video frames only",
+                ))
+            }
         };
         // Frame dims and pixel format are stream-level (set on the
         // encoder at construction); the pipeline upstream is responsible
@@ -213,7 +233,7 @@ impl Encoder for Vp8WebpEncoder {
             PixelFormat::Rgba => encode_rgba_lossy(self.width, self.height, self.qindex, v)?,
             PixelFormat::Rgb24 => encode_rgb24_lossy(self.width, self.height, self.qindex, v)?,
             other => {
-                return Err(Error::unsupported(format!(
+                return Err(oxideav_core::Error::unsupported(format!(
                     "VP8 WebP encoder: frame format {other:?} unsupported"
                 )))
             }
@@ -226,18 +246,18 @@ impl Encoder for Vp8WebpEncoder {
         Ok(())
     }
 
-    fn receive_packet(&mut self) -> Result<Packet> {
+    fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
         if let Some(p) = self.pending.pop_front() {
             return Ok(p);
         }
         if self.eof {
-            Err(Error::Eof)
+            Err(oxideav_core::Error::Eof)
         } else {
-            Err(Error::NeedMore)
+            Err(oxideav_core::Error::NeedMore)
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> oxideav_core::Result<()> {
         self.eof = true;
         Ok(())
     }
@@ -249,6 +269,7 @@ impl Encoder for Vp8WebpEncoder {
 /// full-resolution alpha plane is compressed into the `ALPH` sidecar.
 /// Emits a complete `.webp` file in the extended `VP8X + ALPH + VP8 `
 /// layout.
+#[cfg(feature = "registry")]
 fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
@@ -308,6 +329,7 @@ fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> 
 /// the upstream is RGB and adding alpha would mean a full re-alloc)
 /// pays only for the YUV planes (the natural VP8 input). This is the
 /// VP8-side counterpart to issue #7.
+#[cfg(feature = "registry")]
 fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
@@ -350,6 +372,7 @@ fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Re
 
 /// Encode an RGBA frame as VP8 lossy + ALPH sidecar + VP8X extended
 /// header. Returns a complete `.webp` file.
+#[cfg(feature = "registry")]
 fn encode_rgba_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;

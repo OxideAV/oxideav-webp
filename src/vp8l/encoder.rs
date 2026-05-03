@@ -53,7 +53,7 @@
 //! The entry point is [`encode_vp8l_argb`]: a bare VP8L bitstream (no
 //! RIFF wrapper) sized for a given `width × height` ARGB pixel buffer.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Result, WebpError as Error};
 
 use super::VP8L_SIGNATURE;
 

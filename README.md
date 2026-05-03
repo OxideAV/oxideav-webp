@@ -24,6 +24,44 @@ oxideav-container = "0.1"
 oxideav-webp = "0.0"
 ```
 
+## Standalone use (no `oxideav-core`)
+
+Image-library consumers that just want to turn a `.webp` byte buffer
+into RGBA pixels — no framework, no codec registry, no trait
+objects — can depend on this crate with the default `registry`
+feature off:
+
+```toml
+[dependencies]
+oxideav-webp = { version = "0.0", default-features = false }
+```
+
+That drops the `oxideav-core` dependency entirely (and cascades the
+same off-switch through to `oxideav-vp8`) and exposes the
+free-standing decode/encode entry points:
+
+```rust
+use oxideav_webp::{decode_webp, WebpImage, WebpError};
+
+let img: WebpImage = decode_webp(&bytes)?;
+for frame in &img.frames {
+    // frame.rgba is `Vec<u8>` of length width * height * 4
+}
+# Ok::<_, WebpError>(())
+```
+
+`WebpImage` / `WebpFrame` / `WebpFileMetadata` already use
+std-primitive fields (`Vec<u8>` RGBA, `u32` dimensions). `WebpError`
+covers `InvalidData` / `Unsupported` / `Eof` / `NeedMore` and
+`From`-converts from `oxideav_vp8::Vp8Error` so the VP8 lossy path
+composes through cleanly. Encoder entry points
+(`encode_vp8l_argb` / `encode_vp8l_argb_with`,
+`build_animated_webp`) likewise stay available without
+`oxideav-core`. Turning the `registry` feature back on adds the
+`Decoder` / `Encoder` / `Demuxer` trait implementations + the
+`register` helpers + the `WebpDecoder` streaming type so the crate
+plugs into the framework registry as before.
+
 ## Quick use
 
 `.webp` files carry one or many frames, so the typical path is: open
