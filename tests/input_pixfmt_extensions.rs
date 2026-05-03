@@ -23,9 +23,13 @@
 //! for the implementations.
 
 use oxideav_core::{
-    CodecId, CodecParameters, Decoder as _, Demuxer as _, Encoder as _, Frame, MediaType, Packet,
-    PixelFormat, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, VideoFrame, VideoPlane,
 };
+// `WebpDecoder` is concrete, so trait-method dispatch on it (`send_packet`,
+// `receive_frame`) needs the `Decoder` trait visible. `Box<dyn Encoder>`
+// and `Box<dyn Demuxer>` carry their vtables already and don't need the
+// trait in scope to call methods.
+use oxideav_core::Decoder as _;
 use oxideav_webp::{
     decode_webp, decoder::WebpDecoder, demux, encoder, encoder_vp8, CODEC_ID_VP8, CODEC_ID_VP8L,
 };
