@@ -111,12 +111,22 @@ impl HuffmanTree {
         let mut code_lengths = vec![0u8; alphabet];
         let mut sym = 0usize;
         let mut prev_len = 8u8;
+        // `max_symbol` (when use_length is set) caps the number of *meta-tree
+        // codes* decoded — i.e. one increment per `meta_tree.decode()` call
+        // regardless of whether the code is a literal length (0..15) or a
+        // run code (16/17/18). A run code emits multiple per-position
+        // lengths in one go but still counts as a single meta-symbol read.
+        // Treating the run-emitted lengths as separate "symbols" lets the
+        // loop overshoot and produces over-determined trees that fail
+        // canonical-Huffman assignment with the spurious "self-collides"
+        // diagnostic.
         let mut count = 0usize;
         while sym < alphabet {
             if use_length && count >= max_symbol {
                 break;
             }
             let code = meta_tree.decode(br)?;
+            count += 1;
             match code {
                 0..=15 => {
                     code_lengths[sym] = code as u8;
@@ -124,7 +134,6 @@ impl HuffmanTree {
                         prev_len = code as u8;
                     }
                     sym += 1;
-                    count += 1;
                 }
                 16 => {
                     let repeat = 3 + br.read_bits(2)? as usize;
