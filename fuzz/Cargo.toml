@@ -29,13 +29,25 @@ test = false
 doc = false
 
 [[bin]]
-name = "webp_encode_oxideav_decode"
-path = "fuzz_targets/webp_encode_oxideav_decode.rs"
+name = "webp_encode_oxideav_decode_lossless"
+path = "fuzz_targets/webp_encode_oxideav_decode_lossless.rs"
 test = false
 doc = false
 
 [[bin]]
-name = "oxideav_encode_webp_decode"
-path = "fuzz_targets/oxideav_encode_webp_decode.rs"
+name = "oxideav_encode_webp_decode_lossless"
+path = "fuzz_targets/oxideav_encode_webp_decode_lossless.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "webp_encode_oxideav_decode_lossy"
+path = "fuzz_targets/webp_encode_oxideav_decode_lossy.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oxideav_encode_webp_decode_lossy"
+path = "fuzz_targets/oxideav_encode_webp_decode_lossy.rs"
 test = false
 doc = false
