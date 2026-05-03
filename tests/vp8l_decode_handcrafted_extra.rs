@@ -276,8 +276,8 @@ fn vp8l_distance_tree_never_extends_with_cache() {
     // Distance: sym 50 — out of range for 40-symbol distance alphabet.
     write_simple_one_symbol_tree_8bit(&mut bw, 50);
     let blob = bw.finish();
-    let err = decode_webp(&wrap_in_riff(&blob))
-        .expect_err("decoder must reject sym 50 in distance tree");
+    let err =
+        decode_webp(&wrap_in_riff(&blob)).expect_err("decoder must reject sym 50 in distance tree");
     let _ = format!("{err:?}");
 }
 
