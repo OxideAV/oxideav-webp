@@ -2,17 +2,22 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_webp::decode_webp;
+use oxideav_webp_fuzz::libwebp;
 
 const MAX_WIDTH: usize = 64;
 const MAX_PIXELS: usize = 2048;
 
 fuzz_target!(|data: &[u8]| {
+    // Skip silently if libwebp isn't installed on this host.
+    if !libwebp::available() {
+        return;
+    }
+
     let Some((width, height, quality, rgba)) = image_from_fuzz_input(data) else {
         return;
     };
 
-    let encoded = webp::Encoder::from_rgba(rgba, width, height)
-        .encode_simple(false, quality)
+    let encoded = libwebp::encode_lossy(rgba, width, height, quality)
         .expect("libwebp lossy encoding failed");
 
     let decoded = decode_webp(&encoded).expect("oxideav-webp decoding failed");

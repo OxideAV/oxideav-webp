@@ -10,10 +10,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 oxideav-core = "0.1"
-webp = "0.3.1"
+# libloading is the only libwebp interop: each cross-decode harness
+# `dlopen`s the system-installed libwebp at startup. No `*-sys` crate,
+# no libwebp source pulled into the dep tree. Harnesses skip silently
+# when libwebp isn't installed (see fuzz/src/lib.rs).
+libloading = "0.8"
 
 [dependencies.oxideav-webp]
 path = ".."
+
+[lib]
+name = "oxideav_webp_fuzz"
+path = "src/lib.rs"
 
 # Prevent this from interfering with workspaces
 [workspace]

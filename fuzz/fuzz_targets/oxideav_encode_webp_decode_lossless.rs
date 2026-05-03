@@ -3,24 +3,27 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, VideoFrame, VideoPlane};
 use oxideav_webp::CODEC_ID_VP8L;
+use oxideav_webp_fuzz::libwebp;
 
 const MAX_WIDTH: usize = 64;
 const MAX_PIXELS: usize = 2048;
 
 fuzz_target!(|data: &[u8]| {
+    // Skip silently if libwebp isn't installed on this host.
+    if !libwebp::available() {
+        return;
+    }
+
     let Some((width, height, rgba)) = image_from_fuzz_input(data) else {
         return;
     };
 
     let encoded = encode_webp_losslessly(width, height, rgba);
-    let decoded = webp::Decoder::new(&encoded)
-        .decode()
-        .expect("libwebp decoding failed");
-    let decoded_rgba = decoded_to_rgba(&decoded);
+    let decoded = libwebp::decode_to_rgba(&encoded).expect("libwebp decoding failed");
 
-    assert_eq!(decoded.width(), width);
-    assert_eq!(decoded.height(), height);
-    assert_eq!(decoded_rgba.as_slice(), rgba);
+    assert_eq!(decoded.width, width);
+    assert_eq!(decoded.height, height);
+    assert_eq!(decoded.rgba.as_slice(), rgba);
 });
 
 fn image_from_fuzz_input(data: &[u8]) -> Option<(u32, u32, &[u8])> {
@@ -63,17 +66,4 @@ fn encode_webp_losslessly(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         .receive_packet()
         .expect("oxideav-webp encoder did not emit a packet")
         .data
-}
-
-fn decoded_to_rgba(decoded: &webp::WebPImage) -> Vec<u8> {
-    match decoded.layout() {
-        webp::PixelLayout::Rgba => decoded.to_vec(),
-        webp::PixelLayout::Rgb => {
-            let mut rgba = Vec::with_capacity((decoded.len() / 3) * 4);
-            for pixel in decoded.chunks_exact(3) {
-                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
-            }
-            rgba
-        }
-    }
 }
