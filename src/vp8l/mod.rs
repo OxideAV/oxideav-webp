@@ -189,7 +189,16 @@ pub(crate) fn decode_image_stream(
         groups.push(g);
     }
 
-    // Pixel decode loop.
+    // Pixel decode loop. Most fixtures (everything that doesn't bother
+    // with a meta-Huffman image) use a single Huffman group — the
+    // per-pixel `if let Some(mi) = &meta_image` branch is then dead
+    // weight in the hottest loop in the decoder. Specialise:
+    //   * `pixel_loop_no_meta` — single-group fast path; group index is
+    //     fixed at &groups[0]. The loop also drops the per-pixel
+    //     advance_xy bookkeeping (x/y were only consulted by the
+    //     meta-image branch).
+    //   * `pixel_loop_meta`    — multi-group slow path; per-pixel
+    //     lookup into the meta-Huffman sub-image, x/y tracked.
     let pixel_count = (width as usize) * (height as usize);
     let mut pixels: Vec<u32> = Vec::with_capacity(pixel_count);
     let mut cache: Vec<u32> = if cache_size == 0 {
@@ -198,32 +207,60 @@ pub(crate) fn decode_image_stream(
         vec![0u32; cache_size as usize]
     };
     let cache_bits = color_cache_bits.unwrap_or(0);
-    let mut x: u32 = 0;
-    let mut y: u32 = 0;
+    if let Some(mi) = &meta_image {
+        pixel_loop_meta(
+            br,
+            &mut pixels,
+            &mut cache,
+            cache_bits,
+            cache_size,
+            &groups,
+            width,
+            pixel_count,
+            mi,
+            meta_bits,
+        )?;
+    } else {
+        pixel_loop_no_meta(
+            br,
+            &mut pixels,
+            &mut cache,
+            cache_bits,
+            cache_size,
+            &groups[0],
+            width,
+            pixel_count,
+        )?;
+    }
+
+    Ok(pixels)
+}
+
+/// Single-Huffman-group pixel decode. Specialised for the (very common)
+/// case where the bitstream omits the meta-Huffman image — we use a
+/// fixed `&groups[0]` and skip the per-pixel sub-image lookup entirely.
+#[allow(clippy::too_many_arguments)]
+fn pixel_loop_no_meta(
+    br: &mut BitReader<'_>,
+    pixels: &mut Vec<u32>,
+    cache: &mut [u32],
+    cache_bits: u32,
+    cache_size: u32,
+    g: &HuffmanGroup,
+    width: u32,
+    pixel_count: usize,
+) -> Result<()> {
     while pixels.len() < pixel_count {
-        let group_idx = if let Some(mi) = &meta_image {
-            let mx = x >> meta_bits;
-            let my = y >> meta_bits;
-            let idx = (my * mi.width + mx) as usize;
-            let px = mi.pixels[idx];
-            ((px >> 8) & 0xffff) as usize
-        } else {
-            0
-        };
-        let g = &groups[group_idx];
         let code = g.decode_green(br)?;
         if code < NUM_LITERAL_CODES as u32 {
-            // Literal green — decode R, B, A separately.
             let green = code & 0xff;
             let red = g.decode_red(br)? & 0xff;
             let blue = g.decode_blue(br)? & 0xff;
             let alpha = g.decode_alpha(br)? & 0xff;
             let argb = (alpha << 24) | (red << 16) | (green << 8) | blue;
             pixels.push(argb);
-            cache_add(&mut cache, cache_bits, argb);
-            advance_xy(&mut x, &mut y, width);
+            cache_add(cache, cache_bits, argb);
         } else if code < GREEN_BASE_CODES as u32 {
-            // LZ77 backward reference.
             let len_code = code - NUM_LITERAL_CODES as u32;
             let length = decode_length_or_distance(br, len_code)? as usize;
             let dist_code = g.decode_distance(br)?;
@@ -241,11 +278,80 @@ pub(crate) fn decode_image_stream(
                 }
                 let src = pixels[pixels.len() - distance];
                 pixels.push(src);
-                cache_add(&mut cache, cache_bits, src);
+                cache_add(cache, cache_bits, src);
+            }
+        } else {
+            if cache_size == 0 {
+                return Err(Error::invalid("VP8L: cache code without cache"));
+            }
+            let idx = code as usize - GREEN_BASE_CODES;
+            if idx >= cache.len() {
+                return Err(Error::invalid("VP8L: cache index out of range"));
+            }
+            let argb = cache[idx];
+            pixels.push(argb);
+        }
+    }
+    Ok(())
+}
+
+/// Multi-Huffman-group pixel decode. Carries the per-pixel meta-Huffman
+/// sub-image lookup; only used when the bitstream actually emitted a
+/// meta-Huffman image (i.e. more than one Huffman group).
+#[allow(clippy::too_many_arguments)]
+fn pixel_loop_meta(
+    br: &mut BitReader<'_>,
+    pixels: &mut Vec<u32>,
+    cache: &mut [u32],
+    cache_bits: u32,
+    cache_size: u32,
+    groups: &[HuffmanGroup],
+    width: u32,
+    pixel_count: usize,
+    mi: &MetaImage,
+    meta_bits: u32,
+) -> Result<()> {
+    let mut x: u32 = 0;
+    let mut y: u32 = 0;
+    while pixels.len() < pixel_count {
+        let mx = x >> meta_bits;
+        let my = y >> meta_bits;
+        let idx = (my * mi.width + mx) as usize;
+        let px = mi.pixels[idx];
+        let group_idx = ((px >> 8) & 0xffff) as usize;
+        let g = &groups[group_idx];
+        let code = g.decode_green(br)?;
+        if code < NUM_LITERAL_CODES as u32 {
+            let green = code & 0xff;
+            let red = g.decode_red(br)? & 0xff;
+            let blue = g.decode_blue(br)? & 0xff;
+            let alpha = g.decode_alpha(br)? & 0xff;
+            let argb = (alpha << 24) | (red << 16) | (green << 8) | blue;
+            pixels.push(argb);
+            cache_add(cache, cache_bits, argb);
+            advance_xy(&mut x, &mut y, width);
+        } else if code < GREEN_BASE_CODES as u32 {
+            let len_code = code - NUM_LITERAL_CODES as u32;
+            let length = decode_length_or_distance(br, len_code)? as usize;
+            let dist_code = g.decode_distance(br)?;
+            let distance_raw = decode_length_or_distance(br, dist_code)? as usize;
+            let distance = map_plane_distance(distance_raw, width as usize);
+            if distance == 0 {
+                return Err(Error::invalid("VP8L: LZ77 distance = 0"));
+            }
+            if distance > pixels.len() {
+                return Err(Error::invalid("VP8L: LZ77 distance past stream start"));
+            }
+            for _ in 0..length {
+                if pixels.len() >= pixel_count {
+                    break;
+                }
+                let src = pixels[pixels.len() - distance];
+                pixels.push(src);
+                cache_add(cache, cache_bits, src);
                 advance_xy(&mut x, &mut y, width);
             }
         } else {
-            // Colour-cache reference.
             if cache_size == 0 {
                 return Err(Error::invalid("VP8L: cache code without cache"));
             }
@@ -258,8 +364,7 @@ pub(crate) fn decode_image_stream(
             advance_xy(&mut x, &mut y, width);
         }
     }
-
-    Ok(pixels)
+    Ok(())
 }
 
 /// Decode a "length or distance" symbol per spec §5.2.2. For symbols 0..3
