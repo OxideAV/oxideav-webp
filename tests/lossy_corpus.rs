@@ -392,14 +392,49 @@ fn lossy_corpus_pixel_correctness() {
         eprintln!("{line}");
     }
     eprintln!("========================================================================");
-
-    // TEMPORARY (removed in the immediately-following commit) — panic
-    // with the summary as the message so the per-fixture numbers
-    // surface in the CI failure log. cargo test captures stderr from
-    // passing tests and we have no way to flip `--nocapture` from
-    // inside the reusable workflow. The panic is the agreed-upon way
-    // to surface a one-time data dump; the next commit reverts this
-    // block back to a quiet pass.
-    let body = summary.join("\n");
-    panic!("ONE-TIME DATA DUMP — reverted in next commit. Per-fixture results:\n{body}");
 }
+
+// ----------------------------------------------------------------------
+// Observed results — first CI run on commit b1720d0 (rev next-after-rev
+// b69dd82, the integration-test landing commit). These are the numbers
+// the per-fixture summary block prints. Recorded here so reviewers
+// don't have to re-run the test (cargo captures the eprintln stream
+// for passing tests).
+//
+// fixture                   R%       G%       B%       A%      PSNR
+// ----------------------------------------------------------------------
+// lossy-1x1               100.00%  100.00%  100.00%  100.00%   inf
+// lossy-128x128-q1         16.35%   22.28%   19.45%  100.00%  38.43 dB
+// lossy-128x128-q75        17.85%   22.29%   22.74%  100.00%  40.84 dB
+// lossy-128x128-q100       16.92%   21.42%   24.24%  100.00%  41.25 dB
+// lossy-near-lossless-q40   1.68%   43.45%    0.45%  100.00%   8.85 dB
+// lossy-with-alpha-128x128 18.04%   22.36%   22.16%  100.00%  40.49 dB
+// ----------------------------------------------------------------------
+//
+// Patterns:
+//
+//  * `lossy-1x1` is bit-exact. The only entropy-coded data is one MB
+//    of all-zero residuals (per `trace.txt`: filter_type=2 level=8,
+//    base_q=26) so YUV→RGB only sees the DC predictor — the trivial
+//    case that exercises no rounding.
+//
+//  * `lossy-128x128-q{1,75,100}` and `lossy-with-alpha-128x128` cluster
+//    tightly: ~20% per-channel exact match, PSNR ≈ 38–41 dB, first
+//    divergence is consistently a ±1-LSB offset on every RGB channel
+//    (e.g. q1 pixel #2 actual=[173,235,214] vs expected=[172,234,213]).
+//    Alpha is bit-exact in the ALPH fixture, which means the ALPH-via-
+//    VP8L lossless path is correct; the bias is in the VP8 lossy YUV →
+//    RGB conversion (rounding direction or YUV-clip vs full range).
+//    Tracked as a follow-up — out of scope for this test-integration
+//    task per the brief.
+//
+//  * `lossy-near-lossless-q40` is structurally wrong (PSNR 8.85 dB,
+//    near-zero R/B match). This is NOT the same off-by-one bias —
+//    R and B are scrambled while G is partially correct. The
+//    fixture's `trace.txt` shows a base_q=51 frame with the standard
+//    VP8 quant table; "near-lossless" preprocessing is at encode time
+//    only, no extra decoder hooks. The most likely cause is a
+//    quantizer-table indexing or DC-coefficient bug at higher q
+//    values, but we do NOT chase it here — kept as ReportOnly with
+//    this comment as the breadcrumb for the follow-up task.
+// ----------------------------------------------------------------------
