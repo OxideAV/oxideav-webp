@@ -1274,6 +1274,26 @@ fn build_limited_lengths(freqs: &[u32], max_len: u8) -> Result<Vec<u8>> {
 }
 
 fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
+    // Length-limit a Huffman code: clamp every code length down to
+    // `max_len` while keeping the result a complete binary tree (Σ
+    // 2^-l_i == 1).
+    //
+    // Algorithm:
+    //   (1) Collapse all symbols at depth > max_len to depth max_len.
+    //       This raises the Kraft sum above 1.
+    //   (2) Bleed the excess back down by promoting one short code at
+    //       a time (depth d → d+1, which subtracts 2^-(d+1) from Kraft).
+    //   (3) If we overshot (Kraft < 1, which can happen because phase 2
+    //       moves are quantised), fill the remainder by demoting one
+    //       deep code at a time (depth d → d-1, which adds 2^-d to
+    //       Kraft) — picking depths small enough not to re-overshoot.
+    //
+    // Kraft is tracked in *exact integer* units of 2^-max_len so the
+    // arithmetic is loss-free. A previous version mixed two unit
+    // systems (one for phase 1, another for phase 2) and clamped a
+    // negative overflow to zero, silently producing an under-complete
+    // tree — libwebp rejected those streams with `BITSTREAM_ERROR`
+    // (fuzz crash 7bd80cbd, 1×190 image, predictor + colour-cache).
     let max_observed = *lens.iter().max().unwrap_or(&0);
     if max_observed <= max_len {
         return;
@@ -1284,14 +1304,34 @@ fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
             bl_count[l as usize] += 1;
         }
     }
-    let mut overflow: u64 = 0;
+    // Compute initial Kraft sum (in units of 2^-max_len). Symbols at
+    // depth d contribute 2^-d = 2^(max_len-d) units when d <= max_len,
+    // and 2^(max_len-d) for d > max_len too — but for d > max_len that
+    // is a fractional value (< 1). We only need the integer
+    // post-collapse Kraft, so just collapse everything > max_len down
+    // to max_len first and compute Kraft on the result.
     for l in (max_len as usize + 1)..bl_count.len() {
-        overflow += (bl_count[l] as u64) * ((1u64 << (l - max_len as usize)) - 1);
         bl_count[max_len as usize] += bl_count[l];
         bl_count[l] = 0;
     }
+    // Kraft sum in units of 2^-max_len: depth d contributes 2^(max_len-d).
+    let kraft = |bl: &[u32]| -> i64 {
+        let mut s: i64 = 0;
+        for (d, &c) in bl.iter().enumerate() {
+            if d == 0 || d > max_len as usize {
+                continue;
+            }
+            s += (c as i64) << (max_len as usize - d);
+        }
+        s
+    };
+    let target: i64 = 1i64 << (max_len as u32);
 
-    while overflow > 0 {
+    // Phase 2: while over-complete, promote a short code (smallest
+    // possible move that still bleeds excess). Choose the deepest
+    // available depth d < max_len so the promotion granularity is
+    // smallest (subtracts 2^(max_len-d-1) units).
+    while kraft(&bl_count) > target {
         let mut d = max_len as i32 - 1;
         while d > 0 && bl_count[d as usize] == 0 {
             d -= 1;
@@ -1301,12 +1341,39 @@ fn limit_code_lengths(lens: &mut [u8], max_len: u8) {
         }
         bl_count[d as usize] -= 1;
         bl_count[(d + 1) as usize] += 1;
-        let freed = 1u64 << ((max_len as i32 - d - 1).max(0) as u32);
-        if freed >= overflow {
-            overflow = 0;
-        } else {
-            overflow -= freed;
+    }
+
+    // Phase 3: if we now under-shot, demote one code at a time —
+    // shallower add is bigger, so walk DEEPEST first (smallest add)
+    // and only demote if `add ≤ deficit`. Repeat until balanced or
+    // no safe move remains.
+    loop {
+        let k = kraft(&bl_count);
+        if k >= target {
+            break;
         }
+        let deficit = target - k;
+        // Pick the deepest depth d > 1 with bl_count[d] > 0 such that
+        // moving one symbol from d to d-1 adds 2^(max_len-d) ≤ deficit.
+        // (Going from d to d-1 changes contribution from 2^(max_len-d)
+        // to 2^(max_len-d+1), a delta of 2^(max_len-d).)
+        let mut chosen: Option<i32> = None;
+        let mut d = max_len as i32;
+        while d > 1 {
+            if bl_count[d as usize] > 0 {
+                let add = 1i64 << ((max_len as i32 - d).max(0) as u32);
+                if add <= deficit {
+                    chosen = Some(d);
+                    break;
+                }
+            }
+            d -= 1;
+        }
+        let Some(d) = chosen else {
+            break;
+        };
+        bl_count[d as usize] -= 1;
+        bl_count[(d - 1) as usize] += 1;
     }
 
     let mut by_depth: Vec<(u8, usize)> = lens
