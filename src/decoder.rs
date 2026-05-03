@@ -343,6 +343,52 @@ impl Decoder for WebpDecoder {
     }
 }
 
+/// 14-bit fixed-point BT.601 YUV→RGB constants matching libwebp's
+/// `dsp/yuv.h` (the reference implementation that produces the
+/// `expected.png` ground truth in the lossy-corpus fixtures). RFC 9649
+/// §2.5 specifies "Recommendation 601 SHOULD be used"; libwebp's
+/// implementation choice is the de-facto interop reference.
+///
+/// The constants represent (1.164, 1.596, 0.391, 0.813, 2.018) in
+/// 14-bit fixed point. Despite YUV being limited-range nominally
+/// (Y in [16, 235], chroma in [16, 240]), libwebp does NOT pre-scale
+/// the input — the kCst rounding constants absorb the 16/128 biases
+/// directly so the formulas operate on raw u8 samples.
+///
+/// Why we deviate from the textbook 8-bit `(298 * (Y-16) + …) >> 8`
+/// formula: the 8-bit constants represent slightly different ratios
+/// (298/256 = 1.16406 vs libwebp's 19077/16384 = 1.16461; 409/256 =
+/// 1.59766 vs 26149/16384 = 1.59601). Combined with different
+/// rounding (+128>>8 vs +8192>>14 absorbed into kCst), every RGB
+/// channel ends up biased ~1 LSB high — which is exactly the off-by-
+/// one downward pattern observed against libwebp's expected.png in
+/// the lossy_corpus integration test (q1/q75/q100/with-alpha all
+/// reported "actual = expected + 1" in lockstep).
+const KY_SCALE: i32 = 19077;
+const KV_TO_R: i32 = 26149;
+const KU_TO_G: i32 = 6419;
+const KV_TO_G: i32 = 13320;
+const KU_TO_B: i32 = 33050;
+const YUV_HALF2: i32 = 1 << 13;
+const KR_CST: i32 = -KY_SCALE * 16 - KV_TO_R * 128 + YUV_HALF2;
+const KG_CST: i32 = -KY_SCALE * 16 + KU_TO_G * 128 + KV_TO_G * 128 + YUV_HALF2;
+const KB_CST: i32 = -KY_SCALE * 16 - KU_TO_B * 128 + YUV_HALF2;
+
+#[inline]
+fn yuv_to_r(y: i32, v: i32) -> u8 {
+    ((KY_SCALE * y + KV_TO_R * v + KR_CST) >> 14).clamp(0, 255) as u8
+}
+
+#[inline]
+fn yuv_to_g(y: i32, u: i32, v: i32) -> u8 {
+    ((KY_SCALE * y - KU_TO_G * u - KV_TO_G * v + KG_CST) >> 14).clamp(0, 255) as u8
+}
+
+#[inline]
+fn yuv_to_b(y: i32, u: i32) -> u8 {
+    ((KY_SCALE * y + KU_TO_B * u + KB_CST) >> 14).clamp(0, 255) as u8
+}
+
 fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8>> {
     let vf = decode_vp8_frame(bytes)?;
     // VP8 always produces Yuv420P; pixel format is no longer carried per
@@ -356,20 +402,14 @@ fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8
     let mut out = vec![0u8; w * h * 4];
     for j in 0..h {
         for i in 0..w {
+            // 4:2:0 chroma subsampling — one (u, v) sample per 2×2 luma.
             let y_val = y.data[j * y.stride + i] as i32;
-            let u_val = u.data[(j / 2) * u.stride + (i / 2)] as i32 - 128;
-            let v_val = v.data[(j / 2) * v.stride + (i / 2)] as i32 - 128;
-            // BT.601 limited-range YUV→RGB (VP8 spec uses BT.601 coefs).
-            let c = y_val - 16;
-            let d = u_val;
-            let e = v_val;
-            let r = (298 * c + 409 * e + 128) >> 8;
-            let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-            let b = (298 * c + 516 * d + 128) >> 8;
+            let u_val = u.data[(j / 2) * u.stride + (i / 2)] as i32;
+            let v_val = v.data[(j / 2) * v.stride + (i / 2)] as i32;
             let idx = (j * w + i) * 4;
-            out[idx] = r.clamp(0, 255) as u8;
-            out[idx + 1] = g.clamp(0, 255) as u8;
-            out[idx + 2] = b.clamp(0, 255) as u8;
+            out[idx] = yuv_to_r(y_val, v_val);
+            out[idx + 1] = yuv_to_g(y_val, u_val, v_val);
+            out[idx + 2] = yuv_to_b(y_val, u_val);
             out[idx + 3] = 0xff;
         }
     }

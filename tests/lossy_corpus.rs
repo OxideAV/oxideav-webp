@@ -424,18 +424,22 @@ fn lossy_corpus_pixel_correctness() {
 //    divergence is consistently a ±1-LSB offset on every RGB channel
 //    (e.g. q1 pixel #2 actual=[173,235,214] vs expected=[172,234,213]).
 //    Alpha is bit-exact in the ALPH fixture, which means the ALPH-via-
-//    VP8L lossless path is correct; the bias is in the VP8 lossy YUV →
-//    RGB conversion (rounding direction or YUV-clip vs full range).
-//    Tracked as a follow-up — out of scope for this test-integration
-//    task per the brief.
+//    VP8L lossless path is correct; the bias was in the VP8 lossy
+//    YUV→RGB conversion using textbook 8-bit BT.601 constants
+//    (298, 409, 100, 208, 516) instead of libwebp's 14-bit constants
+//    (19077, 26149, 6419, 13320, 33050). Fixed by switching
+//    `decode_vp8_to_rgba` to libwebp's `dsp/yuv.h` formula. Numbers
+//    above are pre-fix; updated readings will land in CI.
 //
 //  * `lossy-near-lossless-q40` is structurally wrong (PSNR 8.85 dB,
 //    near-zero R/B match). This is NOT the same off-by-one bias —
-//    R and B are scrambled while G is partially correct. The
-//    fixture's `trace.txt` shows a base_q=51 frame with the standard
-//    VP8 quant table; "near-lossless" preprocessing is at encode time
-//    only, no extra decoder hooks. The most likely cause is a
-//    quantizer-table indexing or DC-coefficient bug at higher q
-//    values, but we do NOT chase it here — kept as ReportOnly with
-//    this comment as the breadcrumb for the follow-up task.
+//    R and B are scrambled while G is partially correct.
+//    NOTE: the fourcc on this fixture is actually `VP8L`, not `VP8 `
+//    (the workspace `notes.md` is wrong; the trace.txt + bytes both
+//    show VP8L). cwebp's `-near_lossless` mode preprocesses pixel
+//    values then encodes via the lossless VP8L codec. The bug is
+//    therefore in `oxideav-webp/src/vp8l/`, not in oxideav-vp8 — the
+//    R/B scramble pattern (G partially correct) suggests a
+//    cross_color or predictor-transform bug specific to the
+//    near-lossless preprocessing pattern.
 // ----------------------------------------------------------------------
