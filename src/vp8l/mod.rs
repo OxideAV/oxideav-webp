@@ -272,14 +272,22 @@ fn pixel_loop_no_meta(
             if distance > pixels.len() {
                 return Err(Error::invalid("VP8L: LZ77 distance past stream start"));
             }
-            for _ in 0..length {
-                if pixels.len() >= pixel_count {
-                    break;
-                }
+            // LZ77 backwards copy. Cap the run at the remaining
+            // output budget. Note that `distance` may be smaller than
+            // `length` (and frequently is — that's how WebP encodes
+            // repeated patterns: e.g. `distance=1, length=N` is a run
+            // of one pixel).
+            let copy_n = length.min(pixel_count - pixels.len());
+            let copy_start = pixels.len();
+            for _ in 0..copy_n {
                 let src = pixels[pixels.len() - distance];
                 pixels.push(src);
-                cache_add(cache, cache_bits, src);
             }
+            // Batch-update the cache across the just-copied span.
+            // Skips the per-pixel `cache.is_empty()` check and dedupes
+            // adjacent identical pixels (very common: a `distance=1`
+            // pattern hashes to one slot for the entire run).
+            cache_add_run(cache, cache_bits, &pixels[copy_start..]);
         } else {
             if cache_size == 0 {
                 return Err(Error::invalid("VP8L: cache code without cache"));
@@ -342,15 +350,21 @@ fn pixel_loop_meta(
             if distance > pixels.len() {
                 return Err(Error::invalid("VP8L: LZ77 distance past stream start"));
             }
-            for _ in 0..length {
-                if pixels.len() >= pixel_count {
-                    break;
-                }
+            // LZ77 backwards copy. Cap the run at the remaining
+            // output budget. Same shape as the no-meta path; the
+            // meta-image x/y bookkeeping is advanced via a single
+            // batched call after the copy.
+            let copy_n = length.min(pixel_count - pixels.len());
+            let copy_start = pixels.len();
+            for _ in 0..copy_n {
                 let src = pixels[pixels.len() - distance];
                 pixels.push(src);
-                cache_add(cache, cache_bits, src);
-                advance_xy(&mut x, &mut y, width);
             }
+            cache_add_run(cache, cache_bits, &pixels[copy_start..]);
+            // Batched x/y advance: copy_n increments to (x, y) collapse
+            // to `(x + copy_n) % width`, and y bumps by however many
+            // times we wrap the row.
+            advance_xy_by(&mut x, &mut y, width, copy_n as u32);
         } else {
             if cache_size == 0 {
                 return Err(Error::invalid("VP8L: cache code without cache"));
@@ -434,12 +448,59 @@ fn cache_add(cache: &mut [u32], cache_bits: u32, argb: u32) {
     }
 }
 
+/// Batched cache update across a freshly-copied LZ77 run. Used when we
+/// know the cache is non-empty (the caller has already verified) — skips
+/// the per-pixel `cache.is_empty()` early exit and inlines the hash.
+///
+/// Also dedupes adjacent identical pixels: a length-N backref with
+/// `distance == 1` copies the same pixel N times, and a longer-distance
+/// backref into a flat region (very common for image data — solid
+/// backgrounds, gradients with constant rows) similarly produces runs of
+/// the same value. Hashing once per run + writing once per run is
+/// strictly cheaper than hashing/writing per pixel.
+#[inline]
+fn cache_add_run(cache: &mut [u32], cache_bits: u32, run: &[u32]) {
+    let cache_len = cache.len();
+    if cache_len == 0 || run.is_empty() {
+        return;
+    }
+    let shift = 32 - cache_bits;
+    let mut prev = run[0];
+    let mut idx = 0x1e35_a7bd_u32.wrapping_mul(prev) >> shift;
+    if (idx as usize) < cache_len {
+        cache[idx as usize] = prev;
+    }
+    for &v in &run[1..] {
+        if v == prev {
+            // Same value as previous → same hash → same cache slot,
+            // and that slot already holds `v`. Skip.
+            continue;
+        }
+        prev = v;
+        idx = 0x1e35_a7bd_u32.wrapping_mul(v) >> shift;
+        if (idx as usize) < cache_len {
+            cache[idx as usize] = v;
+        }
+    }
+}
+
 fn advance_xy(x: &mut u32, y: &mut u32, width: u32) {
     *x += 1;
     if *x >= width {
         *x = 0;
         *y += 1;
     }
+}
+
+/// Advance `(x, y)` by `n` raster positions in one shot. Equivalent to
+/// `for _ in 0..n { advance_xy(...) }` but collapses a length-N LZ77
+/// backref's bookkeeping to a single divmod instead of N branchy
+/// per-pixel updates.
+#[inline]
+fn advance_xy_by(x: &mut u32, y: &mut u32, width: u32, n: u32) {
+    let new_x = *x + n;
+    *y += new_x / width;
+    *x = new_x % width;
 }
 
 struct MetaImage {
