@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-webp/compare/v0.0.7...v0.0.8) - 2026-05-03
+
+### Fixed
+
+- *(vp8l)* swap red↔blue in cross-color coefficient packing
+- *(webp)* use libwebp 14-bit BT.601 constants for VP8 YUV→RGB
+- *(clippy)* regroup xorshift seed hex digits into 4-nibble groups
+- *(clippy)* unnecessary cast + doc lazy continuation
+
+### Other
+
+- batch cache_add across LZ77 backref runs
+- specialise apply_color_index per bits_per_pixel
+- hoist tile lookup out of predictor / cross-color inner loops
+- disable strip_transparent_color in roundtrip harnesses
+- rustfmt — wrap PALETTE_WEBP include_bytes per fmt rules
+- split pixel decode loop into meta / no-meta specialisations
+- tighten select_argb / clamp_add_sub_argb predictor inner loops
+- drop residual.to_vec() memcpy in apply_predictor
+- SWAR-ify add_argb / avg2 / apply_subtract_green per-byte math
+- HuffmanTree::decode 8-bit LUT fast-path (3-5× entropy stage)
+- criterion harness for VP8L decode hot paths
+- fix clippy doc-list-overindent + complex-type lints
+- revert one-time panic + record observed numbers
+- rustfmt + one-time summary dump (reverted next commit)
+- wire lossy fixture corpus into integration test (lossy_corpus.rs)
+- add daily fuzz workflow shim
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-webp/compare/v0.0.6...v0.0.7) - 2026-05-03
 
 ### Other
