@@ -42,9 +42,8 @@ const NATURAL_WEBP: &[u8] =
     include_bytes!("../tests/fixtures/lossless_corpus/lossless-128x128-natural/input.webp");
 const CACHE_WEBP: &[u8] =
     include_bytes!("../tests/fixtures/lossless_corpus/lossless-color-cache-stress/input.webp");
-const PALETTE_WEBP: &[u8] = include_bytes!(
-    "../tests/fixtures/lossless_corpus/lossless-color-indexing-paletted/input.webp"
-);
+const PALETTE_WEBP: &[u8] =
+    include_bytes!("../tests/fixtures/lossless_corpus/lossless-color-indexing-paletted/input.webp");
 const SIMPLE_WEBP: &[u8] =
     include_bytes!("../tests/fixtures/lossless_corpus/lossless-32x32-rgba/input.webp");
 
