@@ -1,11 +1,16 @@
 //! `oxideav_core::Encoder` adapter that produces a full `.webp` file
 //! using the VP8 lossy path.
 //!
-//! Two input pixel formats are accepted:
+//! Four input pixel formats are accepted:
 //!
 //! * **`Yuv420P`** — the native VP8 format. We feed it directly to
 //!   [`oxideav_vp8::encoder::encode_keyframe`] and emit a simple-file
 //!   `RIFF/WEBP/VP8 ` container.
+//! * **`Yuva420P`** — VP8 with a side full-resolution alpha plane. The
+//!   YUV planes go straight into the keyframe encoder (no RGB
+//!   roundtrip) and the alpha plane is compressed into the `ALPH`
+//!   sidecar. Emits the extended `RIFF/WEBP/VP8X + ALPH + VP8 `
+//!   container.
 //! * **`Rgba`** — VP8 itself is RGB-only, but the WebP container adds
 //!   alpha support via a separate `ALPH` chunk (§5.2.3 of the WebP
 //!   spec). When given an RGBA frame we convert the RGB plane to
@@ -14,6 +19,10 @@
 //!   `RIFF/WEBP/VP8X + ALPH + VP8 ` container. The VP8X header
 //!   advertises the ALPHA flag + canvas size so any compliant reader
 //!   picks up the sidecar.
+//! * **`Rgb24`** — RGB without alpha. The conversion to YUV 4:2:0
+//!   streams over the input three bytes at a time without ever
+//!   materialising an intermediate `Rgba` byte buffer (issue #7), and
+//!   emits the simple `RIFF/WEBP/VP8 ` container.
 //!
 //! Registered under the crate-level codec id [`crate::CODEC_ID_VP8`]
 //! (`"webp_vp8"`), a sibling of the existing `webp_vp8l` lossless id.
@@ -126,9 +135,13 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
         )));
     }
     let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-    if pix != PixelFormat::Yuv420P && pix != PixelFormat::Rgba {
+    if !matches!(
+        pix,
+        PixelFormat::Yuv420P | PixelFormat::Yuva420P | PixelFormat::Rgba | PixelFormat::Rgb24
+    ) {
         return Err(Error::unsupported(format!(
-            "VP8 WebP encoder: pixel format {pix:?} not supported — feed Yuv420P or Rgba"
+            "VP8 WebP encoder: pixel format {pix:?} not supported — \
+             feed Yuv420P / Yuva420P / Rgba / Rgb24"
         )));
     }
 
@@ -196,7 +209,9 @@ impl Encoder for Vp8WebpEncoder {
                     &WebpMetadata::default(),
                 )
             }
+            PixelFormat::Yuva420P => encode_yuva420_lossy(self.width, self.height, self.qindex, v)?,
             PixelFormat::Rgba => encode_rgba_lossy(self.width, self.height, self.qindex, v)?,
+            PixelFormat::Rgb24 => encode_rgb24_lossy(self.width, self.height, self.qindex, v)?,
             other => {
                 return Err(Error::unsupported(format!(
                     "VP8 WebP encoder: frame format {other:?} unsupported"
@@ -226,6 +241,111 @@ impl Encoder for Vp8WebpEncoder {
         self.eof = true;
         Ok(())
     }
+}
+
+/// Encode a `Yuva420P` frame natively: the YUV planes feed straight into
+/// the VP8 keyframe encoder (no RGB roundtrip — saves a pair of
+/// 8-bit-fixed-point colour conversions vs the `Rgba` path), and the
+/// full-resolution alpha plane is compressed into the `ALPH` sidecar.
+/// Emits a complete `.webp` file in the extended `VP8X + ALPH + VP8 `
+/// layout.
+fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if v.planes.len() < 4 {
+        return Err(Error::invalid(
+            "VP8 WebP encoder: Yuva420P frame needs 4 planes (Y, U, V, A)",
+        ));
+    }
+    let cw = w / 2 + (w & 1);
+    let ch = h / 2 + (h & 1);
+    if v.planes[0].stride < w
+        || v.planes[1].stride < cw
+        || v.planes[2].stride < cw
+        || v.planes[3].stride < w
+    {
+        return Err(Error::invalid(
+            "VP8 WebP encoder: Yuva420P plane stride too small",
+        ));
+    }
+
+    // Build a YUV-only frame view that wraps the same plane data — we
+    // hand it straight to the VP8 keyframe encoder. Since the encoder
+    // takes a `&VideoFrame`, we have to clone the planes; but only the
+    // 3 YUV planes (no copy of the alpha plane and no RGB→YUV maths).
+    let yuv_frame = VideoFrame {
+        pts: v.pts,
+        planes: vec![v.planes[0].clone(), v.planes[1].clone(), v.planes[2].clone()],
+    };
+    let vp8_bytes = encode_keyframe(width, height, qindex, &yuv_frame)?;
+
+    // Pull the alpha plane row-major (handle non-tight stride).
+    let alpha_plane = &v.planes[3];
+    let mut alpha = Vec::with_capacity(w * h);
+    for j in 0..h {
+        let row_start = j * alpha_plane.stride;
+        alpha.extend_from_slice(&alpha_plane.data[row_start..row_start + w]);
+    }
+
+    let alph_payload = encode_alpha_plane_as_vp8l(width, height, &alpha)?;
+    let alph = AlphChunkBytes {
+        // header byte: compression=1 (VP8L), filtering=0, pre=0, reserved=0.
+        header_byte: 1,
+        payload: alph_payload,
+    };
+    Ok(build_webp_file(
+        ImageKind::Vp8Lossy,
+        &vp8_bytes,
+        width,
+        height,
+        Some(&alph),
+        &WebpMetadata::default(),
+    ))
+}
+
+/// Encode an `Rgb24` frame as a simple-layout VP8 lossy `.webp` file.
+/// The RGB → YUV 4:2:0 conversion **streams** through the input three
+/// bytes at a time — there is no intermediate `Rgba` byte buffer, so a
+/// caller that already holds a JPEG- or PNG-without-alpha decode (where
+/// the upstream is RGB and adding alpha would mean a full re-alloc)
+/// pays only for the YUV planes (the natural VP8 input). This is the
+/// VP8-side counterpart to issue #7.
+fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if v.planes.is_empty() {
+        return Err(Error::invalid("VP8 WebP encoder: RGB24 frame has no planes"));
+    }
+    let plane = &v.planes[0];
+    if plane.stride < w * 3 {
+        return Err(Error::invalid(
+            "VP8 WebP encoder: RGB24 stride too small for frame width",
+        ));
+    }
+    let (y, u, v_chroma) = rgb24_rows_to_yuv420(w, h, plane.stride, &plane.data);
+    let yuv_frame = VideoFrame {
+        pts: v.pts,
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane {
+                stride: w / 2 + (w & 1),
+                data: u,
+            },
+            VideoPlane {
+                stride: w / 2 + (w & 1),
+                data: v_chroma,
+            },
+        ],
+    };
+    let vp8_bytes = encode_keyframe(width, height, qindex, &yuv_frame)?;
+    Ok(build_webp_file(
+        ImageKind::Vp8Lossy,
+        &vp8_bytes,
+        width,
+        height,
+        None,
+        &WebpMetadata::default(),
+    ))
 }
 
 /// Encode an RGBA frame as VP8 lossy + ALPH sidecar + VP8X extended
@@ -341,6 +461,74 @@ fn rgba_rows_to_yuv420(
                     let b = px[2] as i32;
                     // U = -0.148 R - 0.291 G + 0.439 B + 128.
                     // V =  0.439 R - 0.368 G - 0.071 B + 128.
+                    u_sum += (-38 * r - 74 * g + 112 * b + 128) >> 8;
+                    v_sum += (112 * r - 94 * g - 18 * b + 128) >> 8;
+                    n += 1;
+                }
+            }
+            let u = (u_sum / n) + 128;
+            let v = (v_sum / n) + 128;
+            u_plane[cy * cw + cx] = u.clamp(0, 255) as u8;
+            v_plane[cy * cw + cx] = v.clamp(0, 255) as u8;
+        }
+    }
+
+    (y_plane, u_plane, v_plane)
+}
+
+/// Convert a row-major Rgb24 buffer into BT.601 limited-range YUV 4:2:0
+/// planes. Mirrors [`rgba_rows_to_yuv420`] for RGB-without-alpha input —
+/// no alpha plane is produced, and the conversion **streams** through
+/// the input three bytes at a time without any intermediate `Rgba`
+/// allocation. Coefficients match the BT.601 formulas the decoder uses
+/// for the inverse transform.
+fn rgb24_rows_to_yuv420(
+    w: usize,
+    h: usize,
+    stride: usize,
+    rgb: &[u8],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let cw = w / 2 + (w & 1);
+    let ch = h / 2 + (h & 1);
+    let mut y_plane = vec![0u8; w * h];
+    let mut u_plane = vec![0u8; cw * ch];
+    let mut v_plane = vec![0u8; cw * ch];
+
+    // First pass: Y from every pixel — single 3-byte read per source
+    // pixel, no alpha handling.
+    for j in 0..h {
+        let row_start = j * stride;
+        for i in 0..w {
+            let px = &rgb[row_start + i * 3..row_start + i * 3 + 3];
+            let r = px[0] as i32;
+            let g = px[1] as i32;
+            let b = px[2] as i32;
+            // BT.601 limited-range: Y = 0.257 R + 0.504 G + 0.098 B + 16.
+            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            y_plane[j * w + i] = y.clamp(0, 255) as u8;
+        }
+    }
+
+    // Second pass: U/V averaged over 2×2 blocks.
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let mut u_sum = 0i32;
+            let mut v_sum = 0i32;
+            let mut n = 0i32;
+            for dy in 0..2 {
+                let jj = cy * 2 + dy;
+                if jj >= h {
+                    break;
+                }
+                for dx in 0..2 {
+                    let ii = cx * 2 + dx;
+                    if ii >= w {
+                        break;
+                    }
+                    let px = &rgb[jj * stride + ii * 3..jj * stride + ii * 3 + 3];
+                    let r = px[0] as i32;
+                    let g = px[1] as i32;
+                    let b = px[2] as i32;
                     u_sum += (-38 * r - 74 * g + 112 * b + 128) >> 8;
                     v_sum += (112 * r - 94 * g - 18 * b + 128) >> 8;
                     n += 1;

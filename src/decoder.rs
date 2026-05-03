@@ -154,6 +154,15 @@ pub struct WebpDecoder {
     pending_pts: Option<i64>,
     pending_tb: TimeBase,
     first_frame: bool,
+    /// When `true`, single-frame VP8+ALPH inputs emit a `Yuva420P`
+    /// frame (4 planes: Y, U, V, A) instead of compositing into the
+    /// RGBA canvas. Default is `false` so existing callers keep the
+    /// historical `Rgba` output. VP8L stays on the RGBA path either
+    /// way (it's natively RGBA inside the bitstream — converting it
+    /// back to YUVA would lose information for negligible benefit) and
+    /// animated files always composite onto the RGBA canvas (cross-
+    /// frame disposal/blend semantics need a unified pixel format).
+    prefer_yuva420p: bool,
 }
 
 impl WebpDecoder {
@@ -167,7 +176,31 @@ impl WebpDecoder {
             pending_pts: None,
             pending_tb: TimeBase::new(1, 1000),
             first_frame: true,
+            prefer_yuva420p: false,
         }
+    }
+
+    /// Build a decoder that emits `Yuva420P` frames whenever the input
+    /// is a single-frame VP8 + ALPH file (the natural shape for
+    /// lossy-with-alpha WebP). For VP8L and animated files this still
+    /// composites into the RGBA canvas — see [`Self::prefer_yuva420p`]
+    /// for the rationale.
+    ///
+    /// Skips the YUV→RGB conversion the VP8 chunk normally goes through
+    /// (and the matching alpha-overlay step), so callers that feed the
+    /// frame back into a YUV-native pipeline (further encoding, video
+    /// compositing, GPU upload paths that prefer YUV) avoid the
+    /// roundtrip.
+    pub fn new_yuva420p(w: u32, h: u32) -> Self {
+        let mut dec = Self::new(w, h);
+        dec.prefer_yuva420p = true;
+        dec
+    }
+
+    /// Toggle the `Yuva420P` output mode after construction. See
+    /// [`Self::new_yuva420p`] for what it does.
+    pub fn set_prefer_yuva420p(&mut self, prefer: bool) {
+        self.prefer_yuva420p = prefer;
     }
 }
 
@@ -187,6 +220,34 @@ impl Decoder for WebpDecoder {
         }
 
         let _ = self.first_frame;
+
+        // Yuva420P fast path: a non-animated VP8 chunk with an ALPH
+        // sidecar that lines up with the canvas (i.e. a still file in
+        // the VP8X + ALPH + VP8 layout). Emits a 4-plane Yuva420P frame
+        // straight from the VP8 decoder + the alpha plane, skipping
+        // YUV→RGB conversion + the canvas composite. VP8L and ANMF
+        // animation always fall through to the RGBA path — see
+        // `prefer_yuva420p` for the reasoning.
+        if self.prefer_yuva420p
+            && !payload.is_vp8l
+            && payload.alph.is_some()
+            && payload.x_offset == 0
+            && payload.y_offset == 0
+            && payload.width == self.canvas_w
+            && payload.height == self.canvas_h
+        {
+            let alph = payload.alph.as_ref().unwrap();
+            let yuva = decode_vp8_alph_to_yuva420p(
+                payload.image,
+                payload.width,
+                payload.height,
+                alph,
+                self.pending_pts,
+            )?;
+            self.queued.push_back(yuva);
+            self.first_frame = false;
+            return Ok(());
+        }
 
         // Decode the image chunk.
         let tile_rgba = if payload.is_vp8l {
@@ -313,6 +374,80 @@ fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8
         }
     }
     Ok(out)
+}
+
+/// Decode a VP8 chunk + ALPH sidecar into a 4-plane `Yuva420P`
+/// `VideoFrame`. The Y/U/V planes come from the VP8 decoder verbatim
+/// (cropped to the frame's logical size — VP8 produces MB-aligned
+/// strides so the raw planes can be wider than `frame_w`/`frame_h`),
+/// and the alpha plane is a fresh full-resolution byte buffer.
+///
+/// Used only for non-animated single-frame VP8+ALPH inputs when the
+/// decoder is in [`WebpDecoder::new_yuva420p`] mode. Skips the
+/// YUV→RGB→consumer roundtrip the default RGBA path forces.
+fn decode_vp8_alph_to_yuva420p(
+    bytes: &[u8],
+    frame_w: u32,
+    frame_h: u32,
+    alph: &DecodedAlph<'_>,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let vf = decode_vp8_frame(bytes)?;
+    let w = frame_w as usize;
+    let h = frame_h as usize;
+    let cw = w / 2 + (w & 1);
+    let ch = h / 2 + (h & 1);
+
+    // VP8 produces MB-aligned (16-pixel) Y plane and 8-pixel chroma
+    // strides; copy out the top-left frame_w × frame_h (and chroma
+    // half-resolution) into tightly-packed planes so callers can rely on
+    // `stride == w` / `stride == cw`.
+    let y_in = &vf.planes[0];
+    let u_in = &vf.planes[1];
+    let v_in = &vf.planes[2];
+
+    let mut y_plane = Vec::with_capacity(w * h);
+    for j in 0..h {
+        let row_start = j * y_in.stride;
+        y_plane.extend_from_slice(&y_in.data[row_start..row_start + w]);
+    }
+    let mut u_plane = Vec::with_capacity(cw * ch);
+    for j in 0..ch {
+        let row_start = j * u_in.stride;
+        u_plane.extend_from_slice(&u_in.data[row_start..row_start + cw]);
+    }
+    let mut v_plane = Vec::with_capacity(cw * ch);
+    for j in 0..ch {
+        let row_start = j * v_in.stride;
+        v_plane.extend_from_slice(&v_in.data[row_start..row_start + cw]);
+    }
+
+    let alpha = decode_alpha_plane(frame_w, frame_h, alph)?;
+    if alpha.len() != w * h {
+        return Err(Error::invalid("WebP: alpha plane size mismatch (Yuva420P)"));
+    }
+
+    Ok(VideoFrame {
+        pts,
+        planes: vec![
+            VideoPlane {
+                stride: w,
+                data: y_plane,
+            },
+            VideoPlane {
+                stride: cw,
+                data: u_plane,
+            },
+            VideoPlane {
+                stride: cw,
+                data: v_plane,
+            },
+            VideoPlane {
+                stride: w,
+                data: alpha,
+            },
+        ],
+    })
 }
 
 fn set_alpha_opaque(mut rgba: Vec<u8>) -> Vec<u8> {

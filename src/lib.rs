@@ -26,11 +26,14 @@
 //! the extended `VP8X` header whenever the frame carries alpha or
 //! metadata).
 //!
-//! The VP8 lossy path also emits a full RIFF file. YUV420P frames use
-//! the simple `VP8 ` layout; RGBA frames split the alpha plane into an
-//! `ALPH` sidecar chunk and emit the extended `VP8X` layout. The
-//! palette (colour-indexing) transform and meta-Huffman grouping are
-//! still scoped non-goals on the lossless side.
+//! The VP8 lossy path also emits a full RIFF file. `Yuv420P` and
+//! `Rgb24` frames use the simple `VP8 ` layout (Rgb24 streams the
+//! RGB→YUV conversion without a Rgba alloc — issue #7); `Rgba` and
+//! `Yuva420P` frames split the alpha plane into an `ALPH` sidecar
+//! chunk and emit the extended `VP8X` layout. `Yuva420P` skips the
+//! YUV→RGB→YUV roundtrip the `Rgba` path goes through. The palette
+//! (colour-indexing) transform and meta-Huffman grouping are still
+//! scoped non-goals on the lossless side.
 
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
