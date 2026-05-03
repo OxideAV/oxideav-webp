@@ -22,3 +22,13 @@ oxideav-vp8 = "0.1"
 # libwebp-encoded `tests/fixtures/lossy_corpus/*` corpus against the
 # matching `expected.png` ground truth, so it needs a PNG decoder.
 oxideav-png = "0.1"
+# `vp8l_decode` bench harness — see `benches/vp8l_decode.rs`. Pinned to
+# the 0.5 line to track the current major; no other criterion users in
+# the workspace yet so the lockfile picks the latest 0.5.x.
+criterion = "0.5"
+
+# Criterion's own runner. `harness = false` opts out of the default libtest
+# harness so criterion's CLI (`cargo bench -- --measurement-time …`) works.
+[[bench]]
+name = "vp8l_decode"
+harness = false

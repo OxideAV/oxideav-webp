@@ -188,6 +188,15 @@ impl HuffmanTree {
         build_from_lengths(&code_lengths)
     }
 
+    /// Build a tree directly from a code-length table. Exposed for the
+    /// criterion bench harness (`benches/vp8l_decode.rs`) which needs to
+    /// construct trees outside the bitstream parser. Not part of the
+    /// stable surface — the wire format is the only supported entry.
+    #[doc(hidden)]
+    pub fn from_code_lengths_for_bench(lengths: &[u8]) -> Self {
+        build_from_lengths(lengths).expect("test/bench-only helper, lengths must be valid")
+    }
+
     /// Decode a single symbol.
     pub fn decode(&self, br: &mut BitReader<'_>) -> Result<HuffmanCode> {
         if let Some(s) = self.only_symbol {
