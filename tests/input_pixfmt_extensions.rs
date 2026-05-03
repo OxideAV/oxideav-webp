@@ -92,7 +92,10 @@ fn vp8l_rgb24_roundtrip_matches_rgba_equivalent() {
     let mut enc_rgb = encoder::make_encoder(&vp8l_params(PixelFormat::Rgb24))
         .expect("vp8l encoder accepts Rgb24");
     enc_rgb
-        .send_frame(&Frame::Video(make_video_frame((W as usize) * 3, rgb.clone())))
+        .send_frame(&Frame::Video(make_video_frame(
+            (W as usize) * 3,
+            rgb.clone(),
+        )))
         .expect("send Rgb24 frame");
     enc_rgb.flush().expect("flush rgb");
     let rgb_pkt = enc_rgb.receive_packet().expect("receive rgb packet");
@@ -142,7 +145,10 @@ fn vp8_lossy_rgb24_roundtrip_yuv_matches_rgba_equivalent() {
     let mut enc_rgb = encoder_vp8::make_encoder(&vp8_params(PixelFormat::Rgb24))
         .expect("vp8 encoder accepts Rgb24");
     enc_rgb
-        .send_frame(&Frame::Video(make_video_frame((W as usize) * 3, rgb.clone())))
+        .send_frame(&Frame::Video(make_video_frame(
+            (W as usize) * 3,
+            rgb.clone(),
+        )))
         .expect("send rgb24");
     enc_rgb.flush().expect("flush");
     let rgb_pkt = enc_rgb.receive_packet().expect("receive rgb packet");
@@ -356,4 +362,3 @@ fn vp8_encoder_rejects_unrelated_pixel_format() {
         "unexpected error: {msg}"
     );
 }
-

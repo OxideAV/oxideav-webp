@@ -275,7 +275,11 @@ fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> 
     // 3 YUV planes (no copy of the alpha plane and no RGB→YUV maths).
     let yuv_frame = VideoFrame {
         pts: v.pts,
-        planes: vec![v.planes[0].clone(), v.planes[1].clone(), v.planes[2].clone()],
+        planes: vec![
+            v.planes[0].clone(),
+            v.planes[1].clone(),
+            v.planes[2].clone(),
+        ],
     };
     let vp8_bytes = encode_keyframe(width, height, qindex, &yuv_frame)?;
 
@@ -314,7 +318,9 @@ fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Re
     let w = width as usize;
     let h = height as usize;
     if v.planes.is_empty() {
-        return Err(Error::invalid("VP8 WebP encoder: RGB24 frame has no planes"));
+        return Err(Error::invalid(
+            "VP8 WebP encoder: RGB24 frame has no planes",
+        ));
     }
     let plane = &v.planes[0];
     if plane.stride < w * 3 {
