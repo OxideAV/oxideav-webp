@@ -150,9 +150,7 @@ fn vp8l_distance_simple_huffman_out_of_range_errors() {
     write_simple_one_symbol_tree_8bit(&mut bw, 100);
     let blob = bw.finish();
     let riff = wrap_in_riff(&blob);
-    let err = decode_webp(&riff)
-        .err()
-        .expect("decoder must reject out-of-range distance symbol");
+    let err = decode_webp(&riff).expect_err("decoder must reject out-of-range distance symbol");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("out of range") || msg.to_lowercase().contains("invalid"),
@@ -279,8 +277,7 @@ fn vp8l_distance_tree_never_extends_with_cache() {
     write_simple_one_symbol_tree_8bit(&mut bw, 50);
     let blob = bw.finish();
     let err = decode_webp(&wrap_in_riff(&blob))
-        .err()
-        .expect("decoder must reject sym 50 in distance tree");
+        .expect_err("decoder must reject sym 50 in distance tree");
     let _ = format!("{err:?}");
 }
 
@@ -298,9 +295,7 @@ fn vp8l_color_cache_bits_12_invalid() {
     bw.write(1, 1); // color cache present
     bw.write(12, 4); // cache_bits = 12 → invalid
     let blob = bw.finish();
-    let err = decode_webp(&wrap_in_riff(&blob))
-        .err()
-        .expect("decoder must reject cache_bits=12");
+    let err = decode_webp(&wrap_in_riff(&blob)).expect_err("decoder must reject cache_bits=12");
     let msg = format!("{err:?}");
     assert!(msg.contains("color cache bits") || msg.to_lowercase().contains("invalid"));
 }
@@ -320,9 +315,7 @@ fn vp8l_color_cache_bits_zero_indicator_invalid() {
     bw.write(1, 1); // cache present
     bw.write(0, 4); // cache_bits = 0 → out of [1..=11]
     let blob = bw.finish();
-    let err = decode_webp(&wrap_in_riff(&blob))
-        .err()
-        .expect("decoder must reject cache_bits=0");
+    let err = decode_webp(&wrap_in_riff(&blob)).expect_err("decoder must reject cache_bits=0");
     let _ = format!("{err:?}");
 }
 
