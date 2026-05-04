@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8-enc)* per-segment quantiser + loop-filter delta tuning driven
+  by quality. The lossy WebP encoder now routes every keyframe through
+  `make_encoder_with_config` with `enable_segments = true` and
+  per-segment QP / LF deltas scaled with the frame qindex (RFC 6386
+  §10 + §15.2). The variance classifier in `oxideav-vp8` lands smooth
+  MBs in segment 0 and high-variance MBs in segment 3; we then spend
+  more bits on the smooth segment (where banding is visible at high
+  QP) and save bits on the textured segment (where DCT noise is
+  masked). Delta magnitudes scale linearly with qindex so the tuning
+  is most aggressive at low quality and collapses toward zero at
+  high quality. Closes #334.
 - *(vp8l-enc)* K=4 meta-Huffman per-tile grouping, in addition to the
   existing K=2 trial. The encoder now tries K=1 (single-group),
   K=2, and (above 4096 px) K=4 splits; whichever produces the

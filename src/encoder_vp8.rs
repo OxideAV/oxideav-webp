@@ -3,9 +3,9 @@
 //!
 //! Four input pixel formats are accepted:
 //!
-//! * **`Yuv420P`** — the native VP8 format. We feed it directly to
-//!   [`oxideav_vp8::encoder::encode_keyframe`] and emit a simple-file
-//!   `RIFF/WEBP/VP8 ` container.
+//! * **`Yuv420P`** — the native VP8 format. We feed it through the
+//!   per-segment-tuned [`encode_keyframe_with_segments`] helper and
+//!   emit a simple-file `RIFF/WEBP/VP8 ` container.
 //! * **`Yuva420P`** — VP8 with a side full-resolution alpha plane. The
 //!   YUV planes go straight into the keyframe encoder (no RGB
 //!   roundtrip) and the alpha plane is compressed into the `ALPH`
@@ -52,11 +52,24 @@
 //!   VP8 qindex in `0..=127` (lower = better).
 //!
 //! The quality→qindex mapping is the linear inversion
-//! `qindex = round((100 - quality) * 1.27)`. This matches libwebp's
-//! API surface but is **not** a perceptual match — libwebp also
-//! adjusts the quantizer matrices, AC/DC deltas, and segment-level QP
-//! based on quality, none of which we do yet. Round-2 work would tune
-//! the quantizer matrix to track libwebp's perceptual targets.
+//! `qindex = round((100 - quality) * 1.27)`. The encoder also tunes
+//! the per-segment quantiser deltas (RFC 6386 §10) and the per-segment
+//! loop-filter level deltas (§15.2) based on quality so that smooth
+//! regions get extra bits where banding is visible and high-variance
+//! regions save bits where DCT noise hides. Mirrors libwebp's
+//! perceptual model: the source-luma variance classifier lands smooth
+//! MBs in segment 0 and textured MBs in segment 3; `segment 0` then
+//! takes a stronger negative qindex delta (finer quant) and `segment 3`
+//! a stronger positive delta (coarser quant) at low quality, with the
+//! deltas tapering toward zero as quality approaches 100 (where every
+//! segment is already near-lossless).
+//!
+//! Round-2 caveats: full per-frequency AC/DC delta tuning
+//! (`y_dc_delta`, `y2_dc_delta`, `y2_ac_delta`, `uv_dc_delta`,
+//! `uv_ac_delta`) still requires a `Vp8EncoderConfig` extension on
+//! the upstream crate — those fields are not yet plumbed through the
+//! quant-context builder, so we leave them at zero and let segment QP
+//! deltas carry the perceptual-tuning load for now.
 
 #[cfg(feature = "registry")]
 use std::collections::VecDeque;
@@ -70,7 +83,9 @@ use oxideav_core::{
 };
 
 #[cfg(feature = "registry")]
-use oxideav_vp8::encoder::{encode_keyframe, DEFAULT_QINDEX};
+use oxideav_vp8::encoder::{
+    make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_QINDEX,
+};
 
 use crate::error::{Result, WebpError as Error};
 use crate::riff::AlphChunkBytes;
@@ -124,6 +139,126 @@ pub fn quality_to_qindex(quality: f32) -> u8 {
     }
     let q = quality.clamp(0.0, 100.0);
     ((100.0 - q) * 1.27).round().clamp(0.0, 127.0) as u8
+}
+
+/// Quality-driven per-segment qindex deltas (RFC 6386 §10). The
+/// encoder classifies each MB into one of four segments by source-luma
+/// variance: segment 0 = smoothest content, segment 3 = highest-variance.
+/// Returning `[neg, neg/2, 0, pos]` lands more bits on smooth segments
+/// (where banding is visible at high QP) and fewer on textured segments
+/// (where DCT noise is masked).
+///
+/// The delta magnitudes scale with `(127 - qindex)`: at very high
+/// quality (qindex near 0) every segment is already near-lossless so
+/// the deltas collapse to ~`[-2, -1, 0, 1]`. At very low quality
+/// (qindex near 127) the deltas widen to ~`[-12, -6, 0, 8]` —
+/// matching libwebp's "spend bits where the eye notices" heuristic.
+///
+/// Returned values are pre-clamped to the legal `[-15, 15]` range
+/// (decoder reads each delta as a 5-bit signed-magnitude field).
+fn segment_quant_deltas_for_qindex(qindex: u8) -> [i32; 4] {
+    // Span ∈ [0, 1]: 0 at qindex 0, 1 at qindex 127.
+    // Higher qindex → wider deltas → more aggressive perceptual tuning.
+    let span = (qindex as f32) / 127.0;
+    // Smooth segment bonus: scales 2..=12 (better quality at smooth).
+    let smooth = -((2.0 + span * 10.0).round() as i32);
+    // Half-smooth: scales 1..=6.
+    let mid_low = -((1.0 + span * 5.0).round() as i32);
+    // High-variance penalty: scales 1..=8 (saves bits on textured).
+    let high = (1.0 + span * 7.0).round() as i32;
+    [
+        smooth.clamp(-15, 15),
+        mid_low.clamp(-15, 15),
+        0,
+        high.clamp(-15, 15),
+    ]
+}
+
+/// Quality-driven per-segment loop-filter level deltas (RFC 6386 §15.2).
+/// Smooth segments take a *negative* LF delta (a softer filter — the
+/// per-segment finer quant already preserves smooth detail, so the
+/// deblocker can ease off and avoid over-smoothing). High-variance
+/// segments take a *positive* LF delta (a stronger filter — masks the
+/// extra DCT block boundaries the coarser per-segment QP exposes).
+///
+/// Magnitudes scale with `qindex` for the same reason as the QP
+/// deltas: at high quality everything's near-lossless and the LF tweaks
+/// approach zero.
+fn segment_lf_deltas_for_qindex(qindex: u8) -> [i32; 4] {
+    let span = (qindex as f32) / 127.0;
+    // Smooth segment LF easing: 0..=3.
+    let smooth_lf = -((span * 3.0).round() as i32);
+    // Half-smooth: 0..=2.
+    let mid_low_lf = -((span * 2.0).round() as i32);
+    // High-variance LF strengthening: 1..=4.
+    let high_lf = (1.0 + span * 3.0).round() as i32;
+    [
+        smooth_lf.clamp(-63, 63),
+        mid_low_lf.clamp(-63, 63),
+        0,
+        high_lf.clamp(-63, 63),
+    ]
+}
+
+/// Build the `Vp8EncoderConfig` used by the WebP single-frame lossy
+/// path. Wires up the quality-driven segment QP / LF deltas (RFC 6386
+/// §10 + §15.2), keeps the scene-cut and lookahead-altref features off
+/// (we only ever emit a single keyframe per `.webp` so there's no GOP
+/// state to manage), and pins `loop_filter_mode = Normal` to preserve
+/// the bit-exact loop-filter behaviour the existing decode-side
+/// regression tests depend on.
+#[cfg(feature = "registry")]
+fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
+    let qi = qindex.min(127);
+    Vp8EncoderConfig {
+        qindex: qi,
+        // Per-frame static-image encode: no scene-cut / lookahead.
+        enable_scene_cut: false,
+        enable_lookahead_altref: false,
+        // Match the historic webp lossy bitstream's loop-filter shape
+        // so the decode-side `lossy_corpus` regression tests don't drift.
+        loop_filter_mode: LoopFilterMode::Normal,
+        // Quality-driven perceptual tuning — segments-on, deltas scaled
+        // with qindex so high quality collapses to near-uniform QP.
+        enable_segments: true,
+        segment_quant_deltas: segment_quant_deltas_for_qindex(qi),
+        segment_lf_deltas: segment_lf_deltas_for_qindex(qi),
+        ..Vp8EncoderConfig::default()
+    }
+}
+
+/// Encode a single VP8 keyframe through the segment-aware
+/// configuration produced by [`webp_lossy_config`]. Goes through the
+/// `Encoder` trait surface so we get the per-segment quant + LF deltas
+/// without having to duplicate the lower-level keyframe entry point.
+#[cfg(feature = "registry")]
+fn encode_keyframe_with_segments(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    frame: &VideoFrame,
+) -> Result<Vec<u8>> {
+    let cfg = webp_lossy_config(qindex);
+    let mut p = CodecParameters::video(CodecId::new(oxideav_vp8::CODEC_ID_STR));
+    p.width = Some(width);
+    p.height = Some(height);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+    let mut enc = match make_encoder_with_config(&p, cfg) {
+        Ok(e) => e,
+        Err(e) => return Err(Error::invalid(format!("vp8 segment encoder: {e}"))),
+    };
+    let f = Frame::Video(frame.clone());
+    if let Err(e) = enc.send_frame(&f) {
+        return Err(Error::invalid(format!("vp8 segment encoder send: {e}")));
+    }
+    if let Err(e) = enc.flush() {
+        return Err(Error::invalid(format!("vp8 segment encoder flush: {e}")));
+    }
+    let pkt = match enc.receive_packet() {
+        Ok(p) => p,
+        Err(e) => return Err(Error::invalid(format!("vp8 segment encoder receive: {e}"))),
+    };
+    Ok(pkt.data)
 }
 
 /// Build a VP8-lossy WebP encoder with an explicit qindex (0..=127).
@@ -219,7 +354,7 @@ impl Encoder for Vp8WebpEncoder {
         // configured input format.
         let bytes = match self.input_format {
             PixelFormat::Yuv420P => {
-                let vp8 = encode_keyframe(self.width, self.height, self.qindex, v)?;
+                let vp8 = encode_keyframe_with_segments(self.width, self.height, self.qindex, v)?;
                 build_webp_file(
                     ImageKind::Vp8Lossy,
                     &vp8,
@@ -301,7 +436,7 @@ fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> 
             v.planes[2].clone(),
         ],
     };
-    let vp8_bytes = encode_keyframe(width, height, qindex, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, &yuv_frame)?;
 
     // Pull the alpha plane row-major (handle non-tight stride).
     let alpha_plane = &v.planes[3];
@@ -359,7 +494,7 @@ fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Re
             },
         ],
     };
-    let vp8_bytes = encode_keyframe(width, height, qindex, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, &yuv_frame)?;
     Ok(build_webp_file(
         ImageKind::Vp8Lossy,
         &vp8_bytes,
@@ -404,7 +539,7 @@ fn encode_rgba_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Res
             },
         ],
     };
-    let vp8_bytes = encode_keyframe(width, height, qindex, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, &yuv_frame)?;
 
     // Encode the alpha plane as a VP8L green-only bitstream with a
     // pre-encode filter pass picked to minimise the resulting payload
@@ -428,7 +563,7 @@ fn encode_rgba_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Res
 /// This mirrors the decoder's YUV→RGB path so a round-trip through the
 /// VP8 codec preserves as much colour fidelity as possible for the
 /// smooth test pattern used in the integration tests.
-fn rgba_rows_to_yuv420(
+pub(crate) fn rgba_rows_to_yuv420(
     w: usize,
     h: usize,
     stride: usize,
@@ -687,7 +822,7 @@ fn alph_filter_cost(plane: &[u8]) -> u64 {
 /// rendered UI / icon overlays) win on mode 1 or 2 because the residual
 /// plane collapses to a tight low-magnitude distribution that the VP8L
 /// green Huffman tree can pack into 1-2 bits per pixel.
-fn encode_alph_chunk(width: u32, height: u32, alpha: &[u8]) -> Result<AlphChunkBytes> {
+pub(crate) fn encode_alph_chunk(width: u32, height: u32, alpha: &[u8]) -> Result<AlphChunkBytes> {
     let w = width as usize;
     let h = height as usize;
     debug_assert_eq!(alpha.len(), w * h);
@@ -781,6 +916,64 @@ mod tests {
         assert_eq!(quality_to_qindex(-10.0), 127);
         assert_eq!(quality_to_qindex(150.0), 0);
         assert_eq!(quality_to_qindex(f32::NAN), 127);
+    }
+
+    #[test]
+    fn segment_quant_deltas_widen_with_qindex() {
+        // At very high quality (qindex 0) the per-segment QP deltas
+        // should be tight — every segment is already near-lossless and
+        // the perceptual gain from spending more bits on smooth content
+        // is gone. At very low quality (qindex 127) the deltas widen so
+        // smooth segments get noticeably finer quant than textured
+        // segments. Validate the magnitude trend on the smooth segment
+        // (id 0) and the high-variance segment (id 3).
+        let lo_q = segment_quant_deltas_for_qindex(0);
+        let mid_q = segment_quant_deltas_for_qindex(64);
+        let hi_q = segment_quant_deltas_for_qindex(127);
+
+        // Segment 0 (smooth) is always negative — better quality there.
+        assert!(lo_q[0] < 0 && mid_q[0] < 0 && hi_q[0] < 0);
+        // Segment 3 (textured) is always positive — coarser quant.
+        assert!(lo_q[3] > 0 && mid_q[3] > 0 && hi_q[3] > 0);
+        // Segment 2 is the unmodified baseline.
+        assert_eq!(lo_q[2], 0);
+        assert_eq!(mid_q[2], 0);
+        assert_eq!(hi_q[2], 0);
+        // Magnitudes monotonically widen with qindex.
+        assert!(hi_q[0] <= mid_q[0] && mid_q[0] <= lo_q[0]);
+        assert!(hi_q[3] >= mid_q[3] && mid_q[3] >= lo_q[3]);
+        // All deltas land in the legal 5-bit signed-magnitude range.
+        for d in lo_q
+            .iter()
+            .chain(mid_q.iter())
+            .chain(hi_q.iter())
+        {
+            assert!(*d >= -15 && *d <= 15, "delta {d} out of [-15, 15]");
+        }
+    }
+
+    #[test]
+    fn segment_lf_deltas_smooth_negative_textured_positive() {
+        // Smooth segment LF delta is non-positive (softer filter); the
+        // textured segment LF delta is non-negative (stronger filter)
+        // for every qindex on the curve.
+        for qi in [0u8, 32, 64, 96, 127] {
+            let lf = segment_lf_deltas_for_qindex(qi);
+            assert!(
+                lf[0] <= 0,
+                "qindex {qi}: smooth LF delta {} should be <= 0",
+                lf[0]
+            );
+            assert_eq!(lf[2], 0, "qindex {qi}: midline segment must be 0");
+            assert!(
+                lf[3] >= 1,
+                "qindex {qi}: textured LF delta {} should be >= 1",
+                lf[3]
+            );
+            for d in lf.iter() {
+                assert!(*d >= -63 && *d <= 63, "qindex {qi}: lf delta {d} out of range");
+            }
+        }
     }
 
     #[test]
