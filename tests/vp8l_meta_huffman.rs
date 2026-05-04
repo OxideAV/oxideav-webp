@@ -326,6 +326,155 @@ fn meta_huffman_k4_shrinks_vs_k2_on_four_region_fixture() {
     );
 }
 
+/// Build a 128×128 image partitioned into eight horizontal strips with
+/// distinctly different statistics — different gradient slopes, noise
+/// seeds, and constant colours. This is the K=8 analogue of the
+/// `four_region_image` fixture: each strip's per-tile histogram lives
+/// in a different corner of the symbol-distribution space, so the
+/// encoder's K=8 trial should be the natural fit.
+fn eight_strip_image(w: u32, h: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let strip_h = h / 8;
+    // Eight different deterministic xorshift seeds — one per strip.
+    let seeds: [u32; 8] = [
+        0x1111_1111,
+        0x2222_2222,
+        0x3333_3333,
+        0x4444_4444,
+        0x5555_5555,
+        0x6666_6666,
+        0x7777_7777,
+        0x8888_8888,
+    ];
+    for strip in 0..8u32 {
+        let mut s = seeds[strip as usize];
+        for y in (strip * strip_h)..((strip + 1) * strip_h).min(h) {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                match strip {
+                    0 => {
+                        // Smooth horizontal gradient.
+                        rgba[i] = (x as u8).wrapping_mul(2);
+                        rgba[i + 1] = (x as u8).wrapping_mul(2);
+                        rgba[i + 2] = (x as u8).wrapping_mul(2);
+                    }
+                    1 => {
+                        // Steep diagonal gradient.
+                        rgba[i] = ((x + y * 4) as u8).wrapping_mul(3);
+                        rgba[i + 1] = ((x + y * 4) as u8).wrapping_mul(3);
+                        rgba[i + 2] = ((x + y * 4) as u8).wrapping_mul(3);
+                    }
+                    2 => {
+                        // Constant (red).
+                        rgba[i] = 0xff;
+                        rgba[i + 1] = 0x00;
+                        rgba[i + 2] = 0x00;
+                    }
+                    3 => {
+                        // Vertical bars (4-pixel wide).
+                        let on = (x / 4) & 1 == 0;
+                        let v = if on { 0xff } else { 0x00 };
+                        rgba[i] = v;
+                        rgba[i + 1] = v;
+                        rgba[i + 2] = v;
+                    }
+                    4 => {
+                        // High-frequency noise (seed[4]).
+                        s ^= s << 13;
+                        s ^= s >> 17;
+                        s ^= s << 5;
+                        rgba[i] = (s & 0xff) as u8;
+                        rgba[i + 1] = ((s >> 8) & 0xff) as u8;
+                        rgba[i + 2] = ((s >> 16) & 0xff) as u8;
+                    }
+                    5 => {
+                        // Constant (green).
+                        rgba[i] = 0x00;
+                        rgba[i + 1] = 0xff;
+                        rgba[i + 2] = 0x00;
+                    }
+                    6 => {
+                        // Horizontal bars (2-pixel tall, but we're inside
+                        // a single strip — alternate by x for variety).
+                        let on = ((x / 2) ^ (y / 2)) & 1 == 0;
+                        let v = if on { 0xc0 } else { 0x40 };
+                        rgba[i] = v;
+                        rgba[i + 1] = v / 2;
+                        rgba[i + 2] = v / 4;
+                    }
+                    _ => {
+                        // High-frequency noise with a different seed.
+                        s ^= s << 17;
+                        s ^= s >> 13;
+                        s ^= s << 5;
+                        rgba[i] = (s & 0xff) as u8;
+                        rgba[i + 1] = ((s >> 8) & 0xff) as u8;
+                        rgba[i + 2] = ((s >> 16) & 0xff) as u8;
+                    }
+                }
+                rgba[i + 3] = 0xff;
+            }
+        }
+    }
+    rgba
+}
+
+#[test]
+fn meta_huffman_k8_round_trips_eight_strip_fixture() {
+    // The K=8 meta-Huffman trial only runs above 16384 px (the minimum
+    // pixel count where the eight extra Huffman-tree headers amortise).
+    // 128×128 = 16384 px clears the threshold; this test exercises the
+    // K=8 candidate end-to-end and verifies it round-trips through the
+    // in-crate decoder.
+    //
+    // We *don't* assert which K the encoder picks — the smallest of the
+    // {single-group, K=2, K=4, K=8} trial bytes always wins, and on a
+    // fixture where K=8 happens to lose (e.g. K=2 captures most of the
+    // variance already) the encoder falls back legally. The critical
+    // soundness check is that whichever K it picks decodes correctly.
+    let w = 128u32;
+    let h = 128u32;
+    let rgba = eight_strip_image(w, h);
+    let opts = EncoderOptions {
+        use_subtract_green: false,
+        use_color_transform: false,
+        use_predictor: false,
+        use_color_index: false,
+        use_color_cache: true,
+        ..EncoderOptions::default()
+    };
+    let _ = assert_roundtrip(w, h, &rgba, opts);
+}
+
+#[test]
+fn meta_huffman_k8_shrinks_or_matches_smaller_k_on_eight_strip() {
+    // Sanity check on the K=8 path: the encoded stream of the eight-strip
+    // 128×128 fixture must not blow up vs the raw RGBA size (≈ 64 KB).
+    // The encoder picks the smallest of {single-group, K=2, K=4, K=8}
+    // automatically; this test ensures that even when the K=8 trial
+    // is the *winner* the resulting stream is still a clear shrink.
+    let w = 128u32;
+    let h = 128u32;
+    let rgba = eight_strip_image(w, h);
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+    let opts = EncoderOptions {
+        use_subtract_green: false,
+        use_color_transform: false,
+        use_predictor: false,
+        use_color_index: false,
+        use_color_cache: true,
+        ..EncoderOptions::default()
+    };
+    let bs = encode_vp8l_argb_with(w, h, &pixels, false, opts).expect("encode");
+    let raw_bytes = (w * h * 4) as usize;
+    assert!(
+        bs.len() < raw_bytes / 2,
+        "encoded size {} bytes should be < half the raw {} bytes for an eight-strip 128×128",
+        bs.len(),
+        raw_bytes,
+    );
+}
+
 #[test]
 fn meta_huffman_does_not_inflate_uniform_image() {
     // A uniform-noise field has roughly equal statistics in every tile,

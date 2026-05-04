@@ -31,16 +31,18 @@
 //!   and the index image often compresses *further* via subtract-green
 //!   plus LZ77 plus colour-cache once the channel-decorrelation is no
 //!   longer the bottleneck.
-//! * **Meta-Huffman per-tile grouping (K=2 and K=4).** Tiles of the
+//! * **Meta-Huffman per-tile grouping (K = 2, 4, 8).** Tiles of the
 //!   main image are clustered into K Huffman groups by green-alphabet
 //!   histogram similarity (k-means++ farthest-first seeding +
 //!   2-iteration assignment). Each group ships its own {green, red,
 //!   blue, alpha, distance} trees and a meta-image carries the per-tile
 //!   group id. The encoder always tries the single-group baseline plus
-//!   K=2 and (above 4096 px) K=4, keeping whichever variant produces
-//!   the shortest bitstream. K>4 is not yet attempted: past K=4 the
-//!   per-group header overhead grows linearly and the gain tails off
-//!   sharply on the natural fixtures we care about.
+//!   K=2, K=4 (above 4096 px), and K=8 (above 16384 px), keeping
+//!   whichever variant produces the shortest bitstream. K>8 is not
+//!   attempted: past K=8 the per-group header overhead grows linearly
+//!   (each group adds five Huffman-tree headers ≈ a few hundred bits)
+//!   and the marginal cluster-fit gain tails off sharply on natural
+//!   fixtures.
 //! * **Near-lossless preprocessing.** Optional two-pass pixel rewrite
 //!   (configurable via `EncoderOptions::near_lossless`). Pass 1 rounds
 //!   each R/G/B byte to a multiple of `1 << shift`; pass 2 walks the
@@ -951,28 +953,32 @@ fn encode_image_stream(
         return Ok(());
     }
 
-    // Speculatively emit the meta-Huffman variants (K = 2, 4) after
+    // Speculatively emit the meta-Huffman variants (K = 2, 4, 8) after
     // rewinding to the same starting position. Compare bit lengths and
     // keep the shortest one in the live writer.
     //
-    // The K=4 trial is gated on the image being big enough to amortise
-    // the additional 2 groups' worth of Huffman-tree headers. K=4 wins
-    // on images with several visually distinct regions (typical photos
-    // with sky / foreground / detail). For smaller / more-uniform images
-    // K=2 (or the single-group baseline) wins because the per-group
-    // header overhead dominates.
+    // K=4 / K=8 trials are gated on the image being big enough to
+    // amortise the additional groups' worth of Huffman-tree headers.
+    // Larger K wins on images with several visually distinct regions
+    // (typical photos with sky / foreground / detail / text overlays);
+    // smaller / more-uniform images stay with K=2 or the single-group
+    // baseline because the per-group header overhead dominates.
     //
     // Performance note: each trial costs one full image-stream encode.
-    // The RDO sweep already runs 32+ trials, so we gate the K=4 trial
-    // on a minimum-pixel-count threshold ([`META_HUFFMAN_K4_MIN_PIXELS`])
+    // The RDO sweep already runs 32+ trials, so we gate the K=4 / K=8
+    // trials on minimum-pixel-count thresholds
+    // ([`META_HUFFMAN_K4_MIN_PIXELS`] / [`META_HUFFMAN_K8_MIN_PIXELS`])
     // to keep the total CPU bounded.
     let mut best_bits = baseline_bits;
     let mut best_kind = MetaHuffmanWinner::SingleGroup;
     let mut best_mark_after = bw.mark();
 
-    for &k in &[2u32, 4u32] {
-        if k > 2 && (width as u64) * (height as u64) < META_HUFFMAN_K4_MIN_PIXELS {
-            break;
+    let pixel_count = (width as u64) * (height as u64);
+    for &k in &[2u32, 4u32, 8u32] {
+        match k {
+            4 if pixel_count < META_HUFFMAN_K4_MIN_PIXELS => continue,
+            8 if pixel_count < META_HUFFMAN_K8_MIN_PIXELS => continue,
+            _ => {}
         }
         bw.restore(baseline_mark);
         let emitted = try_encode_meta_huffman(
@@ -1028,6 +1034,15 @@ enum MetaHuffmanWinner {
 /// 4096 pixels (64×64) is empirically where K=4 starts to pay back its
 /// header overhead on natural images (aligns with libwebp's heuristic).
 const META_HUFFMAN_K4_MIN_PIXELS: u64 = 4096;
+
+/// Below this pixel count the K=8 meta-Huffman trial is skipped. Each
+/// extra group adds five Huffman-tree headers (≈ 200-400 bits typical
+/// after RLE on the code-length tree) and a wider meta-image alphabet,
+/// so the K=8 split needs a noticeably larger image to amortise the
+/// jump from K=4. 16384 pixels (128×128) is empirically the floor at
+/// which K=8 starts to win on natural fixtures with several visually
+/// distinct regions; below it K=4 (or K=2) is always smaller.
+const META_HUFFMAN_K8_MIN_PIXELS: u64 = 16384;
 
 /// Single-Huffman-group baseline: one set of {green, red, blue, alpha,
 /// distance} trees covering the entire image. Mirrors the original

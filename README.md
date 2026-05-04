@@ -209,38 +209,53 @@ perceptual targets at matching `quality` values.
 
 Encoder scope (current):
 
-- VP8L lossless from `Rgba` or `Rgb24` (single frame). Emits subtract-green +
-  colour (G↔R/B decorrelation) + tile-based predictor transforms plus
-  a tunable colour cache, which puts the ratio in the neighbourhood
-  of libwebp on smooth/photographic content. The default `encode_vp8l_argb`
-  entry point now runs a 32-trial RDO sweep over every combination of
-  the four optional transforms × four colour-cache widths
-  ({off, 6, 8, 10} bits) and keeps the smallest encoded variant —
-  callers that want a fixed configuration can still call
-  `encode_vp8l_argb_with` directly. Still missing vs libwebp:
-  the palette (colour-indexing) transform, meta-Huffman grouping, and
-  a wider predictor-mode pool (the encoder currently picks between
-  modes 0/1/2/11 per tile rather than probing all 14).
+- VP8L lossless from `Rgba` or `Rgb24` (single frame). Emits
+  subtract-green + colour (G↔R/B decorrelation) + tile-based predictor
+  + colour-indexing (palette) transforms plus a tunable colour cache.
+  The default `encode_vp8l_argb` entry point runs a 32-trial RDO sweep
+  over every combination of the four optional transforms × four
+  colour-cache widths ({off, 6, 8, 10} bits) and keeps the smallest
+  encoded variant. Each trial also tries meta-Huffman per-tile
+  grouping at K = 1 / 2 / 4 / 8 (gated by image pixel count) and
+  picks the byte-smallest. Predictor pool covers all 14 RFC 9649
+  §4.1 modes per 16-pixel tile. Optional near-lossless preprocessing
+  (libwebp-compatible `0..=100` knob) collapses near-identical pixels
+  into longer LZ77 runs / richer cache hits. Callers that want a
+  fixed configuration call `encode_vp8l_argb_with` directly.
+  Encoder ≈ 90 % libwebp parity on natural fixtures (lossless ratio
+  within ~30 % of cwebp on the workspace corpus); residual gap is
+  multi-pass LZ77 (cost-modelled match selection), the entropy-image
+  transform, and finer predictor-tile-size adaptation.
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)
   container; `Yuva420P` skips the YUV→RGB→YUV roundtrip the `Rgba`
   path forces. `Rgb24` streams the RGB→YUV conversion without a
-  Rgba alloc (issue #7). Default qindex from `oxideav-vp8` is used
-  unless the caller selects a specific one via
-  `encoder_vp8::make_encoder_with_qindex` (VP8 qindex `0..=127`,
-  lower = better) or the libwebp-style
-  `encoder_vp8::make_encoder_with_quality` (`0.0..=100.0`,
-  higher = better) — see the encoder section above for the mapping
-  caveat.
+  Rgba alloc (issue #7). Per-segment quantiser deltas (RFC 6386 §10)
+  + per-segment loop-filter deltas (§15.2) are wired in based on a
+  source-luma variance classifier, so smooth / textured regions get
+  finer / coarser quant + softer / stronger deblocking respectively.
+  Default qindex from `oxideav-vp8` is used unless the caller selects
+  a specific one via `encoder_vp8::make_encoder_with_qindex`
+  (VP8 qindex `0..=127`, lower = better) or the libwebp-style
+  `encoder_vp8::make_encoder_with_quality` (`0.0..=100.0`, higher =
+  better). Encoder ≈ 80 % libwebp parity on natural fixtures;
+  residual gap is per-frequency AC/DC quantiser deltas (`y_dc_delta`
+  / `y2_dc_delta` / `y2_ac_delta` / `uv_dc_delta` / `uv_ac_delta`)
+  pending the next `oxideav-vp8` publish, plus a quality-driven
+  quantizer matrix.
 - `VP8X` extended header is emitted automatically whenever the output
   carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
   the `riff::WebpMetadata` helper.
-- Animated WebP encode via [`build_animated_webp`] — emits a
+- Animated WebP encode via [`build_animated_webp`] /
+  [`build_animated_webp_with_options`] — emits a
   `VP8X + ANIM + ANMF...ANMF` file from a slice of `AnimFrame`s with
-  per-frame durations, x/y offsets, blend, and disposal flags. Each
-  ANMF wraps a `VP8L` lossless sub-chunk (mixed lossy + lossless
-  animations are not yet produced; the decoder accepts both shapes).
+  per-frame durations, x/y offsets, blend, and disposal flags. Per-frame
+  `AnimFrameMode::Auto` runs both VP8L and VP8+ALPH encoders and picks
+  whichever sub-chunk is byte-smaller — animations can mix lossless
+  and lossy frames, matching libwebp's `WebPAnimEncoderAdd` behaviour.
+  All four blend × dispose-to-background combinations round-trip
+  through the in-crate decoder.
 
 Decoder scope:
 

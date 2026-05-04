@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8l-enc)* extend the meta-Huffman per-tile grouping sweep from
+  K = {1, 2, 4} to K = {1, 2, 4, 8}. Each `encode_image_stream` call
+  speculatively emits the K=8 candidate (gated on ≥ 16384 px = 128×128
+  pixels — below it the eight extra Huffman-tree headers dominate any
+  per-cluster savings) alongside the existing K=2 / K=4 trials and
+  keeps the byte-smallest. The k-means clustering already generalised
+  to arbitrary K so this is a one-line widening of the K-loop plus the
+  matching minimum-pixel-count gate. The decoder side already supported
+  arbitrary K (the meta-image's group-id field is 16 bits wide). Pushes
+  VP8L encoder closer to libwebp's per-tile entropy-image parity on
+  fixtures with several visually distinct sub-regions. The K=8 candidate
+  is now also probed inside every RDO trial (the 32-trial sweep already
+  exercises every transform × cache combination, and the K=8 trial
+  rides inside each one), so it picks the winner across the joint
+  configuration space without extra outer iterations.
+- *(test)* `meta_huffman_k8_round_trips_eight_strip_fixture` +
+  `meta_huffman_k8_shrinks_or_matches_smaller_k_on_eight_strip` —
+  exercises the K=8 path on a 128×128 fixture with eight horizontal
+  strips of distinctly-different statistics; verifies round-trip
+  through the in-crate decoder and that the encoded stream is at least
+  half the raw RGBA size.
 - *(vp8-enc)* re-wire per-segment loop-filter delta tuning. Now that
   `oxideav-vp8` 0.1.6 publishes `Vp8EncoderConfig::segment_lf_deltas`
   (#337), the WebP single-frame lossy config plumbs the
