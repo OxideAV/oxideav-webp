@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(test)* `lossless_corpus` integration test walks the seven
+  workspace `docs/image/webp/fixtures/lossless-*` fixtures and asserts
+  bit-exact RGBA equality with each `expected.png` ground truth.
+  Covers the trivial single-pixel case, opaque RGB, RGBA, photo-like
+  content (subtract-green + predictor + LZ77 + Huffman), the
+  colour-cache hit path, the colour-indexing/palette transform, and
+  the cross-colour transform. All seven fixtures pass on the first
+  CI run, which proves the VP8L decoder is bit-exact with libwebp on
+  the workspace docs corpus.
+
 ### Fixed
 
 - *(vp8-decode)* bit-exact YUV→RGB + chroma upsampling alignment with
