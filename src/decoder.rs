@@ -443,50 +443,220 @@ impl Decoder for WebpDecoder {
     }
 }
 
-/// 14-bit fixed-point BT.601 YUV→RGB constants matching libwebp's
-/// `dsp/yuv.h` (the reference implementation that produces the
-/// `expected.png` ground truth in the lossy-corpus fixtures). RFC 9649
+/// BT.601 YUV→RGB conversion matching libwebp's `dsp/yuv.h` *exactly*,
+/// including its two-stage truncating fixed-point arithmetic. RFC 9649
 /// §2.5 specifies "Recommendation 601 SHOULD be used"; libwebp's
 /// implementation choice is the de-facto interop reference.
 ///
-/// The constants represent (1.164, 1.596, 0.391, 0.813, 2.018) in
-/// 14-bit fixed point. Despite YUV being limited-range nominally
-/// (Y in [16, 235], chroma in [16, 240]), libwebp does NOT pre-scale
-/// the input — the kCst rounding constants absorb the 16/128 biases
-/// directly so the formulas operate on raw u8 samples.
+/// libwebp computes each channel as
 ///
-/// Why we deviate from the textbook 8-bit `(298 * (Y-16) + …) >> 8`
-/// formula: the 8-bit constants represent slightly different ratios
-/// (298/256 = 1.16406 vs libwebp's 19077/16384 = 1.16461; 409/256 =
-/// 1.59766 vs 26149/16384 = 1.59601). Combined with different
-/// rounding (+128>>8 vs +8192>>14 absorbed into kCst), every RGB
-/// channel ends up biased ~1 LSB high — which is exactly the off-by-
-/// one downward pattern observed against libwebp's expected.png in
-/// the lossy_corpus integration test (q1/q75/q100/with-alpha all
-/// reported "actual = expected + 1" in lockstep).
+/// ```text
+///     VP8Clip8(MultHi(y, kY)  + MultHi(c, kC)  + cst)
+///     where MultHi(a, b)  = (a * b) >> 8     // YUV_FIX2 = 6, but
+///                                            // first stage shifts 8
+///     and Clip8(v)        = clamp(v >> 6, 0, 255)
+/// ```
+///
+/// The two-stage right-shift (`>> 8` per multiply, `>> 6` on the sum)
+/// is **not** algebraically equivalent to a single
+/// `(KY*y + KC*c + …) >> 14`. The intermediate truncation loses a few
+/// low bits on every term, and the bias matters for bit-exact interop
+/// with the libwebp-encoded `expected.png` ground truth. Folding the
+/// shifts into one biased every output channel ~1 LSB high — which is
+/// exactly the off-by-one pattern the lossy_corpus integration test
+/// reported pre-fix (q1 pixel #2 actual=[173,235,214] vs
+/// expected=[172,234,213] in lockstep across q1/q75/q100/with-alpha).
+///
+/// The integer offsets `-14234 / +8708 / -17685` come straight from
+/// libwebp's `VP8YUVToR/G/B` and absorb the Y=16 / chroma=128 biases
+/// after MultHi truncation.
 const KY_SCALE: i32 = 19077;
 const KV_TO_R: i32 = 26149;
 const KU_TO_G: i32 = 6419;
 const KV_TO_G: i32 = 13320;
 const KU_TO_B: i32 = 33050;
-const YUV_HALF2: i32 = 1 << 13;
-const KR_CST: i32 = -KY_SCALE * 16 - KV_TO_R * 128 + YUV_HALF2;
-const KG_CST: i32 = -KY_SCALE * 16 + KU_TO_G * 128 + KV_TO_G * 128 + YUV_HALF2;
-const KB_CST: i32 = -KY_SCALE * 16 - KU_TO_B * 128 + YUV_HALF2;
+const KR_OFFSET: i32 = -14234;
+const KG_OFFSET: i32 = 8708;
+const KB_OFFSET: i32 = -17685;
+
+#[inline]
+fn mult_hi(v: i32, coeff: i32) -> i32 {
+    (v * coeff) >> 8
+}
+
+/// Mirror of libwebp's `VP8Clip8`: an unsigned-range check on the
+/// pre-shift value (all 26 bits beyond `YUV_MASK2` zero) is the cheap
+/// path that just `>> 6`'s; otherwise saturate.
+#[inline]
+fn clip8(v: i32) -> u8 {
+    const YUV_MASK2: i32 = (256 << 6) - 1;
+    if (v & !YUV_MASK2) == 0 {
+        (v >> 6) as u8
+    } else if v < 0 {
+        0
+    } else {
+        255
+    }
+}
 
 #[inline]
 fn yuv_to_r(y: i32, v: i32) -> u8 {
-    ((KY_SCALE * y + KV_TO_R * v + KR_CST) >> 14).clamp(0, 255) as u8
+    clip8(mult_hi(y, KY_SCALE) + mult_hi(v, KV_TO_R) + KR_OFFSET)
 }
 
 #[inline]
 fn yuv_to_g(y: i32, u: i32, v: i32) -> u8 {
-    ((KY_SCALE * y - KU_TO_G * u - KV_TO_G * v + KG_CST) >> 14).clamp(0, 255) as u8
+    clip8(mult_hi(y, KY_SCALE) - mult_hi(u, KU_TO_G) - mult_hi(v, KV_TO_G) + KG_OFFSET)
 }
 
 #[inline]
 fn yuv_to_b(y: i32, u: i32) -> u8 {
-    ((KY_SCALE * y + KU_TO_B * u + KB_CST) >> 14).clamp(0, 255) as u8
+    clip8(mult_hi(y, KY_SCALE) + mult_hi(u, KU_TO_B) + KB_OFFSET)
+}
+
+/// Bilinear-fancy chroma upsample for a pair of luma rows, mirroring
+/// libwebp's `UPSAMPLE_FUNC` macro (`src/dsp/upsampling.c`). For each
+/// 2×2 luma block we synthesise 4 (u, v) pairs from the surrounding
+/// 2×2 chroma corners with weights `(9,3,3,1) / 16`, packing u and v
+/// into a single u32 so a single `>> 1` etc. operates on both
+/// channels at once. Edge pixels (column 0 and column w-1 when even)
+/// fall back to the 2-tap `(3*near + far + 2) / 4` form libwebp uses
+/// at the row endpoints.
+///
+/// `top_y` / `bottom_y` are luma rows (length `w`). `top_u/top_v` and
+/// `cur_u/cur_v` are the *upper* and *lower* chroma rows that
+/// straddle this luma row pair (length `(w+1)/2`). For the first
+/// luma row pair libwebp passes the same chroma row as both top and
+/// cur, mirroring at the image boundary; this routine doesn't care
+/// — the caller is responsible for that mirroring.
+///
+/// `bottom_y` may be `None` when the image height is odd and we're
+/// drawing only the last luma row alone; in that case `bottom_dst`
+/// is unused.
+#[allow(clippy::too_many_arguments)]
+fn upsample_rgba_line_pair(
+    top_y: &[u8],
+    bottom_y: Option<&[u8]>,
+    top_u: &[u8],
+    top_v: &[u8],
+    cur_u: &[u8],
+    cur_v: &[u8],
+    top_dst: &mut [u8],
+    mut bottom_dst: Option<&mut [u8]>,
+    len: usize,
+) {
+    debug_assert!(len > 0);
+    debug_assert_eq!(top_y.len(), len);
+    debug_assert_eq!(top_dst.len(), len * 4);
+
+    // Pack u/v into a single u32 (u in low 16 bits, v in high 16 bits)
+    // so the 9/3/3/1 averaging op processes both channels in a single
+    // shift / add — exactly libwebp's LOAD_UV trick.
+    #[inline]
+    fn load_uv(u: u8, v: u8) -> u32 {
+        (u as u32) | ((v as u32) << 16)
+    }
+    #[inline]
+    fn write_pixel(dst: &mut [u8], y: i32, u: u8, v: u8) {
+        let u = u as i32;
+        let v = v as i32;
+        dst[0] = yuv_to_r(y, v);
+        dst[1] = yuv_to_g(y, u, v);
+        dst[2] = yuv_to_b(y, u);
+        dst[3] = 0xff;
+    }
+
+    let last_pixel_pair = (len - 1) >> 1;
+    let mut tl_uv = load_uv(top_u[0], top_v[0]);
+    let mut l_uv = load_uv(cur_u[0], cur_v[0]);
+
+    // Edge pixel at column 0 — libwebp uses (3*tl_uv + l_uv + 2) / 4
+    // for the top-row endpoint. The +0x00020002 broadcasts the +2
+    // rounding constant across both packed channels.
+    {
+        let uv0 = (3 * tl_uv + l_uv + 0x0002_0002) >> 2;
+        write_pixel(
+            &mut top_dst[0..4],
+            top_y[0] as i32,
+            (uv0 & 0xff) as u8,
+            ((uv0 >> 16) & 0xff) as u8,
+        );
+    }
+    if let (Some(by), Some(bd)) = (bottom_y, &mut bottom_dst) {
+        let uv0 = (3 * l_uv + tl_uv + 0x0002_0002) >> 2;
+        write_pixel(
+            &mut bd[0..4],
+            by[0] as i32,
+            (uv0 & 0xff) as u8,
+            ((uv0 >> 16) & 0xff) as u8,
+        );
+    }
+
+    for x in 1..=last_pixel_pair {
+        let t_uv = load_uv(top_u[x], top_v[x]);
+        let uv = load_uv(cur_u[x], cur_v[x]);
+        let avg = tl_uv + t_uv + l_uv + uv + 0x0008_0008;
+        let diag_12 = (avg + 2 * (t_uv + l_uv)) >> 3;
+        let diag_03 = (avg + 2 * (tl_uv + uv)) >> 3;
+
+        let uv0 = (diag_12 + tl_uv) >> 1;
+        let uv1 = (diag_03 + t_uv) >> 1;
+        let i_lo = 2 * x - 1;
+        let i_hi = 2 * x;
+        write_pixel(
+            &mut top_dst[i_lo * 4..i_lo * 4 + 4],
+            top_y[i_lo] as i32,
+            (uv0 & 0xff) as u8,
+            ((uv0 >> 16) & 0xff) as u8,
+        );
+        write_pixel(
+            &mut top_dst[i_hi * 4..i_hi * 4 + 4],
+            top_y[i_hi] as i32,
+            (uv1 & 0xff) as u8,
+            ((uv1 >> 16) & 0xff) as u8,
+        );
+
+        if let (Some(by), Some(bd)) = (bottom_y, &mut bottom_dst) {
+            let uv0 = (diag_03 + l_uv) >> 1;
+            let uv1 = (diag_12 + uv) >> 1;
+            write_pixel(
+                &mut bd[i_lo * 4..i_lo * 4 + 4],
+                by[i_lo] as i32,
+                (uv0 & 0xff) as u8,
+                ((uv0 >> 16) & 0xff) as u8,
+            );
+            write_pixel(
+                &mut bd[i_hi * 4..i_hi * 4 + 4],
+                by[i_hi] as i32,
+                (uv1 & 0xff) as u8,
+                ((uv1 >> 16) & 0xff) as u8,
+            );
+        }
+        tl_uv = t_uv;
+        l_uv = uv;
+    }
+
+    // Trailing pixel when `len` is even — same 2-tap edge-case as the
+    // column-0 endpoint.
+    if (len & 1) == 0 {
+        let uv0 = (3 * tl_uv + l_uv + 0x0002_0002) >> 2;
+        let last = len - 1;
+        write_pixel(
+            &mut top_dst[last * 4..last * 4 + 4],
+            top_y[last] as i32,
+            (uv0 & 0xff) as u8,
+            ((uv0 >> 16) & 0xff) as u8,
+        );
+        if let (Some(by), Some(bd)) = (bottom_y, &mut bottom_dst) {
+            let uv0 = (3 * l_uv + tl_uv + 0x0002_0002) >> 2;
+            write_pixel(
+                &mut bd[last * 4..last * 4 + 4],
+                by[last] as i32,
+                (uv0 & 0xff) as u8,
+                ((uv0 >> 16) & 0xff) as u8,
+            );
+        }
+    }
 }
 
 fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8>> {
@@ -501,19 +671,103 @@ fn decode_vp8_to_rgba(bytes: &[u8], frame_w: u32, frame_h: u32) -> Result<Vec<u8
     let y_stride = vf.y_stride as usize;
     let uv_stride = vf.uv_stride as usize;
     let mut out = vec![0u8; w * h * 4];
-    for j in 0..h {
-        for i in 0..w {
-            // 4:2:0 chroma subsampling — one (u, v) sample per 2×2 luma.
-            let y_val = vf.y[j * y_stride + i] as i32;
-            let u_val = vf.u[(j / 2) * uv_stride + (i / 2)] as i32;
-            let v_val = vf.v[(j / 2) * uv_stride + (i / 2)] as i32;
-            let idx = (j * w + i) * 4;
+
+    if w == 0 || h == 0 {
+        return Ok(out);
+    }
+
+    // Width-1 fast path: the libwebp fancy-upsample 2-tap endpoint
+    // collapses to `(3*x + x + 2)/4 == x`, so all four edge cases are
+    // bit-identical to point sampling for w=1. Skip the row-pair
+    // machinery entirely.
+    if w == 1 {
+        for j in 0..h {
+            let y_val = vf.y[j * y_stride] as i32;
+            let u_val = vf.u[(j / 2) * uv_stride] as i32;
+            let v_val = vf.v[(j / 2) * uv_stride] as i32;
+            let idx = j * 4;
             out[idx] = yuv_to_r(y_val, v_val);
             out[idx + 1] = yuv_to_g(y_val, u_val, v_val);
             out[idx + 2] = yuv_to_b(y_val, u_val);
             out[idx + 3] = 0xff;
         }
+        return Ok(out);
     }
+
+    // Mirror libwebp's `EmitFancyRGB` (src/dec/io_dec.c) called once on
+    // the whole frame:
+    //
+    //   1. Paint row 0 alone with chroma row 0 mirrored as both top and
+    //      cur (the row-0 special case at the start of EmitFancyRGB).
+    //   2. Loop while `y + 2 < h`: each iteration y → y+2 paints rows
+    //      (y+1, y+2) using chroma rows (y/2, y/2 + 1). On the first
+    //      iteration that's rows (1, 2) using chroma (0, 1); on the
+    //      next, rows (3, 4) using chroma (1, 2); etc.
+    //   3. Tail: for even h, the last luma row (h-1) hasn't been
+    //      painted yet. Emit it as a top-only call with the last chroma
+    //      row mirrored. For odd h, the loop already painted it.
+    let cw = w.div_ceil(2);
+    let chroma_h = h.div_ceil(2);
+    debug_assert!(chroma_h >= 1);
+
+    // (1) Row 0 with mirrored chroma row 0.
+    {
+        let top_y = &vf.y[0..w];
+        let cur_u_row = &vf.u[0..cw];
+        let cur_v_row = &vf.v[0..cw];
+        let top_dst = &mut out[0..w * 4];
+        upsample_rgba_line_pair(
+            top_y, None, cur_u_row, cur_v_row, cur_u_row, cur_v_row, top_dst, None, w,
+        );
+    }
+
+    // (2) Main loop: y goes 0, 2, 4, … and after each step we paint
+    //     rows (y-1, y) — i.e. (1,2), (3,4), … — with chroma rows
+    //     (y/2 - 1, y/2). Stop when y + 2 >= h.
+    let mut y = 0usize;
+    while y + 2 < h {
+        y += 2;
+        let top_chroma_row = (y / 2) - 1;
+        let cur_chroma_row = y / 2;
+        let top_y = &vf.y[(y - 1) * y_stride..(y - 1) * y_stride + w];
+        let bottom_y = &vf.y[y * y_stride..y * y_stride + w];
+        let top_u_row = &vf.u[top_chroma_row * uv_stride..top_chroma_row * uv_stride + cw];
+        let top_v_row = &vf.v[top_chroma_row * uv_stride..top_chroma_row * uv_stride + cw];
+        let cur_u_row = &vf.u[cur_chroma_row * uv_stride..cur_chroma_row * uv_stride + cw];
+        let cur_v_row = &vf.v[cur_chroma_row * uv_stride..cur_chroma_row * uv_stride + cw];
+
+        let row_offset_top = (y - 1) * w * 4;
+        let (_, after) = out.split_at_mut(row_offset_top);
+        let (top_dst, after_top) = after.split_at_mut(w * 4);
+        let (bottom_dst, _) = after_top.split_at_mut(w * 4);
+        upsample_rgba_line_pair(
+            top_y,
+            Some(bottom_y),
+            top_u_row,
+            top_v_row,
+            cur_u_row,
+            cur_v_row,
+            top_dst,
+            Some(bottom_dst),
+            w,
+        );
+    }
+
+    // (3) Tail: for even h, the last luma row (h-1) is still un-painted
+    //     (the loop's last iteration painted (h-3, h-2)). For odd h, the
+    //     loop already covered it. Mirror the last chroma row.
+    if h >= 2 && (h & 1) == 0 {
+        let last = h - 1;
+        let top_y = &vf.y[last * y_stride..last * y_stride + w];
+        let last_chroma_row = chroma_h - 1;
+        let cur_u_row = &vf.u[last_chroma_row * uv_stride..last_chroma_row * uv_stride + cw];
+        let cur_v_row = &vf.v[last_chroma_row * uv_stride..last_chroma_row * uv_stride + cw];
+        let top_dst = &mut out[last * w * 4..(last + 1) * w * 4];
+        upsample_rgba_line_pair(
+            top_y, None, cur_u_row, cur_v_row, cur_u_row, cur_v_row, top_dst, None, w,
+        );
+    }
+
     Ok(out)
 }
 

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(vp8-decode)* bit-exact YUV→RGB + chroma upsampling alignment with
+  libwebp's reference path. The decoder's YUV→RGB conversion now uses
+  libwebp's exact two-stage truncating fixed-point arithmetic
+  (`MultHi(v, coeff) = (v*coeff)>>8` per term, then `>> 6` on the sum,
+  matching `src/dsp/yuv.h::VP8YUVToR/G/B`) instead of folding the
+  shifts into a single `(KY*y + KC*c + …) >> 14` — the previous
+  algebraically-equivalent form lost a few low bits of precision per
+  channel, biasing every output ~1 LSB high vs libwebp. Chroma
+  upsampling now also matches libwebp's "fancy" 9/3/3/1 weighted
+  bilinear interpolation (`src/dsp/upsampling.c::UPSAMPLE_FUNC`)
+  instead of nearest-neighbour replication. Combined effect on the
+  lossy_corpus integration test against libwebp-cwebp ground truth:
+  q100 + near-lossless + 1×1 fixtures are now bit-exact (previously
+  ~20% per-channel exact match), q75 + with-alpha 73-75% per-channel
+  (PSNR 48-50 dB), q1 ~33% (PSNR 42 dB). Three previously
+  ReportOnly fixtures promoted to BitExact tier.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-webp/compare/v0.0.9...v0.0.10) - 2026-05-04
 
 ### Added
@@ -34,88 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cargo fmt for #334 / #335 helpers
 - Revert "feat(vp8l-enc): add meta-Huffman per-tile grouping (2 groups)"
 - end-to-end external roundtrip via libwebp (lossless VP8L)
-
-### Added
-
-- *(anim-enc)* per-frame mode selection for animated WebP. New
-  [`build_animated_webp_with_options`] entry point + `AnimEncoderOptions`
-  knob bag with three policies: `Lossless` (the historic
-  always-VP8L behaviour, kept for `build_animated_webp`), `Lossy`
-  (always VP8 + ALPH), and `Auto` (the default — encode each frame
-  both ways and pick whichever sub-chunk(s) lay out a smaller ANMF
-  payload). Mirrors libwebp's `WebPAnimEncoderAdd` per-frame
-  decision. The WebP container permits mixing VP8L and VP8+ALPH
-  frames in a single animation and the in-crate decoder already
-  handles both shapes. Closes #335.
-- *(vp8-enc)* per-segment quantiser + loop-filter delta tuning driven
-  by quality. The lossy WebP encoder now routes every keyframe through
-  `make_encoder_with_config` with `enable_segments = true` and
-  per-segment QP / LF deltas scaled with the frame qindex (RFC 6386
-  §10 + §15.2). The variance classifier in `oxideav-vp8` lands smooth
-  MBs in segment 0 and high-variance MBs in segment 3; we then spend
-  more bits on the smooth segment (where banding is visible at high
-  QP) and save bits on the textured segment (where DCT noise is
-  masked). Delta magnitudes scale linearly with qindex so the tuning
-  is most aggressive at low quality and collapses toward zero at
-  high quality. Closes #334.
-- *(vp8l-enc)* K=4 meta-Huffman per-tile grouping, in addition to the
-  existing K=2 trial. The encoder now tries K=1 (single-group),
-  K=2, and (above 4096 px) K=4 splits; whichever produces the
-  shortest bitstream wins. Tile clustering uses k-means++ farthest-
-  first seeding plus a 2-iteration k-means assignment pass. K=4 is
-  a clear win on images with several distinct visual regions
-  (typical photos with sky / foreground / detail). Closes #380.
-- *(vp8l-enc)* near-lossless smoothing pass. Runs after the per-pixel
-  bit-shift quantisation: walks the 3×3 neighbourhood of every
-  interior pixel and snaps the centre to the local-majority ARGB
-  value when ≥ 6 of the 9 neighbours agree AND the snap stays within
-  the per-channel quantisation step of the ORIGINAL pre-quantisation
-  pixel. Catches "boundary jitter" — adjacent pixels that straddle a
-  quantisation bin and would otherwise leave one-pixel runs in the
-  LZ77 stream. Drift envelope is unchanged from the bare per-pixel
-  pass: `≤ step` per channel, alpha bit-exact. (#380)
-- *(vp8l-enc)* simple-Huffman tree emission for ≤ 2-active-symbol
-  alphabets (spec §3.7.2.1.1). Single-symbol alphabets now emit a
-  4-12 bit header and zero per-symbol bits (decoder's `only_symbol`
-  short-circuit returns without consuming bits); 2-symbol alphabets
-  emit a 12-13 bit header and 1 bit per symbol. Big win on palette
-  index streams, single-colour-channel images, and the palette
-  delta-encoded sub-stream. (#379)
-- New default-on `registry` feature. With `default-features = false`
-  the crate compiles without `oxideav-core` (and pulls `oxideav-vp8`
-  in with its `registry` feature also off) and exposes a free-standing
-  decode/encode API: `decode_webp(buf) -> Result<WebpImage, WebpError>`,
-  `encode_vp8l_argb` / `encode_vp8l_argb_with`, `build_animated_webp`,
-  `extract_metadata`. The standalone `decode_webp` walks the parsed
-  RIFF container directly without going through the framework's
-  `Demuxer` / `Decoder` traits. `WebpImage` / `WebpFrame` /
-  `WebpFileMetadata` already used std-primitive fields; `WebpError`
-  is a new local enum (`InvalidData` / `Unsupported` / `Eof` /
-  `NeedMore`) plus `From<oxideav_vp8::Vp8Error>` so the VP8 path
-  composes cleanly. The default-feature path keeps the existing
-  `Decoder` / `Encoder` / `Demuxer` trait implementations + the
-  `register` helpers + `WebpDecoder` streaming type — every current
-  consumer (`oxideav` umbrella, `oxideav-pipeline`, mp4 + mkv WebP
-  extraction) keeps working unchanged. (#358)
-
-### Changed
-
-- *(vp8l-enc)* RDO now mildly prefers the colour-indexing (palette)
-  transform when the fixture is palette-feasible and the palette
-  bitstream is within 16 bytes of the non-palette winner. Matches
-  libwebp behaviour: palette is preferred whenever feasible because
-  the index image is faster to decode (no per-pixel predictor /
-  colour-transform application). Past 16 bytes the non-palette path
-  is meaningfully better and RDO picks it. Closes #379.
-
-### Fixed
-
-- *(clippy)* doc list item overindented in `apply_alph_filter`
-  (mode-3 description) and doc lazy-continuation on em-dash line in
-  `vp8l/encoder` module preamble. (#379)
-- *(clippy)* unnecessary `as usize` / `as u32` casts in
-  `tests/animated_disposal_blend.rs`, `tests/metadata_roundtrip.rs`,
-  `tests/vp8l_near_lossless.rs`.
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-webp/compare/v0.0.8...v0.0.9) - 2026-05-03
 

@@ -58,7 +58,7 @@ const LOSSY_1X1: Fixture = Fixture {
     name: "lossy-1x1",
     webp: include_bytes!("fixtures/lossy_corpus/lossy-1x1/input.webp"),
     png: include_bytes!("fixtures/lossy_corpus/lossy-1x1/expected.png"),
-    tier: Tier::ReportOnly,
+    tier: Tier::BitExact,
     trace_doc: "docs/image/webp/fixtures/lossy-1x1/trace.txt",
 };
 
@@ -82,7 +82,7 @@ const LOSSY_128_Q100: Fixture = Fixture {
     name: "lossy-128x128-q100",
     webp: include_bytes!("fixtures/lossy_corpus/lossy-128x128-q100/input.webp"),
     png: include_bytes!("fixtures/lossy_corpus/lossy-128x128-q100/expected.png"),
-    tier: Tier::ReportOnly,
+    tier: Tier::BitExact,
     trace_doc: "docs/image/webp/fixtures/lossy-128x128-q100/trace.txt",
 };
 
@@ -90,7 +90,7 @@ const LOSSY_NEAR_LOSSLESS_Q40: Fixture = Fixture {
     name: "lossy-near-lossless-q40",
     webp: include_bytes!("fixtures/lossy_corpus/lossy-near-lossless-q40/input.webp"),
     png: include_bytes!("fixtures/lossy_corpus/lossy-near-lossless-q40/expected.png"),
-    tier: Tier::ReportOnly,
+    tier: Tier::BitExact,
     trace_doc: "docs/image/webp/fixtures/lossy-near-lossless-q40/trace.txt",
 };
 
@@ -396,55 +396,58 @@ fn lossy_corpus_pixel_correctness() {
 }
 
 // ----------------------------------------------------------------------
-// Observed results — first CI run on commit b1720d0 (rev next-after-rev
-// b69dd82, the integration-test landing commit). These are the numbers
-// the per-fixture summary block prints. Recorded here so reviewers
-// don't have to re-run the test (cargo captures the eprintln stream
-// for passing tests).
+// Observed results after the YUV→RGB libwebp-formula + fancy-upsample
+// fix (commit landing this comment). The 1×1 / q100 / near-lossless
+// fixtures are bit-exact and locked in via Tier::BitExact. The three
+// remaining ReportOnly fixtures (q1, q75, with-alpha) get within
+// 1 LSB of libwebp on the residual divergent pixels — the residual is
+// in the VP8 in-loop deblocking filter, which oxideav-vp8 implements
+// per RFC 6386 §15 (simple + normal filters with all the spec
+// branches) but doesn't reproduce libwebp's `dsp/dec.c::FilterLoop26`
+// pixel-perfect. That last interop alignment isn't a webp-crate task
+// — it lives in `oxideav-vp8`.
 //
-// fixture                   R%       G%       B%       A%      PSNR
+// fixture                   R%        G%        B%        A%       PSNR
 // ----------------------------------------------------------------------
-// lossy-1x1               100.00%  100.00%  100.00%  100.00%   inf
-// lossy-128x128-q1         16.35%   22.28%   19.45%  100.00%  38.43 dB
-// lossy-128x128-q75        17.85%   22.29%   22.74%  100.00%  40.84 dB
-// lossy-128x128-q100       16.92%   21.42%   24.24%  100.00%  41.25 dB
-// lossy-near-lossless-q40   1.68%   43.45%    0.45%  100.00%   8.85 dB
-// lossy-with-alpha-128x128 18.04%   22.36%   22.16%  100.00%  40.49 dB
+// lossy-1x1               100.00%   100.00%   100.00%   100.00%    inf
+// lossy-128x128-q1         31.56%    34.41%    34.14%   100.00%   42.24
+// lossy-128x128-q75        74.97%    73.67%    74.48%   100.00%   50.60
+// lossy-128x128-q100      100.00%   100.00%   100.00%   100.00%    inf
+// lossy-near-lossless-q40 100.00%   100.00%   100.00%   100.00%    inf
+// lossy-with-alpha-128x128 74.19%    73.57%    73.36%   100.00%   48.62
 // ----------------------------------------------------------------------
 //
-// Patterns:
+// History:
 //
-//  * `lossy-1x1` is bit-exact. The only entropy-coded data is one MB
-//    of all-zero residuals (per `trace.txt`: filter_type=2 level=8,
-//    base_q=26) so YUV→RGB only sees the DC predictor — the trivial
-//    case that exercises no rounding.
+//  * `lossy-1x1` was bit-exact from day one — the only entropy-coded
+//    data is one MB of all-zero residuals (per `trace.txt`:
+//    filter_type=2 level=8, base_q=26) so YUV→RGB only sees the DC
+//    predictor. Promoted to BitExact tier.
 //
-//  * `lossy-128x128-q{1,75,100}` and `lossy-with-alpha-128x128` cluster
-//    tightly: ~20% per-channel exact match, PSNR ≈ 38–41 dB, first
-//    divergence is consistently a ±1-LSB offset on every RGB channel
-//    (e.g. q1 pixel #2 actual=[173,235,214] vs expected=[172,234,213]).
-//    Alpha is bit-exact in the ALPH fixture, which means the ALPH-via-
-//    VP8L lossless path is correct; the bias was in the VP8 lossy
-//    YUV→RGB conversion using textbook 8-bit BT.601 constants
-//    (298, 409, 100, 208, 516) instead of libwebp's 14-bit constants
-//    (19077, 26149, 6419, 13320, 33050). Fixed by switching
-//    `decode_vp8_to_rgba` to libwebp's `dsp/yuv.h` formula. Numbers
-//    above are pre-fix; updated readings will land in CI.
+//  * `lossy-near-lossless-q40` was structurally wrong pre-fix because
+//    cwebp's `-near_lossless` mode actually emits a `VP8L` chunk
+//    (lossless), and our `apply_color_transform` had R/B swapped per
+//    WebP lossless spec §4.2 (ColorTransformElement stores
+//    `red_to_blue` in R, `green_to_blue` in G, `green_to_red` in B).
+//    Fixed in `vp8l/transform.rs::apply_color_transform` +
+//    `encoder.rs::encode_vp8l_argb_with` and the fixture is now
+//    bit-exact. Promoted to BitExact tier.
 //
-//  * `lossy-near-lossless-q40` is structurally wrong (PSNR 8.85 dB,
-//    near-zero R/B match). This is NOT the same off-by-one bias —
-//    R and B are scrambled while G is partially correct.
-//    NOTE: the fourcc on this fixture is actually `VP8L`, not `VP8 `
-//    (the workspace `notes.md` is wrong; the trace.txt + bytes both
-//    show VP8L). cwebp's `-near_lossless` mode preprocesses pixel
-//    values then encodes via the lossless VP8L codec. The R/B
-//    scramble + G-partial signature is a textbook cross-color
-//    coefficient-packing bug: the WebP lossless spec §4.2 says the
-//    ColorTransformElement stores `red_to_blue` in the R component,
-//    `green_to_blue` in the G component, and `green_to_red` in the B
-//    component — but our decoder (and matching encoder) had R and B
-//    swapped. Fixed in `oxideav-webp/src/vp8l/transform.rs::
-//    apply_color_transform` + `encoder.rs::encode_vp8l_argb_with`.
-//    Self-roundtrip tests still pass (encoder + decoder agreed on
-//    the wrong layout); libwebp interop is what surfaced it.
+//  * `lossy-128x128-q100` is bit-exact post-fix because at q=100 every
+//    macroblock has zero quantization residual error and the loop
+//    filter is essentially disabled, so only the YUV→RGB +
+//    upsampling math actually runs. Once we matched libwebp's
+//    `VP8YUVToR/G/B` (truncating two-stage `>> 8` then `>> 6` instead
+//    of a single `>> 14`) and its `UPSAMPLE_FUNC` 9/3/3/1 fancy
+//    chroma upsample (`src/dsp/upsampling.c`) the q100 output became
+//    pixel-perfect. Promoted to BitExact tier.
+//
+//  * `lossy-128x128-q{1,75}` and `lossy-with-alpha-128x128`: the
+//    remaining ~30% / ~75% / ~75% per-channel exact-match rates
+//    cluster around the macroblock loop-filter boundary pixels; the
+//    PSNR is now 42–50 dB which is well above the standard "visually
+//    lossless" 40 dB threshold. Closing this last gap requires
+//    bit-aligning oxideav-vp8's in-loop filter with libwebp's
+//    `dsp/dec.c` SIMD implementation (different rounding in the
+//    delta clip path). Tracked outside this crate.
 // ----------------------------------------------------------------------
