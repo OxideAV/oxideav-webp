@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-webp/compare/v0.0.10...v0.0.11) - 2026-05-04
+
+### Added
+
+- *(vp8-enc)* wire per-frequency AC/DC quantiser deltas via vp8 0.1.7
+- *(vp8l-enc)* add K=8 meta-Huffman trial to per-tile grouping sweep
+- *(vp8-enc)* re-wire per-segment LF deltas via vp8 0.1.6
+
+### Fixed
+
+- *(vp8-decode)* bit-exact YUV→RGB + fancy chroma upsample vs libwebp
+
+### Other
+
+- *(vp8l-decode)* bit-exact lossless corpus walker
+
 ### Added
 
 - *(vp8-enc)* per-frequency AC/DC quantiser delta knob. Wires the
