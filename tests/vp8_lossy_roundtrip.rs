@@ -309,3 +309,148 @@ fn vp8_quality_knob_produces_monotonic_sizes() {
     assert_eq!(img.width, W);
     assert_eq!(img.height, H);
 }
+
+/// Encode the same YUV420P frame twice at the same qindex — once with
+/// all-zero per-frequency AC/DC deltas (the historical default) and
+/// once with a non-trivial mix — and verify
+///
+///   1. the two bitstreams differ (the deltas actually flow through
+///      the underlying encoder);
+///   2. both files round-trip through `decode_webp`;
+///   3. both files cross-decode through libwebp's `dwebp` binary
+///      (when installed) — the bitstream stays spec-compliant under a
+///      reference decoder.
+///
+/// Cross-decode is best-effort: hosts without `dwebp` on `$PATH` skip
+/// step 3 silently. The first two assertions always run.
+#[test]
+fn vp8_per_frequency_deltas_change_bitstream_and_round_trip() {
+    use oxideav_webp::encoder_vp8::Vp8FreqDeltas;
+
+    let (y, u, v) = build_test_pattern();
+    let frame = make_yuv420_frame(&y, &u, &v);
+    let params = make_encoder_params();
+
+    // Use a mid qindex so the per-frequency tweaks have headroom in
+    // both directions (very low qindex saturates the LUT at the floor).
+    let qindex: u8 = 48;
+
+    // Baseline: all-zero deltas (the historical pre-#417 path).
+    let baseline = encode_at_with_deltas(&params, qindex, Vp8FreqDeltas::default(), &frame);
+
+    // Tuned: spend more bits on luma AC + Y2 (negative deltas → finer
+    // step), save bits on chroma (positive deltas → coarser step).
+    let tuned_deltas = Vp8FreqDeltas {
+        y_dc_delta: -6,
+        y2_dc_delta: -4,
+        y2_ac_delta: -2,
+        uv_dc_delta: 6,
+        uv_ac_delta: 6,
+    };
+    let tuned = encode_at_with_deltas(&params, qindex, tuned_deltas, &frame);
+
+    // (1) Bitstreams MUST differ — same qindex, different deltas.
+    assert_ne!(
+        baseline, tuned,
+        "per-frequency AC/DC delta knob did not affect output bitstream — wiring is broken"
+    );
+
+    // (2) Both files round-trip through our own decoder.
+    let img_baseline = decode_webp(&baseline).expect("decode baseline");
+    let img_tuned = decode_webp(&tuned).expect("decode tuned");
+    assert_eq!(img_baseline.width, W);
+    assert_eq!(img_tuned.width, W);
+    assert_eq!(img_baseline.height, H);
+    assert_eq!(img_tuned.height, H);
+    assert_eq!(img_baseline.frames.len(), 1);
+    assert_eq!(img_tuned.frames.len(), 1);
+
+    eprintln!(
+        "VP8 lossy per-freq-delta sizes: baseline={} tuned={}",
+        baseline.len(),
+        tuned.len()
+    );
+
+    // (3) Cross-decode through libwebp's dwebp binary, when available.
+    // We write the bytes to a temp file, invoke dwebp -o /dev/null, and
+    // assert exit status 0. This is the strongest check that a
+    // third-party decoder accepts the tuned bitstream.
+    cross_decode_with_dwebp(&baseline, "baseline");
+    cross_decode_with_dwebp(&tuned, "tuned");
+}
+
+/// Helper: build an encoder at a given qindex + freq-deltas and encode
+/// the supplied frame. Returns the full RIFF/WEBP file bytes.
+fn encode_at_with_deltas(
+    params: &CodecParameters,
+    qindex: u8,
+    freq_deltas: oxideav_webp::encoder_vp8::Vp8FreqDeltas,
+    frame: &VideoFrame,
+) -> Vec<u8> {
+    let mut enc = oxideav_webp::encoder_vp8::make_encoder_with_qindex_and_freq_deltas(
+        params,
+        qindex,
+        freq_deltas,
+    )
+    .expect("make_encoder_with_qindex_and_freq_deltas");
+    enc.send_frame(&Frame::Video(frame.clone()))
+        .expect("send_frame");
+    enc.flush().expect("flush");
+    let pkt = enc.receive_packet().expect("receive_packet");
+    pkt.data
+}
+
+/// Cross-decode `webp_bytes` through libwebp's `dwebp` binary. Skips
+/// silently when `dwebp` isn't on `$PATH` (typical CI hosts without
+/// libwebp installed). Hard-asserts a clean exit when present.
+fn cross_decode_with_dwebp(webp_bytes: &[u8], label: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Probe: is dwebp on $PATH?
+    if Command::new("dwebp")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("dwebp not installed; skipping cross-decode of {label}");
+        return;
+    }
+
+    // Stage the file. tempfile would be nicer but dragging in a dep
+    // for one test isn't worth it — use std::env::temp_dir + a unique
+    // suffix.
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "oxideav_webp_freq_deltas_{label}_{}.webp",
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&path).expect("create temp .webp");
+        f.write_all(webp_bytes).expect("write temp .webp");
+    }
+
+    // Decode to a discardable PNG. `-o -` writes to stdout; we use
+    // /dev/null instead so we don't have to plumb the bytes through a
+    // pipe just to drop them.
+    let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let status = Command::new("dwebp")
+        .arg(&path)
+        .arg("-o")
+        .arg(null_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn dwebp");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        status.status.success(),
+        "dwebp rejected {label} bitstream: status {:?}, stderr=\n{}",
+        status.status,
+        String::from_utf8_lossy(&status.stderr)
+    );
+}

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8-enc)* per-frequency AC/DC quantiser delta knob. Wires the
+  `y_dc_delta` / `y2_dc_delta` / `y2_ac_delta` / `uv_dc_delta` /
+  `uv_ac_delta` fields published in `oxideav-vp8` 0.1.7 (#417)
+  through to the WebP single-frame lossy path via the new
+  `encoder_vp8::Vp8FreqDeltas` struct plus
+  `encoder_vp8::make_encoder_with_qindex_and_freq_deltas` /
+  `make_encoder_with_quality_and_freq_deltas` factories. Defaults
+  (all-zero) reproduce the pre-#417 bitstream byte-for-byte; non-zero
+  values bias bits toward a specific frequency band (e.g. negative
+  `y_dc_delta` for finer luma AC where banding shows up, positive
+  `uv_ac_delta` to lighten chroma AC on screen-recording / line-art
+  content). Each delta is clamped to `[-15, 15]` by the underlying
+  encoder. Closes the deferral noted in `c8c1d69` and bumps
+  `oxideav-vp8` minimum version to `0.1.7`.
+- *(test)* `vp8_per_frequency_deltas_change_bitstream_and_round_trip`
+  encodes the same YUV420P frame twice at the same qindex (zero
+  deltas vs a non-trivial mix) and asserts the bitstreams differ,
+  both round-trip through `decode_webp`, and both cross-decode
+  through libwebp's `dwebp` binary when installed (silent skip
+  otherwise — keeps CI green on hosts without libwebp).
 - *(vp8l-enc)* extend the meta-Huffman per-tile grouping sweep from
   K = {1, 2, 4} to K = {1, 2, 4, 8}. Each `encode_image_stream` call
   speculatively emits the K=8 candidate (gated on ≥ 16384 px = 128×128

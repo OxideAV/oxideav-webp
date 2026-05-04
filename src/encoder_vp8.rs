@@ -63,13 +63,13 @@
 //! at low quality, with the deltas tapering toward zero as quality
 //! approaches 100 (where every segment is already near-lossless).
 //!
-//! Round-2 caveats: per-segment loop-filter deltas (RFC 6386 §15.2)
-//! and full per-frequency AC/DC delta tuning (`y_dc_delta`,
-//! `y2_dc_delta`, `y2_ac_delta`, `uv_dc_delta`, `uv_ac_delta`) still
-//! require new fields on the upstream `oxideav-vp8`
-//! [`Vp8EncoderConfig`] — those knobs are not on the published 0.1.5,
-//! so we leave them at zero and let the segment QP deltas carry the
-//! perceptual-tuning load for now.
+//! Per-frequency AC/DC quantiser deltas (`y_dc_delta`, `y2_dc_delta`,
+//! `y2_ac_delta`, `uv_dc_delta`, `uv_ac_delta`) are wired through the
+//! optional [`Vp8FreqDeltas`] knob now that `oxideav-vp8` 0.1.7
+//! (#417) exposes the matching `Vp8EncoderConfig` fields. Each delta
+//! is clamped to the legal `[-15, 15]` range (decoder reads each as a
+//! 5-bit signed-magnitude field). Defaults are zero so the existing
+//! factory entry points stay byte-identical with the pre-#417 output.
 
 #[cfg(feature = "registry")]
 use std::collections::VecDeque;
@@ -207,6 +207,46 @@ fn segment_lf_deltas_for_qindex(qindex: u8) -> [i32; 4] {
     ]
 }
 
+/// Per-frequency AC/DC quantiser delta knob (RFC 6386 §9.6).
+///
+/// Each field shifts the qindex used to look up a specific transform
+/// coefficient's quant step relative to the frame-level qindex.
+/// Negative values land on a *finer* step (larger output bit count,
+/// better quality at that frequency); positive values land on a
+/// *coarser* step. The legal range is `[-15, 15]` per the bitstream
+/// syntax — values outside that range are clamped at config-build
+/// time by the underlying [`oxideav_vp8::Vp8EncoderConfig`].
+///
+/// The five frequencies map directly onto the VP8 per-block transforms:
+///
+/// * `y_dc_delta` — luma AC base qindex shift (note the misleading
+///   field name on the underlying config — it actually offsets the
+///   intra-Y AC plane).
+/// * `y2_dc_delta` / `y2_ac_delta` — DC / AC of the second-order Y2
+///   transform applied to intra-16×16 DC coefficients.
+/// * `uv_dc_delta` / `uv_ac_delta` — chroma DC / AC.
+///
+/// All-zero (the [`Default`] impl) reproduces the pre-#417 encoder
+/// output exactly, so existing callers and snapshot tests stay
+/// byte-identical without an opt-in.
+///
+/// Wire it through [`make_encoder_with_qindex_and_freq_deltas`] or
+/// [`make_encoder_with_quality_and_freq_deltas`]; both factories
+/// otherwise behave identically to their non-`freq_deltas` variants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vp8FreqDeltas {
+    /// Luma AC qindex delta. See struct docs for the field-name caveat.
+    pub y_dc_delta: i32,
+    /// Y2 DC qindex delta — second-order Hadamard transform of intra-16×16 DCs.
+    pub y2_dc_delta: i32,
+    /// Y2 AC qindex delta.
+    pub y2_ac_delta: i32,
+    /// Chroma DC qindex delta.
+    pub uv_dc_delta: i32,
+    /// Chroma AC qindex delta.
+    pub uv_ac_delta: i32,
+}
+
 /// Build the `Vp8EncoderConfig` used by the WebP single-frame lossy
 /// path. Wires up the quality-driven segment QP deltas (RFC 6386
 /// §10), keeps the scene-cut and lookahead-altref features off (we
@@ -224,8 +264,13 @@ fn segment_lf_deltas_for_qindex(qindex: u8) -> [i32; 4] {
 /// over-smoothing on flat regions) and the textured segment gets a
 /// *heavier* deblock (masks the extra DCT block boundaries the
 /// coarser per-segment QP exposes).
+///
+/// The optional `freq_deltas` argument carries the per-frequency
+/// AC/DC quantiser deltas added in `oxideav-vp8` 0.1.7 (#417); pass
+/// [`Vp8FreqDeltas::default()`] (all zeros) to reproduce the exact
+/// pre-#417 bitstream.
 #[cfg(feature = "registry")]
-fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
+fn webp_lossy_config(qindex: u8, freq_deltas: Vp8FreqDeltas) -> Vp8EncoderConfig {
     let qi = qindex.min(127);
     Vp8EncoderConfig {
         qindex: qi,
@@ -240,6 +285,13 @@ fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
         enable_segments: true,
         segment_quant_deltas: segment_quant_deltas_for_qindex(qi),
         segment_lf_deltas: segment_lf_deltas_for_qindex(qi),
+        // Per-frequency AC/DC qindex deltas. Underlying encoder clamps
+        // each to ±15 internally, so we can pass through untouched.
+        y_dc_delta: freq_deltas.y_dc_delta,
+        y2_dc_delta: freq_deltas.y2_dc_delta,
+        y2_ac_delta: freq_deltas.y2_ac_delta,
+        uv_dc_delta: freq_deltas.uv_dc_delta,
+        uv_ac_delta: freq_deltas.uv_ac_delta,
         ..Vp8EncoderConfig::default()
     }
 }
@@ -247,15 +299,17 @@ fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
 /// Encode a single VP8 keyframe through the segment-aware
 /// configuration produced by [`webp_lossy_config`]. Goes through the
 /// `Encoder` trait surface so we get the per-segment quant + LF deltas
-/// without having to duplicate the lower-level keyframe entry point.
+/// (and the optional per-frequency AC/DC deltas) without having to
+/// duplicate the lower-level keyframe entry point.
 #[cfg(feature = "registry")]
 fn encode_keyframe_with_segments(
     width: u32,
     height: u32,
     qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
     frame: &VideoFrame,
 ) -> Result<Vec<u8>> {
-    let cfg = webp_lossy_config(qindex);
+    let cfg = webp_lossy_config(qindex, freq_deltas);
     let mut p = CodecParameters::video(CodecId::new(oxideav_vp8::CODEC_ID_STR));
     p.width = Some(width);
     p.height = Some(height);
@@ -284,10 +338,37 @@ fn encode_keyframe_with_segments(
 /// Most callers should prefer [`make_encoder_with_quality`], which
 /// takes the libwebp-style `0..=100` scale (higher = better) and is
 /// the more familiar knob across image-encoding libraries.
+///
+/// Per-frequency AC/DC quantiser deltas default to all-zero. Callers
+/// that want to bias bits toward a specific frequency band (the
+/// libvpx `tune_content` story) should reach for
+/// [`make_encoder_with_qindex_and_freq_deltas`].
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_qindex(
     params: &CodecParameters,
     qindex: u8,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    make_encoder_with_qindex_and_freq_deltas(params, qindex, Vp8FreqDeltas::default())
+}
+
+/// Build a VP8-lossy WebP encoder with an explicit qindex (0..=127)
+/// **and** explicit per-frequency AC/DC quantiser deltas (see
+/// [`Vp8FreqDeltas`]).
+///
+/// All-zero `freq_deltas` (the [`Default`] value) is exactly equivalent
+/// to [`make_encoder_with_qindex`] and reproduces the pre-#417 (vp8
+/// 0.1.6) bitstream byte-for-byte.
+///
+/// Use a small negative delta (e.g. `y_dc_delta = -4`) to spend more
+/// bits on luma AC where banding is visible, or a small positive
+/// `uv_ac_delta` to lighten chroma AC on screen-recording / line-art
+/// content where chroma carries less perceptual weight. Each value is
+/// clamped to `[-15, 15]` by the underlying encoder.
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_qindex_and_freq_deltas(
+    params: &CodecParameters,
+    qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
 ) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -327,11 +408,25 @@ pub fn make_encoder_with_qindex(
         width,
         height,
         qindex: qindex.min(127),
+        freq_deltas,
         input_format: pix,
         time_base,
         pending: VecDeque::new(),
         eof: false,
     }))
+}
+
+/// Build a VP8-lossy WebP encoder with a libwebp-style `quality`
+/// scalar **and** explicit per-frequency AC/DC quantiser deltas.
+/// Composes [`make_encoder_with_quality`] with the per-frequency knob
+/// from [`make_encoder_with_qindex_and_freq_deltas`].
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_quality_and_freq_deltas(
+    params: &CodecParameters,
+    quality: f32,
+    freq_deltas: Vp8FreqDeltas,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    make_encoder_with_qindex_and_freq_deltas(params, quality_to_qindex(quality), freq_deltas)
 }
 
 #[cfg(feature = "registry")]
@@ -340,6 +435,7 @@ struct Vp8WebpEncoder {
     width: u32,
     height: u32,
     qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
     input_format: PixelFormat,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
@@ -371,7 +467,13 @@ impl Encoder for Vp8WebpEncoder {
         // configured input format.
         let bytes = match self.input_format {
             PixelFormat::Yuv420P => {
-                let vp8 = encode_keyframe_with_segments(self.width, self.height, self.qindex, v)?;
+                let vp8 = encode_keyframe_with_segments(
+                    self.width,
+                    self.height,
+                    self.qindex,
+                    self.freq_deltas,
+                    v,
+                )?;
                 build_webp_file(
                     ImageKind::Vp8Lossy,
                     &vp8,
@@ -381,9 +483,15 @@ impl Encoder for Vp8WebpEncoder {
                     &WebpMetadata::default(),
                 )
             }
-            PixelFormat::Yuva420P => encode_yuva420_lossy(self.width, self.height, self.qindex, v)?,
-            PixelFormat::Rgba => encode_rgba_lossy(self.width, self.height, self.qindex, v)?,
-            PixelFormat::Rgb24 => encode_rgb24_lossy(self.width, self.height, self.qindex, v)?,
+            PixelFormat::Yuva420P => {
+                encode_yuva420_lossy(self.width, self.height, self.qindex, self.freq_deltas, v)?
+            }
+            PixelFormat::Rgba => {
+                encode_rgba_lossy(self.width, self.height, self.qindex, self.freq_deltas, v)?
+            }
+            PixelFormat::Rgb24 => {
+                encode_rgb24_lossy(self.width, self.height, self.qindex, self.freq_deltas, v)?
+            }
             other => {
                 return Err(oxideav_core::Error::unsupported(format!(
                     "VP8 WebP encoder: frame format {other:?} unsupported"
@@ -422,7 +530,13 @@ impl Encoder for Vp8WebpEncoder {
 /// Emits a complete `.webp` file in the extended `VP8X + ALPH + VP8 `
 /// layout.
 #[cfg(feature = "registry")]
-fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
+fn encode_yuva420_lossy(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
+    v: &VideoFrame,
+) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
     if v.planes.len() < 4 {
@@ -453,7 +567,7 @@ fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> 
             v.planes[2].clone(),
         ],
     };
-    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, freq_deltas, &yuv_frame)?;
 
     // Pull the alpha plane row-major (handle non-tight stride).
     let alpha_plane = &v.planes[3];
@@ -482,7 +596,13 @@ fn encode_yuva420_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> 
 /// pays only for the YUV planes (the natural VP8 input). This is the
 /// VP8-side counterpart to issue #7.
 #[cfg(feature = "registry")]
-fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
+fn encode_rgb24_lossy(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
+    v: &VideoFrame,
+) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
     if v.planes.is_empty() {
@@ -511,7 +631,7 @@ fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Re
             },
         ],
     };
-    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, freq_deltas, &yuv_frame)?;
     Ok(build_webp_file(
         ImageKind::Vp8Lossy,
         &vp8_bytes,
@@ -525,7 +645,13 @@ fn encode_rgb24_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Re
 /// Encode an RGBA frame as VP8 lossy + ALPH sidecar + VP8X extended
 /// header. Returns a complete `.webp` file.
 #[cfg(feature = "registry")]
-fn encode_rgba_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Result<Vec<u8>> {
+fn encode_rgba_lossy(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
+    v: &VideoFrame,
+) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
     if v.planes.is_empty() {
@@ -556,7 +682,7 @@ fn encode_rgba_lossy(width: u32, height: u32, qindex: u8, v: &VideoFrame) -> Res
             },
         ],
     };
-    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, freq_deltas, &yuv_frame)?;
 
     // Encode the alpha plane as a VP8L green-only bitstream with a
     // pre-encode filter pass picked to minimise the resulting payload

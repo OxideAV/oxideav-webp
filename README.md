@@ -235,15 +235,19 @@ Encoder scope (current):
   + per-segment loop-filter deltas (§15.2) are wired in based on a
   source-luma variance classifier, so smooth / textured regions get
   finer / coarser quant + softer / stronger deblocking respectively.
-  Default qindex from `oxideav-vp8` is used unless the caller selects
-  a specific one via `encoder_vp8::make_encoder_with_qindex`
-  (VP8 qindex `0..=127`, lower = better) or the libwebp-style
+  Per-frequency AC/DC quantiser deltas (`y_dc_delta` / `y2_dc_delta`
+  / `y2_ac_delta` / `uv_dc_delta` / `uv_ac_delta`) are exposed via
+  `encoder_vp8::Vp8FreqDeltas` plus the matching factory entry
+  points `make_encoder_with_qindex_and_freq_deltas` /
+  `make_encoder_with_quality_and_freq_deltas` so callers can bias
+  bits toward a specific frequency band (defaults to all-zero, which
+  reproduces the prior bitstream byte-for-byte). Default qindex from
+  `oxideav-vp8` is used unless the caller selects a specific one via
+  `encoder_vp8::make_encoder_with_qindex` (VP8 qindex `0..=127`,
+  lower = better) or the libwebp-style
   `encoder_vp8::make_encoder_with_quality` (`0.0..=100.0`, higher =
   better). Encoder ≈ 80 % libwebp parity on natural fixtures;
-  residual gap is per-frequency AC/DC quantiser deltas (`y_dc_delta`
-  / `y2_dc_delta` / `y2_ac_delta` / `uv_dc_delta` / `uv_ac_delta`)
-  pending the next `oxideav-vp8` publish, plus a quality-driven
-  quantizer matrix.
+  residual gap is a quality-driven quantizer matrix.
 - `VP8X` extended header is emitted automatically whenever the output
   carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
   the `riff::WebpMetadata` helper.
