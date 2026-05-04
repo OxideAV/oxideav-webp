@@ -53,23 +53,23 @@
 //!
 //! The quality→qindex mapping is the linear inversion
 //! `qindex = round((100 - quality) * 1.27)`. The encoder also tunes
-//! the per-segment quantiser deltas (RFC 6386 §10) and the per-segment
-//! loop-filter level deltas (§15.2) based on quality so that smooth
-//! regions get extra bits where banding is visible and high-variance
-//! regions save bits where DCT noise hides. Mirrors libwebp's
-//! perceptual model: the source-luma variance classifier lands smooth
-//! MBs in segment 0 and textured MBs in segment 3; `segment 0` then
-//! takes a stronger negative qindex delta (finer quant) and `segment 3`
-//! a stronger positive delta (coarser quant) at low quality, with the
-//! deltas tapering toward zero as quality approaches 100 (where every
-//! segment is already near-lossless).
+//! the per-segment quantiser deltas (RFC 6386 §10) based on quality
+//! so that smooth regions get extra bits where banding is visible and
+//! high-variance regions save bits where DCT noise hides. Mirrors
+//! libwebp's perceptual model: the source-luma variance classifier
+//! lands smooth MBs in segment 0 and textured MBs in segment 3;
+//! `segment 0` then takes a stronger negative qindex delta (finer
+//! quant) and `segment 3` a stronger positive delta (coarser quant)
+//! at low quality, with the deltas tapering toward zero as quality
+//! approaches 100 (where every segment is already near-lossless).
 //!
-//! Round-2 caveats: full per-frequency AC/DC delta tuning
-//! (`y_dc_delta`, `y2_dc_delta`, `y2_ac_delta`, `uv_dc_delta`,
-//! `uv_ac_delta`) still requires a `Vp8EncoderConfig` extension on
-//! the upstream crate — those fields are not yet plumbed through the
-//! quant-context builder, so we leave them at zero and let segment QP
-//! deltas carry the perceptual-tuning load for now.
+//! Round-2 caveats: per-segment loop-filter deltas (RFC 6386 §15.2)
+//! and full per-frequency AC/DC delta tuning (`y_dc_delta`,
+//! `y2_dc_delta`, `y2_ac_delta`, `uv_dc_delta`, `uv_ac_delta`) still
+//! require new fields on the upstream `oxideav-vp8`
+//! [`Vp8EncoderConfig`] — those knobs are not on the published 0.1.5,
+//! so we leave them at zero and let the segment QP deltas carry the
+//! perceptual-tuning load for now.
 
 #[cfg(feature = "registry")]
 use std::collections::VecDeque;
@@ -184,6 +184,13 @@ fn segment_quant_deltas_for_qindex(qindex: u8) -> [i32; 4] {
 /// Magnitudes scale with `qindex` for the same reason as the QP
 /// deltas: at high quality everything's near-lossless and the LF tweaks
 /// approach zero.
+///
+/// **Currently unused at the call site** — the published
+/// `oxideav-vp8` 0.1.5 `Vp8EncoderConfig` does not expose a
+/// `segment_lf_deltas` field. Kept here (covered by a unit test) so
+/// the wiring is ready to land once the upstream API extension is
+/// published.
+#[allow(dead_code)]
 fn segment_lf_deltas_for_qindex(qindex: u8) -> [i32; 4] {
     let span = (qindex as f32) / 127.0;
     // Smooth segment LF easing: 0..=3.
@@ -201,12 +208,19 @@ fn segment_lf_deltas_for_qindex(qindex: u8) -> [i32; 4] {
 }
 
 /// Build the `Vp8EncoderConfig` used by the WebP single-frame lossy
-/// path. Wires up the quality-driven segment QP / LF deltas (RFC 6386
-/// §10 + §15.2), keeps the scene-cut and lookahead-altref features off
-/// (we only ever emit a single keyframe per `.webp` so there's no GOP
+/// path. Wires up the quality-driven segment QP deltas (RFC 6386
+/// §10), keeps the scene-cut and lookahead-altref features off (we
+/// only ever emit a single keyframe per `.webp` so there's no GOP
 /// state to manage), and pins `loop_filter_mode = Normal` to preserve
 /// the bit-exact loop-filter behaviour the existing decode-side
 /// regression tests depend on.
+///
+/// The matching per-segment loop-filter delta knob (RFC 6386 §15.2)
+/// computed by [`segment_lf_deltas_for_qindex`] is *not* wired in
+/// here yet — the published `oxideav-vp8` 0.1.5 [`Vp8EncoderConfig`]
+/// doesn't expose `segment_lf_deltas`. Round-2 work on the upstream
+/// crate adds the field; once that lands and is published we'll plumb
+/// it through here without churning the call site.
 #[cfg(feature = "registry")]
 fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
     let qi = qindex.min(127);
@@ -222,7 +236,6 @@ fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
         // with qindex so high quality collapses to near-uniform QP.
         enable_segments: true,
         segment_quant_deltas: segment_quant_deltas_for_qindex(qi),
-        segment_lf_deltas: segment_lf_deltas_for_qindex(qi),
         ..Vp8EncoderConfig::default()
     }
 }
