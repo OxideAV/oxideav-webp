@@ -2593,6 +2593,20 @@ fn try_emit_simple_huffman(bw: &mut BitWriter, freqs: &[u32]) -> Option<(Vec<u8>
     let nonzero: Vec<usize> = (0..alphabet).filter(|&i| freqs[i] > 0).collect();
     let lens = vec![0u8; alphabet];
     let codes = vec![0u32; alphabet];
+    // CRITICAL: decide eligibility *before* writing any bits. A previous
+    // version wrote `simple=1` (and partial sym fields) into `bw` and
+    // *then* returned `None` for symbols ≥ 256 — corrupting the
+    // bitstream by leaking those header bits into the caller's normal-
+    // tree emit. Repro: 1×1 black opaque ARGB with predictor + colour
+    // cache — the residual collapses to 0x00000000 which lands cache
+    // index 0, so the only green-alphabet symbol is the cache-ref at
+    // index 280. simple-Huffman can't address ≥ 256, so we must abort
+    // *cleanly* (no bits emitted) and let the normal-tree path own the
+    // header byte. Caught by the `vp8l_lossless_roundtrip` fuzz target;
+    // pre-fix the decoder rejected the resulting stream with the
+    // "canonical Huffman length table self-collides" diagnostic because
+    // the leaked 4 simple-header bits desynchronised every subsequent
+    // tree's normal-code length-table read.
     match nonzero.len() {
         0 => {
             // No active symbols. Emit a 1-symbol simple tree pointing at
@@ -2606,18 +2620,22 @@ fn try_emit_simple_huffman(bw: &mut BitWriter, freqs: &[u32]) -> Option<(Vec<u8>
         }
         1 => {
             let s = nonzero[0];
+            // Simple-Huffman wire format limits sym0 to either a 1-bit
+            // (s ∈ {0, 1}) or 8-bit (s < 256) field. Anything wider —
+            // typical for green-alphabet cache refs at indices ≥ 280 —
+            // *must* take the normal-tree fallback. Bail before any
+            // bits hit `bw` (see the function-level comment).
+            if s >= 256 {
+                return None;
+            }
             bw.write(1, 1); // simple = 1
             bw.write(0, 1); // num_symbols - 1 = 0 → 1 symbol
             if s <= 1 {
                 bw.write(0, 1); // is_first_8bits = 0 (1-bit field)
                 bw.write(s as u32, 1);
-            } else if s < 256 {
+            } else {
                 bw.write(1, 1); // is_first_8bits = 1 (8-bit field)
                 bw.write(s as u32, 8);
-            } else {
-                // sym out of range for 8-bit field — fall back to normal
-                // Huffman. Triggers for cache/length symbols above 256.
-                return None;
             }
             // lens stay all-zero: decoder's `only_symbol` short-circuit
             // returns the symbol without consuming any bits, and our
@@ -2630,6 +2648,8 @@ fn try_emit_simple_huffman(bw: &mut BitWriter, freqs: &[u32]) -> Option<(Vec<u8>
             // sym0 carries the 1-bit / 8-bit field choice. Put the
             // smaller index in sym0 so we can use the 1-bit field when
             // possible. sym1 is always 8-bit, so it must fit in 8 bits.
+            // Both symbols must be < 256 — bail *before* any bits land
+            // in `bw` (see the function-level comment).
             if a >= 256 || b >= 256 {
                 return None;
             }

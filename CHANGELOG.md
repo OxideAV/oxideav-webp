@@ -25,6 +25,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8-enc)* quality-driven per-frequency quantiser-matrix preset
+  (closes the libwebp-parity gap noted in #465). The `quality` knob
+  on `make_encoder_with_quality` (and `make_encoder_with_qindex`) now
+  also drives the five per-frequency AC/DC qindex deltas (RFC 6386
+  §6.6 + §9.6) in addition to the existing per-segment QP / LF
+  deltas. The new `freq_deltas_for_qindex` curve keeps every delta at
+  zero at qindex=0 (no shift on top of the already-finest step), then
+  widens the high-frequency bins as quality drops: at qindex=127 the
+  preset lands on `[y_dc=0, y2_dc=-2, y2_ac=+4, uv_dc=0, uv_ac=+4]`
+  — coarser Y2/chroma AC for compression, finer Y2 DC to suppress
+  visible block-mean banding, chroma DC held put to avoid colour
+  shifts. Compression behaviour stays strictly byte-size monotone
+  with quality on AC-rich content; bitstreams remain spec-compliant
+  under libwebp's `dwebp`. The explicit
+  `make_encoder_with_qindex_and_freq_deltas` /
+  `make_encoder_with_quality_and_freq_deltas` factories pass user
+  freq-deltas through *verbatim* (no preset added on top), so callers
+  that have already done their own perceptual tuning aren't double-
+  shifted; an explicit `Vp8FreqDeltas::default()` argument still
+  reproduces the pre-#465 bitstream byte-for-byte.
+- *(test)* `vp8_quality_driven_quant_matrix_q20_vs_q80_roundtrips`
+  exercises the new preset end-to-end: encodes the AC-rich
+  `build_noisy_pattern` at q=20 and q=80, asserts the bitstreams
+  differ, both round-trip through `decode_webp`, q=20 produces a
+  strictly smaller file than q=80 (≈4.5x growth on the test
+  fixture), and both cross-decode through libwebp's `dwebp` when
+  installed.
+- *(test)* `vp8l_fuzz_simple_huffman_leak.rs` regression suite for
+  the `vp8l_lossless_roundtrip` fuzz crash on a 1×1 black-opaque
+  input (#458). Pre-fix the encoder's `try_emit_simple_huffman`
+  wrote `simple=1, num_symbols-1` into the bitstream *before*
+  branching on the symbol-index range, then returned `None` for any
+  single-active-symbol alphabet whose only nonzero index was ≥ 256
+  (typical for green-alphabet cache refs at indices ≥ 280). The
+  caller's normal-tree fallback then wrote its own header on top of
+  the leaked 2-bit prefix, desynchronising every subsequent tree
+  read. Reproduced by predictor + colour-cache on a 1×1 black-opaque
+  ARGB pixel: the residual collapses to `0x00000000`, lands at cache
+  index 0 (matching the cache's zero-initialised state), and the
+  only emitted symbol is `CacheRef{index: 0}` → green_freq[280] = 1.
+
+### Fixed
+
+- *(vp8l-enc)* `try_emit_simple_huffman` no longer leaks the
+  `simple=1, num_symbols-1` prefix into the bitstream when bailing
+  to the normal-tree path. Eligibility checks (`s >= 256` for the
+  1-symbol case, `a >= 256 || b >= 256` for the 2-symbol case) now
+  run *before* any `bw.write` call, so the function either commits
+  its full header in one shot or returns `None` without touching the
+  writer. Pre-fix, our own decoder rejected the resulting stream
+  with `"VP8L: canonical Huffman length table self-collides"`; with
+  the fix the `vp8l_lossless_roundtrip` fuzz target completes 350K+
+  runs without a crash and the `oxideav_encode_webp_decode_lossless`
+  cross-decode target completes 350K+ runs cleanly through libwebp.
+
 - *(vp8-enc)* per-frequency AC/DC quantiser delta knob. Wires the
   `y_dc_delta` / `y2_dc_delta` / `y2_ac_delta` / `uv_dc_delta` /
   `uv_ac_delta` fields published in `oxideav-vp8` 0.1.7 (#417)

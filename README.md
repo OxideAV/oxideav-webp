@@ -198,12 +198,17 @@ entry points for picking a target compression level —
   that already speak the libvpx scale.
 
 The `quality → qindex` mapping is the linear inversion
-`qindex = round((100 - quality) * 1.27)`, so the API surface lines up
-with libwebp but the **perceptual** behaviour does not: libwebp also
-adjusts its quantizer matrices, AC/DC deltas, and segment-level QP
-based on quality, none of which we currently do. Round-2 work would
-tune the quantizer matrix and segment QPs to track libwebp's
-perceptual targets at matching `quality` values.
+`qindex = round((100 - quality) * 1.27)`. As of #465 the per-quality
+knob also drives the per-segment QP / LF deltas (§10 / §15.2) **and**
+the per-frequency AC/DC quant deltas (§6.6 / §9.6) — at high quality
+every delta collapses to zero, at low quality the high-frequency Y2
+AC and chroma AC bins land on a coarser step while the macroblock-
+mean (Y2 DC) bin holds finer to suppress visible block-mean banding.
+File size is byte-strictly monotone with quality on AC-rich content
+and bitstreams stay spec-compliant under libwebp's `dwebp`. Callers
+that have already done their own perceptual tuning should reach for
+the explicit `*_and_freq_deltas` factories, which pass the supplied
+`Vp8FreqDeltas` through verbatim (no preset added on top).
 
 ### Scope
 
@@ -236,18 +241,20 @@ Encoder scope (current):
   source-luma variance classifier, so smooth / textured regions get
   finer / coarser quant + softer / stronger deblocking respectively.
   Per-frequency AC/DC quantiser deltas (`y_dc_delta` / `y2_dc_delta`
-  / `y2_ac_delta` / `uv_dc_delta` / `uv_ac_delta`) are exposed via
-  `encoder_vp8::Vp8FreqDeltas` plus the matching factory entry
-  points `make_encoder_with_qindex_and_freq_deltas` /
-  `make_encoder_with_quality_and_freq_deltas` so callers can bias
-  bits toward a specific frequency band (defaults to all-zero, which
-  reproduces the prior bitstream byte-for-byte). Default qindex from
-  `oxideav-vp8` is used unless the caller selects a specific one via
+  / `y2_ac_delta` / `uv_dc_delta` / `uv_ac_delta`) are wired through
+  `encoder_vp8::Vp8FreqDeltas` and driven by the libwebp-style
+  `quality` knob via `freq_deltas_for_qindex`: zero at qindex=0,
+  widening to `[0, -2, +4, 0, +4]` at qindex=127 so high-frequency
+  bins compress harder and the macroblock-mean bin holds finer to
+  suppress block-mean banding. Default qindex from `oxideav-vp8` is
+  used unless the caller selects one via
   `encoder_vp8::make_encoder_with_qindex` (VP8 qindex `0..=127`,
   lower = better) or the libwebp-style
   `encoder_vp8::make_encoder_with_quality` (`0.0..=100.0`, higher =
-  better). Encoder ≈ 80 % libwebp parity on natural fixtures;
-  residual gap is a quality-driven quantizer matrix.
+  better). Explicit `*_and_freq_deltas` factories pass user
+  freq-deltas through verbatim (zero argument reproduces the
+  pre-#465 bitstream byte-for-byte). Encoder ≈ 90 % libwebp parity
+  on natural fixtures; residual gap is psy-RDO + per-MB rate control.
 - `VP8X` extended header is emitted automatically whenever the output
   carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
   the `riff::WebpMetadata` helper.

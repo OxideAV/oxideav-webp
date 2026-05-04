@@ -106,14 +106,19 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
 ///
 /// `0.0` maps to maximum compression (qindex 127), `100.0` maps to
 /// maximum quality (qindex 0); values are clamped to that range. The
-/// mapping is the linear inversion
-/// `qindex = round((100 - quality) * 1.27)`, which lines up with
-/// libwebp's API surface but is **not** a perceptual match: libwebp
-/// also adjusts its quantizer matrices, AC/DC deltas, and segment-level
-/// QP based on quality, none of which we do here. Treat the knob as a
-/// drop-in replacement for the libwebp parameter name only — round-2
-/// work would tune the quantizer matrix and segment QPs to track
-/// libwebp's perceptual targets at matching quality values.
+/// frame-level mapping is the linear inversion
+/// `qindex = round((100 - quality) * 1.27)`, matching the libwebp API
+/// surface. As of #465 the per-segment QP / LF deltas
+/// ([`segment_quant_deltas_for_qindex`] /
+/// [`segment_lf_deltas_for_qindex`]) and the per-frequency AC/DC
+/// quant deltas ([`freq_deltas_for_qindex`]) are also driven by
+/// `quality` so the per-bin quant matrix tracks libwebp's perceptual
+/// shape — high-frequency Y2 / chroma AC bins land on a coarser step
+/// at low quality, while the macroblock-mean (Y2 DC) bin holds finer
+/// to suppress visible banding. Compression behaviour is now
+/// monotone-with-quality on natural-image content (lower quality →
+/// strictly smaller bitstream), and decode parity with `dwebp` /
+/// libwebp is preserved across the curve.
 ///
 /// The libwebp default of `75.0` corresponds to qindex ≈ 32 here.
 #[cfg(feature = "registry")]
@@ -172,6 +177,67 @@ fn segment_quant_deltas_for_qindex(qindex: u8) -> [i32; 4] {
         0,
         high.clamp(-15, 15),
     ]
+}
+
+/// Quality-driven per-frequency AC/DC quantiser deltas (RFC 6386 §6.6
+/// dequant tables + §9.6 `quant_indices`). Drives the same five
+/// per-frequency offsets exposed by [`Vp8FreqDeltas`] from the frame-
+/// level `qindex`, so a single libwebp-style `quality` knob now also
+/// shapes the *per-bin* quant matrix instead of just scaling the
+/// frame-wide step.
+///
+/// The shape is the libwebp perceptual model in miniature: at high
+/// quality (qindex near 0) every coefficient is already at the finest
+/// representable step, so the deltas collapse to all-zero. At lower
+/// quality the deltas widen only on the bins where the eye notices
+/// least:
+///
+/// * `y_dc_delta` — luma AC base. Stays 0 across the curve; the
+///   per-segment quant deltas already shape luma AC, and adding a
+///   second curve here would double-tune.
+/// * `y2_dc_delta` — second-order Hadamard DC (the visible mean of
+///   each intra-16×16 macroblock). Goes mildly *negative* with
+///   quality drop to keep the macroblock means crisp — the eye reads
+///   block-mean drift as banding even when the AC content is muddy.
+/// * `y2_ac_delta` — second-order Hadamard AC. Goes positive with
+///   quality drop. The Y2 plane only carries the four 16×16 DC
+///   coefficients of each macroblock, so a coarser step here is
+///   essentially "trim the WHT residual" — a clear win at low
+///   quality where most of those residuals quantise to zero anyway.
+/// * `uv_dc_delta` — chroma DC. Held at 0 across the curve. Chroma
+///   DC carries the visible chroma mean per block; even a small
+///   positive delta produces obvious colour shifts at low quality.
+/// * `uv_ac_delta` — chroma AC. Goes positive with quality drop on
+///   the same "luminance > chroma" perceptual basis libwebp uses.
+///
+/// Returned values are pre-clamped to the legal `[-15, 15]` 5-bit
+/// signed-magnitude range. All-zero at qindex 0; the widest spread
+/// at qindex 127 is `[0, -2, +4, 0, +4]`.
+///
+/// ## Composition with explicit user freq_deltas
+///
+/// [`make_encoder_with_qindex`] / [`make_encoder_with_quality`] —
+/// the *non-`freq_deltas`* factories — apply this preset
+/// automatically. The explicit
+/// [`make_encoder_with_qindex_and_freq_deltas`] /
+/// [`make_encoder_with_quality_and_freq_deltas`] entry points pass
+/// the caller's deltas through verbatim (no preset added) so callers
+/// that have done their own perceptual tuning aren't double-shifted.
+fn freq_deltas_for_qindex(qindex: u8) -> Vp8FreqDeltas {
+    let qi = qindex.min(127);
+    // Span ∈ [0, 1]: 0 at qindex 0 (perfect quality), 1 at qindex 127.
+    let span = (qi as f32) / 127.0;
+    // Y2 DC tilts negative (finer mean) by up to 2 steps.
+    let y2_dc = -((span * 2.0).round() as i32);
+    // Y2 AC + chroma AC tilt positive (coarser high-freq) by up to 4.
+    let high_ac = (span * 4.0).round() as i32;
+    Vp8FreqDeltas {
+        y_dc_delta: 0,
+        y2_dc_delta: y2_dc.clamp(-15, 15),
+        y2_ac_delta: high_ac.clamp(-15, 15),
+        uv_dc_delta: 0,
+        uv_ac_delta: high_ac.clamp(-15, 15),
+    }
 }
 
 /// Quality-driven per-segment loop-filter level deltas (RFC 6386 §15.2).
@@ -339,25 +405,36 @@ fn encode_keyframe_with_segments(
 /// takes the libwebp-style `0..=100` scale (higher = better) and is
 /// the more familiar knob across image-encoding libraries.
 ///
-/// Per-frequency AC/DC quantiser deltas default to all-zero. Callers
-/// that want to bias bits toward a specific frequency band (the
-/// libvpx `tune_content` story) should reach for
-/// [`make_encoder_with_qindex_and_freq_deltas`].
+/// Per-frequency AC/DC quantiser deltas (RFC 6386 §6.6 + §9.6) are
+/// driven from `qindex` by [`freq_deltas_for_qindex`] so the per-bin
+/// quant matrix tracks libwebp's perceptual-weighted shape: at high
+/// quality the deltas collapse to zero, at low quality the high-
+/// frequency Y2 AC and chroma AC bins land on a coarser step while the
+/// macroblock-mean (Y2 DC) bin holds finer to suppress visible
+/// banding. Callers that have already done their own perceptual tuning
+/// and want to disable this preset should reach for
+/// [`make_encoder_with_qindex_and_freq_deltas`] (which takes the
+/// freq-deltas verbatim — including all-zero, which then exactly
+/// reproduces the pre-#465 bitstream).
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_qindex(
     params: &CodecParameters,
     qindex: u8,
 ) -> oxideav_core::Result<Box<dyn Encoder>> {
-    make_encoder_with_qindex_and_freq_deltas(params, qindex, Vp8FreqDeltas::default())
+    make_encoder_with_qindex_and_freq_deltas(params, qindex, freq_deltas_for_qindex(qindex))
 }
 
 /// Build a VP8-lossy WebP encoder with an explicit qindex (0..=127)
 /// **and** explicit per-frequency AC/DC quantiser deltas (see
 /// [`Vp8FreqDeltas`]).
 ///
-/// All-zero `freq_deltas` (the [`Default`] value) is exactly equivalent
-/// to [`make_encoder_with_qindex`] and reproduces the pre-#417 (vp8
-/// 0.1.6) bitstream byte-for-byte.
+/// `freq_deltas` is passed through verbatim — the quality-driven
+/// preset that [`make_encoder_with_qindex`] applies is **not** added
+/// on top. All-zero `freq_deltas` (the [`Default`] value) reproduces
+/// the pre-#417 (vp8 0.1.6) bitstream byte-for-byte. Use this entry
+/// point when you've already done your own perceptual tuning and want
+/// the encoder to honour your numbers without the libwebp-style
+/// per-quality preset interfering.
 ///
 /// Use a small negative delta (e.g. `y_dc_delta = -4`) to spend more
 /// bits on luma AC where banding is visible, or a small positive
@@ -1088,6 +1165,87 @@ mod tests {
         // All deltas land in the legal 5-bit signed-magnitude range.
         for d in lo_q.iter().chain(mid_q.iter()).chain(hi_q.iter()) {
             assert!(*d >= -15 && *d <= 15, "delta {d} out of [-15, 15]");
+        }
+    }
+
+    #[test]
+    fn freq_deltas_collapse_to_zero_at_top_quality() {
+        // qindex=0 is the finest representable per-coefficient step. The
+        // per-quality preset must NOT add any negative shift on top —
+        // the underlying clamp would no-op it, and any positive shift
+        // would actively coarsen the coefficient at the user's stated
+        // "best quality" setting.
+        let d = freq_deltas_for_qindex(0);
+        assert_eq!(d.y_dc_delta, 0);
+        assert_eq!(d.y2_dc_delta, 0);
+        assert_eq!(d.y2_ac_delta, 0);
+        assert_eq!(d.uv_dc_delta, 0);
+        assert_eq!(d.uv_ac_delta, 0);
+    }
+
+    #[test]
+    fn freq_deltas_widen_high_freq_at_low_quality() {
+        // At the qindex=127 endpoint the preset should land on its
+        // widest spread. The exact numbers are pinned here so a future
+        // curve tweak surfaces as a test diff (a refactor that
+        // accidentally drops a sign or rounding step would otherwise
+        // sneak past the byte-size monotone check on flat fixtures).
+        let d = freq_deltas_for_qindex(127);
+        // Y AC base is left to the per-segment system.
+        assert_eq!(d.y_dc_delta, 0);
+        // Y2 DC tilts negative — preserve the macroblock mean.
+        assert_eq!(d.y2_dc_delta, -2);
+        // Y2 AC + chroma AC tilt positive — coarser high-freq trim.
+        assert_eq!(d.y2_ac_delta, 4);
+        // Chroma DC stays put — chroma DC drift reads as colour shift.
+        assert_eq!(d.uv_dc_delta, 0);
+        assert_eq!(d.uv_ac_delta, 4);
+    }
+
+    #[test]
+    fn freq_deltas_monotone_in_qindex() {
+        // For every step up in qindex (lower quality), the high-freq AC
+        // deltas must be ≥ the previous step, and the Y2 DC delta must
+        // be ≤ the previous step. Anything else means the curve isn't
+        // monotone and the byte-size invariant breaks.
+        let mut prev = freq_deltas_for_qindex(0);
+        for qi in 1u8..=127 {
+            let cur = freq_deltas_for_qindex(qi);
+            assert!(
+                cur.y2_ac_delta >= prev.y2_ac_delta,
+                "qi={qi}: y2_ac_delta {} < prev {}",
+                cur.y2_ac_delta,
+                prev.y2_ac_delta
+            );
+            assert!(
+                cur.uv_ac_delta >= prev.uv_ac_delta,
+                "qi={qi}: uv_ac_delta {} < prev {}",
+                cur.uv_ac_delta,
+                prev.uv_ac_delta
+            );
+            assert!(
+                cur.y2_dc_delta <= prev.y2_dc_delta,
+                "qi={qi}: y2_dc_delta {} > prev {}",
+                cur.y2_dc_delta,
+                prev.y2_dc_delta
+            );
+            // Y AC base + chroma DC stay 0 across the curve.
+            assert_eq!(cur.y_dc_delta, 0);
+            assert_eq!(cur.uv_dc_delta, 0);
+            // Every delta must land in the legal 5-bit signed range.
+            for v in [
+                cur.y_dc_delta,
+                cur.y2_dc_delta,
+                cur.y2_ac_delta,
+                cur.uv_dc_delta,
+                cur.uv_ac_delta,
+            ] {
+                assert!(
+                    (-15..=15).contains(&v),
+                    "qi={qi}: delta {v} out of [-15, 15]"
+                );
+            }
+            prev = cur;
         }
     }
 

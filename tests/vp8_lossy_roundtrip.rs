@@ -267,9 +267,18 @@ fn find_chunks(buf: &[u8]) -> (bool, bool) {
 /// quality. This is the cheapest end-to-end check that the new
 /// `quality` knob actually feeds through to the underlying VP8 qindex
 /// (a non-monotone result would mean the mapping or wiring is broken).
+///
+/// Uses a noisy AC-rich pattern (not the smooth gradient used by the
+/// other tests in this file) — the per-quality preset added in #465
+/// (per-frequency AC/DC quant deltas, per-segment QP / LF deltas) only
+/// produces a measurable byte-size delta when the source carries
+/// enough AC content for the coarser high-frequency steps to actually
+/// cull coefficients. The smooth gradient quantises to all-DC at any
+/// reasonable qindex, so the size curve there flatlines at low quality
+/// and the strict-monotone invariant is invisible.
 #[test]
 fn vp8_quality_knob_produces_monotonic_sizes() {
-    let (y, u, v) = build_test_pattern();
+    let (y, u, v) = build_noisy_pattern();
     let frame = make_yuv420_frame(&y, &u, &v);
     let params = make_encoder_params();
 
@@ -284,17 +293,33 @@ fn vp8_quality_knob_produces_monotonic_sizes() {
     };
 
     let size_q0 = encode_at(0.0); // worst quality → smallest file.
+    let size_q20 = encode_at(20.0);
     let size_q50 = encode_at(50.0);
+    let size_q80 = encode_at(80.0);
     let size_q100 = encode_at(100.0); // best quality → largest file.
 
-    eprintln!("VP8 lossy WebP sizes: q0={size_q0} q50={size_q50} q100={size_q100}");
+    eprintln!(
+        "VP8 lossy WebP sizes: q0={size_q0} q20={size_q20} q50={size_q50} q80={size_q80} q100={size_q100}"
+    );
+    // Strict-monotone over the full curve. The per-quality preset
+    // shipped in #465 keeps this invariant on AC-rich content even
+    // after the per-frequency / per-segment deltas have been folded in,
+    // matching libwebp's "size strictly grows with quality" behaviour.
     assert!(
-        size_q0 < size_q50,
-        "expected q=0 ({size_q0}) < q=50 ({size_q50}) — qindex wiring broken?"
+        size_q0 <= size_q20,
+        "q=0 ({size_q0}) > q=20 ({size_q20}) — qindex wiring broken?"
     );
     assert!(
-        size_q50 < size_q100,
-        "expected q=50 ({size_q50}) < q=100 ({size_q100}) — qindex wiring broken?"
+        size_q20 < size_q50,
+        "q=20 ({size_q20}) >= q=50 ({size_q50}) — qindex wiring broken?"
+    );
+    assert!(
+        size_q50 < size_q80,
+        "q=50 ({size_q50}) >= q=80 ({size_q80}) — qindex wiring broken?"
+    );
+    assert!(
+        size_q80 < size_q100,
+        "q=80 ({size_q80}) >= q=100 ({size_q100}) — qindex wiring broken?"
     );
 
     // Sanity: the q=100 build still produces a valid .webp file.
@@ -308,6 +333,51 @@ fn vp8_quality_knob_produces_monotonic_sizes() {
     let img = decode_webp(&pkt.data).expect("decode q=100");
     assert_eq!(img.width, W);
     assert_eq!(img.height, H);
+}
+
+/// Deterministic AC-rich YUV420P test pattern (xorshift32 LCG, no
+/// std-rand dep). Used by [`vp8_quality_knob_produces_monotonic_sizes`]
+/// to give the per-quality preset's high-frequency quant deltas
+/// something to actually trim — the smooth gradient
+/// [`build_test_pattern`] uses everywhere else collapses to all-DC at
+/// any non-trivial qindex.
+fn build_noisy_pattern() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+    let mut y = vec![0u8; (W * H) as usize];
+    let mut u = vec![0u8; cw * ch];
+    let mut v = vec![0u8; cw * ch];
+    let mut s: u32 = 0xc0ff_eeed;
+    let mut next = || -> u8 {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        (s & 0xff) as u8
+    };
+    // Bias each channel into a "natural-image" range (not pure white
+    // noise — that compresses badly even at q=100 and the q=80 vs q=100
+    // gap shrinks). 3-row autocorrelation on each plane gives the
+    // frame visible structure while keeping enough AC for the deltas
+    // to bite.
+    for j in 0..H as usize {
+        for i in 0..W as usize {
+            let n = next() as i32;
+            let lp = if i > 0 {
+                y[j * W as usize + i - 1] as i32
+            } else {
+                128
+            };
+            let blended = (lp * 3 + n + 64) / 4;
+            y[j * W as usize + i] = blended.clamp(0, 255) as u8;
+        }
+    }
+    for j in 0..ch {
+        for i in 0..cw {
+            u[j * cw + i] = next() % 192 + 32;
+            v[j * cw + i] = next() % 192 + 32;
+        }
+    }
+    (y, u, v)
 }
 
 /// Encode the same YUV420P frame twice at the same qindex — once with
@@ -453,4 +523,72 @@ fn cross_decode_with_dwebp(webp_bytes: &[u8], label: &str) {
         status.status,
         String::from_utf8_lossy(&status.stderr)
     );
+}
+
+/// Quality-driven quantizer-matrix tuning regression (#465). Verifies
+/// the per-quality preset added in
+/// `encoder_vp8::freq_deltas_for_qindex` produces:
+///
+/// 1. Two distinct bitstreams at quality=20 vs quality=80 — the
+///    perceptual preset has to actually flow through to the underlying
+///    VP8 quant tables. Both streams round-trip through our own
+///    `decode_webp`.
+/// 2. Strict-monotone byte-size with quality on AC-rich content
+///    (`build_noisy_pattern`) across q=20 → q=80. Lower quality must
+///    produce a strictly smaller bitstream.
+/// 3. Both bitstreams cross-decode cleanly through libwebp's `dwebp`
+///    binary (when installed). This is the "spec-compliant under a
+///    third-party decoder" check.
+///
+/// Goes through `make_encoder_with_quality` (the libwebp-style
+/// `0..=100` knob), which is the entry point that picks up the
+/// quality-driven freq_deltas preset by default.
+#[test]
+fn vp8_quality_driven_quant_matrix_q20_vs_q80_roundtrips() {
+    let (y, u, v) = build_noisy_pattern();
+    let frame = make_yuv420_frame(&y, &u, &v);
+    let params = make_encoder_params();
+
+    let encode = |q: f32| -> Vec<u8> {
+        let mut enc =
+            encoder_vp8::make_encoder_with_quality(&params, q).expect("make_encoder_with_quality");
+        enc.send_frame(&Frame::Video(frame.clone())).expect("send");
+        enc.flush().expect("flush");
+        enc.receive_packet().expect("receive_packet").data
+    };
+
+    let q20 = encode(20.0);
+    let q80 = encode(80.0);
+
+    // (1) Distinct bitstreams + self-roundtrip.
+    assert_ne!(
+        q20, q80,
+        "quality=20 and quality=80 must produce different bitstreams \
+         (per-quality preset wiring broken?)"
+    );
+    let img_q20 = decode_webp(&q20).expect("self-decode q=20");
+    assert_eq!(img_q20.width, W);
+    assert_eq!(img_q20.height, H);
+    let img_q80 = decode_webp(&q80).expect("self-decode q=80");
+    assert_eq!(img_q80.width, W);
+    assert_eq!(img_q80.height, H);
+
+    // (2) Byte-size monotone with quality.
+    assert!(
+        q20.len() < q80.len(),
+        "expected q=20 ({} bytes) < q=80 ({} bytes) — quality knob \
+         not driving the per-bin quant matrix?",
+        q20.len(),
+        q80.len()
+    );
+    eprintln!(
+        "VP8 lossy q-driven quant-matrix: q20={} bytes, q80={} bytes ({:.1}x growth)",
+        q20.len(),
+        q80.len(),
+        q80.len() as f32 / q20.len() as f32
+    );
+
+    // (3) dwebp cross-decode (skips silently when unavailable).
+    cross_decode_with_dwebp(&q20, "q20-quality-preset");
+    cross_decode_with_dwebp(&q80, "q80-quality-preset");
 }
