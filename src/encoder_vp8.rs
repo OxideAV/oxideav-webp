@@ -185,12 +185,12 @@ fn segment_quant_deltas_for_qindex(qindex: u8) -> [i32; 4] {
 /// deltas: at high quality everything's near-lossless and the LF tweaks
 /// approach zero.
 ///
-/// **Currently unused at the call site** — the published
-/// `oxideav-vp8` 0.1.5 `Vp8EncoderConfig` does not expose a
-/// `segment_lf_deltas` field. Kept here (covered by a unit test) so
-/// the wiring is ready to land once the upstream API extension is
-/// published.
-#[allow(dead_code)]
+/// Wired through `webp_lossy_config` into
+/// [`oxideav_vp8::Vp8EncoderConfig::segment_lf_deltas`] (added in
+/// `oxideav-vp8` 0.1.6 / [#337]). The decoder applies these as
+/// `clamp(frame_level + segment_lf_deltas[seg], 0..=63)` per RFC 6386
+/// §15.2, so the segment map produced by the variance classifier
+/// dictates per-MB filter strength.
 fn segment_lf_deltas_for_qindex(qindex: u8) -> [i32; 4] {
     let span = (qindex as f32) / 127.0;
     // Smooth segment LF easing: 0..=3.
@@ -216,11 +216,14 @@ fn segment_lf_deltas_for_qindex(qindex: u8) -> [i32; 4] {
 /// regression tests depend on.
 ///
 /// The matching per-segment loop-filter delta knob (RFC 6386 §15.2)
-/// computed by [`segment_lf_deltas_for_qindex`] is *not* wired in
-/// here yet — the published `oxideav-vp8` 0.1.5 [`Vp8EncoderConfig`]
-/// doesn't expose `segment_lf_deltas`. Round-2 work on the upstream
-/// crate adds the field; once that lands and is published we'll plumb
-/// it through here without churning the call site.
+/// computed by [`segment_lf_deltas_for_qindex`] is wired in alongside
+/// the per-segment quant deltas now that `oxideav-vp8` 0.1.6 (#337)
+/// exposes the `segment_lf_deltas` field. The variance classifier in
+/// `oxideav-vp8` lands smooth MBs in segment 0 and high-variance MBs
+/// in segment 3; the smooth segment gets a *lighter* deblock (less
+/// over-smoothing on flat regions) and the textured segment gets a
+/// *heavier* deblock (masks the extra DCT block boundaries the
+/// coarser per-segment QP exposes).
 #[cfg(feature = "registry")]
 fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
     let qi = qindex.min(127);
@@ -233,9 +236,10 @@ fn webp_lossy_config(qindex: u8) -> Vp8EncoderConfig {
         // so the decode-side `lossy_corpus` regression tests don't drift.
         loop_filter_mode: LoopFilterMode::Normal,
         // Quality-driven perceptual tuning — segments-on, deltas scaled
-        // with qindex so high quality collapses to near-uniform QP.
+        // with qindex so high quality collapses to near-uniform QP / LF.
         enable_segments: true,
         segment_quant_deltas: segment_quant_deltas_for_qindex(qi),
+        segment_lf_deltas: segment_lf_deltas_for_qindex(qi),
         ..Vp8EncoderConfig::default()
     }
 }

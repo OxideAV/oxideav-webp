@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8-enc)* re-wire per-segment loop-filter delta tuning. Now that
+  `oxideav-vp8` 0.1.6 publishes `Vp8EncoderConfig::segment_lf_deltas`
+  (#337), the WebP single-frame lossy config plumbs the
+  quality-scaled deltas computed by `segment_lf_deltas_for_qindex`
+  into the encoder. Variance-segment 0 (smooth) gets a *lighter*
+  deblock so flat regions don't over-smooth; variance-segment 3
+  (textured) gets a *heavier* deblock so the coarser per-segment QP's
+  DCT block boundaries get masked. Closes the wiring previously
+  deferred in `a46ecf2 fix(vp8-enc): drop segment_lf_deltas — not on
+  published vp8 0.1.5`. Bumps `oxideav-vp8` minimum version to
+  `0.1.6`.
 - *(test)* `lossless_corpus` integration test walks the seven
   workspace `docs/image/webp/fixtures/lossless-*` fixtures and asserts
   bit-exact RGBA equality with each `expected.png` ground truth.
