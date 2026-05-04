@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-enc)* per-frame mode selection for animated WebP. New
+  [`build_animated_webp_with_options`] entry point + `AnimEncoderOptions`
+  knob bag with three policies: `Lossless` (the historic
+  always-VP8L behaviour, kept for `build_animated_webp`), `Lossy`
+  (always VP8 + ALPH), and `Auto` (the default — encode each frame
+  both ways and pick whichever sub-chunk(s) lay out a smaller ANMF
+  payload). Mirrors libwebp's `WebPAnimEncoderAdd` per-frame
+  decision. The WebP container permits mixing VP8L and VP8+ALPH
+  frames in a single animation and the in-crate decoder already
+  handles both shapes. Closes #335.
 - *(vp8-enc)* per-segment quantiser + loop-filter delta tuning driven
   by quality. The lossy WebP encoder now routes every keyframe through
   `make_encoder_with_config` with `enable_segments = true` and

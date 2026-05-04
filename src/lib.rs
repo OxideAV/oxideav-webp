@@ -71,7 +71,10 @@ pub const CODEC_ID_VP8: &str = "webp_vp8";
 // Public unconditional API — works whether or not `registry` is enabled.
 pub use decoder::{decode_webp, WebpFrame, WebpImage};
 pub use demux::{extract_metadata, WebpFileMetadata};
-pub use encoder_anim::{build_animated_webp, AnimFrame};
+pub use encoder_anim::{
+    build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions, AnimFrame,
+    AnimFrameMode,
+};
 pub use error::{Result, WebpError};
 pub use vp8l::{encode_vp8l_argb, encode_vp8l_argb_with, EncoderOptions};
 
