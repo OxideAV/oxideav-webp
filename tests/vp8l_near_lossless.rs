@@ -140,7 +140,7 @@ fn near_lossless_alpha_preserved_at_level_0() {
     for y in 0..h {
         for x in 0..w {
             // Varying alpha: 0..255 in steps of ~16.
-            let a = ((x + y * w) as u32 * 16 / (w * h) * 16).min(255);
+            let a = ((x + y * w) * 16 / (w * h) * 16).min(255);
             pixels.push((a << 24) | 0x00_5050a0);
         }
     }

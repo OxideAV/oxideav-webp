@@ -139,7 +139,7 @@ fn decoder_honours_dispose_to_background_between_frames() {
     // Top-left 4x4: green from F1.
     for y in 0..4 {
         for x in 0..4 {
-            let i = ((y * W as usize + x) * 4) as usize;
+            let i = (y * W as usize + x) * 4;
             assert_eq!(
                 &f1_canvas[i..i + 4],
                 &[0, 0xff, 0, 0xff],
@@ -150,7 +150,7 @@ fn decoder_honours_dispose_to_background_between_frames() {
     // Outside the 4x4 tile: must be (0,0,0,0) due to F0's dispose-to-bg.
     for y in 4..H as usize {
         for x in 0..W as usize {
-            let i = ((y * W as usize + x) * 4) as usize;
+            let i = (y * W as usize + x) * 4;
             assert_eq!(
                 &f1_canvas[i..i + 4],
                 &[0, 0, 0, 0],

@@ -27,10 +27,10 @@
 //!   when the image has ≤ 256 unique ARGB colours. Replaces every pixel
 //!   with a small palette index (1, 2, 4, or 8 bits per index, packed
 //!   into the green channel of the index image) and ships a delta-coded
-//!   palette out of band. Wins 2-5× on icons, line art, and screenshots
-//!   — and the index image often compresses *further* via subtract-green
-//!   + LZ77 + colour-cache once the channel-decorrelation is no longer
-//!   the bottleneck.
+//!   palette out of band. Wins 2-5× on icons, line art, and screenshots,
+//!   and the index image often compresses *further* via subtract-green
+//!   plus LZ77 plus colour-cache once the channel-decorrelation is no
+//!   longer the bottleneck.
 //! * **Meta-Huffman per-tile grouping (2 groups).** Tiles of the main
 //!   image are clustered into 2 Huffman groups by green-alphabet
 //!   histogram similarity (2-iteration K-means). Each group ships its
@@ -708,7 +708,10 @@ fn encode_vp8l_argb_rdo(
     let mut stripped: Vec<u32> = pixels.to_vec();
     strip_transparent_rgb(&mut stripped);
 
-    let mut best: Option<Vec<u8>> = None;
+    // Track best palette and best non-palette winners separately so we
+    // can apply a small palette bias at the end.
+    let mut best_palette: Option<Vec<u8>> = None;
+    let mut best_non_palette: Option<Vec<u8>> = None;
 
     for &use_palette in &[true, false] {
         for &use_sg in &[true, false] {
@@ -732,16 +735,54 @@ fn encode_vp8l_argb_rdo(
                         };
                         let bytes =
                             encode_vp8l_argb_with(width, height, &stripped, has_alpha, opts)?;
-                        if best.as_ref().map(|b| bytes.len() < b.len()).unwrap_or(true) {
-                            best = Some(bytes);
+                        let slot = if use_palette {
+                            &mut best_palette
+                        } else {
+                            &mut best_non_palette
+                        };
+                        if slot.as_ref().map(|b| bytes.len() < b.len()).unwrap_or(true) {
+                            *slot = Some(bytes);
                         }
                     }
                 }
             }
         }
     }
-    // `best` is always Some — we ran at least one trial above.
-    Ok(best.expect("RDO produced at least one candidate"))
+    // Prefer palette when the fixture is palette-feasible (≤ 256 unique
+    // ARGB colours) and the palette winner is within a small slack of
+    // the non-palette winner. The palette transform carries a fixed
+    // ~10-byte overhead (transform header + 5 simple-Huffman trees for
+    // the palette stream + delta-encoded palette literals) which can
+    // lose by a few bytes on microscopic fixtures — but the palette
+    // index image is significantly cheaper to decode (the decoder skips
+    // per-pixel predictor / colour-transform application) and the
+    // palette structure is preserved through the lossless round-trip.
+    // libwebp behaves the same way: when a palette is feasible it wins
+    // by default.
+    //
+    // The slack budget covers the realistic palette-transform overhead
+    // for tiny palettes (≤ 4 colours): 11 bits transform header, plus
+    // ~5 simple-Huffman trees in the palette sub-image (~50 bits), plus
+    // a few literal codes for the delta-encoded palette entries. Past
+    // ~16 bytes the non-palette path is genuinely a meaningfully better
+    // encode (e.g. 16-colour palette_like 64×64 fixture: palette = 243B
+    // vs no-palette = 225B) and we let RDO pick the no-palette winner.
+    const PALETTE_PREFERENCE_SLACK_BYTES: usize = 16;
+    let best = match (best_palette, best_non_palette) {
+        (Some(pal), Some(np)) => {
+            if pal.len() <= np.len().saturating_add(PALETTE_PREFERENCE_SLACK_BYTES) {
+                pal
+            } else {
+                np
+            }
+        }
+        (Some(pal), None) => pal,
+        (None, Some(np)) => np,
+        (None, None) => {
+            return Err(Error::invalid("RDO produced no candidate"));
+        }
+    };
+    Ok(best)
 }
 
 /// Encode a `width × height` VP8L image stream (post-transform residuals)
@@ -865,23 +906,11 @@ fn encode_image_stream_single_group(
         );
     }
 
-    let green_lens = build_limited_lengths(&green_freq, MAX_CODE_LENGTH)?;
-    let red_lens = build_limited_lengths(&red_freq, MAX_CODE_LENGTH)?;
-    let blue_lens = build_limited_lengths(&blue_freq, MAX_CODE_LENGTH)?;
-    let alpha_lens = build_limited_lengths(&alpha_freq, MAX_CODE_LENGTH)?;
-    let dist_lens = build_limited_lengths(&dist_freq, MAX_CODE_LENGTH)?;
-
-    let green_codes = canonical_codes(&green_lens);
-    let red_codes = canonical_codes(&red_lens);
-    let blue_codes = canonical_codes(&blue_lens);
-    let alpha_codes = canonical_codes(&alpha_lens);
-    let dist_codes = canonical_codes(&dist_lens);
-
-    emit_huffman_tree(bw, &green_lens)?;
-    emit_huffman_tree(bw, &red_lens)?;
-    emit_huffman_tree(bw, &blue_lens)?;
-    emit_huffman_tree(bw, &alpha_lens)?;
-    emit_huffman_tree(bw, &dist_lens)?;
+    let (green_lens, green_codes) = build_and_emit_huffman_tree(bw, &green_freq, MAX_CODE_LENGTH)?;
+    let (red_lens, red_codes) = build_and_emit_huffman_tree(bw, &red_freq, MAX_CODE_LENGTH)?;
+    let (blue_lens, blue_codes) = build_and_emit_huffman_tree(bw, &blue_freq, MAX_CODE_LENGTH)?;
+    let (alpha_lens, alpha_codes) = build_and_emit_huffman_tree(bw, &alpha_freq, MAX_CODE_LENGTH)?;
+    let (dist_lens, dist_codes) = build_and_emit_huffman_tree(bw, &dist_freq, MAX_CODE_LENGTH)?;
 
     for sym in stream {
         emit_symbol(
@@ -1184,45 +1213,30 @@ fn try_encode_meta_huffman(
         .collect();
     encode_image_stream(bw, &meta_pixels, meta_w, meta_h, false, 0)?;
 
-    // Build per-group Huffman trees.
-    let g0_green_lens = build_limited_lengths(&g0_green, MAX_CODE_LENGTH)?;
-    let g0_red_lens = build_limited_lengths(&g0_red, MAX_CODE_LENGTH)?;
-    let g0_blue_lens = build_limited_lengths(&g0_blue, MAX_CODE_LENGTH)?;
-    let g0_alpha_lens = build_limited_lengths(&g0_alpha, MAX_CODE_LENGTH)?;
-    let g0_dist_lens = build_limited_lengths(&g0_dist, MAX_CODE_LENGTH)?;
-
-    let g1_green_lens = build_limited_lengths(&g1_green, MAX_CODE_LENGTH)?;
-    let g1_red_lens = build_limited_lengths(&g1_red, MAX_CODE_LENGTH)?;
-    let g1_blue_lens = build_limited_lengths(&g1_blue, MAX_CODE_LENGTH)?;
-    let g1_alpha_lens = build_limited_lengths(&g1_alpha, MAX_CODE_LENGTH)?;
-    let g1_dist_lens = build_limited_lengths(&g1_dist, MAX_CODE_LENGTH)?;
-
-    let g0_green_codes = canonical_codes(&g0_green_lens);
-    let g0_red_codes = canonical_codes(&g0_red_lens);
-    let g0_blue_codes = canonical_codes(&g0_blue_lens);
-    let g0_alpha_codes = canonical_codes(&g0_alpha_lens);
-    let g0_dist_codes = canonical_codes(&g0_dist_lens);
-
-    let g1_green_codes = canonical_codes(&g1_green_lens);
-    let g1_red_codes = canonical_codes(&g1_red_lens);
-    let g1_blue_codes = canonical_codes(&g1_blue_lens);
-    let g1_alpha_codes = canonical_codes(&g1_alpha_lens);
-    let g1_dist_codes = canonical_codes(&g1_dist_lens);
-
-    // Emit groups in numeric order (group 0 then group 1), each as a
-    // run of 5 trees (green/red/blue/alpha/distance). Matches what
+    // Build & emit per-group Huffman trees in one pass. The
+    // build_and_emit_huffman_tree helper picks the simple-Huffman wire
+    // format for ≤ 2-active-symbol alphabets — important for groups that
+    // end up with only a handful of active symbols (e.g. one group
+    // covering a flat-colour region).
+    //
+    // Emission order: group 0 then group 1, each as a run of 5 trees
+    // (green/red/blue/alpha/distance). Matches what
     // [`super::HuffmanGroup::read`] expects.
-    emit_huffman_tree(bw, &g0_green_lens)?;
-    emit_huffman_tree(bw, &g0_red_lens)?;
-    emit_huffman_tree(bw, &g0_blue_lens)?;
-    emit_huffman_tree(bw, &g0_alpha_lens)?;
-    emit_huffman_tree(bw, &g0_dist_lens)?;
+    let (g0_green_lens, g0_green_codes) =
+        build_and_emit_huffman_tree(bw, &g0_green, MAX_CODE_LENGTH)?;
+    let (g0_red_lens, g0_red_codes) = build_and_emit_huffman_tree(bw, &g0_red, MAX_CODE_LENGTH)?;
+    let (g0_blue_lens, g0_blue_codes) = build_and_emit_huffman_tree(bw, &g0_blue, MAX_CODE_LENGTH)?;
+    let (g0_alpha_lens, g0_alpha_codes) =
+        build_and_emit_huffman_tree(bw, &g0_alpha, MAX_CODE_LENGTH)?;
+    let (g0_dist_lens, g0_dist_codes) = build_and_emit_huffman_tree(bw, &g0_dist, MAX_CODE_LENGTH)?;
 
-    emit_huffman_tree(bw, &g1_green_lens)?;
-    emit_huffman_tree(bw, &g1_red_lens)?;
-    emit_huffman_tree(bw, &g1_blue_lens)?;
-    emit_huffman_tree(bw, &g1_alpha_lens)?;
-    emit_huffman_tree(bw, &g1_dist_lens)?;
+    let (g1_green_lens, g1_green_codes) =
+        build_and_emit_huffman_tree(bw, &g1_green, MAX_CODE_LENGTH)?;
+    let (g1_red_lens, g1_red_codes) = build_and_emit_huffman_tree(bw, &g1_red, MAX_CODE_LENGTH)?;
+    let (g1_blue_lens, g1_blue_codes) = build_and_emit_huffman_tree(bw, &g1_blue, MAX_CODE_LENGTH)?;
+    let (g1_alpha_lens, g1_alpha_codes) =
+        build_and_emit_huffman_tree(bw, &g1_alpha, MAX_CODE_LENGTH)?;
+    let (g1_dist_lens, g1_dist_codes) = build_and_emit_huffman_tree(bw, &g1_dist, MAX_CODE_LENGTH)?;
 
     // Per-symbol writes: pick the group from the tile assignment.
     for (idx, sym) in stream.iter().enumerate() {
@@ -2403,6 +2417,122 @@ fn emit_huffman_tree(bw: &mut BitWriter, lens: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Emit a simple-Huffman tree (spec §3.7.2.1.1) for an alphabet that has
+/// at most 2 active symbols, and return the (lens, codes) tables that
+/// match the wire-format. Used as a compact alternative to the normal
+/// Huffman header. For single-symbol alphabets the saving is roughly
+/// 28 bits of header, and the per-symbol coding cost drops to ZERO bits
+/// because the decoder's `read_simple` 1-symbol path returns the symbol
+/// without consuming any bits (`only_symbol` short-circuit in
+/// `huffman.rs`).
+///
+/// Wire format (matches `huffman.rs::read_simple`):
+/// * `simple = 1` (1 bit)
+/// * `num_symbols - 1` (1 bit) — 0 for 1-symbol, 1 for 2-symbol
+/// * `is_first_8bits` (1 bit) — picks 1-bit or 8-bit field for sym0
+/// * `sym0` (1 or 8 bits)
+/// * if 2 symbols: `sym1` (8 bits)
+///
+/// Returns `Some((lens, codes))` on success — the lens/codes are
+/// configured so [`write_code`] emits zero bits for the 1-symbol case
+/// (matching the decoder's no-consume return) and 1 bit each for the
+/// 2-symbol case (sym0 → 0, sym1 → 1).
+fn try_emit_simple_huffman(
+    bw: &mut BitWriter,
+    freqs: &[u32],
+) -> Option<(Vec<u8>, Vec<u32>)> {
+    let alphabet = freqs.len();
+    let nonzero: Vec<usize> = (0..alphabet).filter(|&i| freqs[i] > 0).collect();
+    let lens = vec![0u8; alphabet];
+    let codes = vec![0u32; alphabet];
+    match nonzero.len() {
+        0 => {
+            // No active symbols. Emit a 1-symbol simple tree pointing at
+            // sym=0 — the encoder will never reference this alphabet, so
+            // the choice is purely formal.
+            bw.write(1, 1); // simple = 1
+            bw.write(0, 1); // num_symbols - 1 = 0 → 1 symbol
+            bw.write(0, 1); // is_first_8bits = 0
+            bw.write(0, 1); // sym0 = 0
+            Some((lens, codes))
+        }
+        1 => {
+            let s = nonzero[0];
+            bw.write(1, 1); // simple = 1
+            bw.write(0, 1); // num_symbols - 1 = 0 → 1 symbol
+            if s <= 1 {
+                bw.write(0, 1); // is_first_8bits = 0 (1-bit field)
+                bw.write(s as u32, 1);
+            } else if s < 256 {
+                bw.write(1, 1); // is_first_8bits = 1 (8-bit field)
+                bw.write(s as u32, 8);
+            } else {
+                // sym out of range for 8-bit field — fall back to normal
+                // Huffman. Triggers for cache/length symbols above 256.
+                return None;
+            }
+            // lens stay all-zero: decoder's `only_symbol` short-circuit
+            // returns the symbol without consuming any bits, and our
+            // matching `write_code` with `len = 0` writes nothing.
+            Some((lens, codes))
+        }
+        2 => {
+            let mut a = nonzero[0];
+            let mut b = nonzero[1];
+            // sym0 carries the 1-bit / 8-bit field choice. Put the
+            // smaller index in sym0 so we can use the 1-bit field when
+            // possible. sym1 is always 8-bit, so it must fit in 8 bits.
+            if a >= 256 || b >= 256 {
+                return None;
+            }
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            bw.write(1, 1); // simple = 1
+            bw.write(1, 1); // num_symbols - 1 = 1 → 2 symbols
+            if a <= 1 {
+                bw.write(0, 1); // is_first_8bits = 0
+                bw.write(a as u32, 1);
+            } else {
+                bw.write(1, 1); // is_first_8bits = 1
+                bw.write(a as u32, 8);
+            }
+            bw.write(b as u32, 8); // sym1: always 8 bits
+            // 2-symbol simple tree: sym0 (the lower index) gets code 0,
+            // sym1 gets code 1 — both length 1. Matches `read_simple`'s
+            // explicit `0 → sym0, 1 → sym1` bit assignment.
+            let mut lens = lens;
+            let mut codes = codes;
+            lens[a] = 1;
+            lens[b] = 1;
+            codes[a] = 0;
+            codes[b] = 1;
+            Some((lens, codes))
+        }
+        _ => None,
+    }
+}
+
+/// One-shot build + emit of a Huffman header: picks the simple-Huffman
+/// wire format for ≤ 2-active-symbol alphabets (large savings on palette
+/// index streams + single-pixel-colour alphabets), falls back to the
+/// normal length-table format otherwise. Returns the per-symbol
+/// (lens, codes) tables that [`emit_symbol`] / [`write_code`] should use
+/// to encode the body — matching the wire format we just emitted.
+fn build_and_emit_huffman_tree(
+    bw: &mut BitWriter,
+    freqs: &[u32],
+    max_len: u8,
+) -> Result<(Vec<u8>, Vec<u32>)> {
+    if let Some((lens, codes)) = try_emit_simple_huffman(bw, freqs) {
+        return Ok((lens, codes));
+    }
+    let lens = build_limited_lengths(freqs, max_len)?;
+    let codes = canonical_codes(&lens);
+    emit_huffman_tree(bw, &lens)?;
+    Ok((lens, codes))
 }
 
 fn compress_lengths(lens: &[u8]) -> Vec<(u8, u32)> {

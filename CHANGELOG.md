@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8l-enc)* simple-Huffman tree emission for ≤ 2-active-symbol
+  alphabets (spec §3.7.2.1.1). Single-symbol alphabets now emit a
+  4-12 bit header and zero per-symbol bits (decoder's `only_symbol`
+  short-circuit returns without consuming bits); 2-symbol alphabets
+  emit a 12-13 bit header and 1 bit per symbol. Big win on palette
+  index streams, single-colour-channel images, and the palette
+  delta-encoded sub-stream.
 - New default-on `registry` feature. With `default-features = false`
   the crate compiles without `oxideav-core` (and pulls `oxideav-vp8`
   in with its `registry` feature also off) and exposes a free-standing
@@ -25,6 +32,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `register` helpers + `WebpDecoder` streaming type — every current
   consumer (`oxideav` umbrella, `oxideav-pipeline`, mp4 + mkv WebP
   extraction) keeps working unchanged. (#358)
+
+### Changed
+
+- *(vp8l-enc)* RDO now mildly prefers the colour-indexing (palette)
+  transform when the fixture is palette-feasible and the palette
+  bitstream is within 16 bytes of the non-palette winner. Matches
+  libwebp behaviour: palette is preferred whenever feasible because
+  the index image is faster to decode (no per-pixel predictor /
+  colour-transform application). Past 16 bytes the non-palette path
+  is meaningfully better and RDO picks it. Closes #379.
+
+### Fixed
+
+- *(clippy)* doc list item overindented in `apply_alph_filter`
+  (mode-3 description) and doc lazy-continuation on em-dash line in
+  `vp8l/encoder` module preamble. (#379)
+- *(clippy)* unnecessary `as usize` / `as u32` casts in
+  `tests/animated_disposal_blend.rs`, `tests/metadata_roundtrip.rs`,
+  `tests/vp8l_near_lossless.rs`.
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-webp/compare/v0.0.8...v0.0.9) - 2026-05-03
 

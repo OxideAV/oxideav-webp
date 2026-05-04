@@ -599,7 +599,7 @@ fn encode_alpha_plane_as_vp8l(width: u32, height: u32, alpha: &[u8]) -> Result<V
 /// * 1 — horizontal: `r[x] = a[x] - a[x-1]` (first column kept as-is).
 /// * 2 — vertical:   `r[x,y] = a[x,y] - a[x,y-1]` (first row kept).
 /// * 3 — gradient:   `r = a - clip(L + T - TL)` (first row + first
-///                   column degenerate to mode-1 / mode-2 / identity).
+///   column degenerate to mode-1 / mode-2 / identity).
 ///
 /// The forward pass mirrors the decoder's `unfilter_alpha` per-mode
 /// arithmetic exactly, so encode-then-decode is byte-identical.

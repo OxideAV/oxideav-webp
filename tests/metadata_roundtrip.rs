@@ -163,8 +163,8 @@ fn simple_layout_decode_returns_empty_metadata() {
     let mut argb = Vec::with_capacity((W * H) as usize);
     for y in 0..H {
         for x in 0..W {
-            let r = x as u32;
-            let g = y as u32;
+            let r = x;
+            let g = y;
             argb.push(0xff00_0000 | (r << 16) | (g << 8));
         }
     }
