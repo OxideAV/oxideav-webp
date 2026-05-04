@@ -283,7 +283,10 @@ struct AnmfSubChunk {
 /// alpha) depending on `options.mode`. With `Auto`, both encodings
 /// are produced and the byte-smaller wins (sum of sub-chunk header
 /// + payload, mirroring the on-disk cost).
-fn encode_one_anmf_image(f: &AnimFrame<'_>, options: AnimEncoderOptions) -> Result<Vec<AnmfSubChunk>> {
+fn encode_one_anmf_image(
+    f: &AnimFrame<'_>,
+    options: AnimEncoderOptions,
+) -> Result<Vec<AnmfSubChunk>> {
     // Always produce the lossless candidate first — it's the
     // historic behaviour and the fallback when the lossy encode fails
     // (e.g. on too-small frames).
@@ -389,10 +392,8 @@ fn encode_lossy_anmf(f: &AnimFrame<'_>, quality: f32) -> Result<Option<Vec<AnmfS
 
     let mut subs: Vec<AnmfSubChunk> = Vec::with_capacity(2);
     if has_alpha {
-        let alph =
-            crate::encoder_vp8::encode_alph_chunk(f.width, f.height, &alpha_plane).map_err(|e| {
-                Error::invalid(format!("animated WebP: ALPH encode: {e}"))
-            })?;
+        let alph = crate::encoder_vp8::encode_alph_chunk(f.width, f.height, &alpha_plane)
+            .map_err(|e| Error::invalid(format!("animated WebP: ALPH encode: {e}")))?;
         // ALPH on disk: 1 header byte + payload bytes.
         let mut alph_payload = Vec::with_capacity(1 + alph.payload.len());
         alph_payload.push(alph.header_byte);

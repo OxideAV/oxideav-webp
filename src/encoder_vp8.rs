@@ -956,11 +956,7 @@ mod tests {
         assert!(hi_q[0] <= mid_q[0] && mid_q[0] <= lo_q[0]);
         assert!(hi_q[3] >= mid_q[3] && mid_q[3] >= lo_q[3]);
         // All deltas land in the legal 5-bit signed-magnitude range.
-        for d in lo_q
-            .iter()
-            .chain(mid_q.iter())
-            .chain(hi_q.iter())
-        {
+        for d in lo_q.iter().chain(mid_q.iter()).chain(hi_q.iter()) {
             assert!(*d >= -15 && *d <= 15, "delta {d} out of [-15, 15]");
         }
     }
@@ -984,7 +980,10 @@ mod tests {
                 lf[3]
             );
             for d in lf.iter() {
-                assert!(*d >= -63 && *d <= 63, "qindex {qi}: lf delta {d} out of range");
+                assert!(
+                    *d >= -63 && *d <= 63,
+                    "qindex {qi}: lf delta {d} out of range"
+                );
             }
         }
     }
