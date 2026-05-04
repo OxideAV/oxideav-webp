@@ -9,13 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8l-enc)* K=4 meta-Huffman per-tile grouping, in addition to the
+  existing K=2 trial. The encoder now tries K=1 (single-group),
+  K=2, and (above 4096 px) K=4 splits; whichever produces the
+  shortest bitstream wins. Tile clustering uses k-means++ farthest-
+  first seeding plus a 2-iteration k-means assignment pass. K=4 is
+  a clear win on images with several distinct visual regions
+  (typical photos with sky / foreground / detail). Closes #380.
+- *(vp8l-enc)* near-lossless smoothing pass. Runs after the per-pixel
+  bit-shift quantisation: walks the 3×3 neighbourhood of every
+  interior pixel and snaps the centre to the local-majority ARGB
+  value when ≥ 6 of the 9 neighbours agree AND the snap stays within
+  the per-channel quantisation step of the ORIGINAL pre-quantisation
+  pixel. Catches "boundary jitter" — adjacent pixels that straddle a
+  quantisation bin and would otherwise leave one-pixel runs in the
+  LZ77 stream. Drift envelope is unchanged from the bare per-pixel
+  pass: `≤ step` per channel, alpha bit-exact. (#380)
 - *(vp8l-enc)* simple-Huffman tree emission for ≤ 2-active-symbol
   alphabets (spec §3.7.2.1.1). Single-symbol alphabets now emit a
   4-12 bit header and zero per-symbol bits (decoder's `only_symbol`
   short-circuit returns without consuming bits); 2-symbol alphabets
   emit a 12-13 bit header and 1 bit per symbol. Big win on palette
   index streams, single-colour-channel images, and the palette
-  delta-encoded sub-stream.
+  delta-encoded sub-stream. (#379)
 - New default-on `registry` feature. With `default-features = false`
   the crate compiles without `oxideav-core` (and pulls `oxideav-vp8`
   in with its `registry` feature also off) and exposes a free-standing

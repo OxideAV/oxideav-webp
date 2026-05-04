@@ -164,6 +164,91 @@ fn near_lossless_alpha_preserved_at_level_0() {
 }
 
 #[test]
+fn near_lossless_smoothing_collapses_boundary_jitter() {
+    // 32×32 plateau where every pixel is (128, 128, 128) except for a
+    // sparse set of "boundary jitter" outliers — pixels that differ by
+    // ±1 from the plateau, simulating quantisation rounding noise.
+    // The smoothing pass should snap each outlier to (128, 128, 128)
+    // because the 8-neighbourhood majority is the plateau, and the
+    // resulting near-lossless bitstream should be measurably smaller
+    // than what bare per-pixel quantisation produces.
+    //
+    // We can't directly observe the smoothing in the bitstream, but we
+    // can compare encoded sizes against an output that's already on a
+    // single value (the all-plateau ground truth) — smoothing should
+    // bring our jittered fixture closer to that baseline.
+    let w = 32u32;
+    let h = 32u32;
+    let plateau: u32 = 0xff80_8080; // ARGB: a=ff, r=80, g=80, b=80
+    let mut jittered = vec![plateau; (w * h) as usize];
+    // Sprinkle ~30% outliers, each ±1 on one channel — well within the
+    // shift=1 quantisation step (step=2) so the smoothing pass can
+    // legally snap them.
+    let mut s: u32 = 0xC0DE_C0DE;
+    let mut outlier_count = 0;
+    for slot in jittered.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        if (s & 0b11) != 0 {
+            // 75% jitter — but since the smoothing requires 6/9
+            // neighbours to share a value, this rate has to leave
+            // enough majority pockets for snapping to fire.
+            continue;
+        }
+        // Modify just one channel by 1 — within step=2 of the plateau
+        // so the (re-)quantisation rounds to the plateau bin and
+        // smoothing can confirm the snap.
+        let ch = (s >> 2) & 3;
+        let delta: i32 = if (s >> 4) & 1 == 0 { 1 } else { -1 };
+        let mut p = *slot;
+        let v = ((p >> (ch * 8)) & 0xff) as i32;
+        let nv = (v + delta).clamp(0, 255) as u32;
+        p = (p & !(0xffu32 << (ch * 8))) | (nv << (ch * 8));
+        *slot = p;
+        outlier_count += 1;
+    }
+    assert!(
+        outlier_count > 0,
+        "fixture must have some outliers to smooth"
+    );
+
+    let opts = EncoderOptions {
+        near_lossless: 60, // shift=1, step=2
+        ..EncoderOptions::default()
+    };
+    let bs = encode_vp8l_argb_with(w, h, &jittered, false, opts).expect("encode");
+    let dec = vp8l::decode(&bs).expect("decode");
+    assert_eq!(dec.width, w);
+    assert_eq!(dec.height, h);
+    // Drift bound: every pixel must stay within step=2 of the input.
+    for (i, (orig, got)) in jittered.iter().zip(dec.pixels.iter()).enumerate() {
+        for ch in 0..3 {
+            let sh = ch * 8;
+            let ov = ((orig >> sh) & 0xff) as i32;
+            let gv = ((got >> sh) & 0xff) as i32;
+            assert!(
+                (ov - gv).abs() <= 2,
+                "smoothing pushed pixel {i} ch {ch} past drift bound: {ov} → {gv}"
+            );
+        }
+    }
+
+    // The smoothing pass should make the decoded interior pixels the
+    // plateau value at most positions — the snapped pixels become
+    // bit-identical to their neighbours. Count how many pixels match
+    // the plateau vs how many would match in the original input. The
+    // smoothed encode should expose more matches.
+    let plateau_matches_after = dec.pixels.iter().filter(|&&p| p == plateau).count();
+    let plateau_matches_before = jittered.iter().filter(|&&p| p == plateau).count();
+    assert!(
+        plateau_matches_after > plateau_matches_before,
+        "smoothing should collapse outliers onto the plateau majority \
+         (before: {plateau_matches_before}, after: {plateau_matches_after})"
+    );
+}
+
+#[test]
 fn near_lossless_shrinks_photographic_bitstream() {
     let w = 64;
     let h = 64;

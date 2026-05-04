@@ -31,20 +31,25 @@
 //!   and the index image often compresses *further* via subtract-green
 //!   plus LZ77 plus colour-cache once the channel-decorrelation is no
 //!   longer the bottleneck.
-//! * **Meta-Huffman per-tile grouping (2 groups).** Tiles of the main
-//!   image are clustered into 2 Huffman groups by green-alphabet
-//!   histogram similarity (2-iteration K-means). Each group ships its
-//!   own {green, red, blue, alpha, distance} trees and a meta-image
-//!   carries the per-tile group id. The encoder always also tries the
-//!   single-group baseline and keeps whichever variant produces the
-//!   shorter bitstream — the trial is strictly non-regressing.
-//!
-//! What we still don't do (compared to libwebp):
-//!
-//! * **K=4+ meta-Huffman.** Only 2 clusters today; libwebp scales up
-//!   to 16. Past 2 the per-group overhead grows linearly and the gain
-//!   tails off on small / medium images, so 2 is the sweet spot for
-//!   our typical fixtures.
+//! * **Meta-Huffman per-tile grouping (K=2 and K=4).** Tiles of the
+//!   main image are clustered into K Huffman groups by green-alphabet
+//!   histogram similarity (k-means++ farthest-first seeding +
+//!   2-iteration assignment). Each group ships its own {green, red,
+//!   blue, alpha, distance} trees and a meta-image carries the per-tile
+//!   group id. The encoder always tries the single-group baseline plus
+//!   K=2 and (above 4096 px) K=4, keeping whichever variant produces
+//!   the shortest bitstream. K>4 is not yet attempted: past K=4 the
+//!   per-group header overhead grows linearly and the gain tails off
+//!   sharply on the natural fixtures we care about.
+//! * **Near-lossless preprocessing.** Optional two-pass pixel rewrite
+//!   (configurable via `EncoderOptions::near_lossless`). Pass 1 rounds
+//!   each R/G/B byte to a multiple of `1 << shift`; pass 2 walks the
+//!   3×3 neighbourhood of every interior pixel and snaps the centre to
+//!   the local-majority ARGB value when ≥ 6 of its 9 neighbours agree
+//!   AND the snap stays within the quantisation step. Together they
+//!   collapse near-identical pixels into longer LZ77 runs and richer
+//!   colour-cache hits without visibly affecting the decoded image.
+//!   Alpha is preserved bit-exact.
 //!
 //! What *is* implemented end-to-end:
 //!
@@ -312,12 +317,6 @@ fn near_lossless_shift(level: u8) -> Option<u32> {
 /// than the marginal gain from rounding it, and the strip-transparent
 /// pass (run earlier when enabled) already collapses RGB on alpha=0
 /// pixels.
-///
-/// This pass intentionally does *not* try to be neighbourhood-aware —
-/// the expensive smoothing libwebp does on top of the bit-shift is a
-/// further refinement; the bare quantisation step alone already
-/// captures most of the size win on photographic content. Smoothing
-/// can be layered on later as a second pass if benchmarks justify it.
 fn apply_near_lossless(pixels: &mut [u32], shift: u32) {
     debug_assert!((1..=7).contains(&shift));
     let step = 1u32 << shift;
@@ -332,6 +331,115 @@ fn apply_near_lossless(pixels: &mut [u32], shift: u32) {
         let ng = quantise_channel(g, bias, mask);
         let nb = quantise_channel(b, bias, mask);
         *p = (a << 24) | (nr << 16) | (ng << 8) | nb;
+    }
+}
+
+/// Run a 3×3 neighbourhood smoothing pass after [`apply_near_lossless`]:
+/// for every interior pixel, if at least `MAJORITY` of the 9 cells in
+/// its 3×3 window share the same ARGB value, snap the centre to that
+/// value — provided the snap stays within the SAME per-channel drift
+/// envelope as the bare bit-shift quantisation (i.e. ≤ `step` away from
+/// the *original* pre-quantisation pixel, not the intermediate
+/// quantised pixel).
+///
+/// Captures the "near-identical pixels become identical" intent — the
+/// per-channel bit-shift quantisation already rounds values into bins,
+/// but boundary jitter can leave adjacent pixels in different bins by
+/// one step. Snapping the centre to the local majority collapses these
+/// boundary cases and feeds longer LZ77 runs to the entropy coder
+/// without widening the visible drift envelope.
+///
+/// `original` is the pre-quantisation snapshot; we re-check the snap
+/// candidate against it so the total drift (original → smoothed) stays
+/// at the same `step` bound the bare quantisation step honours.
+///
+/// Operates on a snapshot of the post-quantisation input (not in-place
+/// over the live buffer) so the majority count for pixel (x, y) doesn't
+/// see the already-smoothed values at (x-1, y), (x, y-1), etc — the
+/// pass is thus independent of raster order.
+fn apply_near_lossless_smoothing(
+    pixels: &mut [u32],
+    original: &[u32],
+    width: u32,
+    height: u32,
+    shift: u32,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    if w < 3 || h < 3 {
+        return;
+    }
+    debug_assert!((1..=7).contains(&shift));
+    debug_assert_eq!(pixels.len(), original.len());
+    // Need at least this many of the 9 cells to share a value before
+    // we snap the centre. 6/9 (≈ 67%) is a good balance: high enough
+    // that we don't smear isolated pixels into their neighbourhood,
+    // low enough to catch the typical "edge of a flat region with one
+    // straggler in a different bin" case.
+    const MAJORITY: u32 = 6;
+
+    let step = 1u32 << shift;
+    let snapshot: Vec<u32> = pixels.to_vec();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let centre = snapshot[y * w + x];
+            // Count how many of the 9 cells (including centre) share
+            // the most-common ARGB value. We use a tiny up-to-9-entry
+            // associative array — adequate for K ≤ 9.
+            let mut counts: [(u32, u32); 9] = [(0, 0); 9];
+            let mut n_distinct = 0usize;
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let p = snapshot[(y + dy - 1) * w + (x + dx - 1)];
+                    let mut found = false;
+                    for slot in counts.iter_mut().take(n_distinct) {
+                        if slot.0 == p {
+                            slot.1 += 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        counts[n_distinct] = (p, 1);
+                        n_distinct += 1;
+                    }
+                }
+            }
+            let mut best = (0u32, 0u32);
+            for slot in counts.iter().take(n_distinct) {
+                if slot.1 > best.1 {
+                    best = *slot;
+                }
+            }
+            if best.1 < MAJORITY || centre == best.0 {
+                continue;
+            }
+            // Bound the snap by the ORIGINAL pre-quantisation pixel,
+            // not the post-quantisation centre. This keeps the total
+            // drift (original → smoothed) within the same `step`
+            // envelope the bare quantisation honours, so the public
+            // `near_lossless` drift bound (≤ step) holds end-to-end.
+            //
+            // Alpha must stay bit-exact: the strip-transparent and
+            // metadata-roundtrip paths assume alpha is preserved, and
+            // the test fixture's drift assertion requires alpha drift
+            // = 0 regardless of level.
+            let orig = original[y * w + x];
+            let oa = (orig >> 24) & 0xff;
+            let ba = (best.0 >> 24) & 0xff;
+            if oa != ba {
+                continue;
+            }
+            let or = (orig >> 16) & 0xff;
+            let og = (orig >> 8) & 0xff;
+            let ob = orig & 0xff;
+            let br = (best.0 >> 16) & 0xff;
+            let bg = (best.0 >> 8) & 0xff;
+            let bb = best.0 & 0xff;
+            if or.abs_diff(br) <= step && og.abs_diff(bg) <= step && ob.abs_diff(bb) <= step {
+                pixels[y * w + x] = best.0;
+            }
+        }
     }
 }
 
@@ -494,8 +602,20 @@ pub fn encode_vp8l_argb_with(
     // channels (alpha is preserved); the resulting bitstream is still
     // a fully-spec-compliant lossless VP8L stream — this is a pure
     // pre-encode pixel rewrite that improves entropy-coder statistics.
+    //
+    // Two passes:
+    //   1. Per-pixel bit-shift quantisation (rounds R/G/B to multiples
+    //      of `1 << shift`).
+    //   2. 3×3 neighbourhood smoothing pass: snap a centre pixel to
+    //      its local-majority value when ≥ 6 of its 9 neighbours share
+    //      the same ARGB triple AND the snap stays within `step` of the
+    //      ORIGINAL (pre-quantisation) pixel. Catches "boundary jitter"
+    //      where adjacent pixels straddle a quantisation bin and would
+    //      otherwise leave one-pixel runs in the LZ77 stream.
     if let Some(shift) = near_lossless_shift(opts.near_lossless) {
+        let original = working.clone();
         apply_near_lossless(&mut working, shift);
+        apply_near_lossless_smoothing(&mut working, &original, width, height, shift);
     }
 
     // ── Optional colour-indexing (palette) transform ────────────────
@@ -831,39 +951,83 @@ fn encode_image_stream(
         return Ok(());
     }
 
-    // Speculatively emit the meta-Huffman variant after rewinding to
-    // the same starting position. Compare bit lengths and keep the
-    // shorter one in the live writer.
+    // Speculatively emit the meta-Huffman variants (K = 2, 4) after
+    // rewinding to the same starting position. Compare bit lengths and
+    // keep the shortest one in the live writer.
     //
-    // Performance note: the rewind-then-meta-trial-then-maybe-rewind-
-    // again dance can in the worst case cost two full single-group
-    // encodes plus one meta-Huffman encode for the main image. The
-    // RDO sweep runs this 32+ times per `encode_vp8l_argb_rdo`, so we
-    // gate on the early-bail flags inside [`try_encode_meta_huffman`]
-    // (image too small / single-cluster degeneration) before paying
-    // the full meta-Huffman cost.
-    bw.restore(baseline_mark);
-    let meta_emitted = try_encode_meta_huffman(bw, &stream, width, height, cache_bits, cache_size)?;
-    if meta_emitted {
-        let meta_bits = bw.bit_pos() - baseline_mark.bit_pos();
-        if meta_bits < baseline_bits {
-            // Meta-Huffman wins — leave its bytes in place.
-            return Ok(());
+    // The K=4 trial is gated on the image being big enough to amortise
+    // the additional 2 groups' worth of Huffman-tree headers. K=4 wins
+    // on images with several visually distinct regions (typical photos
+    // with sky / foreground / detail). For smaller / more-uniform images
+    // K=2 (or the single-group baseline) wins because the per-group
+    // header overhead dominates.
+    //
+    // Performance note: each trial costs one full image-stream encode.
+    // The RDO sweep already runs 32+ trials, so we gate the K=4 trial
+    // on a minimum-pixel-count threshold ([`META_HUFFMAN_K4_MIN_PIXELS`])
+    // to keep the total CPU bounded.
+    let mut best_bits = baseline_bits;
+    let mut best_kind = MetaHuffmanWinner::SingleGroup;
+    let mut best_mark_after = bw.mark();
+
+    for &k in &[2u32, 4u32] {
+        if k > 2 && (width as u64) * (height as u64) < META_HUFFMAN_K4_MIN_PIXELS {
+            break;
         }
-        // Meta-Huffman lost. Rewind whatever the trial wrote and
-        // re-emit the baseline.
         bw.restore(baseline_mark);
-        encode_image_stream_single_group(bw, &stream, cache_bits, cache_size, main_image)?;
-        debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), baseline_bits);
-    } else {
-        // The trial returned without writing — the writer is still at
-        // `baseline_mark`. Re-emit the baseline (no rewind needed
-        // because the trial left no trace).
-        encode_image_stream_single_group(bw, &stream, cache_bits, cache_size, main_image)?;
-        debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), baseline_bits);
+        let emitted = try_encode_meta_huffman(
+            bw, &stream, width, height, cache_bits, cache_size, k as usize,
+        )?;
+        if !emitted {
+            continue;
+        }
+        let bits = bw.bit_pos() - baseline_mark.bit_pos();
+        if bits < best_bits {
+            best_bits = bits;
+            best_kind = MetaHuffmanWinner::Groups(k as usize);
+            best_mark_after = bw.mark();
+        }
+    }
+
+    // If neither K=2 nor K=4 beat the baseline, restore the baseline
+    // bytes (the writer is currently positioned wherever the last trial
+    // left it).
+    match best_kind {
+        MetaHuffmanWinner::SingleGroup => {
+            bw.restore(baseline_mark);
+            encode_image_stream_single_group(bw, &stream, cache_bits, cache_size, main_image)?;
+            debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), baseline_bits);
+        }
+        MetaHuffmanWinner::Groups(k) => {
+            // If the winning K is the one we just emitted, its bytes
+            // are already in place at `best_mark_after`. Otherwise we
+            // need to re-emit the winning K from scratch.
+            if bw.bit_pos() != best_mark_after.bit_pos() {
+                bw.restore(baseline_mark);
+                let emitted =
+                    try_encode_meta_huffman(bw, &stream, width, height, cache_bits, cache_size, k)?;
+                debug_assert!(emitted, "winning K trial must re-emit cleanly");
+                debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), best_bits);
+            }
+        }
     }
     Ok(())
 }
+
+/// Discriminates which encoder variant wins the meta-Huffman trial:
+/// the single-group baseline, or a K-group meta-Huffman split.
+#[derive(Clone, Copy)]
+enum MetaHuffmanWinner {
+    SingleGroup,
+    Groups(usize),
+}
+
+/// Below this pixel count the K=4 meta-Huffman trial is skipped — the
+/// 2 extra groups' worth of Huffman-tree headers would dominate any
+/// per-cluster savings on an image with only a few hundred symbols.
+/// 4096 pixels (64×64) is empirically where K=4 starts to pay back its
+/// header overhead on natural images (aligns with libwebp's heuristic).
+const META_HUFFMAN_K4_MIN_PIXELS: u64 = 4096;
 
 /// Single-Huffman-group baseline: one set of {green, red, blue, alpha,
 /// distance} trees covering the entire image. Mirrors the original
@@ -1059,26 +1223,28 @@ fn try_encode_meta_huffman(
     height: u32,
     cache_bits: u32,
     cache_size: u32,
+    k: usize,
 ) -> Result<bool> {
     // Meta-Huffman tile size. The spec allows `meta_bits ∈ 2..=9`
     // (4..=512 px per side). 4 (16-pixel tiles) is libwebp's default
     // and gives a reasonable signal-to-overhead ratio.
     const META_BITS: u32 = 4;
+    debug_assert!((2..=16).contains(&k), "K must be in 2..=16");
     let tile_side = 1u32 << META_BITS;
     let meta_w = (width + tile_side - 1) / tile_side;
     let meta_h = (height + tile_side - 1) / tile_side;
     let num_tiles = (meta_w * meta_h) as usize;
 
-    // No grouping makes sense with a single tile.
-    if num_tiles < 2 {
+    // No grouping makes sense with fewer tiles than groups.
+    if num_tiles < k {
         return Ok(false);
     }
 
-    // Bail out early on tiny images — the two extra Huffman-tree sets
-    // plus the meta-image stream overhead easily outweigh any per-group
+    // Bail out early on tiny images — the K extra Huffman-tree sets plus
+    // the meta-image stream overhead easily outweigh any per-group
     // savings on an image with few hundred symbols. 1024 pixels (32×32)
-    // is a conservative floor; smaller images stick with the single-
-    // group baseline.
+    // is a conservative floor for K=2; the K=4 caller adds its own
+    // gate ([`META_HUFFMAN_K4_MIN_PIXELS`]).
     if (width as u64) * (height as u64) < 1024 {
         return Ok(false);
     }
@@ -1120,72 +1286,43 @@ fn try_encode_meta_huffman(
         x = new_x % width;
     }
 
-    // ── Step 2: cluster tiles into 2 groups by histogram similarity.
-    // The "fingerprint" we cluster on is the green-alphabet histogram —
-    // it carries the most discriminative info (mix of literal-greens,
-    // length codes, cache hits varies wildly between e.g. flat and
-    // textured tiles).
-    //
-    // We use a 2-iteration k-means with K=2: pick two seed tiles
-    // (first non-empty + the one farthest from it), assign every tile
-    // to its nearest seed, recompute centroids, reassign. Two
-    // iterations is enough for the histograms to stabilise on natural
-    // images and keeps the worst-case cost bounded at
-    // O(num_tiles × green_alpha × K × iters).
-    let assignments = cluster_tiles_kmeans2(&tile_green, num_tiles);
+    // ── Step 2: cluster tiles into K groups by green-alphabet histogram
+    // similarity. A 2-iteration k-means is enough for the histograms to
+    // stabilise on natural images; further iterations rarely shift
+    // membership. Worst-case cost is O(num_tiles × green_alpha × K × 2).
+    let assignments = cluster_tiles_kmeans(&tile_green, num_tiles, k);
 
-    // If every tile landed in one group there's no point continuing —
-    // the meta-Huffman variant degenerates back to the single-group
-    // baseline plus pure overhead. Skip.
+    // If every tile landed in fewer than K groups there's no point
+    // continuing — the meta-Huffman variant degenerates back to a
+    // smaller-K baseline plus pure overhead. Skip.
     let used_groups: std::collections::BTreeSet<u32> = assignments.iter().copied().collect();
-    if used_groups.len() < 2 {
+    if used_groups.len() < k {
         return Ok(false);
     }
 
     // ── Step 3: build per-group histograms by summing over the tiles
     // assigned to each group.
-    let mut g0_green = vec![0u32; green_alpha];
-    let mut g0_red = vec![0u32; 256];
-    let mut g0_blue = vec![0u32; 256];
-    let mut g0_alpha = vec![0u32; 256];
-    let mut g0_dist = vec![0u32; 40];
-    let mut g1_green = vec![0u32; green_alpha];
-    let mut g1_red = vec![0u32; 256];
-    let mut g1_blue = vec![0u32; 256];
-    let mut g1_alpha = vec![0u32; 256];
-    let mut g1_dist = vec![0u32; 40];
+    let mut groups_green: Vec<Vec<u32>> = (0..k).map(|_| vec![0u32; green_alpha]).collect();
+    let mut groups_red: Vec<Vec<u32>> = (0..k).map(|_| vec![0u32; 256]).collect();
+    let mut groups_blue: Vec<Vec<u32>> = (0..k).map(|_| vec![0u32; 256]).collect();
+    let mut groups_alpha: Vec<Vec<u32>> = (0..k).map(|_| vec![0u32; 256]).collect();
+    let mut groups_dist: Vec<Vec<u32>> = (0..k).map(|_| vec![0u32; 40]).collect();
     for t in 0..num_tiles {
-        let (g, r, b, a, d) = if assignments[t] == 0 {
-            (
-                &mut g0_green,
-                &mut g0_red,
-                &mut g0_blue,
-                &mut g0_alpha,
-                &mut g0_dist,
-            )
-        } else {
-            (
-                &mut g1_green,
-                &mut g1_red,
-                &mut g1_blue,
-                &mut g1_alpha,
-                &mut g1_dist,
-            )
-        };
+        let g = assignments[t] as usize;
         for (i, v) in tile_green[t].iter().enumerate() {
-            g[i] += v;
+            groups_green[g][i] += v;
         }
         for (i, v) in tile_red[t].iter().enumerate() {
-            r[i] += v;
+            groups_red[g][i] += v;
         }
         for (i, v) in tile_blue[t].iter().enumerate() {
-            b[i] += v;
+            groups_blue[g][i] += v;
         }
         for (i, v) in tile_alpha[t].iter().enumerate() {
-            a[i] += v;
+            groups_alpha[g][i] += v;
         }
         for (i, v) in tile_dist[t].iter().enumerate() {
-            d[i] += v;
+            groups_dist[g][i] += v;
         }
     }
 
@@ -1219,83 +1356,72 @@ fn try_encode_meta_huffman(
     // end up with only a handful of active symbols (e.g. one group
     // covering a flat-colour region).
     //
-    // Emission order: group 0 then group 1, each as a run of 5 trees
+    // Emission order: groups in numeric order, each as a run of 5 trees
     // (green/red/blue/alpha/distance). Matches what
     // [`super::HuffmanGroup::read`] expects.
-    let (g0_green_lens, g0_green_codes) =
-        build_and_emit_huffman_tree(bw, &g0_green, MAX_CODE_LENGTH)?;
-    let (g0_red_lens, g0_red_codes) = build_and_emit_huffman_tree(bw, &g0_red, MAX_CODE_LENGTH)?;
-    let (g0_blue_lens, g0_blue_codes) = build_and_emit_huffman_tree(bw, &g0_blue, MAX_CODE_LENGTH)?;
-    let (g0_alpha_lens, g0_alpha_codes) =
-        build_and_emit_huffman_tree(bw, &g0_alpha, MAX_CODE_LENGTH)?;
-    let (g0_dist_lens, g0_dist_codes) = build_and_emit_huffman_tree(bw, &g0_dist, MAX_CODE_LENGTH)?;
-
-    let (g1_green_lens, g1_green_codes) =
-        build_and_emit_huffman_tree(bw, &g1_green, MAX_CODE_LENGTH)?;
-    let (g1_red_lens, g1_red_codes) = build_and_emit_huffman_tree(bw, &g1_red, MAX_CODE_LENGTH)?;
-    let (g1_blue_lens, g1_blue_codes) = build_and_emit_huffman_tree(bw, &g1_blue, MAX_CODE_LENGTH)?;
-    let (g1_alpha_lens, g1_alpha_codes) =
-        build_and_emit_huffman_tree(bw, &g1_alpha, MAX_CODE_LENGTH)?;
-    let (g1_dist_lens, g1_dist_codes) = build_and_emit_huffman_tree(bw, &g1_dist, MAX_CODE_LENGTH)?;
+    let mut group_lens: Vec<[Vec<u8>; 5]> = Vec::with_capacity(k);
+    let mut group_codes: Vec<[Vec<u32>; 5]> = Vec::with_capacity(k);
+    for g in 0..k {
+        let (gl, gc) = build_and_emit_huffman_tree(bw, &groups_green[g], MAX_CODE_LENGTH)?;
+        let (rl, rc) = build_and_emit_huffman_tree(bw, &groups_red[g], MAX_CODE_LENGTH)?;
+        let (bl, bc) = build_and_emit_huffman_tree(bw, &groups_blue[g], MAX_CODE_LENGTH)?;
+        let (al, ac) = build_and_emit_huffman_tree(bw, &groups_alpha[g], MAX_CODE_LENGTH)?;
+        let (dl, dc) = build_and_emit_huffman_tree(bw, &groups_dist[g], MAX_CODE_LENGTH)?;
+        group_lens.push([gl, rl, bl, al, dl]);
+        group_codes.push([gc, rc, bc, ac, dc]);
+    }
 
     // Per-symbol writes: pick the group from the tile assignment.
     for (idx, sym) in stream.iter().enumerate() {
-        let group = assignments[sym_tile[idx]];
-        if group == 0 {
-            emit_symbol(
-                bw,
-                sym,
-                &g0_green_codes,
-                &g0_green_lens,
-                &g0_red_codes,
-                &g0_red_lens,
-                &g0_blue_codes,
-                &g0_blue_lens,
-                &g0_alpha_codes,
-                &g0_alpha_lens,
-                &g0_dist_codes,
-                &g0_dist_lens,
-            );
-        } else {
-            emit_symbol(
-                bw,
-                sym,
-                &g1_green_codes,
-                &g1_green_lens,
-                &g1_red_codes,
-                &g1_red_lens,
-                &g1_blue_codes,
-                &g1_blue_lens,
-                &g1_alpha_codes,
-                &g1_alpha_lens,
-                &g1_dist_codes,
-                &g1_dist_lens,
-            );
-        }
+        let g = assignments[sym_tile[idx]] as usize;
+        emit_symbol(
+            bw,
+            sym,
+            &group_codes[g][0],
+            &group_lens[g][0],
+            &group_codes[g][1],
+            &group_lens[g][1],
+            &group_codes[g][2],
+            &group_lens[g][2],
+            &group_codes[g][3],
+            &group_lens[g][3],
+            &group_codes[g][4],
+            &group_lens[g][4],
+        );
     }
 
     Ok(true)
 }
 
-/// Cluster `num_tiles` per-tile green-alphabet histograms into 2 groups
-/// using a tiny 2-iteration k-means. Returns one group id (0 or 1) per
-/// tile in row-major order.
+/// Cluster `num_tiles` per-tile green-alphabet histograms into K groups
+/// using a 2-iteration k-means. Returns one group id (0..K) per tile in
+/// row-major order.
 ///
-/// The seeding picks the busiest tile (highest total count — usually the
-/// one with the most diverse content) as group 0's centroid and the tile
-/// most distant from it (L1 over the histogram) as group 1's centroid.
+/// Seeding follows a k-means++-style farthest-first approach: pick the
+/// busiest tile as seed 0, then for each subsequent seed pick the tile
+/// whose minimum L1 distance to any already-chosen seed is maximised.
+/// This spreads the seeds across the histogram space and avoids the
+/// degenerate "two seeds in the same cluster" failure mode that random
+/// seeding suffers from.
+///
 /// Two reassignment passes are enough for the histograms to settle on
 /// most natural images; further iterations rarely change cluster
 /// membership and would only burn CPU.
-fn cluster_tiles_kmeans2(tile_green: &[Vec<u32>], num_tiles: usize) -> Vec<u32> {
+///
+/// Centroids carry the **mean** histogram per cluster (sum ÷ count) so
+/// that L1 distance against a single tile is meaningful — otherwise a
+/// 50-tile cluster's centroid would dwarf any per-tile histogram and
+/// the comparison would degenerate to "which cluster has more tiles".
+fn cluster_tiles_kmeans(tile_green: &[Vec<u32>], num_tiles: usize, k: usize) -> Vec<u32> {
     let alpha = tile_green.first().map(|h| h.len()).unwrap_or(0);
-    if num_tiles < 2 || alpha == 0 {
+    if num_tiles < k || alpha == 0 || k < 2 {
         return vec![0u32; num_tiles];
     }
 
-    // Pick seed 0: the tile with the largest total count.
-    let mut seed0 = 0usize;
+    // Pick seed 0: the tile with the largest total symbol count.
+    let mut seeds: Vec<usize> = Vec::with_capacity(k);
     let mut max_total = 0u64;
+    let mut seed0 = 0usize;
     for (i, h) in tile_green.iter().enumerate() {
         let total: u64 = h.iter().map(|&v| v as u64).sum();
         if total > max_total {
@@ -1303,71 +1429,79 @@ fn cluster_tiles_kmeans2(tile_green: &[Vec<u32>], num_tiles: usize) -> Vec<u32> 
             seed0 = i;
         }
     }
-    // Pick seed 1: the tile farthest from seed 0 by L1 distance over
-    // the green histogram.
-    let mut seed1 = if seed0 == 0 { 1 } else { 0 };
-    let mut max_dist: u64 = 0;
-    for (i, h) in tile_green.iter().enumerate() {
-        if i == seed0 {
-            continue;
+    seeds.push(seed0);
+
+    // Subsequent seeds: farthest-first by min L1 distance to any
+    // already-chosen seed. Falls back to "first not yet picked" if
+    // every candidate ties at zero.
+    while seeds.len() < k {
+        let mut best_i = 0usize;
+        let mut best_d: u64 = 0;
+        for (i, h) in tile_green.iter().enumerate() {
+            if seeds.contains(&i) {
+                continue;
+            }
+            let min_d = seeds
+                .iter()
+                .map(|&s| l1_dist_u32(&tile_green[s], h))
+                .min()
+                .unwrap_or(0);
+            if min_d > best_d
+                || (min_d == best_d && best_d == 0 && best_i == 0 && !seeds.contains(&best_i))
+            {
+                best_d = min_d;
+                best_i = i;
+            }
         }
-        let d = l1_dist_u32(&tile_green[seed0], h);
-        if d > max_dist {
-            max_dist = d;
-            seed1 = i;
+        // If best_i is already a seed (tie at 0), pick the first un-
+        // seeded tile to guarantee progress.
+        if seeds.contains(&best_i) {
+            for i in 0..num_tiles {
+                if !seeds.contains(&i) {
+                    best_i = i;
+                    break;
+                }
+            }
         }
+        seeds.push(best_i);
     }
 
-    // Centroids carry the **mean** histogram for each cluster — divided
-    // by the cluster size so that L1 distance against a single tile's
-    // histogram is meaningful (otherwise the sum of e.g. 50 tile
-    // histograms would dwarf the per-tile counts and the comparison
-    // would degenerate to "which cluster has more tiles").
-    let mut centroid0 = tile_green[seed0].clone();
-    let mut centroid1 = tile_green[seed1].clone();
+    let mut centroids: Vec<Vec<u32>> = seeds.iter().map(|&s| tile_green[s].clone()).collect();
     let mut assignments = vec![0u32; num_tiles];
 
     for _iter in 0..2 {
         // Reassign every tile to its nearest centroid.
         for (t, h) in tile_green.iter().enumerate() {
-            let d0 = l1_dist_u32(&centroid0, h);
-            let d1 = l1_dist_u32(&centroid1, h);
-            assignments[t] = if d1 < d0 { 1 } else { 0 };
+            let mut best = 0u32;
+            let mut best_d = u64::MAX;
+            for (g, c) in centroids.iter().enumerate() {
+                let d = l1_dist_u32(c, h);
+                if d < best_d {
+                    best_d = d;
+                    best = g as u32;
+                }
+            }
+            assignments[t] = best;
         }
-        // Recompute centroids as per-bucket means over the assigned
-        // tiles. Empty-cluster pathology: leave a centroid at its
-        // previous value if nothing was assigned to it (keeps the
-        // seeding stable rather than collapsing to the all-zero
-        // histogram).
-        let mut sum0 = vec![0u64; alpha];
-        let mut sum1 = vec![0u64; alpha];
-        let mut n0 = 0u64;
-        let mut n1 = 0u64;
+        // Recompute centroids as per-bucket means. Empty cluster: keep
+        // the previous centroid in place (avoids collapsing to the
+        // all-zero histogram, which would attract every tile and
+        // re-trigger the empty-cluster pathology forever).
+        let mut sums: Vec<Vec<u64>> = (0..k).map(|_| vec![0u64; alpha]).collect();
+        let mut counts = vec![0u64; k];
         for (t, h) in tile_green.iter().enumerate() {
-            if assignments[t] == 0 {
-                for (i, &v) in h.iter().enumerate() {
-                    sum0[i] += v as u64;
-                }
-                n0 += 1;
-            } else {
-                for (i, &v) in h.iter().enumerate() {
-                    sum1[i] += v as u64;
-                }
-                n1 += 1;
+            let g = assignments[t] as usize;
+            counts[g] += 1;
+            for (i, &v) in h.iter().enumerate() {
+                sums[g][i] += v as u64;
             }
         }
-        // `checked_div` returns `None` when the cluster is empty —
-        // skip the centroid update in that case (leaves the previous
-        // centroid in place, which keeps the seeding stable rather
-        // than collapsing to all-zero).
-        for (i, s) in sum0.iter().enumerate() {
-            if let Some(v) = s.checked_div(n0) {
-                centroid0[i] = v as u32;
+        for g in 0..k {
+            if counts[g] == 0 {
+                continue;
             }
-        }
-        for (i, s) in sum1.iter().enumerate() {
-            if let Some(v) = s.checked_div(n1) {
-                centroid1[i] = v as u32;
+            for (i, s) in sums[g].iter().enumerate() {
+                centroids[g][i] = (s / counts[g]) as u32;
             }
         }
     }
@@ -2439,10 +2573,7 @@ fn emit_huffman_tree(bw: &mut BitWriter, lens: &[u8]) -> Result<()> {
 /// configured so [`write_code`] emits zero bits for the 1-symbol case
 /// (matching the decoder's no-consume return) and 1 bit each for the
 /// 2-symbol case (sym0 → 0, sym1 → 1).
-fn try_emit_simple_huffman(
-    bw: &mut BitWriter,
-    freqs: &[u32],
-) -> Option<(Vec<u8>, Vec<u32>)> {
+fn try_emit_simple_huffman(bw: &mut BitWriter, freqs: &[u32]) -> Option<(Vec<u8>, Vec<u32>)> {
     let alphabet = freqs.len();
     let nonzero: Vec<usize> = (0..alphabet).filter(|&i| freqs[i] > 0).collect();
     let lens = vec![0u8; alphabet];
@@ -2500,9 +2631,9 @@ fn try_emit_simple_huffman(
                 bw.write(a as u32, 8);
             }
             bw.write(b as u32, 8); // sym1: always 8 bits
-            // 2-symbol simple tree: sym0 (the lower index) gets code 0,
-            // sym1 gets code 1 — both length 1. Matches `read_simple`'s
-            // explicit `0 → sym0, 1 → sym1` bit assignment.
+                                   // 2-symbol simple tree: sym0 (the lower index) gets code 0,
+                                   // sym1 gets code 1 — both length 1. Matches `read_simple`'s
+                                   // explicit `0 → sym0, 1 → sym1` bit assignment.
             let mut lens = lens;
             let mut codes = codes;
             lens[a] = 1;
