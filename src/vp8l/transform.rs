@@ -330,7 +330,13 @@ fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
         2 => t,
         3 => tr,
         4 => tl,
-        5 => avg3(l, tr, t),
+        // Mode 5 per RFC 9649 §4.1: `Average2(Average2(L, TR), T)`. The
+        // associativity matters — `Average2(L, Average2(TR, T))` would be
+        // a different rounding because `Average2` is per-byte floor (not
+        // associative), and that mismatch would silently break interop
+        // with libwebp on every pixel that picks mode 5 (the encoder and
+        // decoder must agree on the same nesting).
+        5 => avg2(avg2(l, tr), t),
         6 => avg2(l, tl),
         7 => avg2(l, t),
         8 => avg2(tl, t),
@@ -357,10 +363,6 @@ fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
 #[inline]
 fn avg2(a: u32, b: u32) -> u32 {
     (a & b).wrapping_add(((a ^ b) & 0xfefe_fefe) >> 1)
-}
-
-fn avg3(a: u32, b: u32, c: u32) -> u32 {
-    avg2(a, avg2(b, c))
 }
 
 /// Predictor mode 11 ("select"): a Paeth-like decision that picks the

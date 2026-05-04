@@ -1728,7 +1728,13 @@ fn predict_argb(out: &[u32], w: usize, x: usize, y: usize, mode: u32) -> u32 {
         2 => t,
         3 => tr,
         4 => tl,
-        5 => avg3(l, tr, t),
+        // Mode 5 per RFC 9649 §4.1: `Average2(Average2(L, TR), T)`. The
+        // associativity matters — `Average2(L, Average2(TR, T))` would be
+        // a different rounding because `Average2` is per-byte floor (not
+        // associative), and that mismatch would silently break interop
+        // with libwebp on every pixel that picks mode 5 (the encoder and
+        // decoder must agree on the same nesting).
+        5 => avg2(avg2(l, tr), t),
         6 => avg2(l, tl),
         7 => avg2(l, t),
         8 => avg2(tl, t),
@@ -1750,10 +1756,6 @@ fn avg2(a: u32, b: u32) -> u32 {
         out |= ((av + bv) >> 1) << sh;
     }
     out
-}
-
-fn avg3(a: u32, b: u32, c: u32) -> u32 {
-    avg2(a, avg2(b, c))
 }
 
 fn select_argb(l: u32, t: u32, tl: u32) -> u32 {
@@ -2466,5 +2468,36 @@ mod tests {
         assert_eq!(codes[0], 0b10);
         assert_eq!(codes[2], 0b110);
         assert_eq!(codes[3], 0b111);
+    }
+
+    /// Predictor mode 5 per RFC 9649 §4.1 is `Average2(Average2(L, TR), T)`,
+    /// not `Average2(L, Average2(TR, T))`. Because `Average2` is per-byte
+    /// floor (truncating divide-by-2) and not associative, the two
+    /// nestings give different results on most inputs — and a wrong
+    /// nesting silently desyncs from libwebp on every pixel that picks
+    /// mode 5. Caught by the external libwebp roundtrip test on Ubuntu
+    /// CI: a 640×480 random-RGBA image diverged at pixel 992 with the
+    /// swapped nesting.
+    ///
+    /// L=2, TR=4, T=8 makes the two formulae land on different bytes
+    /// (5 vs 4) — fails with the pre-fix `avg2(l, avg2(tr, t))` shape,
+    /// passes with the corrected `avg2(avg2(l, tr), t)`.
+    #[test]
+    fn predictor_mode5_matches_spec_nesting() {
+        // 1×3 image with row 1 col 2 the prediction target. Per
+        // `predict_argb`, TR for the rightmost column wraps to current
+        // row col 0, so TR(1,2) = buf[3].
+        let mut buf = vec![0u32; 6];
+        buf[2] = 0xff00_0800; // (0, 2): green=8 → T
+        buf[3] = 0xff00_0400; // (1, 0): green=4 → TR (via wraparound)
+        buf[4] = 0xff00_0200; // (1, 1): green=2 → L
+        let pred = predict_argb(&buf, 3, 2, 1, 5);
+        let pred_g = (pred >> 8) & 0xff;
+        // Spec: avg2(avg2(L=2, TR=4), T=8) = avg2(3, 8) = 5
+        // Buggy: avg2(L=2, avg2(TR=4, T=8)) = avg2(2, 6) = 4
+        assert_eq!(
+            pred_g, 5,
+            "mode 5 must compute Average2(Average2(L, TR), T) per spec"
+        );
     }
 }
