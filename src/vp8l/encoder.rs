@@ -31,11 +31,20 @@
 //!   — and the index image often compresses *further* via subtract-green
 //!   + LZ77 + colour-cache once the channel-decorrelation is no longer
 //!   the bottleneck.
+//! * **Meta-Huffman per-tile grouping (2 groups).** Tiles of the main
+//!   image are clustered into 2 Huffman groups by green-alphabet
+//!   histogram similarity (2-iteration K-means). Each group ships its
+//!   own {green, red, blue, alpha, distance} trees and a meta-image
+//!   carries the per-tile group id. The encoder always also tries the
+//!   single-group baseline and keeps whichever variant produces the
+//!   shorter bitstream — the trial is strictly non-regressing.
 //!
 //! What we still don't do (compared to libwebp):
 //!
-//! * **No meta-Huffman image.** A single Huffman group covers the
-//!   whole picture.
+//! * **K=4+ meta-Huffman.** Only 2 clusters today; libwebp scales up
+//!   to 16. Past 2 the per-group overhead grows linearly and the gain
+//!   tails off on small / medium images, so 2 is the sweet spot for
+//!   our typical fixtures.
 //!
 //! What *is* implemented end-to-end:
 //!
@@ -136,6 +145,16 @@ struct BitWriter {
     nbits: u32,
 }
 
+/// Snapshot of [`BitWriter`] state. Used by the meta-Huffman trial path
+/// to roll back a speculative encode when the single-group baseline
+/// turns out to be smaller.
+#[derive(Clone, Copy)]
+struct BitWriterMark {
+    out_len: usize,
+    cur: u64,
+    nbits: u32,
+}
+
 impl BitWriter {
     fn new() -> Self {
         Self {
@@ -163,11 +182,47 @@ impl BitWriter {
         }
     }
 
+    /// Capture the writer's current position so a speculative chunk can
+    /// be rolled back later via [`Self::restore`]. Cheap (one `usize` +
+    /// scalar copies).
+    fn mark(&self) -> BitWriterMark {
+        BitWriterMark {
+            out_len: self.out.len(),
+            cur: self.cur,
+            nbits: self.nbits,
+        }
+    }
+
+    /// Roll the writer back to a prior [`BitWriterMark`]. Truncates
+    /// `out` and restores the staging buffer + bit count to the saved
+    /// values. Required for the meta-Huffman trial path: we encode both
+    /// candidates speculatively into the live writer, pick the smaller,
+    /// and rewind to re-emit the winner cleanly.
+    fn restore(&mut self, mark: BitWriterMark) {
+        self.out.truncate(mark.out_len);
+        self.cur = mark.cur;
+        self.nbits = mark.nbits;
+    }
+
+    /// Bit position of the writer's tail, in bits since the start of
+    /// the output. Used to score speculative encodes — `bits_emitted -
+    /// mark.bit_pos()` gives the bit length of the chunk written since
+    /// `mark`.
+    fn bit_pos(&self) -> u64 {
+        (self.out.len() as u64) * 8 + self.nbits as u64
+    }
+
     fn finish(mut self) -> Vec<u8> {
         if self.nbits > 0 {
             self.out.push((self.cur & 0xff) as u8);
         }
         self.out
+    }
+}
+
+impl BitWriterMark {
+    fn bit_pos(&self) -> u64 {
+        (self.out_len as u64) * 8 + self.nbits as u64
     }
 }
 
@@ -694,6 +749,13 @@ fn encode_vp8l_argb_rdo(
 /// colour sub-images. Sub-images always pass `main_image = false` + zero
 /// cache bits; the decoder-side parse at [`super::decode_image_stream`]
 /// matches that calling convention.
+///
+/// On the main image (and only there) this entry point now also tries
+/// the **meta-Huffman per-tile grouping** path. Tiles are clustered
+/// into 2 Huffman groups and the shorter-bitstream variant (single-
+/// group baseline vs 2-group meta-Huffman) wins. The single-group
+/// path is always tried first, so the meta-Huffman attempt is strictly
+/// non-regressing — it just gives the encoder a second shot.
 fn encode_image_stream(
     bw: &mut BitWriter,
     pixels: &[u32],
@@ -702,6 +764,77 @@ fn encode_image_stream(
     main_image: bool,
     cache_bits: u32,
 ) -> Result<()> {
+    let cache_size = if cache_bits == 0 {
+        0u32
+    } else {
+        1u32 << cache_bits
+    };
+
+    // Single-pass build of the symbol stream — shared by every encode
+    // attempt below (single-group baseline and the 2-group meta-Huffman
+    // variant).
+    let stream = build_symbol_stream(pixels, width, height, cache_bits);
+
+    // Speculatively emit the single-group baseline into the live writer,
+    // measure the bit length, and remember the rollback point. If the
+    // meta-Huffman variant turns out smaller we'll rewind and re-emit;
+    // otherwise we keep what's already there.
+    let baseline_mark = bw.mark();
+    encode_image_stream_single_group(bw, &stream, cache_bits, cache_size, main_image)?;
+    let baseline_bits = bw.bit_pos() - baseline_mark.bit_pos();
+
+    // For sub-images (e.g. predictor/colour mode maps) the spec only
+    // allows a single group — meta-Huffman lives on the main image
+    // alone. Skip the trial entirely on sub-images.
+    if !main_image {
+        return Ok(());
+    }
+
+    // Speculatively emit the meta-Huffman variant after rewinding to
+    // the same starting position. Compare bit lengths and keep the
+    // shorter one in the live writer.
+    //
+    // Performance note: the rewind-then-meta-trial-then-maybe-rewind-
+    // again dance can in the worst case cost two full single-group
+    // encodes plus one meta-Huffman encode for the main image. The
+    // RDO sweep runs this 32+ times per `encode_vp8l_argb_rdo`, so we
+    // gate on the early-bail flags inside [`try_encode_meta_huffman`]
+    // (image too small / single-cluster degeneration) before paying
+    // the full meta-Huffman cost.
+    bw.restore(baseline_mark);
+    let meta_emitted = try_encode_meta_huffman(bw, &stream, width, height, cache_bits, cache_size)?;
+    if meta_emitted {
+        let meta_bits = bw.bit_pos() - baseline_mark.bit_pos();
+        if meta_bits < baseline_bits {
+            // Meta-Huffman wins — leave its bytes in place.
+            return Ok(());
+        }
+        // Meta-Huffman lost. Rewind whatever the trial wrote and
+        // re-emit the baseline.
+        bw.restore(baseline_mark);
+        encode_image_stream_single_group(bw, &stream, cache_bits, cache_size, main_image)?;
+        debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), baseline_bits);
+    } else {
+        // The trial returned without writing — the writer is still at
+        // `baseline_mark`. Re-emit the baseline (no rewind needed
+        // because the trial left no trace).
+        encode_image_stream_single_group(bw, &stream, cache_bits, cache_size, main_image)?;
+        debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), baseline_bits);
+    }
+    Ok(())
+}
+
+/// Single-Huffman-group baseline: one set of {green, red, blue, alpha,
+/// distance} trees covering the entire image. Mirrors the original
+/// encoder shape; factored out so the meta-Huffman trial path can call
+/// the same code with a per-group symbol partition.
+fn encode_image_stream_single_group(
+    bw: &mut BitWriter,
+    stream: &[StreamSym],
+    cache_bits: u32,
+    cache_size: u32,
+    main_image: bool,
+) -> Result<()> {
     if cache_bits > 0 {
         bw.write(1, 1);
         bw.write(cache_bits, 4);
@@ -709,21 +842,10 @@ fn encode_image_stream(
         bw.write(0, 1);
     }
 
-    // Meta-Huffman "present" bit is only read by the decoder on the
-    // outermost (main) image; sub-images (predictor mode map, colour
-    // sub-image) skip this entirely. We always emit 0 (single group)
-    // when we do write it.
     if main_image {
+        // Single Huffman group → meta-Huffman absent.
         bw.write(0, 1);
     }
-
-    let cache_size = if cache_bits == 0 {
-        0u32
-    } else {
-        1u32 << cache_bits
-    };
-
-    let stream = build_symbol_stream(pixels, width, height, cache_bits);
 
     let green_alpha = 256 + 24 + cache_size as usize;
     let mut green_freq = vec![0u32; green_alpha];
@@ -732,24 +854,15 @@ fn encode_image_stream(
     let mut alpha_freq = vec![0u32; 256];
     let mut dist_freq = vec![0u32; 40];
 
-    for sym in &stream {
-        match *sym {
-            StreamSym::Literal { a, r, g, b } => {
-                green_freq[g as usize] += 1;
-                red_freq[r as usize] += 1;
-                blue_freq[b as usize] += 1;
-                alpha_freq[a as usize] += 1;
-            }
-            StreamSym::Backref {
-                len_sym, dist_sym, ..
-            } => {
-                green_freq[256 + len_sym as usize] += 1;
-                dist_freq[dist_sym as usize] += 1;
-            }
-            StreamSym::CacheRef { index } => {
-                green_freq[256 + 24 + index as usize] += 1;
-            }
-        }
+    for sym in stream {
+        accumulate_symbol_freq(
+            sym,
+            &mut green_freq,
+            &mut red_freq,
+            &mut blue_freq,
+            &mut alpha_freq,
+            &mut dist_freq,
+        );
     }
 
     let green_lens = build_limited_lengths(&green_freq, MAX_CODE_LENGTH)?;
@@ -770,37 +883,497 @@ fn encode_image_stream(
     emit_huffman_tree(bw, &alpha_lens)?;
     emit_huffman_tree(bw, &dist_lens)?;
 
-    for sym in &stream {
-        match *sym {
-            StreamSym::Literal { a, r, g, b } => {
-                write_code(bw, &green_codes, &green_lens, g as usize);
-                write_code(bw, &red_codes, &red_lens, r as usize);
-                write_code(bw, &blue_codes, &blue_lens, b as usize);
-                write_code(bw, &alpha_codes, &alpha_lens, a as usize);
+    for sym in stream {
+        emit_symbol(
+            bw,
+            sym,
+            &green_codes,
+            &green_lens,
+            &red_codes,
+            &red_lens,
+            &blue_codes,
+            &blue_lens,
+            &alpha_codes,
+            &alpha_lens,
+            &dist_codes,
+            &dist_lens,
+        );
+    }
+    Ok(())
+}
+
+/// Push the frequencies of one symbol onto the per-alphabet histograms.
+/// Hoisted out so the single-group and meta-Huffman paths share the same
+/// accounting code.
+#[inline]
+fn accumulate_symbol_freq(
+    sym: &StreamSym,
+    green: &mut [u32],
+    red: &mut [u32],
+    blue: &mut [u32],
+    alpha: &mut [u32],
+    dist: &mut [u32],
+) {
+    match *sym {
+        StreamSym::Literal { a, r, g, b } => {
+            green[g as usize] += 1;
+            red[r as usize] += 1;
+            blue[b as usize] += 1;
+            alpha[a as usize] += 1;
+        }
+        StreamSym::Backref {
+            len_sym, dist_sym, ..
+        } => {
+            green[256 + len_sym as usize] += 1;
+            dist[dist_sym as usize] += 1;
+        }
+        StreamSym::CacheRef { index } => {
+            green[256 + 24 + index as usize] += 1;
+        }
+    }
+}
+
+/// Emit one symbol using the supplied per-alphabet codes/lengths. As
+/// with [`accumulate_symbol_freq`], shared between the two encoder
+/// paths so the wire-format details live in exactly one place.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn emit_symbol(
+    bw: &mut BitWriter,
+    sym: &StreamSym,
+    green_codes: &[u32],
+    green_lens: &[u8],
+    red_codes: &[u32],
+    red_lens: &[u8],
+    blue_codes: &[u32],
+    blue_lens: &[u8],
+    alpha_codes: &[u32],
+    alpha_lens: &[u8],
+    dist_codes: &[u32],
+    dist_lens: &[u8],
+) {
+    match *sym {
+        StreamSym::Literal { a, r, g, b } => {
+            write_code(bw, green_codes, green_lens, g as usize);
+            write_code(bw, red_codes, red_lens, r as usize);
+            write_code(bw, blue_codes, blue_lens, b as usize);
+            write_code(bw, alpha_codes, alpha_lens, a as usize);
+        }
+        StreamSym::Backref {
+            len_sym,
+            len_extra_bits,
+            len_extra,
+            dist_sym,
+            dist_extra_bits,
+            dist_extra,
+        } => {
+            write_code(bw, green_codes, green_lens, 256 + len_sym as usize);
+            if len_extra_bits > 0 {
+                bw.write(len_extra, len_extra_bits);
             }
-            StreamSym::Backref {
-                len_sym,
-                len_extra_bits,
-                len_extra,
-                dist_sym,
-                dist_extra_bits,
-                dist_extra,
-            } => {
-                write_code(bw, &green_codes, &green_lens, 256 + len_sym as usize);
-                if len_extra_bits > 0 {
-                    bw.write(len_extra, len_extra_bits);
-                }
-                write_code(bw, &dist_codes, &dist_lens, dist_sym as usize);
-                if dist_extra_bits > 0 {
-                    bw.write(dist_extra, dist_extra_bits);
-                }
+            write_code(bw, dist_codes, dist_lens, dist_sym as usize);
+            if dist_extra_bits > 0 {
+                bw.write(dist_extra, dist_extra_bits);
             }
-            StreamSym::CacheRef { index } => {
-                write_code(bw, &green_codes, &green_lens, 256 + 24 + index as usize);
+        }
+        StreamSym::CacheRef { index } => {
+            write_code(bw, green_codes, green_lens, 256 + 24 + index as usize);
+        }
+    }
+}
+
+/// Number of pixels consumed by one symbol when the decoder applies it.
+/// Literal/CacheRef advance one pixel; a backref advances `length` (which
+/// we recover from the prefix-symbol + extra-bits factoring inverse).
+#[inline]
+fn symbol_pixel_span(sym: &StreamSym) -> usize {
+    match *sym {
+        StreamSym::Literal { .. } | StreamSym::CacheRef { .. } => 1,
+        StreamSym::Backref {
+            len_sym,
+            len_extra_bits: _,
+            len_extra,
+            ..
+        } => decode_len_or_dist_value(len_sym, len_extra) as usize,
+    }
+}
+
+/// Inverse of [`encode_len_or_dist_value`]. Mirrors the decoder's
+/// `decode_length_or_distance` — kept here so the encoder can compute
+/// per-symbol pixel spans without re-deriving the formula in the
+/// meta-Huffman tile-assignment loop.
+#[inline]
+fn decode_len_or_dist_value(symbol: u32, extra: u32) -> u32 {
+    if symbol < 4 {
+        symbol + 1
+    } else {
+        let extra_bits = (symbol - 2) >> 1;
+        let offset = (2 + (symbol & 1)) << extra_bits;
+        offset + extra + 1
+    }
+}
+
+/// Try the 2-group meta-Huffman path. Writes the candidate bitstream
+/// into `bw` and returns `Ok(true)` when something was emitted, or
+/// `Ok(false)` when the trial decided meta-Huffman wasn't worth
+/// attempting (e.g. the picture is too small to make per-tile clustering
+/// pay for the extra Huffman trees + meta-image overhead).
+///
+/// The decision to keep or discard the result is left to the caller —
+/// pair this with [`BitWriter::mark`] / [`BitWriter::restore`] so the
+/// candidate can be rolled back when a previously-tried variant was
+/// shorter.
+fn try_encode_meta_huffman(
+    bw: &mut BitWriter,
+    stream: &[StreamSym],
+    width: u32,
+    height: u32,
+    cache_bits: u32,
+    cache_size: u32,
+) -> Result<bool> {
+    // Meta-Huffman tile size. The spec allows `meta_bits ∈ 2..=9`
+    // (4..=512 px per side). 4 (16-pixel tiles) is libwebp's default
+    // and gives a reasonable signal-to-overhead ratio.
+    const META_BITS: u32 = 4;
+    let tile_side = 1u32 << META_BITS;
+    let meta_w = (width + tile_side - 1) / tile_side;
+    let meta_h = (height + tile_side - 1) / tile_side;
+    let num_tiles = (meta_w * meta_h) as usize;
+
+    // No grouping makes sense with a single tile.
+    if num_tiles < 2 {
+        return Ok(false);
+    }
+
+    // Bail out early on tiny images — the two extra Huffman-tree sets
+    // plus the meta-image stream overhead easily outweigh any per-group
+    // savings on an image with few hundred symbols. 1024 pixels (32×32)
+    // is a conservative floor; smaller images stick with the single-
+    // group baseline.
+    if (width as u64) * (height as u64) < 1024 {
+        return Ok(false);
+    }
+
+    // ── Step 1: compute per-tile histograms over each of the five
+    // alphabets. Each symbol's tile is determined by its starting pixel
+    // position in raster order; backrefs are bound to the tile they
+    // *start* in (matching the decoder, which looks up the meta-image
+    // once at the start of every prefix-coded symbol).
+    let green_alpha = 256 + 24 + cache_size as usize;
+    let mut tile_green: Vec<Vec<u32>> = (0..num_tiles).map(|_| vec![0u32; green_alpha]).collect();
+    let mut tile_red: Vec<Vec<u32>> = (0..num_tiles).map(|_| vec![0u32; 256]).collect();
+    let mut tile_blue: Vec<Vec<u32>> = (0..num_tiles).map(|_| vec![0u32; 256]).collect();
+    let mut tile_alpha: Vec<Vec<u32>> = (0..num_tiles).map(|_| vec![0u32; 256]).collect();
+    let mut tile_dist: Vec<Vec<u32>> = (0..num_tiles).map(|_| vec![0u32; 40]).collect();
+    // Per-symbol index → tile index. We need this twice: once to seed
+    // the clustering, once to emit the per-symbol writes after groups
+    // have been assigned. Store it here so we don't re-walk positions.
+    let mut sym_tile: Vec<usize> = Vec::with_capacity(stream.len());
+
+    let mut x: u32 = 0;
+    let mut y: u32 = 0;
+    for sym in stream {
+        let mx = x >> META_BITS;
+        let my = y >> META_BITS;
+        let tile_idx = (my * meta_w + mx) as usize;
+        sym_tile.push(tile_idx);
+        accumulate_symbol_freq(
+            sym,
+            &mut tile_green[tile_idx],
+            &mut tile_red[tile_idx],
+            &mut tile_blue[tile_idx],
+            &mut tile_alpha[tile_idx],
+            &mut tile_dist[tile_idx],
+        );
+        let span = symbol_pixel_span(sym) as u32;
+        let new_x = x + span;
+        y += new_x / width;
+        x = new_x % width;
+    }
+
+    // ── Step 2: cluster tiles into 2 groups by histogram similarity.
+    // The "fingerprint" we cluster on is the green-alphabet histogram —
+    // it carries the most discriminative info (mix of literal-greens,
+    // length codes, cache hits varies wildly between e.g. flat and
+    // textured tiles).
+    //
+    // We use a 2-iteration k-means with K=2: pick two seed tiles
+    // (first non-empty + the one farthest from it), assign every tile
+    // to its nearest seed, recompute centroids, reassign. Two
+    // iterations is enough for the histograms to stabilise on natural
+    // images and keeps the worst-case cost bounded at
+    // O(num_tiles × green_alpha × K × iters).
+    let assignments = cluster_tiles_kmeans2(&tile_green, num_tiles);
+
+    // If every tile landed in one group there's no point continuing —
+    // the meta-Huffman variant degenerates back to the single-group
+    // baseline plus pure overhead. Skip.
+    let used_groups: std::collections::BTreeSet<u32> = assignments.iter().copied().collect();
+    if used_groups.len() < 2 {
+        return Ok(false);
+    }
+
+    // ── Step 3: build per-group histograms by summing over the tiles
+    // assigned to each group.
+    let mut g0_green = vec![0u32; green_alpha];
+    let mut g0_red = vec![0u32; 256];
+    let mut g0_blue = vec![0u32; 256];
+    let mut g0_alpha = vec![0u32; 256];
+    let mut g0_dist = vec![0u32; 40];
+    let mut g1_green = vec![0u32; green_alpha];
+    let mut g1_red = vec![0u32; 256];
+    let mut g1_blue = vec![0u32; 256];
+    let mut g1_alpha = vec![0u32; 256];
+    let mut g1_dist = vec![0u32; 40];
+    for t in 0..num_tiles {
+        let (g, r, b, a, d) = if assignments[t] == 0 {
+            (
+                &mut g0_green,
+                &mut g0_red,
+                &mut g0_blue,
+                &mut g0_alpha,
+                &mut g0_dist,
+            )
+        } else {
+            (
+                &mut g1_green,
+                &mut g1_red,
+                &mut g1_blue,
+                &mut g1_alpha,
+                &mut g1_dist,
+            )
+        };
+        for (i, v) in tile_green[t].iter().enumerate() {
+            g[i] += v;
+        }
+        for (i, v) in tile_red[t].iter().enumerate() {
+            r[i] += v;
+        }
+        for (i, v) in tile_blue[t].iter().enumerate() {
+            b[i] += v;
+        }
+        for (i, v) in tile_alpha[t].iter().enumerate() {
+            a[i] += v;
+        }
+        for (i, v) in tile_dist[t].iter().enumerate() {
+            d[i] += v;
+        }
+    }
+
+    // ── Step 4: emit. Header → cache flag → meta-Huffman flag → meta
+    // sub-image → per-group Huffman trees → interleaved symbols.
+
+    if cache_bits > 0 {
+        bw.write(1, 1);
+        bw.write(cache_bits, 4);
+    } else {
+        bw.write(0, 1);
+    }
+
+    // Meta-Huffman present.
+    bw.write(1, 1);
+    bw.write(META_BITS - 2, 3);
+
+    // Build the meta-image: one ARGB pixel per tile. The decoder reads
+    // the group index from `(p >> 8) & 0xffff` (green byte = low 8 bits
+    // of group_idx; we keep K ≤ 256 so no need for the red byte). Alpha
+    // 0xff so the decode path treats it as a normal opaque pixel.
+    let meta_pixels: Vec<u32> = assignments
+        .iter()
+        .map(|&g| 0xff00_0000 | ((g & 0xff) << 8))
+        .collect();
+    encode_image_stream(bw, &meta_pixels, meta_w, meta_h, false, 0)?;
+
+    // Build per-group Huffman trees.
+    let g0_green_lens = build_limited_lengths(&g0_green, MAX_CODE_LENGTH)?;
+    let g0_red_lens = build_limited_lengths(&g0_red, MAX_CODE_LENGTH)?;
+    let g0_blue_lens = build_limited_lengths(&g0_blue, MAX_CODE_LENGTH)?;
+    let g0_alpha_lens = build_limited_lengths(&g0_alpha, MAX_CODE_LENGTH)?;
+    let g0_dist_lens = build_limited_lengths(&g0_dist, MAX_CODE_LENGTH)?;
+
+    let g1_green_lens = build_limited_lengths(&g1_green, MAX_CODE_LENGTH)?;
+    let g1_red_lens = build_limited_lengths(&g1_red, MAX_CODE_LENGTH)?;
+    let g1_blue_lens = build_limited_lengths(&g1_blue, MAX_CODE_LENGTH)?;
+    let g1_alpha_lens = build_limited_lengths(&g1_alpha, MAX_CODE_LENGTH)?;
+    let g1_dist_lens = build_limited_lengths(&g1_dist, MAX_CODE_LENGTH)?;
+
+    let g0_green_codes = canonical_codes(&g0_green_lens);
+    let g0_red_codes = canonical_codes(&g0_red_lens);
+    let g0_blue_codes = canonical_codes(&g0_blue_lens);
+    let g0_alpha_codes = canonical_codes(&g0_alpha_lens);
+    let g0_dist_codes = canonical_codes(&g0_dist_lens);
+
+    let g1_green_codes = canonical_codes(&g1_green_lens);
+    let g1_red_codes = canonical_codes(&g1_red_lens);
+    let g1_blue_codes = canonical_codes(&g1_blue_lens);
+    let g1_alpha_codes = canonical_codes(&g1_alpha_lens);
+    let g1_dist_codes = canonical_codes(&g1_dist_lens);
+
+    // Emit groups in numeric order (group 0 then group 1), each as a
+    // run of 5 trees (green/red/blue/alpha/distance). Matches what
+    // [`super::HuffmanGroup::read`] expects.
+    emit_huffman_tree(bw, &g0_green_lens)?;
+    emit_huffman_tree(bw, &g0_red_lens)?;
+    emit_huffman_tree(bw, &g0_blue_lens)?;
+    emit_huffman_tree(bw, &g0_alpha_lens)?;
+    emit_huffman_tree(bw, &g0_dist_lens)?;
+
+    emit_huffman_tree(bw, &g1_green_lens)?;
+    emit_huffman_tree(bw, &g1_red_lens)?;
+    emit_huffman_tree(bw, &g1_blue_lens)?;
+    emit_huffman_tree(bw, &g1_alpha_lens)?;
+    emit_huffman_tree(bw, &g1_dist_lens)?;
+
+    // Per-symbol writes: pick the group from the tile assignment.
+    for (idx, sym) in stream.iter().enumerate() {
+        let group = assignments[sym_tile[idx]];
+        if group == 0 {
+            emit_symbol(
+                bw,
+                sym,
+                &g0_green_codes,
+                &g0_green_lens,
+                &g0_red_codes,
+                &g0_red_lens,
+                &g0_blue_codes,
+                &g0_blue_lens,
+                &g0_alpha_codes,
+                &g0_alpha_lens,
+                &g0_dist_codes,
+                &g0_dist_lens,
+            );
+        } else {
+            emit_symbol(
+                bw,
+                sym,
+                &g1_green_codes,
+                &g1_green_lens,
+                &g1_red_codes,
+                &g1_red_lens,
+                &g1_blue_codes,
+                &g1_blue_lens,
+                &g1_alpha_codes,
+                &g1_alpha_lens,
+                &g1_dist_codes,
+                &g1_dist_lens,
+            );
+        }
+    }
+
+    Ok(true)
+}
+
+/// Cluster `num_tiles` per-tile green-alphabet histograms into 2 groups
+/// using a tiny 2-iteration k-means. Returns one group id (0 or 1) per
+/// tile in row-major order.
+///
+/// The seeding picks the busiest tile (highest total count — usually the
+/// one with the most diverse content) as group 0's centroid and the tile
+/// most distant from it (L1 over the histogram) as group 1's centroid.
+/// Two reassignment passes are enough for the histograms to settle on
+/// most natural images; further iterations rarely change cluster
+/// membership and would only burn CPU.
+fn cluster_tiles_kmeans2(tile_green: &[Vec<u32>], num_tiles: usize) -> Vec<u32> {
+    let alpha = tile_green.first().map(|h| h.len()).unwrap_or(0);
+    if num_tiles < 2 || alpha == 0 {
+        return vec![0u32; num_tiles];
+    }
+
+    // Pick seed 0: the tile with the largest total count.
+    let mut seed0 = 0usize;
+    let mut max_total = 0u64;
+    for (i, h) in tile_green.iter().enumerate() {
+        let total: u64 = h.iter().map(|&v| v as u64).sum();
+        if total > max_total {
+            max_total = total;
+            seed0 = i;
+        }
+    }
+    // Pick seed 1: the tile farthest from seed 0 by L1 distance over
+    // the green histogram.
+    let mut seed1 = if seed0 == 0 { 1 } else { 0 };
+    let mut max_dist: u64 = 0;
+    for (i, h) in tile_green.iter().enumerate() {
+        if i == seed0 {
+            continue;
+        }
+        let d = l1_dist_u32(&tile_green[seed0], h);
+        if d > max_dist {
+            max_dist = d;
+            seed1 = i;
+        }
+    }
+
+    // Centroids carry the **mean** histogram for each cluster — divided
+    // by the cluster size so that L1 distance against a single tile's
+    // histogram is meaningful (otherwise the sum of e.g. 50 tile
+    // histograms would dwarf the per-tile counts and the comparison
+    // would degenerate to "which cluster has more tiles").
+    let mut centroid0 = tile_green[seed0].clone();
+    let mut centroid1 = tile_green[seed1].clone();
+    let mut assignments = vec![0u32; num_tiles];
+
+    for _iter in 0..2 {
+        // Reassign every tile to its nearest centroid.
+        for (t, h) in tile_green.iter().enumerate() {
+            let d0 = l1_dist_u32(&centroid0, h);
+            let d1 = l1_dist_u32(&centroid1, h);
+            assignments[t] = if d1 < d0 { 1 } else { 0 };
+        }
+        // Recompute centroids as per-bucket means over the assigned
+        // tiles. Empty-cluster pathology: leave a centroid at its
+        // previous value if nothing was assigned to it (keeps the
+        // seeding stable rather than collapsing to the all-zero
+        // histogram).
+        let mut sum0 = vec![0u64; alpha];
+        let mut sum1 = vec![0u64; alpha];
+        let mut n0 = 0u64;
+        let mut n1 = 0u64;
+        for (t, h) in tile_green.iter().enumerate() {
+            if assignments[t] == 0 {
+                for (i, &v) in h.iter().enumerate() {
+                    sum0[i] += v as u64;
+                }
+                n0 += 1;
+            } else {
+                for (i, &v) in h.iter().enumerate() {
+                    sum1[i] += v as u64;
+                }
+                n1 += 1;
+            }
+        }
+        // `checked_div` returns `None` when the cluster is empty —
+        // skip the centroid update in that case (leaves the previous
+        // centroid in place, which keeps the seeding stable rather
+        // than collapsing to all-zero).
+        for (i, s) in sum0.iter().enumerate() {
+            if let Some(v) = s.checked_div(n0) {
+                centroid0[i] = v as u32;
+            }
+        }
+        for (i, s) in sum1.iter().enumerate() {
+            if let Some(v) = s.checked_div(n1) {
+                centroid1[i] = v as u32;
             }
         }
     }
-    Ok(())
+
+    assignments
+}
+
+/// L1 distance between two equal-length u32 histograms. `abs_diff`
+/// avoids signed-arithmetic underflow; the per-bucket diff sums into a
+/// u64 — never overflows for typical tile sizes (16×16 tiles cap each
+/// bucket at ~256, summing across <512 buckets stays well under u32
+/// anyway, but u64 keeps the helper general).
+#[inline]
+fn l1_dist_u32(a: &[u32], b: &[u32]) -> u64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut s = 0u64;
+    for (av, bv) in a.iter().zip(b.iter()) {
+        s += (*av).abs_diff(*bv) as u64;
+    }
+    s
 }
 
 /// Parsed-pixel symbol. Either a literal ARGB quadruplet, an LZ77
