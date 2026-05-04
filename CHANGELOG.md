@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-webp/compare/v0.0.9...v0.0.10) - 2026-05-04
+
+### Added
+
+- *(anim-enc)* per-frame mode selection (lossy vs lossless) ([#335](https://github.com/OxideAV/oxideav-webp/pull/335))
+- *(vp8-enc)* per-segment QP + LF delta tuning by quality ([#334](https://github.com/OxideAV/oxideav-webp/pull/334))
+- *(vp8l-enc)* K=4 meta-Huffman + near-lossless smoothing close #380
+- *(vp8l-enc)* add meta-Huffman per-tile grouping (2 groups)
+- *(vp8l-enc)* add meta-Huffman per-tile grouping (2 groups)
+- *(vp8l-enc)* add near-lossless preprocessing knob
+- gate oxideav-core behind default-on `registry` feature ([#358](https://github.com/OxideAV/oxideav-webp/pull/358))
+- *(webp)* pick best ALPH filter mode per alpha plane
+- *(vp8l-enc)* add colour-indexing (palette) transform
+- *(vp8l-enc)* widen predictor mode pool to all 14 modes
+- *(webp)* surface VP8X metadata (ICCP / EXIF / XMP) to callers
+
+### Fixed
+
+- *(vp8-enc)* drop segment_lf_deltas — not on published vp8 0.1.5
+- *(vp8l-enc)* simple-Huffman + palette RDO bias close #379
+- *(vp8l)* correct predictor mode 5 nesting per RFC 9649 §4.1
+
+### Other
+
+- cargo fmt for #334 / #335 helpers
+- Revert "feat(vp8l-enc): add meta-Huffman per-tile grouping (2 groups)"
+- end-to-end external roundtrip via libwebp (lossless VP8L)
+
 ### Added
 
 - *(anim-enc)* per-frame mode selection for animated WebP. New
