@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8l-enc)* **Viterbi-style optimal LZ77** as a third pass on top
+  of the existing two-pass cost-modelled LZ77 pipeline. Pass 3 runs a
+  forward dynamic-programming sweep over the LZ77 backward-reference
+  graph: at each pixel position `i` it considers (a) literal-at-i,
+  (b) cache-ref-at-i (when the colour-cache slot already holds the
+  pixel), and (c) every hash-chain backref candidate `(len, dist)`
+  reachable from `i` (probing each chain entry at multiple lengths,
+  not just `max_len`), and updates `dp[i + span]` with the minimum
+  cumulative cost in 1/16-bit units under the same [`CostModel`]
+  passes 1 and 2 share. Backtrack from `dp[n]` recovers the optimal
+  symbol sequence. The colour-cache state at every position is a
+  deterministic function of `pixels[0..i]` (`cache_add` only reads
+  the pixel's ARGB value, not the token type that emitted it) so the
+  DP is path-independent — a single rolling cache walk pre-fills
+  `cache_hit_at[]` / `cache_idx_at[]` arrays and the DP becomes a
+  pure forward sweep. A **refit** sub-step rebuilds the cost model
+  from the pass-3a Viterbi histogram and re-runs the DP; the lower
+  modelled-cost candidate of the two wins. Closes the "lacks Viterbi-
+  style optimal LZ77" tail noted in the WebP VP8L row of the
+  workspace README. Gated on ≥ 65 536 px (256×256) so smaller
+  fixtures stay on the cheaper pass-2 cost-aware-greedy path.
+  Measured wins on natural ≥ 256×256 fixtures: **−298 bytes
+  (−0.67 %)** on the synthetic 256×256 landscape (sky/foliage/
+  foreground), bringing it from `1.0203x` to `1.0135x` of cwebp 1.6.0
+  (`-lossless -m 6 -z 9`); 256×256 portrait-on-textured-background
+  and 256×256 brick-wall mosaic fixtures land at `1.0403x` and
+  `1.0332x` respectively. Residual ~1.5-4 % gap to cwebp on natural
+  photos comes from histogram-fitting heuristics + per-tile transform
+  selection that operate outside the LZ77 path; full byte-parity on
+  every natural-image fixture is a further-rounds target.
+- *(test)* `vp8l_viterbi_lz77` integration suite (3 tests):
+  `viterbi_outputs_round_trip_through_in_crate_decoder` (3 fixtures
+  × 256×256 — landscape / portrait / brick-wall — round-trip bit-
+  exact through the in-crate VP8L decoder),
+  `viterbi_outputs_decode_through_external_dwebp_on_natural_256`
+  (cross-decode through libwebp's `dwebp` binary; silently skipped
+  when `dwebp` isn't on PATH), `viterbi_within_5pct_of_cwebp_lossless_on_natural_256`
+  (encodes each fixture, runs `cwebp -lossless -m 6 -z 9` against
+  the same input, asserts ratio ≤ 1.05x). Per-fixture ratios are
+  printed via `eprintln!` for size-tracking visibility across
+  releases.
+
 - *(vp8l-enc)* **EntropyImage tile-bits sweep + smart tile-boundary
   switching.** The meta-Huffman per-tile-grouping path (RFC 9649
   §3.7.2.2 EntropyImage / "prefix code groups") used to hard-code

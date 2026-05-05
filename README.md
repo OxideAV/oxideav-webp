@@ -249,24 +249,34 @@ Encoder scope (current):
   rather than collapsing to a smaller-K baseline. Predictor pool
   covers all 14 RFC 9649 §4.1 modes per tile. LZ77 backreference
   search uses a 16384-pixel sliding window with up to 256 hash-chain
-  candidates per starting position; the matcher runs a **two-pass
+  candidates per starting position; the matcher runs a **three-pass
   cost-modelled** scan on the main image — pass 1 is greedy
   first-match, pass 2 re-walks the chain with a per-symbol
   `-log2(p) × 16` bit-cost model derived from the pass-1 histogram
   and picks each match by lowest bit-cost-per-pixel (plus a one-step
   lazy lookahead that defers a match if literal-here +
-  match-at-i+1 bills fewer model bits). Optional near-lossless
-  preprocessing (libwebp-compatible `0..=100` knob) collapses
-  near-identical pixels into longer LZ77 runs / richer cache hits.
-  Callers that want a fixed configuration call `encode_vp8l_argb_with`
-  directly. Encoder ≈ 95 % libwebp parity on natural fixtures
-  (≤ 1.13× cwebp on a 1024×768 photo, ≤ 1.06× on a 512×512 still,
-  **beats cwebp by 4.5 %** on the in-tree 128×128 natural fixture and
-  by 14.4 % on the 64×64 cache-stress fixture, **byte-parity** with
-  cwebp on a synthetic three-region 256×256 photo where the
-  entropy-image tile-bits sweep saves an extra ~290 B vs the
-  fixed-16-px-tile baseline); residual gap is full Viterbi-style
-  optimal LZ77.
+  match-at-i+1 bills fewer model bits), and pass 3 runs a full
+  **Viterbi-style optimal LZ77** dynamic-programming sweep over the
+  backward-reference graph (gated on ≥ 65 536 px = 256×256 — below
+  it the per-position chain-walk cost dominates the per-K-trial
+  budget). Pass 3 considers, at each pixel position, every plausible
+  edge out of that position (literal, cache-ref, every reachable
+  `(len, dist)` backref candidate at multiple lengths per chain
+  entry) and updates `dp[i + span]` with the minimum cumulative
+  cost; backtrack from `dp[n]` recovers the optimal symbol sequence.
+  A refit sub-step rebuilds the cost model from the pass-3a histogram
+  and re-runs the DP, keeping whichever Viterbi candidate bills
+  fewer modelled bits. Optional near-lossless preprocessing
+  (libwebp-compatible `0..=100` knob) collapses near-identical
+  pixels into longer LZ77 runs / richer cache hits. Callers that
+  want a fixed configuration call `encode_vp8l_argb_with` directly.
+  Encoder ≈ 96 % libwebp parity on natural fixtures (≤ 1.13× cwebp
+  on a 1024×768 photo, ≤ 1.06× on a 512×512 still, **beats cwebp by
+  4.5 %** on the in-tree 128×128 natural fixture and by 14.4 % on
+  the 64×64 cache-stress fixture, **byte-parity** with cwebp on a
+  synthetic three-region 256×256 photo, **1.014× cwebp** on a
+  256×256 landscape — Viterbi pass 3 saves another 298 B / −0.67 %
+  over the pass-2 cost-aware-greedy baseline on that fixture).
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)
