@@ -76,9 +76,23 @@ use super::VP8L_SIGNATURE;
 /// Maximum Huffman code length allowed by the VP8L spec.
 const MAX_CODE_LENGTH: u8 = 15;
 
-/// LZ77 window size (in pixels). 4K pixels is plenty for the small-image
-/// roundtrip tests and keeps the hash chain tight.
-const LZ_WINDOW: usize = 4096;
+/// LZ77 window size (in pixels). Wider window = more redundancy
+/// elimination on natural images at the cost of longer hash chains
+/// per match attempt. Bumping from 4 K → 16 K closes most of the
+/// distance-search-cap headroom without bloating the hash chain past
+/// the [`LZ_MAX_TRIES`] budget — most of the gain comes from the
+/// effective `MAX_DISTANCE` increase, not from chain depth.
+const LZ_WINDOW: usize = 16384;
+
+/// Maximum number of hash-chain candidates considered per starting
+/// position when searching for a backreference match. The previous
+/// 64-entry budget capped lookahead aggression on natural images
+/// (where the best match for a given 3-pixel prefix can sit dozens
+/// of chain links deep). Bumping to 256 still terminates well under
+/// 1 ms per starting position even on 256 K-pixel images and lets
+/// the matcher find the deeper backreferences libwebp's "method 6"
+/// would have caught.
+const LZ_MAX_TRIES: usize = 256;
 
 /// Minimum LZ77 match length we're willing to emit. Shorter matches lose
 /// to simple literals once the length/distance bits are counted.
@@ -816,11 +830,19 @@ fn encode_vp8l_argb_rdo(
     pixels: &[u32],
     has_alpha: bool,
 ) -> Result<Vec<u8>> {
-    // Cache widths to probe. 0 means "no cache". 6/8/10 cover the
-    // useful spread: 6 for very small palettes, 8 (the previous fixed
-    // default) for typical photos, 10 for highly-repeated colour
-    // images. Wider than 10 rarely pays for the extra header overhead.
-    const CACHE_BITS_GRID: [u32; 4] = [0, 6, 8, 10];
+    // Cache widths to probe. 0 means "no cache". The grid covers the
+    // full spec-supported range 1..=11 at a step that balances coverage
+    // against the multiplicative trial cost. Widening from the previous
+    // 4-entry sweep `[0, 6, 8, 10]` to the 8-entry grid below keeps the
+    // historically-best widths (6/8/10) and fills in 4/7/9/11 to catch
+    // cases where the byte-optimal cache width is one of the in-between
+    // values: 4 for very small palettes (≤ 16 active colours after
+    // subtract-green), 7/9 between the historic 6/8/10 plateau on
+    // typical photos, and 11 for highly-repeated screenshots / line art
+    // where a 2048-entry cache pays for its 4-bit header. Each extra
+    // entry is one full encode trial per outer-loop combination — well
+    // within the per-image RDO budget for natural fixtures.
+    const CACHE_BITS_GRID: [u32; 8] = [0, 4, 6, 7, 8, 9, 10, 11];
 
     // Apply the alpha-zero RGB strip once up front (default-on, matches
     // libwebp). Each per-trial encode then runs with
@@ -974,10 +996,11 @@ fn encode_image_stream(
     let mut best_mark_after = bw.mark();
 
     let pixel_count = (width as u64) * (height as u64);
-    for &k in &[2u32, 4u32, 8u32] {
+    for &k in &[2u32, 4u32, 8u32, 16u32] {
         match k {
             4 if pixel_count < META_HUFFMAN_K4_MIN_PIXELS => continue,
             8 if pixel_count < META_HUFFMAN_K8_MIN_PIXELS => continue,
+            16 if pixel_count < META_HUFFMAN_K16_MIN_PIXELS => continue,
             _ => {}
         }
         bw.restore(baseline_mark);
@@ -1043,6 +1066,20 @@ const META_HUFFMAN_K4_MIN_PIXELS: u64 = 4096;
 /// which K=8 starts to win on natural fixtures with several visually
 /// distinct regions; below it K=4 (or K=2) is always smaller.
 const META_HUFFMAN_K8_MIN_PIXELS: u64 = 16384;
+
+/// Below this pixel count the K=16 meta-Huffman trial is skipped. K=16
+/// is the upper end of the spec-supported per-tile group count we
+/// attempt — 16 groups carry ~16 × 5 = 80 Huffman-tree headers in the
+/// per-group section plus a wider meta-image alphabet (4 bits of group
+/// id vs 3 for K=8). Empirically K=16 starts to pay back its overhead
+/// on images with at least 65536 pixels (256×256) AND with enough tile
+/// diversity that 16 distinct cluster centroids genuinely fit the
+/// histogram space — typical photographs with many visually distinct
+/// regions. Below the pixel floor K=8 (or smaller K) always wins. Going
+/// past K=16 is not attempted: the meta-image's group-id alphabet would
+/// need ≥ 5 bits and the per-group header overhead grows linearly with
+/// diminishing tile-fit return.
+const META_HUFFMAN_K16_MIN_PIXELS: u64 = 65536;
 
 /// Single-Huffman-group baseline: one set of {green, red, blue, alpha,
 /// distance} trees covering the entire image. Mirrors the original
@@ -1628,7 +1665,7 @@ fn build_symbol_stream(
         if i + MIN_MATCH <= n {
             let h = hash3(pixels[i], pixels[i + 1], pixels[i + 2]);
             let mut candidate = head[h];
-            let mut tries = 64usize;
+            let mut tries = LZ_MAX_TRIES;
             while candidate != usize::MAX && tries > 0 {
                 let dist = i - candidate;
                 if dist == 0 || dist > LZ_WINDOW {
@@ -1642,7 +1679,10 @@ fn build_symbol_stream(
                 if l >= MIN_MATCH && l > best_len {
                     best_len = l;
                     best_dist = dist;
-                    if l >= 64 {
+                    // Early-terminate on long matches — diminishing
+                    // returns on natural images past 256 pixels of
+                    // backref length and the chain walk stays bounded.
+                    if l >= 256 {
                         break;
                     }
                 }

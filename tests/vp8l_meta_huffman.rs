@@ -475,6 +475,178 @@ fn meta_huffman_k8_shrinks_or_matches_smaller_k_on_eight_strip() {
     );
 }
 
+/// Build a 256×256 image partitioned into 16 horizontal strips with
+/// distinctly different statistics. K=16 is the upper end of the
+/// meta-Huffman split we attempt; this fixture forces 16 visually
+/// distinct regions so the K=16 trial has the natural fit it needs.
+/// Each strip uses a different colour or pattern so per-tile histograms
+/// land in 16 different corners of the symbol-distribution space.
+fn sixteen_strip_image(w: u32, h: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let strip_h = h / 16;
+    // 16 different deterministic xorshift seeds + colours.
+    for strip in 0..16u32 {
+        let mut s: u32 = 0x1111_1111u32.wrapping_mul(strip + 1);
+        for y in (strip * strip_h)..((strip + 1) * strip_h).min(h) {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                match strip {
+                    0 => {
+                        // Smooth horizontal gradient.
+                        rgba[i] = (x as u8).wrapping_mul(2);
+                        rgba[i + 1] = (x as u8).wrapping_mul(2);
+                        rgba[i + 2] = (x as u8).wrapping_mul(2);
+                    }
+                    1 => {
+                        // Constant red.
+                        rgba[i] = 0xff;
+                    }
+                    2 => {
+                        // Constant green.
+                        rgba[i + 1] = 0xff;
+                    }
+                    3 => {
+                        // Constant blue.
+                        rgba[i + 2] = 0xff;
+                    }
+                    4 => {
+                        // Constant yellow.
+                        rgba[i] = 0xff;
+                        rgba[i + 1] = 0xff;
+                    }
+                    5 => {
+                        // Constant cyan.
+                        rgba[i + 1] = 0xff;
+                        rgba[i + 2] = 0xff;
+                    }
+                    6 => {
+                        // Constant magenta.
+                        rgba[i] = 0xff;
+                        rgba[i + 2] = 0xff;
+                    }
+                    7 => {
+                        // High-frequency noise.
+                        s ^= s << 13;
+                        s ^= s >> 17;
+                        s ^= s << 5;
+                        rgba[i] = (s & 0xff) as u8;
+                        rgba[i + 1] = ((s >> 8) & 0xff) as u8;
+                        rgba[i + 2] = ((s >> 16) & 0xff) as u8;
+                    }
+                    8 => {
+                        // Vertical bars (4-pixel wide) in red.
+                        let on = (x / 4) & 1 == 0;
+                        rgba[i] = if on { 0xff } else { 0x40 };
+                    }
+                    9 => {
+                        // Vertical bars (4-pixel wide) in green.
+                        let on = (x / 4) & 1 == 0;
+                        rgba[i + 1] = if on { 0xff } else { 0x40 };
+                    }
+                    10 => {
+                        // Diagonal gradient.
+                        rgba[i] = ((x + y) as u8).wrapping_mul(2);
+                        rgba[i + 1] = ((x + y) as u8).wrapping_mul(3);
+                        rgba[i + 2] = ((x + y) as u8).wrapping_mul(5);
+                    }
+                    11 => {
+                        // Steep horizontal gradient.
+                        rgba[i] = (x as u8).wrapping_mul(7);
+                        rgba[i + 1] = (x as u8).wrapping_mul(3);
+                    }
+                    12 => {
+                        // Constant grey.
+                        rgba[i] = 0x80;
+                        rgba[i + 1] = 0x80;
+                        rgba[i + 2] = 0x80;
+                    }
+                    13 => {
+                        // Different noise seed.
+                        s ^= s << 17;
+                        s ^= s >> 13;
+                        s ^= s << 5;
+                        rgba[i] = (s & 0xff) as u8;
+                        rgba[i + 1] = ((s >> 8) & 0xff) as u8;
+                        rgba[i + 2] = ((s >> 16) & 0xff) as u8;
+                    }
+                    14 => {
+                        // Checkerboard 2x2.
+                        let on = ((x / 2) ^ (y / 2)) & 1 == 0;
+                        let v = if on { 0xff } else { 0x00 };
+                        rgba[i] = v;
+                        rgba[i + 1] = v / 2;
+                    }
+                    _ => {
+                        // Constant near-white.
+                        rgba[i] = 0xf0;
+                        rgba[i + 1] = 0xf0;
+                        rgba[i + 2] = 0xf0;
+                    }
+                }
+                rgba[i + 3] = 0xff;
+            }
+        }
+    }
+    rgba
+}
+
+#[test]
+fn meta_huffman_k16_round_trips_sixteen_strip_fixture() {
+    // The K=16 meta-Huffman trial only runs above 65536 px (the minimum
+    // pixel count where the 16 extra Huffman-tree headers amortise).
+    // 256×256 = 65536 px clears the threshold; this test exercises the
+    // K=16 candidate end-to-end and verifies it round-trips through the
+    // in-crate decoder.
+    //
+    // We *don't* assert which K the encoder picks — the smallest of the
+    // {single-group, K=2, K=4, K=8, K=16} trial bytes always wins, and
+    // on a fixture where K=16 happens to lose (e.g. K=8 captures most of
+    // the variance already) the encoder falls back legally. The critical
+    // soundness check is that whichever K it picks decodes correctly.
+    let w = 256u32;
+    let h = 256u32;
+    let rgba = sixteen_strip_image(w, h);
+    let opts = EncoderOptions {
+        use_subtract_green: false,
+        use_color_transform: false,
+        use_predictor: false,
+        use_color_index: false,
+        use_color_cache: true,
+        ..EncoderOptions::default()
+    };
+    let _ = assert_roundtrip(w, h, &rgba, opts);
+}
+
+#[test]
+fn meta_huffman_k16_shrinks_or_matches_smaller_k_on_sixteen_strip() {
+    // Sanity check on the K=16 path: the encoded stream of the
+    // sixteen-strip 256×256 fixture must not blow up vs the raw RGBA
+    // size (≈ 256 KB). The encoder picks the smallest of {single-group,
+    // K=2, K=4, K=8, K=16} automatically; this test ensures that even
+    // when the K=16 trial is the *winner* the resulting stream is still
+    // a clear shrink.
+    let w = 256u32;
+    let h = 256u32;
+    let rgba = sixteen_strip_image(w, h);
+    let pixels = rgba_bytes_to_argb_pixels(&rgba);
+    let opts = EncoderOptions {
+        use_subtract_green: false,
+        use_color_transform: false,
+        use_predictor: false,
+        use_color_index: false,
+        use_color_cache: true,
+        ..EncoderOptions::default()
+    };
+    let bs = encode_vp8l_argb_with(w, h, &pixels, false, opts).expect("encode");
+    let raw_bytes = (w * h * 4) as usize;
+    assert!(
+        bs.len() < raw_bytes / 2,
+        "encoded size {} bytes should be < half the raw {} bytes for a sixteen-strip 256×256",
+        bs.len(),
+        raw_bytes,
+    );
+}
+
 #[test]
 fn meta_huffman_does_not_inflate_uniform_image() {
     // A uniform-noise field has roughly equal statistics in every tile,

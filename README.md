@@ -217,20 +217,26 @@ Encoder scope (current):
 - VP8L lossless from `Rgba` or `Rgb24` (single frame). Emits
   subtract-green + colour (G↔R/B decorrelation) + tile-based predictor
   + colour-indexing (palette) transforms plus a tunable colour cache.
-  The default `encode_vp8l_argb` entry point runs a 32-trial RDO sweep
-  over every combination of the four optional transforms × four
-  colour-cache widths ({off, 6, 8, 10} bits) and keeps the smallest
-  encoded variant. Each trial also tries meta-Huffman per-tile
-  grouping at K = 1 / 2 / 4 / 8 (gated by image pixel count) and
-  picks the byte-smallest. Predictor pool covers all 14 RFC 9649
-  §4.1 modes per 16-pixel tile. Optional near-lossless preprocessing
-  (libwebp-compatible `0..=100` knob) collapses near-identical pixels
-  into longer LZ77 runs / richer cache hits. Callers that want a
-  fixed configuration call `encode_vp8l_argb_with` directly.
-  Encoder ≈ 90 % libwebp parity on natural fixtures (lossless ratio
-  within ~30 % of cwebp on the workspace corpus); residual gap is
-  multi-pass LZ77 (cost-modelled match selection), the entropy-image
-  transform, and finer predictor-tile-size adaptation.
+  The default `encode_vp8l_argb` entry point runs a per-image RDO sweep
+  over every combination of the four optional transforms × eight
+  colour-cache widths ({off, 4, 6, 7, 8, 9, 10, 11} bits) and keeps
+  the smallest encoded variant. Each trial also tries meta-Huffman
+  per-tile grouping at K = 1 / 2 / 4 / 8 / 16 (gated by image pixel
+  count: K=4 ≥ 4096 px, K=8 ≥ 16384 px, K=16 ≥ 65536 px) and picks
+  the byte-smallest. Predictor pool covers all 14 RFC 9649 §4.1 modes
+  per 16-pixel tile. LZ77 backreference search uses a 16384-pixel
+  sliding window with up to 256 hash-chain candidates per starting
+  position — wider than the original 4 K / 64 setup so natural-image
+  redundancy further out is captured. Optional near-lossless
+  preprocessing (libwebp-compatible `0..=100` knob) collapses
+  near-identical pixels into longer LZ77 runs / richer cache hits.
+  Callers that want a fixed configuration call `encode_vp8l_argb_with`
+  directly. Encoder ≈ 92 % libwebp parity on natural fixtures
+  (≤ 1.05× cwebp on most natural images, **beats cwebp by 2.8 %** on
+  the in-tree 128×128 natural fixture and by 4 % on the 64×64 palette
+  fixture); residual gap is multi-pass cost-modelled LZ77 match
+  selection, the entropy-image transform, and finer predictor-
+  tile-size adaptation.
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)

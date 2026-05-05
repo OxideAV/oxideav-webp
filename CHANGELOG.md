@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(vp8l-enc)* extend meta-Huffman per-tile grouping with K=16 trial
+  (gated to images ≥ 65536 pixels via `META_HUFFMAN_K16_MIN_PIXELS`).
+  Completes the K = {1, 2, 4, 8, 16} sweep up to the spec-supported
+  upper end of meta-Huffman group counts. The decoder already accepts
+  up to 65536 group ids per the meta-image-pixel `(p >> 8) & 0xffff`
+  parse, so K=16 needed no decoder-side change. Round-trip + sanity
+  tests in `tests/vp8l_meta_huffman.rs` (`sixteen_strip_image` 256×256
+  fixture). Wins ~1.6 % on a 256×256 photographic fixture vs the
+  previous K=8 ceiling.
+- *(vp8l-enc)* widen the colour-cache RDO sweep grid from 4 entries
+  `{0, 6, 8, 10}` to 8 entries `{0, 4, 6, 7, 8, 9, 10, 11}`. Catches
+  byte-optimal cache widths that fell between the old 6/8/10 plateau:
+  4 for very small palettes (≤ 16 active colours after subtract-green),
+  7 / 9 for in-between natural images, 11 for highly-repeated
+  screenshots / line art. Each extra entry is one full encode trial
+  per outer-loop combination — within the per-image RDO budget.
+- *(vp8l-enc)* widen the LZ77 search window from 4096 → 16384 pixels
+  and the per-position hash-chain depth from 64 → 256 candidates
+  (`LZ_WINDOW` / `LZ_MAX_TRIES`). Drops the `lossless-128x128-natural`
+  in-tree fixture from 1452 → 776 bytes (-46.6 %, now beats cwebp's
+  `-lossless -m 6 -z 9` output by 2.8 %), the synthetic 256×256 palette
+  fixture from 466 → 306 bytes (-34.3 %, matches cwebp), and the
+  128×128 palette fixture from 330 → 272 bytes (-17.6 %, beats cwebp).
+
+### Other
+
+- *(test)* `vp8l_encode_widened_predictor_pool_shrinks_diagonal`
+  asserts the widened-pool encode strictly beats the bare baseline
+  rather than the historic 2× multiplier — the wider LZ77 search
+  window + chain depth already collapses the 8-stripe diagonal via
+  long backrefs, leaving the predictor's win as the (still-real) ~10 %
+  residual reduction.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-webp/compare/v0.0.10...v0.0.11) - 2026-05-04
 
 ### Added

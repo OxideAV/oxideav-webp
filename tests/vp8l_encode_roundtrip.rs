@@ -393,9 +393,18 @@ fn vp8l_encode_widened_predictor_pool_shrinks_diagonal() {
         widened.len(),
         100.0 * (widened.len() as f64 - bare.len() as f64) / bare.len() as f64,
     );
+    // Predictor mode 3 (top-right) is exact on this fixture so the
+    // residual collapses to mostly zeros — the widened-pool encode must
+    // be strictly smaller than the bare baseline. The historic 2x
+    // multiplier no longer applies: with the wider LZ77 window
+    // ([`LZ_WINDOW`] bumped from 4096 to 16384 + chain depth from 64
+    // to 256) the bare encoder already collapses the diagonals via
+    // long backrefs, so the predictor's win shrinks to a still-real
+    // ~10 % residual reduction. The qualitative property (widened
+    // beats bare) is what matters and is asserted directly.
     assert!(
-        widened.len() * 2 < bare.len(),
-        "widened-pool encode should beat bare encode by 2x+ on diagonal stripes: \
+        widened.len() < bare.len(),
+        "widened-pool encode should beat bare encode on diagonal stripes: \
          bare={} bytes, widened={} bytes",
         bare.len(),
         widened.len(),
