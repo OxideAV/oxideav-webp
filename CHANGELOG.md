@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/OxideAV/oxideav-webp/compare/v0.0.11...v0.1.0) - 2026-05-05
+
+### Added
+
+- *(vp8l-enc)* K=16 meta-Huffman + wider LZ77 + denser cache_bits sweep
+- *(vp8-enc)* quality-driven per-frequency quant matrix + fix VP8L simple-Huffman bit leak
+
+### Other
+
+- promote to 0.1
+
 ### Added
 
 - *(vp8l-enc)* extend meta-Huffman per-tile grouping with K=16 trial
