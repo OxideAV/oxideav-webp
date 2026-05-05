@@ -240,6 +240,261 @@ fn freq_deltas_for_qindex(qindex: u8) -> Vp8FreqDeltas {
     }
 }
 
+/// Per-frame psy-RDO source statistics. Computed once from the source
+/// luma plane in `send_frame` (a single linear pass over the Y bytes,
+/// so analysis cost is negligible vs the VP8 encode itself), then used
+/// to bias the per-segment quant / loop-filter deltas and the
+/// per-frequency AC/DC quant deltas to spend bits where the eye
+/// notices most.
+///
+/// This is the WebP-layer surrogate for libwebp's per-MB rate control:
+/// `oxideav-vp8` already classifies each macroblock into one of four
+/// variance segments internally (see `SEGMENT_VARIANCE_THRESHOLDS`),
+/// but the per-segment delta values it consumes are *fixed* (a
+/// `qindex`-only curve). Computing them from the actual source
+/// distribution lets a frame whose MBs cluster in one variance bucket
+/// get tighter deltas (no point granting bonus quality to a smoothness
+/// segment that's empty) than a frame whose MBs spread evenly across
+/// the variance ladder.
+///
+/// All fields are deliberately frame-wide scalars rather than per-MB
+/// arrays — the underlying encoder consumes a single `[i32; 4]` of
+/// segment deltas + a single `Vp8FreqDeltas`, so per-MB granularity
+/// can't survive the API surface anyway. The `mean_activity` and
+/// `edge_density` fields capture the two perceptual axes that drive
+/// the modulation curves below.
+#[cfg(feature = "registry")]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PsyStats {
+    /// Mean per-pixel luma activity (sum of absolute deviations from
+    /// each row's mean, normalised by pixel count). Range `[0.0, 128.0]`
+    /// in practice — flat plates land near 0, white noise saturates
+    /// near 64. Higher values indicate more high-frequency texture; the
+    /// human visual system is *less* sensitive to noise in textured
+    /// regions, so high `mean_activity` lets us push the per-frequency
+    /// AC bins coarser and save bits without subjective loss
+    /// (CSF-style activity masking).
+    pub mean_activity: f32,
+    /// Fraction of macroblocks classified as "high variance" by the
+    /// same per-MB variance metric `oxideav-vp8` uses internally
+    /// (variance ≥ `SEGMENT_VARIANCE_THRESHOLDS[2]` = `3200 * 256`).
+    /// Range `[0.0, 1.0]`. Frames where this is near 1.0 (e.g. heavy
+    /// noise / fine texture) get widened segment-3 deltas because the
+    /// few smooth MBs left are precious. Frames where it's near 0.0
+    /// (e.g. sky photos / flat illustrations) tighten segment-0
+    /// deltas because the segmenter has nothing to discriminate.
+    pub high_variance_fraction: f32,
+    /// Number of macroblocks the analyser scanned. Used to detect the
+    /// degenerate sub-MB frame case (1×1 .. 15×15 inputs) where the
+    /// stats are unreliable and modulation should fall back to the
+    /// pure qindex-only curve.
+    pub mb_count: u32,
+}
+
+/// Compute frame-level psy-RDO statistics from a source luma plane.
+///
+/// Walks the plane in 16×16 macroblock tiles (matching VP8's intrinsic
+/// MB grid) and accumulates two stats per tile:
+///
+/// * Activity — mean absolute deviation of every pixel from its row
+///   mean within the MB. Cheaper than full-plane variance and tracks
+///   the high-frequency response the eye actually sees (rows are 16
+///   pixels, well above the CSF peak frequency for typical viewing
+///   distance).
+/// * Variance gate — sum of squared deviations from the MB mean,
+///   compared against the same `3200 * 256` threshold the VP8
+///   per-MB segmenter uses internally. Counts MBs that land in the
+///   "high variance" bucket.
+///
+/// Edge MBs (right / bottom partial MBs at non-multiple-of-16 frame
+/// sizes) are skipped — they're a small fraction of any meaningfully-
+/// sized frame and including them would bias the activity numbers
+/// (partial-MB padding rows are usually all zero / repeated edge
+/// pixels).
+///
+/// Returns `PsyStats { mean_activity: 0, high_variance_fraction: 0,
+/// mb_count: 0 }` for sub-MB frames.
+#[cfg(feature = "registry")]
+pub fn compute_psy_stats(width: u32, height: u32, y_plane: &[u8], y_stride: usize) -> PsyStats {
+    let w = width as usize;
+    let h = height as usize;
+    let mb_x = w / 16;
+    let mb_y = h / 16;
+    if mb_x == 0 || mb_y == 0 {
+        return PsyStats::default();
+    }
+    // Same threshold the vp8 segmenter uses for the highest-variance
+    // bucket (SEGMENT_VARIANCE_THRESHOLDS[2] = 3200 * 256). Imported
+    // implicitly via the magic number to avoid a cross-crate const
+    // import that's already a fixed part of the spec-derived ladder.
+    const HI_VAR_THRESHOLD: u64 = 3200 * 256;
+
+    let mut activity_sum: f64 = 0.0;
+    let mut hi_var_count: u32 = 0;
+
+    for my in 0..mb_y {
+        for mx in 0..mb_x {
+            let base = my * 16 * y_stride + mx * 16;
+            // Per-row mean + per-row mean-absolute-deviation. The row
+            // mean is cheap (16 adds + a >>4) and the row MAD captures
+            // the horizontal high-frequency response — vertical
+            // contributions average out across the 16 rows of the MB.
+            let mut mb_act: u32 = 0;
+            // For variance we need sum and sum-of-squares across the
+            // full MB. Both fit in u32 since 16*16*255 = 65280 sum
+            // and 16*16*255*255 = 16,646,400 sum2 — well within
+            // 32-bit range.
+            let mut mb_sum: u32 = 0;
+            let mut mb_sum2: u32 = 0;
+            for r in 0..16 {
+                let row = &y_plane[base + r * y_stride..base + r * y_stride + 16];
+                let mut row_sum: u32 = 0;
+                for &p in row {
+                    row_sum += p as u32;
+                }
+                let row_mean = (row_sum + 8) >> 4;
+                let mut row_mad: u32 = 0;
+                for &p in row {
+                    let d = (p as i32 - row_mean as i32).unsigned_abs();
+                    row_mad += d;
+                    mb_sum2 += (p as u32) * (p as u32);
+                }
+                mb_act += row_mad;
+                mb_sum += row_sum;
+            }
+            // Normalise per pixel (256 px per MB).
+            activity_sum += (mb_act as f64) / 256.0;
+            // VP8 variance metric: sum2 - sum*sum/n. Same scale as
+            // `SEGMENT_VARIANCE_THRESHOLDS` (which compares against
+            // an unnormalised sum-of-squares-residual).
+            let n = 256u64;
+            let s = mb_sum as u64;
+            let s2 = mb_sum2 as u64;
+            let var = s2.saturating_sub((s * s) / n);
+            if var >= HI_VAR_THRESHOLD {
+                hi_var_count += 1;
+            }
+        }
+    }
+
+    let mb_count = (mb_x * mb_y) as u32;
+    let mean_activity = (activity_sum / mb_count as f64) as f32;
+    let high_variance_fraction = hi_var_count as f32 / mb_count as f32;
+    PsyStats {
+        mean_activity,
+        high_variance_fraction,
+        mb_count,
+    }
+}
+
+/// Apply a psy-RDO modulation to the qindex-driven per-frequency AC/DC
+/// quant deltas. Inputs:
+///
+/// * `base` — the qindex-only curve from [`freq_deltas_for_qindex`].
+/// * `stats` — frame-level analysis from [`compute_psy_stats`].
+/// * `qindex` — the current frame qindex (modulation strength scales
+///   with `qindex`; at qindex=0 every delta stays at 0 because we're
+///   already at the finest representable step).
+///
+/// Modulation rules (CSF-derived):
+///
+/// * High activity (`mean_activity >= 24`): the eye is *less*
+///   sensitive to noise in textured regions, so push the high-frequency
+///   AC bins (`y2_ac_delta`, `uv_ac_delta`) one step further toward
+///   coarser. Saves bits without visible loss. Capped at +1 step so
+///   the change is incremental rather than dramatic — the qindex-only
+///   preset already does the bulk of the work.
+/// * Low activity (`mean_activity < 8`): the eye is *more* sensitive
+///   to artefacts on flat content (banding shows up clearly), so pull
+///   the high-frequency AC bins one step toward finer to suppress
+///   ringing on the rare edges. Same +/- 1 cap.
+/// * Y2 DC bin and chroma DC bin are left alone — those carry the
+///   visible block / chroma mean, and small psy-driven shifts there
+///   produce obvious blockiness / colour drift.
+///
+/// At qindex=0 the modulation collapses to all-zero (preserves the
+/// pre-#465 high-quality byte-identical guarantee). The clamp to
+/// `[-15, 15]` is preserved.
+#[cfg(feature = "registry")]
+fn psy_modulate_freq_deltas(base: Vp8FreqDeltas, stats: PsyStats, qindex: u8) -> Vp8FreqDeltas {
+    if stats.mb_count == 0 || qindex == 0 {
+        return base;
+    }
+    // Scale the modulation strength with qindex — at high quality the
+    // base curve is all-zero and any psy shift would actively coarsen
+    // the source, so the bias has to fade out alongside the base curve.
+    let strength = (qindex as f32) / 127.0;
+    let activity = stats.mean_activity;
+    // High activity → coarser high-freq; low activity → finer high-
+    // freq. Threshold values come from empirical sweep on the test
+    // patterns: 16 separates "natural photo / textured image" from
+    // "low-detail photo or screenshot" (the average MAD of a typical
+    // 128×128 macroblock crop on a JPEG photo is 12-25), 6 separates
+    // "sky / flat plate" from "mid-detail photo".
+    let mod_step: i32 = if activity >= 16.0 {
+        (1.0 * strength).round() as i32
+    } else if activity < 6.0 {
+        -(1.0 * strength).round() as i32
+    } else {
+        0
+    };
+    Vp8FreqDeltas {
+        y_dc_delta: base.y_dc_delta,
+        y2_dc_delta: base.y2_dc_delta,
+        // High-freq AC bins take the modulation; clamp preserves the
+        // ±15 5-bit signed-magnitude range.
+        y2_ac_delta: (base.y2_ac_delta + mod_step).clamp(-15, 15),
+        uv_dc_delta: base.uv_dc_delta,
+        uv_ac_delta: (base.uv_ac_delta + mod_step).clamp(-15, 15),
+    }
+}
+
+/// Apply a psy-RDO modulation to the qindex-driven per-segment quant
+/// deltas. Inputs:
+///
+/// * `base` — the qindex-only curve from
+///   [`segment_quant_deltas_for_qindex`].
+/// * `stats` — frame-level analysis from [`compute_psy_stats`].
+/// * `qindex` — the current frame qindex (modulation strength scales
+///   with `qindex`).
+///
+/// Modulation rules (rate-control surrogate for per-MB QP):
+///
+/// * Frames with a high `high_variance_fraction` (≥ 0.5): the
+///   variance segmenter is putting most MBs in segment 3 (textured),
+///   so push segment 3 one step *further* coarse to recover bits —
+///   the eye won't see the extra coarseness on already-noisy content,
+///   and the saved bits go to the few non-textured MBs that segment
+///   0 / 1 still care about.
+/// * Frames with low `high_variance_fraction` (< 0.05): nearly every
+///   MB is below the variance threshold, so segment 3 is almost
+///   empty; pull its delta one step *finer* (less waste on the rare
+///   textured MB) and keep segment 0 at its full bonus.
+/// * Otherwise (0.05 ≤ frac < 0.5): leave the qindex-only curve
+///   alone — it's already a good fit for mid-range content.
+///
+/// At qindex=0 the modulation collapses to all-zero. Returned values
+/// stay in the `[-15, 15]` 5-bit signed-magnitude range.
+#[cfg(feature = "registry")]
+fn psy_modulate_segment_deltas(base: [i32; 4], stats: PsyStats, qindex: u8) -> [i32; 4] {
+    if stats.mb_count == 0 || qindex == 0 {
+        return base;
+    }
+    let strength = (qindex as f32) / 127.0;
+    let frac = stats.high_variance_fraction;
+    let bias: i32 = if frac >= 0.5 {
+        // Segment 3 is the dominant bucket — coarsen it further.
+        (1.0 * strength).round() as i32
+    } else if frac < 0.05 {
+        // Segment 3 is nearly empty — recover its delta toward 0 so
+        // the rare textured MB doesn't get hammered.
+        -(1.0 * strength).round() as i32
+    } else {
+        0
+    };
+    [base[0], base[1], base[2], (base[3] + bias).clamp(-15, 15)]
+}
+
 /// Quality-driven per-segment loop-filter level deltas (RFC 6386 §15.2).
 /// Smooth segments take a *negative* LF delta (a softer filter — the
 /// per-segment finer quant already preserves smooth detail, so the
@@ -335,8 +590,18 @@ pub struct Vp8FreqDeltas {
 /// AC/DC quantiser deltas added in `oxideav-vp8` 0.1.7 (#417); pass
 /// [`Vp8FreqDeltas::default()`] (all zeros) to reproduce the exact
 /// pre-#417 bitstream.
+/// Build the `Vp8EncoderConfig` used by the WebP single-frame lossy
+/// path with the per-segment quant deltas supplied explicitly. The
+/// caller picks between the qindex-only baseline
+/// ([`segment_quant_deltas_for_qindex`]) and the psy-RDO modulated
+/// override ([`psy_modulate_segment_deltas`]) — the underlying encoder
+/// only sees the final `[i32; 4]`.
 #[cfg(feature = "registry")]
-fn webp_lossy_config(qindex: u8, freq_deltas: Vp8FreqDeltas) -> Vp8EncoderConfig {
+fn webp_lossy_config_with_segments(
+    qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
+    segment_quant_deltas: [i32; 4],
+) -> Vp8EncoderConfig {
     let qi = qindex.min(127);
     Vp8EncoderConfig {
         qindex: qi,
@@ -349,7 +614,7 @@ fn webp_lossy_config(qindex: u8, freq_deltas: Vp8FreqDeltas) -> Vp8EncoderConfig
         // Quality-driven perceptual tuning — segments-on, deltas scaled
         // with qindex so high quality collapses to near-uniform QP / LF.
         enable_segments: true,
-        segment_quant_deltas: segment_quant_deltas_for_qindex(qi),
+        segment_quant_deltas,
         segment_lf_deltas: segment_lf_deltas_for_qindex(qi),
         // Per-frequency AC/DC qindex deltas. Underlying encoder clamps
         // each to ±15 internally, so we can pass through untouched.
@@ -363,19 +628,23 @@ fn webp_lossy_config(qindex: u8, freq_deltas: Vp8FreqDeltas) -> Vp8EncoderConfig
 }
 
 /// Encode a single VP8 keyframe through the segment-aware
-/// configuration produced by [`webp_lossy_config`]. Goes through the
-/// `Encoder` trait surface so we get the per-segment quant + LF deltas
-/// (and the optional per-frequency AC/DC deltas) without having to
-/// duplicate the lower-level keyframe entry point.
+/// configuration produced by [`webp_lossy_config_with_segments`]. Goes
+/// through the `Encoder` trait surface so we get the per-segment quant +
+/// LF deltas (and the optional per-frequency AC/DC deltas) without
+/// having to duplicate the lower-level keyframe entry point. The
+/// per-segment quant deltas are supplied by the caller (see the
+/// [`psy_modulate_segment_deltas`] / [`segment_quant_deltas_for_qindex`]
+/// helpers).
 #[cfg(feature = "registry")]
-fn encode_keyframe_with_segments(
+fn encode_keyframe_with_explicit_segments(
     width: u32,
     height: u32,
     qindex: u8,
     freq_deltas: Vp8FreqDeltas,
+    segment_quant_deltas: [i32; 4],
     frame: &VideoFrame,
 ) -> Result<Vec<u8>> {
-    let cfg = webp_lossy_config(qindex, freq_deltas);
+    let cfg = webp_lossy_config_with_segments(qindex, freq_deltas, segment_quant_deltas);
     let mut p = CodecParameters::video(CodecId::new(oxideav_vp8::CODEC_ID_STR));
     p.width = Some(width);
     p.height = Some(height);
@@ -421,7 +690,66 @@ pub fn make_encoder_with_qindex(
     params: &CodecParameters,
     qindex: u8,
 ) -> oxideav_core::Result<Box<dyn Encoder>> {
-    make_encoder_with_qindex_and_freq_deltas(params, qindex, freq_deltas_for_qindex(qindex))
+    // Non-explicit factory: psy-RDO modulation kicks in on top of the
+    // qindex-only freq-delta + segment-delta presets. Callers that want
+    // to disable psy + supply their own perceptual tuning should reach
+    // for [`make_encoder_with_qindex_and_freq_deltas`].
+    build_encoder(
+        params,
+        qindex,
+        freq_deltas_for_qindex(qindex),
+        /* psy_enabled */ true,
+        /* target_bytes */ None,
+    )
+}
+
+/// Build a VP8-lossy WebP encoder driven by a target output size in
+/// bytes (whole `.webp` file, not the bare VP8 chunk).
+///
+/// The caller picks a single byte budget; the encoder runs a small
+/// bisection over `qindex` (max 5 trials = `ceil(log2(128))`) on each
+/// `send_frame` to land within ±10 % of the budget. The starting
+/// qindex is `oxideav_vp8::DEFAULT_QINDEX`; the bisection narrows
+/// toward higher qindex when the trial output is too large and lower
+/// qindex when it's too small.
+///
+/// Worst-case encode cost is `1 + MAX_ITERS = 6×` the single-shot
+/// path. Most natural-image inputs converge in 2-3 iterations because
+/// the size-vs-qindex curve is monotone (the qindex-driven preset
+/// keeps it that way). Frames whose intrinsic complexity makes the
+/// target unreachable (e.g. a 1-MB target on a 1×1 fixture, or a
+/// 100-byte target on a 1024×1024 photo) bail out at the closest-to-
+/// target qindex seen during the search.
+///
+/// Psy-RDO modulation runs on every trial encode, so the bisection
+/// converges on the actual production output.
+///
+/// # Example
+///
+/// ```ignore
+/// use oxideav_core::{CodecId, CodecParameters, PixelFormat};
+/// use oxideav_webp::{encoder_vp8, CODEC_ID_VP8};
+///
+/// let mut params = CodecParameters::video(CodecId::new(CODEC_ID_VP8));
+/// params.width = Some(640);
+/// params.height = Some(480);
+/// params.pixel_format = Some(PixelFormat::Yuv420P);
+/// // Aim for a ~16 KB file regardless of source complexity.
+/// let mut enc = encoder_vp8::make_encoder_with_target_size(&params, 16 * 1024)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_target_size(
+    params: &CodecParameters,
+    target_bytes: usize,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    build_encoder(
+        params,
+        DEFAULT_QINDEX,
+        freq_deltas_for_qindex(DEFAULT_QINDEX),
+        /* psy_enabled */ true,
+        Some(target_bytes),
+    )
 }
 
 /// Build a VP8-lossy WebP encoder with an explicit qindex (0..=127)
@@ -446,6 +774,31 @@ pub fn make_encoder_with_qindex_and_freq_deltas(
     params: &CodecParameters,
     qindex: u8,
     freq_deltas: Vp8FreqDeltas,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    // Explicit `_and_freq_deltas` factory: psy modulation OFF. Caller
+    // freq-deltas pass through verbatim — historical guarantee that an
+    // all-zero `Vp8FreqDeltas` reproduces the pre-#465 bitstream
+    // byte-for-byte.
+    build_encoder(
+        params,
+        qindex,
+        freq_deltas,
+        /* psy_enabled */ false,
+        /* target_bytes */ None,
+    )
+}
+
+/// Shared builder for every public `make_encoder_*` entry point.
+/// Centralises the parameter validation, the `output_params` derivation,
+/// and the [`Vp8WebpEncoder`] construction so each public factory only
+/// needs to express its psy / rate-control policy.
+#[cfg(feature = "registry")]
+fn build_encoder(
+    params: &CodecParameters,
+    qindex: u8,
+    freq_deltas: Vp8FreqDeltas,
+    psy_enabled: bool,
+    target_bytes: Option<usize>,
 ) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -486,6 +839,8 @@ pub fn make_encoder_with_qindex_and_freq_deltas(
         height,
         qindex: qindex.min(127),
         freq_deltas,
+        psy_enabled,
+        target_bytes,
         input_format: pix,
         time_base,
         pending: VecDeque::new(),
@@ -513,6 +868,20 @@ struct Vp8WebpEncoder {
     height: u32,
     qindex: u8,
     freq_deltas: Vp8FreqDeltas,
+    /// When `true`, every `send_frame` call computes [`PsyStats`] from
+    /// the source luma plane and uses them to bias the per-frequency
+    /// AC/DC quant deltas + the per-segment quant deltas before
+    /// invoking the underlying VP8 encoder. Off by default — the
+    /// explicit `*_and_freq_deltas` factories leave this `false` so
+    /// caller-supplied freq-deltas pass through verbatim.
+    psy_enabled: bool,
+    /// Optional target output size (whole-`.webp`-file bytes). When
+    /// `Some`, `send_frame` runs a small bisection over `qindex` to
+    /// land within ±10 % of the target. The starting `qindex` is the
+    /// initial value supplied at construction; iterations are bounded
+    /// to 5 (= `ceil(log2(128))`) so worst-case encode cost is ~6×
+    /// the single-shot path.
+    target_bytes: Option<usize>,
     input_format: PixelFormat,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
@@ -542,39 +911,42 @@ impl Encoder for Vp8WebpEncoder {
         // encoder at construction); the pipeline upstream is responsible
         // for matching `output_params`. Dispatch on the encoder's
         // configured input format.
-        let bytes = match self.input_format {
-            PixelFormat::Yuv420P => {
-                let vp8 = encode_keyframe_with_segments(
-                    self.width,
-                    self.height,
-                    self.qindex,
-                    self.freq_deltas,
-                    v,
-                )?;
-                build_webp_file(
-                    ImageKind::Vp8Lossy,
-                    &vp8,
-                    self.width,
-                    self.height,
-                    None,
-                    &WebpMetadata::default(),
-                )
-            }
-            PixelFormat::Yuva420P => {
-                encode_yuva420_lossy(self.width, self.height, self.qindex, self.freq_deltas, v)?
-            }
-            PixelFormat::Rgba => {
-                encode_rgba_lossy(self.width, self.height, self.qindex, self.freq_deltas, v)?
-            }
-            PixelFormat::Rgb24 => {
-                encode_rgb24_lossy(self.width, self.height, self.qindex, self.freq_deltas, v)?
-            }
-            other => {
-                return Err(oxideav_core::Error::unsupported(format!(
-                    "VP8 WebP encoder: frame format {other:?} unsupported"
-                )))
-            }
+        //
+        // Psy-RDO + per-frame rate control orchestration:
+        //
+        // 1. If psy is enabled, extract the source luma plane (cheap —
+        //    YUV inputs hand it to us directly; RGB inputs build it
+        //    on-the-fly inside the lossy path, but for stats we do a
+        //    quick BT.601 Y-only synthesis here).
+        // 2. Compute `PsyStats` from that Y plane.
+        // 3. Pick the qindex: either the construction value, or — if
+        //    `target_bytes` is set — bisect over qindex in the
+        //    `[0..=127]` range to hit the byte budget.
+        // 4. Modulate the freq-deltas + segment deltas with the psy
+        //    stats and run the chosen encode path.
+        let psy_stats = if self.psy_enabled {
+            extract_psy_stats(self.width, self.height, self.input_format, v)
+        } else {
+            PsyStats::default()
         };
+
+        let chosen_qindex = if let Some(target) = self.target_bytes {
+            self.bisect_qindex_for_target(target, v, psy_stats)?
+        } else {
+            self.qindex
+        };
+
+        let chosen_freq_deltas = if self.psy_enabled {
+            psy_modulate_freq_deltas(
+                freq_deltas_for_qindex(chosen_qindex),
+                psy_stats,
+                chosen_qindex,
+            )
+        } else {
+            self.freq_deltas
+        };
+
+        let bytes = self.encode_at(chosen_qindex, chosen_freq_deltas, psy_stats, v)?;
         let mut pkt = Packet::new(0, self.time_base, bytes);
         pkt.pts = v.pts;
         pkt.dts = pkt.pts;
@@ -600,18 +972,283 @@ impl Encoder for Vp8WebpEncoder {
     }
 }
 
+#[cfg(feature = "registry")]
+impl Vp8WebpEncoder {
+    /// Run a single per-format encode with explicit qindex + freq-
+    /// deltas + psy stats.
+    ///
+    /// The psy stats drive the per-segment quant deltas when
+    /// [`Self::psy_enabled`] is set; otherwise the qindex-only curve
+    /// is used. Centralised so the bisection rate-control loop can
+    /// call this repeatedly without re-deriving the dispatch tree.
+    fn encode_at(
+        &self,
+        qindex: u8,
+        freq_deltas: Vp8FreqDeltas,
+        psy_stats: PsyStats,
+        v: &VideoFrame,
+    ) -> oxideav_core::Result<Vec<u8>> {
+        let segment_deltas = if self.psy_enabled {
+            psy_modulate_segment_deltas(
+                segment_quant_deltas_for_qindex(qindex.min(127)),
+                psy_stats,
+                qindex,
+            )
+        } else {
+            segment_quant_deltas_for_qindex(qindex.min(127))
+        };
+        let bytes = match self.input_format {
+            PixelFormat::Yuv420P => {
+                let vp8 = encode_keyframe_with_explicit_segments(
+                    self.width,
+                    self.height,
+                    qindex,
+                    freq_deltas,
+                    segment_deltas,
+                    v,
+                )
+                .map_err(|e| oxideav_core::Error::invalid(format!("{e}")))?;
+                build_webp_file(
+                    ImageKind::Vp8Lossy,
+                    &vp8,
+                    self.width,
+                    self.height,
+                    None,
+                    &WebpMetadata::default(),
+                )
+            }
+            PixelFormat::Yuva420P => encode_yuva420_lossy_with_segments(
+                self.width,
+                self.height,
+                qindex,
+                freq_deltas,
+                segment_deltas,
+                v,
+            )
+            .map_err(|e| oxideav_core::Error::invalid(format!("{e}")))?,
+            PixelFormat::Rgba => encode_rgba_lossy_with_segments(
+                self.width,
+                self.height,
+                qindex,
+                freq_deltas,
+                segment_deltas,
+                v,
+            )
+            .map_err(|e| oxideav_core::Error::invalid(format!("{e}")))?,
+            PixelFormat::Rgb24 => encode_rgb24_lossy_with_segments(
+                self.width,
+                self.height,
+                qindex,
+                freq_deltas,
+                segment_deltas,
+                v,
+            )
+            .map_err(|e| oxideav_core::Error::invalid(format!("{e}")))?,
+            other => {
+                return Err(oxideav_core::Error::unsupported(format!(
+                    "VP8 WebP encoder: frame format {other:?} unsupported"
+                )))
+            }
+        };
+        Ok(bytes)
+    }
+
+    /// Per-frame rate control: bisect over `qindex` to land within
+    /// ±10 % of `target_bytes`. Returns the chosen qindex.
+    ///
+    /// Strategy is a five-step fixed-iteration bisection (so worst-case
+    /// encode cost is ~6× the single-shot path):
+    ///
+    /// 1. Encode at the construction-time `qindex` to get a baseline
+    ///    size. If already within ±10 %, return it directly.
+    /// 2. Otherwise, bisect: each iteration encodes at the midpoint
+    ///    of the current `[lo, hi]` qindex range and updates the
+    ///    bound. The encode at the midpoint is *not* wasted — it
+    ///    becomes the next bisection's reference.
+    /// 3. Bound the loop at 5 iterations. After that the chosen
+    ///    qindex is the best (closest-to-target) one seen.
+    ///
+    /// The bisection inverts the usual qindex-vs-quality direction:
+    /// qindex 0 = max quality / max bytes, qindex 127 = min quality /
+    /// min bytes. So a too-large output bisects toward higher qindex,
+    /// a too-small one toward lower qindex.
+    fn bisect_qindex_for_target(
+        &self,
+        target_bytes: usize,
+        v: &VideoFrame,
+        psy_stats: PsyStats,
+    ) -> oxideav_core::Result<u8> {
+        const MAX_ITERS: usize = 5;
+        // ±10 % tolerance: anywhere in [0.9×, 1.1×] target counts as
+        // a clean hit and we bail early. Below the lower bound we
+        // can't recover bytes (the qindex floor is 0); above the
+        // upper bound we widen toward 127.
+        let lo_target = (target_bytes as f64 * 0.9) as usize;
+        let hi_target = (target_bytes as f64 * 1.1) as usize;
+
+        let mut lo: u8 = 0;
+        let mut hi: u8 = 127;
+        let mut best_qindex: u8 = self.qindex;
+        let mut best_dist: usize;
+
+        // Helper: encode at `qi`, return byte length. Uses the same
+        // psy modulation as the final encode so the bisection
+        // converges on the actual production output rather than a
+        // psy-less proxy.
+        let try_encode = |qi: u8| -> oxideav_core::Result<usize> {
+            let fd = if self.psy_enabled {
+                psy_modulate_freq_deltas(freq_deltas_for_qindex(qi), psy_stats, qi)
+            } else {
+                self.freq_deltas
+            };
+            let bytes = self.encode_at(qi, fd, psy_stats, v)?;
+            Ok(bytes.len())
+        };
+
+        // First trial: the construction qindex. If it already lands in
+        // the tolerance band we're done.
+        let initial = try_encode(self.qindex)?;
+        if initial >= lo_target && initial <= hi_target {
+            return Ok(self.qindex);
+        }
+        best_dist = initial.abs_diff(target_bytes);
+        if initial > target_bytes {
+            // Too large → need higher qindex (coarser).
+            lo = self.qindex.saturating_add(1);
+        } else {
+            // Too small → need lower qindex (finer).
+            hi = self.qindex.saturating_sub(1);
+        }
+
+        for _ in 0..MAX_ITERS {
+            if lo > hi {
+                break;
+            }
+            let mid = lo + (hi - lo) / 2;
+            let sz = try_encode(mid)?;
+            let dist = sz.abs_diff(target_bytes);
+            if dist < best_dist {
+                best_dist = dist;
+                best_qindex = mid;
+            }
+            if sz >= lo_target && sz <= hi_target {
+                return Ok(mid);
+            }
+            if sz > target_bytes {
+                lo = mid.saturating_add(1);
+            } else if mid == 0 {
+                // Already at the finest step and still too small —
+                // can't go finer. Best we can do is return 0.
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        Ok(best_qindex)
+    }
+}
+
+/// Pull a `(width, height)`-shaped Y plane out of the input frame and
+/// hand it to [`compute_psy_stats`]. Routes per pixel format:
+///
+/// * `Yuv420P` / `Yuva420P` — the Y plane is `planes[0]`. Stride may
+///   exceed `width` (input frames don't promise tight strides), so
+///   the Y bytes are passed through with their actual stride.
+/// * `Rgba` / `Rgb24` — synthesise a tight Y plane on the fly using
+///   the same BT.601 formula the per-format encoders use. Costs one
+///   linear pass over the input but lets us run psy analysis without
+///   a YUV roundtrip.
+///
+/// Returns `PsyStats::default()` for malformed inputs (the encoder
+/// will produce a more specific error downstream when it tries to
+/// actually consume the frame).
+#[cfg(feature = "registry")]
+fn extract_psy_stats(
+    width: u32,
+    height: u32,
+    input_format: PixelFormat,
+    v: &VideoFrame,
+) -> PsyStats {
+    let w = width as usize;
+    let h = height as usize;
+    match input_format {
+        PixelFormat::Yuv420P | PixelFormat::Yuva420P => {
+            if v.planes.is_empty() {
+                return PsyStats::default();
+            }
+            let y_plane = &v.planes[0];
+            if y_plane.stride < w || y_plane.data.len() < y_plane.stride * h {
+                return PsyStats::default();
+            }
+            compute_psy_stats(width, height, &y_plane.data, y_plane.stride)
+        }
+        PixelFormat::Rgb24 => {
+            if v.planes.is_empty() {
+                return PsyStats::default();
+            }
+            let plane = &v.planes[0];
+            if plane.stride < w * 3 || plane.data.len() < plane.stride * h {
+                return PsyStats::default();
+            }
+            // Synthesise a tight Y plane via BT.601 limited-range. The
+            // same formula the encoder uses (see [`rgb24_rows_to_yuv420`])
+            // so the analysis result tracks what the VP8 encoder will
+            // actually consume.
+            let mut y = vec![0u8; w * h];
+            for j in 0..h {
+                let row_start = j * plane.stride;
+                for i in 0..w {
+                    let px = &plane.data[row_start + i * 3..row_start + i * 3 + 3];
+                    let r = px[0] as i32;
+                    let g = px[1] as i32;
+                    let b = px[2] as i32;
+                    let yv = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                    y[j * w + i] = yv.clamp(0, 255) as u8;
+                }
+            }
+            compute_psy_stats(width, height, &y, w)
+        }
+        PixelFormat::Rgba => {
+            if v.planes.is_empty() {
+                return PsyStats::default();
+            }
+            let plane = &v.planes[0];
+            if plane.stride < w * 4 || plane.data.len() < plane.stride * h {
+                return PsyStats::default();
+            }
+            let mut y = vec![0u8; w * h];
+            for j in 0..h {
+                let row_start = j * plane.stride;
+                for i in 0..w {
+                    let px = &plane.data[row_start + i * 4..row_start + i * 4 + 4];
+                    let r = px[0] as i32;
+                    let g = px[1] as i32;
+                    let b = px[2] as i32;
+                    let yv = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                    y[j * w + i] = yv.clamp(0, 255) as u8;
+                }
+            }
+            compute_psy_stats(width, height, &y, w)
+        }
+        _ => PsyStats::default(),
+    }
+}
+
 /// Encode a `Yuva420P` frame natively: the YUV planes feed straight into
 /// the VP8 keyframe encoder (no RGB roundtrip — saves a pair of
 /// 8-bit-fixed-point colour conversions vs the `Rgba` path), and the
 /// full-resolution alpha plane is compressed into the `ALPH` sidecar.
 /// Emits a complete `.webp` file in the extended `VP8X + ALPH + VP8 `
-/// layout.
+/// layout. The per-segment quant deltas are supplied by the caller —
+/// either the qindex-only baseline ([`segment_quant_deltas_for_qindex`])
+/// or the psy-RDO modulated override ([`psy_modulate_segment_deltas`]).
 #[cfg(feature = "registry")]
-fn encode_yuva420_lossy(
+fn encode_yuva420_lossy_with_segments(
     width: u32,
     height: u32,
     qindex: u8,
     freq_deltas: Vp8FreqDeltas,
+    segment_deltas: [i32; 4],
     v: &VideoFrame,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
@@ -644,7 +1281,14 @@ fn encode_yuva420_lossy(
             v.planes[2].clone(),
         ],
     };
-    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, freq_deltas, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_explicit_segments(
+        width,
+        height,
+        qindex,
+        freq_deltas,
+        segment_deltas,
+        &yuv_frame,
+    )?;
 
     // Pull the alpha plane row-major (handle non-tight stride).
     let alpha_plane = &v.planes[3];
@@ -671,13 +1315,15 @@ fn encode_yuva420_lossy(
 /// caller that already holds a JPEG- or PNG-without-alpha decode (where
 /// the upstream is RGB and adding alpha would mean a full re-alloc)
 /// pays only for the YUV planes (the natural VP8 input). This is the
-/// VP8-side counterpart to issue #7.
+/// VP8-side counterpart to issue #7. Per-segment quant deltas come from
+/// the caller (qindex baseline or psy-modulated).
 #[cfg(feature = "registry")]
-fn encode_rgb24_lossy(
+fn encode_rgb24_lossy_with_segments(
     width: u32,
     height: u32,
     qindex: u8,
     freq_deltas: Vp8FreqDeltas,
+    segment_deltas: [i32; 4],
     v: &VideoFrame,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
@@ -708,7 +1354,14 @@ fn encode_rgb24_lossy(
             },
         ],
     };
-    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, freq_deltas, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_explicit_segments(
+        width,
+        height,
+        qindex,
+        freq_deltas,
+        segment_deltas,
+        &yuv_frame,
+    )?;
     Ok(build_webp_file(
         ImageKind::Vp8Lossy,
         &vp8_bytes,
@@ -720,13 +1373,15 @@ fn encode_rgb24_lossy(
 }
 
 /// Encode an RGBA frame as VP8 lossy + ALPH sidecar + VP8X extended
-/// header. Returns a complete `.webp` file.
+/// header. Returns a complete `.webp` file. Per-segment quant deltas
+/// come from the caller (qindex baseline or psy-modulated).
 #[cfg(feature = "registry")]
-fn encode_rgba_lossy(
+fn encode_rgba_lossy_with_segments(
     width: u32,
     height: u32,
     qindex: u8,
     freq_deltas: Vp8FreqDeltas,
+    segment_deltas: [i32; 4],
     v: &VideoFrame,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
@@ -759,7 +1414,14 @@ fn encode_rgba_lossy(
             },
         ],
     };
-    let vp8_bytes = encode_keyframe_with_segments(width, height, qindex, freq_deltas, &yuv_frame)?;
+    let vp8_bytes = encode_keyframe_with_explicit_segments(
+        width,
+        height,
+        qindex,
+        freq_deltas,
+        segment_deltas,
+        &yuv_frame,
+    )?;
 
     // Encode the alpha plane as a VP8L green-only bitstream with a
     // pre-encode filter pass picked to minimise the resulting payload

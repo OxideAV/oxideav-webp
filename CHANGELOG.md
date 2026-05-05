@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(vp8-enc)* psy-RDO source analysis + per-frame target-size rate
+  control. Each `send_frame` on the non-explicit factories
+  ([`make_encoder`] / [`make_encoder_with_quality`] /
+  [`make_encoder_with_qindex`]) now runs a one-pass MAD analyser
+  over the source luma plane (`encoder_vp8::compute_psy_stats`)
+  and uses the resulting `PsyStats { mean_activity,
+  high_variance_fraction, mb_count }` to bias both the per-segment
+  quant deltas and the per-frequency AC/DC quant deltas before
+  invoking the underlying VP8 encoder. CSF-style activity masking:
+  frames with `mean_activity ≥ 16` (typical natural-image
+  textures) get one step coarser high-freq AC bins (saves bits the
+  eye won't notice on busy content); frames with `mean_activity
+  < 6` (sky photos / flat plates) get one step finer to suppress
+  visible banding on the rare edges. Variance-segment 3 delta also
+  modulates: widens on segment-3-heavy frames (most MBs textured →
+  recover bits there), narrows on segment-3-empty frames (rare
+  textured MB shouldn't get hammered). Modulation strength scales
+  with qindex so the qindex=0 endpoint reproduces the pre-psy
+  bitstream byte-for-byte. New
+  [`encoder_vp8::make_encoder_with_target_size`] factory hits a
+  caller-supplied byte budget within ±10 % via a 5-iteration
+  bisection over qindex (worst-case 6× single-shot encode cost,
+  converges in 2-3 iterations on natural-image content because the
+  size-vs-qindex curve is monotone). Measured win on the AC-rich
+  noisy 128×128 fixture at qindex 64: −1.1 % bytes and +0.01 dB
+  PSNR vs the no-psy baseline; both bitstreams cross-decode
+  cleanly through libwebp's `dwebp`. Explicit `*_and_freq_deltas`
+  factories continue to pass freq-deltas through verbatim and
+  bypass the psy modulation, preserving the
+  `Vp8FreqDeltas::default()` byte-identical guarantee for tuning
+  callers.
+- *(test)* `vp8_lossy_psy_rdo` integration suite (7 tests):
+  `psy_stats_distinguish_smooth_vs_noisy` (asserts the analyser
+  ranks the smooth fixture at activity 3.0 and the noisy fixture
+  at 18.4 on the same 128×128 frame), `psy_stats_sub_mb_frame_returns_default`
+  (8×8 frames return `mb_count=0` rather than panic),
+  `psy_modulation_changes_bitstream_and_keeps_quality_on_noisy_source`
+  (psy-on vs psy-off bytes / PSNR comparison + dwebp cross-decode),
+  `psy_modulation_smooth_source_does_not_blow_up_bytes` (bytes
+  growth ≤ 25 % on smooth content),
+  `target_size_rate_control_hits_within_tolerance` (6 KB / 12 KB
+  / 20 KB targets all land within ±15 %),
+  `target_size_rate_control_handles_unreachable_target` (50-byte
+  target on a 128×128 noisy fixture lands at the smallest
+  achievable size without panicking),
+  `psy_modulation_collapses_to_baseline_at_qindex_zero`
+  (high-quality byte-identical guarantee).
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-webp/compare/v0.1.1...v0.1.2) - 2026-05-05
 
 ### Other

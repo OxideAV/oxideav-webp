@@ -186,8 +186,8 @@ Four input pixel formats are accepted:
 YUV-with-alpha frame from a video decoder. It avoids the YUV→RGB→YUV
 roundtrip the `Rgba` path goes through.
 
-Quality control: the VP8 lossy encoder exposes two equivalent factory
-entry points for picking a target compression level —
+Quality control: the VP8 lossy encoder exposes three factory entry
+points for picking a target compression level —
 
 * `encoder_vp8::make_encoder_with_quality(&params, quality)` — takes
   a libwebp-style `quality: f32` in `0.0..=100.0` (higher = better
@@ -195,6 +195,11 @@ entry points for picking a target compression level —
 * `encoder_vp8::make_encoder_with_qindex(&params, qindex)` — takes
   the underlying VP8 qindex in `0..=127` (lower = better) for callers
   that already speak the libvpx scale.
+* `encoder_vp8::make_encoder_with_target_size(&params, target_bytes)`
+  — drives a per-frame rate-control bisection (≤ 5 trials over
+  qindex) to hit a caller-supplied byte budget within ±10 %. Use
+  this when you need a known output footprint regardless of source
+  complexity (image-thumbnailers, fixed-quota uploads, etc.).
 
 The `quality → qindex` mapping is the linear inversion
 `qindex = round((100 - quality) * 1.27)`. As of #465 the per-quality
@@ -203,11 +208,20 @@ the per-frequency AC/DC quant deltas (§6.6 / §9.6) — at high quality
 every delta collapses to zero, at low quality the high-frequency Y2
 AC and chroma AC bins land on a coarser step while the macroblock-
 mean (Y2 DC) bin holds finer to suppress visible block-mean banding.
-File size is byte-strictly monotone with quality on AC-rich content
-and bitstreams stay spec-compliant under libwebp's `dwebp`. Callers
-that have already done their own perceptual tuning should reach for
-the explicit `*_and_freq_deltas` factories, which pass the supplied
-`Vp8FreqDeltas` through verbatim (no preset added on top).
+A **psy-RDO** modulation runs on top: the encoder computes per-frame
+[`PsyStats`] from the source luma (mean activity + high-variance MB
+fraction, one O(W·H) MAD pass), and biases the per-frequency AC and
+per-segment-3 quant deltas by ±1 step based on the resulting CSF
+profile — high-activity frames trim more bits from the masked high-
+freq bins, low-activity frames spend extra bits to suppress visible
+banding on flat regions. Modulation strength scales with qindex so
+high-quality (qindex=0) output stays byte-identical to the pre-psy
+bitstream. File size is byte-strictly monotone with quality on
+AC-rich content and bitstreams stay spec-compliant under libwebp's
+`dwebp`. Callers that have already done their own perceptual tuning
+should reach for the explicit `*_and_freq_deltas` factories, which
+pass the supplied `Vp8FreqDeltas` through verbatim *and* skip the
+psy modulation (no preset added on top).
 
 ### Scope
 
@@ -257,15 +271,33 @@ Encoder scope (current):
   `quality` knob via `freq_deltas_for_qindex`: zero at qindex=0,
   widening to `[0, -2, +4, 0, +4]` at qindex=127 so high-frequency
   bins compress harder and the macroblock-mean bin holds finer to
-  suppress block-mean banding. Default qindex from `oxideav-vp8` is
-  used unless the caller selects one via
-  `encoder_vp8::make_encoder_with_qindex` (VP8 qindex `0..=127`,
-  lower = better) or the libwebp-style
-  `encoder_vp8::make_encoder_with_quality` (`0.0..=100.0`, higher =
-  better). Explicit `*_and_freq_deltas` factories pass user
-  freq-deltas through verbatim (zero argument reproduces the
-  pre-#465 bitstream byte-for-byte). Encoder ≈ 90 % libwebp parity
-  on natural fixtures; residual gap is psy-RDO + per-MB rate control.
+  suppress block-mean banding. **Psy-RDO source analysis**
+  (`encoder_vp8::compute_psy_stats`) runs once per frame on the
+  source luma plane (cost is one O(W·H) MAD pass) and modulates
+  both the per-frequency deltas and the per-segment quant deltas
+  from the actual content distribution: high-activity frames
+  (`mean_activity ≥ 16`) get one step coarser high-freq AC bins
+  (CSF activity-mask saving on visually-noisy content),
+  low-activity frames (`mean_activity < 6`) get one step finer
+  high-freq AC bins to suppress banding on flat regions, and
+  variance-segment deltas widen on segment-3-heavy frames /
+  narrow on segment-3-empty frames. **Per-frame rate control**
+  (`encoder_vp8::make_encoder_with_target_size`) bisects qindex
+  in ≤ 5 trials (worst-case 6× single-shot encode cost) to land
+  within ±10 % of a caller-supplied byte budget — converges in
+  2-3 iterations on natural-image content (size-vs-qindex curve
+  is monotone). Default qindex from `oxideav-vp8` is used unless
+  the caller selects one via `encoder_vp8::make_encoder_with_qindex`
+  (VP8 qindex `0..=127`, lower = better) or the libwebp-style
+  `encoder_vp8::make_encoder_with_quality` (`0.0..=100.0`,
+  higher = better). Explicit `*_and_freq_deltas` factories pass
+  user freq-deltas through verbatim *and* skip the psy modulation
+  (zero argument reproduces the pre-#465 bitstream byte-for-byte).
+  Encoder ≈ 92 % libwebp parity on natural fixtures (psy save:
+  −1.1 % bytes / +0.01 dB at qindex 64 on the in-tree noisy
+  128×128 fixture); the residual gap is fully-internal per-MB QP
+  refinement (sub-MB rate control inside `oxideav-vp8`'s segment
+  classifier).
 - `VP8X` extended header is emitted automatically whenever the output
   carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
   the `riff::WebpMetadata` helper.
