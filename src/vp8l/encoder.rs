@@ -114,17 +114,17 @@ const MAX_MATCH: usize = 4096;
 /// Derived from `encode_len_or_dist_value`: each entry is the first length
 /// that maps to a new (symbol, extra_bits_count) pair.
 const LEN_BIN_STARTS: &[usize] = &[
-    1, 2, 3, 4,           // lengths 1–4: own symbol each
-    5, 7,                 // 2-element bins (1 extra bit)
-    9, 13,                // 4-element bins (2 extra bits)
-    17, 25,               // 8-element bins (3 extra bits)
-    33, 49,               // 16-element bins (4 extra bits)
-    65, 97,               // 32-element bins (5 extra bits)
-    129, 193,             // 64-element bins (6 extra bits)
-    257, 385,             // 128-element bins (7 extra bits)
-    513, 769,             // 256-element bins (8 extra bits)
-    1025, 1537,           // 512-element bins (9 extra bits)
-    2049, 3073,           // 1024-element bins (10 extra bits)
+    1, 2, 3, 4, // lengths 1–4: own symbol each
+    5, 7, // 2-element bins (1 extra bit)
+    9, 13, // 4-element bins (2 extra bits)
+    17, 25, // 8-element bins (3 extra bits)
+    33, 49, // 16-element bins (4 extra bits)
+    65, 97, // 32-element bins (5 extra bits)
+    129, 193, // 64-element bins (6 extra bits)
+    257, 385, // 128-element bins (7 extra bits)
+    513, 769, // 256-element bins (8 extra bits)
+    1025, 1537, // 512-element bins (9 extra bits)
+    2049, 3073, // 1024-element bins (10 extra bits)
 ];
 
 /// Colour-cache bit width. 8 bits = 256-entry cache — small enough to
@@ -2512,8 +2512,7 @@ fn build_cost_modelled_stream(
 
         for _iter in 0..3 {
             // Build exact Huffman lengths from current best stream.
-            let (gl, rl, bl, al, dl) =
-                huffman_lengths_for_stream(&current_best, cache_size_u32);
+            let (gl, rl, bl, al, dl) = huffman_lengths_for_stream(&current_best, cache_size_u32);
             // Exact cost model: code_length × 16, absent → COST_UNSEEN.
             let cm_exact = CostModel::from_code_lengths(&gl, &rl, &bl, &al, &dl);
             // Run Viterbi under the exact model.
