@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-webp/compare/v0.1.2...v0.1.3) - 2026-05-05
+
+### Added
+
+- *(vp8l-enc)* Shannon-entropy colour-transform scoring + full-RDO portrait/brick tests
+- *(vp8l-enc)* Shannon-entropy predictor scoring replaces SAD
+- *(vp8l-enc)* multi-iter Huffman refit + bin-boundary Viterbi probing
+- *(vp8l-enc)* Viterbi-style optimal LZ77 + natural ≥256×256 fixtures
+- *(vp8l-enc)* EntropyImage tile-bits sweep + smart tile-boundary switching
+- *(vp8-enc)* psy-RDO source analysis + per-frame target-size rate control
+
+### Fixed
+
+- *(test/vp8l-viterbi)* u32 underflow in portrait_textured_256 fixture + cap CI cost
+
+### Other
+
+- rustfmt LEN_BIN_STARTS comments + unwrap huffman_lengths call
+- rustfmt sweep on cwebp args (one arg per line per fmt config)
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+
 ### Changed
 
 - *(vp8l-enc)* **Shannon-entropy colour-transform scoring** replaces
