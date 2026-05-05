@@ -17,8 +17,9 @@
 //!   libwebp.
 //! * **Predictor transform** (always on, tile-based). Each 16×16 tile
 //!   picks the best of all 14 VP8L predictor modes (RFC 9649 §4.1) by
-//!   forward-pass sum-of-abs-residuals cost; the tile modes ride in a
-//!   sub-image pixel stream.
+//!   minimising Shannon entropy (`Σ -p_i log2(p_i)`) of the per-channel
+//!   residual-byte histograms; the tile modes ride in a sub-image pixel
+//!   stream. Matches cwebp's predictor-mode selection criterion.
 //! * **Colour cache** (always on, 256 entries). Every literal pixel is
 //!   also addressable by its hashed cache index, which shortens the
 //!   green alphabet on repeat colours.
@@ -185,7 +186,7 @@ const COLOR_R2B_GRID: [i8; 5] = [-12, -6, 0, 6, 12];
 
 /// Predictor modes we're willing to pick between on the encoder side.
 /// We probe all 14 VP8L predictor modes (RFC 9649 §4.1) and let the
-/// per-tile sum-of-abs-residuals scan pick the cheapest. The earlier
+/// per-tile Shannon-entropy scan pick the cheapest. The earlier
 /// pool was `[0, 1, 2, 11]` — fine on flat / left-correlated / top-
 /// correlated / "select"-friendly content but blind to:
 ///
@@ -198,10 +199,11 @@ const COLOR_R2B_GRID: [i8; 5] = [-12, -6, 0, 6, 12];
 /// * 13 — clamped (avg(L,T)) + half delta (handles content that's
 ///   "almost an average" of two neighbours but with a slight bias).
 ///
-/// Cost per tile is one residual-sum scan per candidate, so the budget
-/// scales linearly with the pool size — going from 4 modes to 14 is a
-/// 3.5× per-tile cost which still amortises cheaply against entropy
-/// coding (the sub-image is one byte per tile per the spec).
+/// Cost per tile is one Shannon-entropy histogram scan per candidate,
+/// so the budget scales linearly with the pool size — going from 4
+/// modes to 14 is a 3.5× per-tile cost which still amortises cheaply
+/// against entropy coding (the sub-image is one byte per tile per the
+/// spec).
 const PREDICTOR_MODES: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 /// LSB-first bit writer matching the VP8L decoder's bit-reader convention.
@@ -3125,11 +3127,15 @@ fn sub_argb(a: u32, b: u32) -> u32 {
         | ((ab.wrapping_sub(bb)) & 0xff)
 }
 
-/// Score a predictor mode on a tile. The "cost" is sum-of-abs per-
-/// channel residuals over the tile: a crude but monotonic proxy for
-/// entropy that doesn't require building a second Huffman pass. Chooses
-/// between modes purely by residual magnitude, which correlates well
-/// enough with final code length on natural images.
+/// Score a predictor mode on a tile using Shannon entropy of the
+/// residual byte histogram. For each of the 4 ARGB channels, build
+/// a 256-bin histogram of `(pixel - prediction) mod 256` values, then
+/// compute `H = -Σ p_i log2(p_i)`. Return the sum of per-channel
+/// entropies (lower = more compressible = better).
+///
+/// This matches cwebp's predictor-mode selection criterion at `-m 6`
+/// and closes the remaining parity gap vs sum-of-abs-residuals on
+/// natural photographic images.
 fn score_predictor_on_tile(
     originals: &[u32],
     decoded: &[u32],
@@ -3139,8 +3145,11 @@ fn score_predictor_on_tile(
     tile_x1: usize,
     tile_y1: usize,
     mode: u32,
-) -> u64 {
-    let mut cost = 0u64;
+) -> f64 {
+    // One 256-bin histogram per channel (A, R, G, B in order of shifts
+    // 24, 16, 8, 0). Stack-allocated; always 4 × 256 × 4 = 4 KiB.
+    let mut hist = [[0u32; 256]; 4];
+    let mut n_pixels = 0u32;
     for y in tile_y0..tile_y1 {
         for x in tile_x0..tile_x1 {
             let idx = y * width + x;
@@ -3156,22 +3165,41 @@ fn score_predictor_on_tile(
             let p = originals[idx];
             for c in 0..4 {
                 let sh = c * 8;
-                let pv = ((p >> sh) & 0xff) as i32;
-                let prv = ((pred >> sh) & 0xff) as i32;
-                let d = (pv - prv).unsigned_abs() as u64;
-                // Fold the wrap-around: residual is mod 256, so the
-                // "real" magnitude is min(d, 256-d) — that matches what
-                // the Huffman alphabet will see.
-                cost += d.min(256 - d);
+                let pv = ((p >> sh) & 0xff) as u8;
+                let prv = ((pred >> sh) & 0xff) as u8;
+                let residual = pv.wrapping_sub(prv) as usize;
+                hist[c][residual] += 1;
             }
+            n_pixels += 1;
         }
     }
-    cost
+    if n_pixels == 0 {
+        return 0.0;
+    }
+    // Shannon entropy H = -Σ (count/N) * log2(count/N)
+    //                    = log2(N) - (1/N) * Σ count * log2(count)
+    // We sum H over all 4 channels. log2(N) and 1/N are shared.
+    let n = n_pixels as f64;
+    let log2_n = n.log2();
+    let inv_n = 1.0 / n;
+    let mut total_entropy = 0.0f64;
+    for channel_hist in &hist {
+        let mut sum_c_log_c = 0.0f64;
+        for &count in channel_hist {
+            if count > 0 {
+                let c = count as f64;
+                sum_c_log_c += c * c.log2();
+            }
+        }
+        // H for this channel = log2(N) - (1/N) * Σ count * log2(count)
+        total_entropy += log2_n - inv_n * sum_c_log_c;
+    }
+    total_entropy
 }
 
-/// Pick one predictor mode per tile by minimising sum-of-abs residuals
-/// over the [`PREDICTOR_MODES`] pool. Returns one entry per tile in
-/// row-major order.
+/// Pick one predictor mode per tile by minimising Shannon entropy of the
+/// residual byte histograms over the [`PREDICTOR_MODES`] pool. Returns
+/// one entry per tile in row-major order.
 fn choose_predictor_modes(
     pixels: &[u32],
     width: u32,
@@ -3196,7 +3224,7 @@ fn choose_predictor_modes(
             let x1 = (x0 + tile_side).min(w);
             let y1 = (y0 + tile_side).min(h);
             let mut best = PREDICTOR_MODES[0];
-            let mut best_cost = u64::MAX;
+            let mut best_cost = f64::INFINITY;
             for &m in PREDICTOR_MODES {
                 let c = score_predictor_on_tile(pixels, pixels, w, x0, y0, x1, y1, m);
                 if c < best_cost {

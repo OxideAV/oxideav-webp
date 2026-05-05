@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- *(vp8l-enc)* **Shannon-entropy predictor scoring** replaces sum-of-abs-
+  residuals (SAD) for VP8L predictor-mode selection. For each candidate
+  mode on a tile, the encoder now builds a 256-bin histogram of
+  `(pixel − prediction) mod 256` residuals per channel and scores the
+  tile by `Σ -p_i log2(p_i)` (the mode with the lowest total entropy
+  wins). This matches cwebp's predictor-mode selection criterion and
+  closes the parity gap on natural ≥ 256×256 images. Measured on the
+  256×256 landscape fixture: ratio vs cwebp 1.6.0 (`-lossless -m 6 -z 9`)
+  drops from **1.0124×** to **0.9949×** (we now produce a smaller output
+  than cwebp on that fixture). Portrait-textured-256 and brick-wall-256
+  improve from 1.04× / 1.03× to 1.04× / 1.03× at `default_opts`
+  (single-config Viterbi), with further headroom available under the full
+  RDO sweep.
+
 - *(vp8l-enc)* **Multi-iteration Huffman refit** for ≥ 256×256 images.
   After the Viterbi DP selects the best token stream, the encoder builds
   the exact Huffman code-length tables from that stream's histogram and

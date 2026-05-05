@@ -396,3 +396,105 @@ fn viterbi_within_5pct_of_cwebp_lossless_on_landscape_256() {
         ratio,
     );
 }
+
+/// cwebp parity check for the portrait-textured-256 fixture using the
+/// default encoder configuration (Viterbi-enabled at ≥65 536 px).
+/// Uses default_opts rather than the full RDO sweep so the test stays
+/// fast enough for CI (single-config Viterbi instead of 32-config RDO).
+/// Ceiling: ≤ 1.05× cwebp `-lossless -m 6 -z 9`.
+#[test]
+fn viterbi_within_5pct_of_cwebp_on_portrait_textured_256() {
+    let Some(cwebp) = cwebp_path() else {
+        eprintln!("skip: cwebp not on PATH");
+        return;
+    };
+    let w = 256u32;
+    let h = 256u32;
+    let rgba = portrait_textured_256(w, h);
+    let pam = "/tmp/oxideav-webp-viterbi-cmp-portrait.pam";
+    let cwebp_out = "/tmp/oxideav-webp-viterbi-cmp-portrait-cwebp.webp";
+    write_pam_rgba(pam, w, h, &rgba);
+    let status = Command::new(cwebp)
+        .args([
+            "-lossless",
+            "-m",
+            "6",
+            "-z",
+            "9",
+            "-quiet",
+            pam,
+            "-o",
+            cwebp_out,
+        ])
+        .status()
+        .expect("invoke cwebp");
+    assert!(status.success(), "cwebp failed");
+    let cwebp_size = std::fs::metadata(cwebp_out)
+        .expect("cwebp out metadata")
+        .len() as usize;
+    let pixels = rgba_to_argb(&rgba);
+    let bare = encode_vp8l_argb_with(w, h, &pixels, false, default_opts()).expect("encode");
+    let our_size = bare.len() + 20 + (bare.len() & 1);
+    let ratio = our_size as f64 / cwebp_size as f64;
+    eprintln!(
+        "[viterbi/cwebp] portrait-textured-256: ours={} cwebp={} ratio={:.4}",
+        our_size, cwebp_size, ratio
+    );
+    assert!(
+        ratio <= 1.05,
+        "VP8L default-opts output ({} bytes) exceeds 1.05× cwebp ({} bytes); ratio={:.4}",
+        our_size,
+        cwebp_size,
+        ratio,
+    );
+}
+
+/// cwebp parity check for the brick-wall-256 fixture using the
+/// default encoder configuration (Viterbi-enabled at ≥65 536 px).
+/// Ceiling: ≤ 1.05× cwebp `-lossless -m 6 -z 9`.
+#[test]
+fn viterbi_within_5pct_of_cwebp_on_brick_wall_256() {
+    let Some(cwebp) = cwebp_path() else {
+        eprintln!("skip: cwebp not on PATH");
+        return;
+    };
+    let w = 256u32;
+    let h = 256u32;
+    let rgba = brick_wall_256(w, h);
+    let pam = "/tmp/oxideav-webp-viterbi-cmp-brick.pam";
+    let cwebp_out = "/tmp/oxideav-webp-viterbi-cmp-brick-cwebp.webp";
+    write_pam_rgba(pam, w, h, &rgba);
+    let status = Command::new(cwebp)
+        .args([
+            "-lossless",
+            "-m",
+            "6",
+            "-z",
+            "9",
+            "-quiet",
+            pam,
+            "-o",
+            cwebp_out,
+        ])
+        .status()
+        .expect("invoke cwebp");
+    assert!(status.success(), "cwebp failed");
+    let cwebp_size = std::fs::metadata(cwebp_out)
+        .expect("cwebp out metadata")
+        .len() as usize;
+    let pixels = rgba_to_argb(&rgba);
+    let bare = encode_vp8l_argb_with(w, h, &pixels, false, default_opts()).expect("encode");
+    let our_size = bare.len() + 20 + (bare.len() & 1);
+    let ratio = our_size as f64 / cwebp_size as f64;
+    eprintln!(
+        "[viterbi/cwebp] brick-wall-256: ours={} cwebp={} ratio={:.4}",
+        our_size, cwebp_size, ratio
+    );
+    assert!(
+        ratio <= 1.05,
+        "VP8L default-opts output ({} bytes) exceeds 1.05× cwebp ({} bytes); ratio={:.4}",
+        our_size,
+        cwebp_size,
+        ratio,
+    );
+}
