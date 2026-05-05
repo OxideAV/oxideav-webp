@@ -15,6 +15,7 @@
 //!   error type.
 
 use oxideav_core::ContainerRegistry;
+use oxideav_core::RuntimeContext;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
@@ -67,11 +68,12 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     crate::demux::register(reg);
 }
 
-/// Combined registration for callers that want codecs + containers in
-/// one call (matches the pattern used elsewhere in the workspace).
-pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) {
-    register_codecs(codecs);
-    register_containers(containers);
+/// Unified registration entry point — installs WebP codecs into the
+/// codec sub-registry and the WebP container into the container
+/// sub-registry of the supplied [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 fn make_vp8l_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
@@ -84,4 +86,30 @@ fn make_vp8l_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn E
 
 fn make_vp8_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     crate::encoder_vp8::make_encoder(params)
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_both_sides() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let id_vp8l = CodecId::new(CODEC_ID_VP8L);
+        let id_vp8 = CodecId::new(CODEC_ID_VP8);
+        assert!(
+            ctx.codecs.has_decoder(&id_vp8l),
+            "VP8L decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id_vp8),
+            "VP8 encoder factory not installed via RuntimeContext"
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("webp"),
+            Some("webp"),
+            "WebP container extension not installed via RuntimeContext"
+        );
+    }
 }

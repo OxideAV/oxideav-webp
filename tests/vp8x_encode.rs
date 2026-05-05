@@ -14,9 +14,8 @@
 //! Both paths also round-trip through `decode_webp` to make sure the
 //! emitted file is parseable by our own decoder.
 
-use oxideav_core::ContainerRegistry;
+use oxideav_core::Encoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, VideoFrame, VideoPlane};
-use oxideav_core::{CodecRegistry, Encoder};
 use oxideav_webp::{decode_webp, CODEC_ID_VP8L};
 
 const W: u32 = 32;
@@ -50,14 +49,13 @@ fn make_rgba_frame(with_alpha: bool) -> VideoFrame {
 }
 
 fn make_vp8l_encoder() -> Box<dyn Encoder> {
-    let mut codecs = CodecRegistry::new();
-    let mut containers = ContainerRegistry::new();
-    oxideav_webp::register(&mut codecs, &mut containers);
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_webp::register(&mut ctx);
     let mut params = CodecParameters::video(CodecId::new(CODEC_ID_VP8L));
     params.width = Some(W);
     params.height = Some(H);
     params.pixel_format = Some(PixelFormat::Rgba);
-    codecs.make_encoder(&params).expect("make_encoder")
+    ctx.codecs.make_encoder(&params).expect("make_encoder")
 }
 
 #[test]
