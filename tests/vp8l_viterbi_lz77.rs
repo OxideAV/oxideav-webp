@@ -356,7 +356,15 @@ fn viterbi_within_5pct_of_cwebp_lossless_on_landscape_256() {
     write_pam_rgba(pam, w, h, &rgba);
     let status = Command::new(cwebp)
         .args([
-            "-lossless", "-m", "6", "-z", "9", "-quiet", pam, "-o", cwebp_out,
+            "-lossless",
+            "-m",
+            "6",
+            "-z",
+            "9",
+            "-quiet",
+            pam,
+            "-o",
+            cwebp_out,
         ])
         .status()
         .expect("invoke cwebp");
