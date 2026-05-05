@@ -21,6 +21,10 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # `decode_webp` / `encode_vp8l_argb` API plus local `WebpImage`,
 # `WebpFrame`, `WebpError` types and never references `oxideav-core`.
 oxideav-core = { version = "0.1", optional = true }
+# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
+# via the `oxideav_core::register!` macro. Tiny crate, no transitive
+# deps; works on every target including wasm.
+linkme = "0.3"
 # Cascade the registry-vs-standalone choice through to `oxideav-vp8`:
 # when our `registry` feature is on we also pull in vp8's `registry`
 # feature (so its `Decoder`/`Encoder`/IVF surface is available);
