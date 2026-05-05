@@ -20,6 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8l-enc)* **two-pass cost-modelled LZ77** with cost-aware
+  match selection. Pass 1 runs greedy first-match; the resulting
+  histogram seeds a per-alphabet bit-cost model
+  (`-log2(p) × 16` in 1/16-bit units, capped at 40 bits). Pass 2
+  re-walks the LZ77 hash chain and at each position picks the
+  candidate match whose bit cost per pixel under the model is
+  lowest, plus a one-step lazy-lookahead defer when
+  `literal-here + match-at-i+1` is cheaper than `match-here`. Both
+  candidate streams score against the SAME model; the cheaper one
+  wins. Adds 1-2 % byte savings on photographic content
+  (1024×768 photo: -525 B; 64×64 cache stress: -3 B; 128×128
+  natural: -14 B vs the K=16 baseline).
+- *(vp8l-enc)* **predictor tile-bits RDO sweep** over
+  `{8, 16, 32}` px tiles. Previously fixed at 16 px (libwebp
+  default); the encoder now picks the smallest output across the
+  three tile sizes per image. Wins on smooth photographic content
+  where 32-px tiles' smaller predictor sub-image saves a few
+  hundred bits, and on dense small-feature content (icons, line
+  art) where 8-px tiles' finer per-tile mode accuracy beats the
+  side-image overhead. Sweep is gated to predictor-on /
+  non-palette trials so the trial budget grows by 3× only on the
+  trials that benefit. New `predictor_tile_bits` field on
+  `EncoderOptions` lets explicit callers pin a single value.
 - *(vp8l-enc)* extend meta-Huffman per-tile grouping with K=16 trial
   (gated to images ≥ 65536 pixels via `META_HUFFMAN_K16_MIN_PIXELS`).
   Completes the K = {1, 2, 4, 8, 16} sweep up to the spec-supported

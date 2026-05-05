@@ -64,6 +64,7 @@ fn black_opaque_1x1_predictor_plus_cache_roundtrips() {
         strip_transparent_color: false,
         use_color_index: false,
         near_lossless: 100,
+        predictor_tile_bits: 4,
     };
     let argb = vec![0xff_00_00_00u32];
     let bitstream = encode_vp8l_argb_with(1, 1, &argb, true, opts).expect("encode must succeed");
@@ -109,6 +110,7 @@ fn one_pixel_predictor_plus_cache_sweep_roundtrips() {
         strip_transparent_color: false,
         use_color_index: false,
         near_lossless: 100,
+        predictor_tile_bits: 4,
     };
     for &argb in &[
         0xff_00_00_00u32,

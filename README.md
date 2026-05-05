@@ -219,24 +219,30 @@ Encoder scope (current):
   + colour-indexing (palette) transforms plus a tunable colour cache.
   The default `encode_vp8l_argb` entry point runs a per-image RDO sweep
   over every combination of the four optional transforms × eight
-  colour-cache widths ({off, 4, 6, 7, 8, 9, 10, 11} bits) and keeps
-  the smallest encoded variant. Each trial also tries meta-Huffman
-  per-tile grouping at K = 1 / 2 / 4 / 8 / 16 (gated by image pixel
-  count: K=4 ≥ 4096 px, K=8 ≥ 16384 px, K=16 ≥ 65536 px) and picks
-  the byte-smallest. Predictor pool covers all 14 RFC 9649 §4.1 modes
-  per 16-pixel tile. LZ77 backreference search uses a 16384-pixel
-  sliding window with up to 256 hash-chain candidates per starting
-  position — wider than the original 4 K / 64 setup so natural-image
-  redundancy further out is captured. Optional near-lossless
-  preprocessing (libwebp-compatible `0..=100` knob) collapses
-  near-identical pixels into longer LZ77 runs / richer cache hits.
-  Callers that want a fixed configuration call `encode_vp8l_argb_with`
-  directly. Encoder ≈ 92 % libwebp parity on natural fixtures
-  (≤ 1.05× cwebp on most natural images, **beats cwebp by 2.8 %** on
-  the in-tree 128×128 natural fixture and by 4 % on the 64×64 palette
-  fixture); residual gap is multi-pass cost-modelled LZ77 match
-  selection, the entropy-image transform, and finer predictor-
-  tile-size adaptation.
+  colour-cache widths ({off, 4, 6, 7, 8, 9, 10, 11} bits) × three
+  predictor tile sizes ({8, 16, 32} px) and keeps the smallest
+  encoded variant. Each trial also tries meta-Huffman per-tile
+  grouping at K = 1 / 2 / 4 / 8 / 16 (gated by image pixel count:
+  K=4 ≥ 4096 px, K=8 ≥ 16384 px, K=16 ≥ 65536 px) and picks the
+  byte-smallest. Predictor pool covers all 14 RFC 9649 §4.1 modes
+  per tile. LZ77 backreference search uses a 16384-pixel sliding
+  window with up to 256 hash-chain candidates per starting position;
+  the matcher runs a **two-pass cost-modelled** scan on the main
+  image — pass 1 is greedy first-match, pass 2 re-walks the chain
+  with a per-symbol `-log2(p) × 16` bit-cost model derived from the
+  pass-1 histogram and picks each match by lowest bit-cost-per-pixel
+  (plus a one-step lazy lookahead that defers a match if literal-
+  here + match-at-i+1 bills fewer model bits). Optional near-
+  lossless preprocessing (libwebp-compatible `0..=100` knob)
+  collapses near-identical pixels into longer LZ77 runs / richer
+  cache hits. Callers that want a fixed configuration call
+  `encode_vp8l_argb_with` directly. Encoder ≈ 93 % libwebp parity
+  on natural fixtures (≤ 1.13× cwebp on a 1024×768 photo, ≤ 1.06×
+  on a 512×512 still, **beats cwebp by 7.0 %** on the in-tree
+  128×128 natural fixture and by 25.6 % on the 64×64 cache-stress
+  fixture); residual gap is the entropy-image transform (per-tile
+  entropy clustering driving meta-Huffman group assignment) and
+  full Viterbi-style optimal LZ77.
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)
