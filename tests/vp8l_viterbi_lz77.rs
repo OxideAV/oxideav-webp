@@ -498,3 +498,167 @@ fn viterbi_within_5pct_of_cwebp_on_brick_wall_256() {
         ratio,
     );
 }
+
+/// Full-RDO cwebp parity check for portrait-textured-256. Runs the same
+/// full 32-configuration RDO sweep used for the landscape fixture, which
+/// is tractable in release mode (~14 s per fixture on an M-series Mac).
+/// This test is the release-mode companion to the `default_opts` tests
+/// above; it validates that the entropy-based colour-transform scoring
+/// translates into actual byte savings on portrait/textured content under
+/// the full RDO sweep. Also cross-decodes through external `dwebp` when
+/// present. Ceiling: ≤ 1.05× cwebp `-lossless -m 6 -z 9`.
+#[test]
+fn rdo_within_5pct_of_cwebp_lossless_on_portrait_textured_256() {
+    let Some(cwebp) = cwebp_path() else {
+        eprintln!("skip: cwebp not on PATH");
+        return;
+    };
+    let w = 256u32;
+    let h = 256u32;
+    let rgba = portrait_textured_256(w, h);
+    let pam = "/tmp/oxideav-webp-rdo-portrait-256.pam";
+    let cwebp_out = "/tmp/oxideav-webp-rdo-portrait-256-cwebp.webp";
+    write_pam_rgba(pam, w, h, &rgba);
+    let status = Command::new(cwebp)
+        .args([
+            "-lossless",
+            "-m",
+            "6",
+            "-z",
+            "9",
+            "-quiet",
+            pam,
+            "-o",
+            cwebp_out,
+        ])
+        .status()
+        .expect("invoke cwebp");
+    assert!(status.success(), "cwebp failed on portrait fixture");
+    let cwebp_size = std::fs::metadata(cwebp_out)
+        .expect("cwebp out metadata")
+        .len() as usize;
+    let pixels = rgba_to_argb(&rgba);
+    let bare = encode_vp8l_argb(w, h, &pixels, false).expect("full-RDO encode");
+    let our_size = bare.len() + 20 + (bare.len() & 1);
+    let ratio = our_size as f64 / cwebp_size as f64;
+    eprintln!(
+        "[rdo/cwebp] portrait-textured-256: ours={} cwebp={} ratio={:.4}",
+        our_size, cwebp_size, ratio
+    );
+    // Round-trip through in-crate decoder to confirm correctness.
+    let decoded = vp8l::decode(&bare).expect("decode RDO portrait output");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "portrait-textured-256 full-RDO failed lossless round-trip"
+    );
+    // Cross-decode through external dwebp when available.
+    if let Some(dwebp) = dwebp_path() {
+        let wrapped = wrap_riff_vp8l(&bare);
+        let webp_path = "/tmp/oxideav-webp-rdo-portrait-256.webp";
+        let dwebp_pam = "/tmp/oxideav-webp-rdo-portrait-256-dwebp.pam";
+        std::fs::write(webp_path, &wrapped).expect("write portrait webp");
+        let status = Command::new(dwebp)
+            .args([webp_path, "-quiet", "-pam", "-o", dwebp_pam])
+            .status()
+            .expect("invoke dwebp");
+        assert!(
+            status.success(),
+            "dwebp failed on portrait-textured-256 RDO output"
+        );
+        let (dw, dh, dwebp_rgba) = read_pam_rgba(dwebp_pam);
+        assert_eq!(dw, w);
+        assert_eq!(dh, h);
+        assert_eq!(
+            dwebp_rgba, rgba,
+            "dwebp decode mismatch on portrait-textured-256"
+        );
+    }
+    assert!(
+        ratio <= 1.05,
+        "VP8L full-RDO output ({} bytes) exceeds 1.05× cwebp ({} bytes); ratio={:.4}",
+        our_size,
+        cwebp_size,
+        ratio,
+    );
+}
+
+/// Full-RDO cwebp parity check for brick-wall-256. Runs the same full
+/// RDO sweep as the landscape and portrait tests. The repeating brick
+/// structure is ideal for LZ77 backrefs; this test checks that the
+/// entropy-based colour-transform scoring helps (or at least doesn't
+/// regress) on high-spatial-frequency content. Also cross-decodes through
+/// external `dwebp` when present.
+/// Ceiling: ≤ 1.05× cwebp `-lossless -m 6 -z 9`.
+#[test]
+fn rdo_within_5pct_of_cwebp_lossless_on_brick_wall_256() {
+    let Some(cwebp) = cwebp_path() else {
+        eprintln!("skip: cwebp not on PATH");
+        return;
+    };
+    let w = 256u32;
+    let h = 256u32;
+    let rgba = brick_wall_256(w, h);
+    let pam = "/tmp/oxideav-webp-rdo-brick-256.pam";
+    let cwebp_out = "/tmp/oxideav-webp-rdo-brick-256-cwebp.webp";
+    write_pam_rgba(pam, w, h, &rgba);
+    let status = Command::new(cwebp)
+        .args([
+            "-lossless",
+            "-m",
+            "6",
+            "-z",
+            "9",
+            "-quiet",
+            pam,
+            "-o",
+            cwebp_out,
+        ])
+        .status()
+        .expect("invoke cwebp");
+    assert!(status.success(), "cwebp failed on brick fixture");
+    let cwebp_size = std::fs::metadata(cwebp_out)
+        .expect("cwebp out metadata")
+        .len() as usize;
+    let pixels = rgba_to_argb(&rgba);
+    let bare = encode_vp8l_argb(w, h, &pixels, false).expect("full-RDO encode");
+    let our_size = bare.len() + 20 + (bare.len() & 1);
+    let ratio = our_size as f64 / cwebp_size as f64;
+    eprintln!(
+        "[rdo/cwebp] brick-wall-256: ours={} cwebp={} ratio={:.4}",
+        our_size, cwebp_size, ratio
+    );
+    // Round-trip through in-crate decoder.
+    let decoded = vp8l::decode(&bare).expect("decode RDO brick output");
+    assert_eq!(
+        decoded.to_rgba(),
+        rgba,
+        "brick-wall-256 full-RDO failed lossless round-trip"
+    );
+    // Cross-decode through external dwebp when available.
+    if let Some(dwebp) = dwebp_path() {
+        let wrapped = wrap_riff_vp8l(&bare);
+        let webp_path = "/tmp/oxideav-webp-rdo-brick-256.webp";
+        let dwebp_pam = "/tmp/oxideav-webp-rdo-brick-256-dwebp.pam";
+        std::fs::write(webp_path, &wrapped).expect("write brick webp");
+        let status = Command::new(dwebp)
+            .args([webp_path, "-quiet", "-pam", "-o", dwebp_pam])
+            .status()
+            .expect("invoke dwebp");
+        assert!(
+            status.success(),
+            "dwebp failed on brick-wall-256 RDO output"
+        );
+        let (dw, dh, dwebp_rgba) = read_pam_rgba(dwebp_pam);
+        assert_eq!(dw, w);
+        assert_eq!(dh, h);
+        assert_eq!(dwebp_rgba, rgba, "dwebp decode mismatch on brick-wall-256");
+    }
+    assert!(
+        ratio <= 1.05,
+        "VP8L full-RDO output ({} bytes) exceeds 1.05× cwebp ({} bytes); ratio={:.4}",
+        our_size,
+        cwebp_size,
+        ratio,
+    );
+}

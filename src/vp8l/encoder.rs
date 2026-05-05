@@ -3261,19 +3261,6 @@ struct ColorCoeffs {
     r2b: i8,
 }
 
-/// Cost of a single (pixel, coeffs) pair: sum-of-abs residual over the
-/// three mutable channels (green is unchanged). Wrap-around is folded so
-/// a large positive residual matches its negative equivalent — tracks
-/// Huffman-alphabet magnitude.
-fn residual_cost(r: i32, g: i32, b: i32, c: ColorCoeffs) -> u64 {
-    let nr = r - (((c.g2r as i32) * sign_extend_i8(g)) >> 5);
-    let nb1 = b - (((c.g2b as i32) * sign_extend_i8(g)) >> 5);
-    let nb2 = nb1 - (((c.r2b as i32) * sign_extend_i8(r)) >> 5);
-    let rr = nr.rem_euclid(256) as u64;
-    let bb = nb2.rem_euclid(256) as u64;
-    rr.min(256 - rr) + bb.min(256 - bb)
-}
-
 /// Sign-extend the low 8 bits of `v` to a signed i32. Mirrors the
 /// `coeff as i8 as i32` trick the decoder uses; kept as a function so
 /// unit tests can lean on it.
@@ -3281,9 +3268,54 @@ fn sign_extend_i8(v: i32) -> i32 {
     ((v & 0xff) as i8) as i32
 }
 
-/// Pick a colour-transform coefficient triple per tile by scanning the
-/// [`COLOR_COEFF_GRID`] × [`COLOR_COEFF_GRID`] grid with `r2b=0`, then
-/// refining `r2b` around the best (g2r, g2b).
+/// Score a colour-transform coefficient triple on a pre-materialised tile
+/// using Shannon entropy of the transformed R and B channel histograms.
+/// Green is unchanged by the colour transform and is excluded. Lower
+/// entropy = more compressible = better.
+///
+/// `H = -Σ p_i log2(p_i)` over the 256-bin byte histograms for the
+/// forward-transformed R and B channels, summed across both channels.
+/// This is the same criterion used in `score_predictor_on_tile`, which
+/// gives consistent scoring across both transform-selection loops and
+/// keeps our choices aligned with cwebp's entropy-based heuristics.
+fn score_color_coeffs_on_tile(tile: &[(i32, i32, i32)], c: ColorCoeffs) -> f64 {
+    // Two 256-bin histograms: [0] = R, [1] = B.
+    let mut hist = [[0u32; 256]; 2];
+    for &(r, g, b) in tile {
+        let nr = (r - (((c.g2r as i32) * sign_extend_i8(g)) >> 5)).rem_euclid(256) as usize;
+        let nb1 = b - (((c.g2b as i32) * sign_extend_i8(g)) >> 5);
+        let nb2 = (nb1 - (((c.r2b as i32) * sign_extend_i8(r)) >> 5)).rem_euclid(256) as usize;
+        hist[0][nr] += 1;
+        hist[1][nb2] += 1;
+    }
+    let n = tile.len() as f64;
+    if n == 0.0 {
+        return 0.0;
+    }
+    let log2_n = n.log2();
+    let inv_n = 1.0 / n;
+    let mut total_entropy = 0.0f64;
+    for channel_hist in &hist {
+        let mut sum_c_log_c = 0.0f64;
+        for &count in channel_hist {
+            if count > 0 {
+                let c = count as f64;
+                sum_c_log_c += c * c.log2();
+            }
+        }
+        // H for this channel = log2(N) - (1/N) * Σ count * log2(count)
+        total_entropy += log2_n - inv_n * sum_c_log_c;
+    }
+    total_entropy
+}
+
+/// Pick a colour-transform coefficient triple per tile by minimising the
+/// Shannon entropy of the transformed R and B channel byte histograms.
+/// Scans the [`COLOR_COEFF_GRID`] × [`COLOR_COEFF_GRID`] grid with
+/// `r2b=0` for the first pass, then refines `r2b` around the best
+/// `(g2r, g2b)` pair. This replaces the earlier sum-of-abs-residuals
+/// criterion, aligning colour-transform selection with the same
+/// entropy-based scoring used in `choose_predictor_modes`.
 fn choose_color_transform(
     pixels: &[u32],
     width: u32,
@@ -3316,29 +3348,18 @@ fn choose_color_transform(
                 }
             }
 
-            let baseline_score = tile.iter().fold(0u64, |acc, &(r, _g, b)| {
-                let rr = r.rem_euclid(256) as u64;
-                let bb = b.rem_euclid(256) as u64;
-                acc + rr.min(256 - rr) + bb.min(256 - bb)
-            });
+            // Baseline: zero-coefficients (identity transform).
+            let baseline = ColorCoeffs::default();
+            let mut best = baseline;
+            let mut best_cost = score_color_coeffs_on_tile(&tile, baseline);
 
-            let mut best = ColorCoeffs::default();
-            let mut best_cost = baseline_score;
             // 16 × 16 grid over (g2r, g2b) with r2b = 0.
             for &g2r in COLOR_COEFF_GRID.iter() {
                 for &g2b in COLOR_COEFF_GRID.iter() {
                     let c = ColorCoeffs { g2r, g2b, r2b: 0 };
-                    let mut total = 0u64;
-                    for &(r, g, b) in &tile {
-                        total += residual_cost(r, g, b, c);
-                        // Early-abort: if we're already past the best,
-                        // further pixels can only make it worse.
-                        if total >= best_cost {
-                            break;
-                        }
-                    }
-                    if total < best_cost {
-                        best_cost = total;
+                    let cost = score_color_coeffs_on_tile(&tile, c);
+                    if cost < best_cost {
+                        best_cost = cost;
                         best = c;
                     }
                 }
@@ -3350,15 +3371,9 @@ fn choose_color_transform(
                     g2b: best.g2b,
                     r2b,
                 };
-                let mut total = 0u64;
-                for &(r, g, b) in &tile {
-                    total += residual_cost(r, g, b, c);
-                    if total >= best_cost {
-                        break;
-                    }
-                }
-                if total < best_cost {
-                    best_cost = total;
+                let cost = score_color_coeffs_on_tile(&tile, c);
+                if cost < best_cost {
+                    best_cost = cost;
                     best = c;
                 }
             }

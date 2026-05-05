@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- *(vp8l-enc)* **Shannon-entropy colour-transform scoring** replaces
+  sum-of-abs-residuals (SAD) in `choose_color_transform`. For each
+  candidate `(g2r, g2b, r2b)` coefficient triple on a tile the encoder
+  now builds 256-bin histograms of the transformed R and B byte values
+  and scores the tile by `Σ -p_i log2(p_i)` (lower entropy = more
+  compressible = wins). This is the same criterion already used by
+  `score_predictor_on_tile`, keeping the two selection loops consistent.
+  Measured under full RDO on the 256×256 synthetic fixtures vs cwebp 1.6.0
+  (`-lossless -m 6 -z 9`): brick-wall-256 improves from **1.0311× to
+  1.0301×** (−42 bytes), portrait-textured-256 from **1.0405× to
+  1.0398×** (−20 bytes); landscape-256 stays at **0.9949×** (sub-cwebp).
+  Full-RDO release-mode tests added for portrait and brick with dwebp
+  cross-decode verification.
+
 - *(vp8l-enc)* **Shannon-entropy predictor scoring** replaces sum-of-abs-
   residuals (SAD) for VP8L predictor-mode selection. For each candidate
   mode on a tile, the encoder now builds a 256-bin histogram of

@@ -274,13 +274,19 @@ Encoder scope (current):
   the exact code-length cost model) further tightens the token
   sequence after the initial Viterbi selection. Predictor-mode
   selection uses **Shannon-entropy scoring** (`Σ -p_i log2(p_i)` over
-  per-channel residual histograms) matching cwebp's criterion.
-  Encoder ≈ 96 % libwebp parity on natural fixtures (≤ 1.13× cwebp on
-  a 1024×768 photo, ≤ 1.06× on a 512×512 still, **beats cwebp by
+  per-channel residual histograms) matching cwebp's criterion;
+  **colour-transform coefficient selection** likewise uses Shannon-
+  entropy (256-bin histograms over the transformed R and B channels),
+  replacing the earlier sum-of-abs-residuals (SAD) criterion and
+  keeping both selection loops consistent.
+  Encoder ≈ 96–100 % libwebp parity on natural fixtures (≤ 1.13× cwebp
+  on a 1024×768 photo, ≤ 1.06× on a 512×512 still, **beats cwebp by
   4.5 %** on the in-tree 128×128 natural fixture and by 14.4 % on the
   64×64 cache-stress fixture, **byte-parity** with cwebp on a synthetic
   three-region 256×256 photo, **sub-cwebp (0.995×)** on the 256×256
-  landscape with Shannon-entropy predictor scoring).
+  landscape, **1.030×** on brick-wall-256, **1.040×** on
+  portrait-textured-256 — all measured under full RDO vs cwebp
+  `-lossless -m 6 -z 9`).
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)
