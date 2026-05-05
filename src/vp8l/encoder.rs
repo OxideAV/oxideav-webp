@@ -1035,24 +1035,42 @@ fn encode_image_stream(
         return Ok(());
     }
 
-    // Speculatively emit the meta-Huffman variants (K = 2, 4, 8) after
-    // rewinding to the same starting position. Compare bit lengths and
-    // keep the shortest one in the live writer.
+    // Speculatively emit the meta-Huffman variants (K = 2, 4, 8, 16)
+    // after rewinding to the same starting position. Compare bit
+    // lengths and keep the shortest one in the live writer.
     //
-    // K=4 / K=8 trials are gated on the image being big enough to
-    // amortise the additional groups' worth of Huffman-tree headers.
+    // K=4 / K=8 / K=16 trials are gated on the image being big enough
+    // to amortise the additional groups' worth of Huffman-tree headers.
     // Larger K wins on images with several visually distinct regions
     // (typical photos with sky / foreground / detail / text overlays);
     // smaller / more-uniform images stay with K=2 or the single-group
     // baseline because the per-group header overhead dominates.
     //
-    // Performance note: each trial costs one full image-stream encode.
-    // The RDO sweep already runs 32+ trials, so we gate the K=4 / K=8
-    // trials on minimum-pixel-count thresholds
-    // ([`META_HUFFMAN_K4_MIN_PIXELS`] / [`META_HUFFMAN_K8_MIN_PIXELS`])
-    // to keep the total CPU bounded.
+    // **Smart entropy-image tile-bits sweep.** For each K we additionally
+    // sweep `meta_bits ∈ META_BITS_SWEEP` (8 / 16 / 32 px tile sides on
+    // big-enough images, narrowing on smaller ones). Per RFC 9649
+    // §3.7.2.2.1 the entropy image carries the prefix-code-group selector
+    // at one entry per `(1 << prefix_bits)`-sided tile; smaller
+    // `prefix_bits` means MORE tiles → finer per-region histogram capture
+    // but a bigger meta-image, while larger `prefix_bits` collapses
+    // several regions into one tile → smaller meta-image but coarser
+    // per-region fit. The byte-optimum varies image to image: heterogeneous
+    // photos with sharp content boundaries typically prefer 8-px or 16-px
+    // tiles; broad-region landscapes (large sky / sand bands) often want
+    // 32-px tiles. Sweeping picks the per-image winner — closes the
+    // "smart tile-boundary switching" gap noted in the README.
+    //
+    // Performance note: each (K, meta_bits) trial costs one full
+    // image-stream encode. The RDO sweep already runs 32+ trials per
+    // image, so we gate the K=4 / K=8 / K=16 trials on minimum-pixel-
+    // count thresholds ([`META_HUFFMAN_K4_MIN_PIXELS`] /
+    // [`META_HUFFMAN_K8_MIN_PIXELS`] / [`META_HUFFMAN_K16_MIN_PIXELS`])
+    // to keep the total CPU bounded, and the meta_bits inner loop skips
+    // tile sizes that degenerate to a 1×1 meta-image or fewer tiles
+    // than the requested K.
     let mut best_bits = baseline_bits;
     let mut best_kind = MetaHuffmanWinner::SingleGroup;
+    let mut best_meta_bits: u32 = META_BITS_DEFAULT;
     let mut best_mark_after = bw.mark();
 
     let pixel_count = (width as u64) * (height as u64);
@@ -1063,22 +1081,41 @@ fn encode_image_stream(
             16 if pixel_count < META_HUFFMAN_K16_MIN_PIXELS => continue,
             _ => {}
         }
-        bw.restore(baseline_mark);
-        let emitted = try_encode_meta_huffman(
-            bw, &stream, width, height, cache_bits, cache_size, k as usize,
-        )?;
-        if !emitted {
-            continue;
-        }
-        let bits = bw.bit_pos() - baseline_mark.bit_pos();
-        if bits < best_bits {
-            best_bits = bits;
-            best_kind = MetaHuffmanWinner::Groups(k as usize);
-            best_mark_after = bw.mark();
+        for &meta_bits in META_BITS_SWEEP {
+            // Skip tile sizes that would yield fewer tiles than the
+            // requested cluster count K — `try_encode_meta_huffman`
+            // would bail out anyway, so this saves a redundant trial.
+            let tile_side = 1u32 << meta_bits;
+            let meta_w = width.div_ceil(tile_side);
+            let meta_h = height.div_ceil(tile_side);
+            if (meta_w as u64) * (meta_h as u64) < k as u64 {
+                continue;
+            }
+            // Skip pathological tiny meta-images: a 1×1 entropy image
+            // can't carry useful per-tile assignment beyond the single-
+            // group baseline (every K trial would assign every tile to
+            // group 0 and degenerate to overhead).
+            if meta_w * meta_h < 2 {
+                continue;
+            }
+            bw.restore(baseline_mark);
+            let emitted = try_encode_meta_huffman(
+                bw, &stream, width, height, cache_bits, cache_size, k as usize, meta_bits,
+            )?;
+            if !emitted {
+                continue;
+            }
+            let bits = bw.bit_pos() - baseline_mark.bit_pos();
+            if bits < best_bits {
+                best_bits = bits;
+                best_kind = MetaHuffmanWinner::Groups(k as usize);
+                best_meta_bits = meta_bits;
+                best_mark_after = bw.mark();
+            }
         }
     }
 
-    // If neither K=2 nor K=4 beat the baseline, restore the baseline
+    // If no meta-Huffman variant beat the baseline, restore the baseline
     // bytes (the writer is currently positioned wherever the last trial
     // left it).
     match best_kind {
@@ -1088,13 +1125,22 @@ fn encode_image_stream(
             debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), baseline_bits);
         }
         MetaHuffmanWinner::Groups(k) => {
-            // If the winning K is the one we just emitted, its bytes
-            // are already in place at `best_mark_after`. Otherwise we
-            // need to re-emit the winning K from scratch.
+            // If the winning (K, meta_bits) pair is the one we just
+            // emitted, its bytes are already in place at
+            // `best_mark_after`. Otherwise we need to re-emit the
+            // winning combination from scratch.
             if bw.bit_pos() != best_mark_after.bit_pos() {
                 bw.restore(baseline_mark);
-                let emitted =
-                    try_encode_meta_huffman(bw, &stream, width, height, cache_bits, cache_size, k)?;
+                let emitted = try_encode_meta_huffman(
+                    bw,
+                    &stream,
+                    width,
+                    height,
+                    cache_bits,
+                    cache_size,
+                    k,
+                    best_meta_bits,
+                )?;
                 debug_assert!(emitted, "winning K trial must re-emit cleanly");
                 debug_assert_eq!(bw.bit_pos() - baseline_mark.bit_pos(), best_bits);
             }
@@ -1140,6 +1186,58 @@ const META_HUFFMAN_K8_MIN_PIXELS: u64 = 16384;
 /// need ≥ 5 bits and the per-group header overhead grows linearly with
 /// diminishing tile-fit return.
 const META_HUFFMAN_K16_MIN_PIXELS: u64 = 65536;
+
+/// Default entropy-image (meta-Huffman) tile bits. Per RFC 9649 §3.7.2.2.1
+/// the spec range is 2..=9 (4..=512 px sides). 4 (= 16-pixel tiles) is the
+/// libwebp default and the historical OxideAV-WebP default; the
+/// [`META_BITS_SWEEP`] pool below probes alternatives and picks the
+/// byte-smallest per-image winner.
+const META_BITS_DEFAULT: u32 = 4;
+
+/// Entropy-image tile-bits values explored by the smart tile-boundary
+/// switching sweep. Each value yields a `1 << bits`-pixel-sided tile:
+///
+/// * 3 → 8-pixel tiles. Best on sharp-edged content (text overlays,
+///   line-art-heavy photos) where each region is small and per-tile
+///   histograms benefit from finer granularity. The meta-image grows
+///   4× vs the 16-px default but the per-group fit can be substantially
+///   tighter on heterogeneous fixtures.
+/// * 4 → 16-pixel tiles (default; libwebp default). The historical
+///   trade-off point — wins on most natural photos where 16×16 tiles
+///   captures one "scene element" per tile cleanly.
+/// * 5 → 32-pixel tiles. Best on broad-region content (landscapes with
+///   large sky / sand bands, smoothly-blended portraits) where
+///   neighbouring 16-px tiles share statistics anyway and the smaller
+///   meta-image saves the bits the per-tile resolution wouldn't pay
+///   for.
+///
+/// Smaller bits (= 2 → 4-pixel tiles) are excluded — the meta-image
+/// overhead (one ARGB pixel per 16 source pixels) dominates almost
+/// everything past 64×64 source images. Larger bits (≥ 6 → ≥ 64-pixel
+/// tiles) are excluded too: most natural images don't carry enough
+/// distinct sub-regions at that scale, so the meta-image collapses to
+/// 1-2 entries and the meta-Huffman variant degenerates to the single-
+/// group baseline plus pure overhead.
+///
+/// The sweep matches the predictor-tile-bits sweep
+/// ([`PREDICTOR_TILE_BITS_SWEEP`]) for symmetry; the two are independent
+/// degrees of freedom in the encoder so there's no tile-size correlation
+/// gain from sweeping them jointly.
+const META_BITS_SWEEP: &[u32] = &[3, 4, 5];
+
+/// k-means iteration count for K-group cluster refinement. Larger K
+/// benefits from more passes (the cluster boundaries take longer to
+/// settle when there are more centroids competing for the same tiles);
+/// smaller K converges in 2 iterations on most natural images.
+fn kmeans_iters_for_k(k: usize) -> usize {
+    if k >= 8 {
+        4
+    } else if k >= 4 {
+        3
+    } else {
+        2
+    }
+}
 
 /// Single-Huffman-group baseline: one set of {green, red, blue, alpha,
 /// distance} trees covering the entire image. Mirrors the original
@@ -1336,15 +1434,17 @@ fn try_encode_meta_huffman(
     cache_bits: u32,
     cache_size: u32,
     k: usize,
+    meta_bits: u32,
 ) -> Result<bool> {
     // Meta-Huffman tile size. The spec allows `meta_bits ∈ 2..=9`
-    // (4..=512 px per side). 4 (16-pixel tiles) is libwebp's default
-    // and gives a reasonable signal-to-overhead ratio.
-    const META_BITS: u32 = 4;
+    // (4..=512 px per side). The caller picks one value out of
+    // [`META_BITS_SWEEP`]; the byte-smallest winner across (K, meta_bits)
+    // tuples is selected by `encode_image_stream`.
+    debug_assert!((2..=9).contains(&meta_bits), "meta_bits must be in 2..=9");
     debug_assert!((2..=16).contains(&k), "K must be in 2..=16");
-    let tile_side = 1u32 << META_BITS;
-    let meta_w = (width + tile_side - 1) / tile_side;
-    let meta_h = (height + tile_side - 1) / tile_side;
+    let tile_side = 1u32 << meta_bits;
+    let meta_w = width.div_ceil(tile_side);
+    let meta_h = height.div_ceil(tile_side);
     let num_tiles = (meta_w * meta_h) as usize;
 
     // No grouping makes sense with fewer tiles than groups.
@@ -1380,8 +1480,8 @@ fn try_encode_meta_huffman(
     let mut x: u32 = 0;
     let mut y: u32 = 0;
     for sym in stream {
-        let mx = x >> META_BITS;
-        let my = y >> META_BITS;
+        let mx = x >> meta_bits;
+        let my = y >> meta_bits;
         let tile_idx = (my * meta_w + mx) as usize;
         sym_tile.push(tile_idx);
         accumulate_symbol_freq(
@@ -1399,10 +1499,12 @@ fn try_encode_meta_huffman(
     }
 
     // ── Step 2: cluster tiles into K groups by green-alphabet histogram
-    // similarity. A 2-iteration k-means is enough for the histograms to
-    // stabilise on natural images; further iterations rarely shift
-    // membership. Worst-case cost is O(num_tiles × green_alpha × K × 2).
-    let assignments = cluster_tiles_kmeans(&tile_green, num_tiles, k);
+    // similarity. K-means iteration count scales with K (per
+    // [`kmeans_iters_for_k`]) — small K converges in 2 passes, K ≥ 4
+    // benefits from 3, K ≥ 8 from 4. Worst-case cost is
+    // O(num_tiles × green_alpha × K × iters).
+    let iters = kmeans_iters_for_k(k);
+    let assignments = cluster_tiles_kmeans(&tile_green, num_tiles, k, iters);
 
     // If every tile landed in fewer than K groups there's no point
     // continuing — the meta-Huffman variant degenerates back to a
@@ -1450,7 +1552,7 @@ fn try_encode_meta_huffman(
 
     // Meta-Huffman present.
     bw.write(1, 1);
-    bw.write(META_BITS - 2, 3);
+    bw.write(meta_bits - 2, 3);
 
     // Build the meta-image: one ARGB pixel per tile. The decoder reads
     // the group index from `(p >> 8) & 0xffff` (green byte = low 8 bits
@@ -1506,8 +1608,8 @@ fn try_encode_meta_huffman(
 }
 
 /// Cluster `num_tiles` per-tile green-alphabet histograms into K groups
-/// using a 2-iteration k-means. Returns one group id (0..K) per tile in
-/// row-major order.
+/// using a k-means iteration loop. Returns one group id (0..K) per tile
+/// in row-major order.
 ///
 /// Seeding follows a k-means++-style farthest-first approach: pick the
 /// busiest tile as seed 0, then for each subsequent seed pick the tile
@@ -1516,15 +1618,22 @@ fn try_encode_meta_huffman(
 /// degenerate "two seeds in the same cluster" failure mode that random
 /// seeding suffers from.
 ///
-/// Two reassignment passes are enough for the histograms to settle on
-/// most natural images; further iterations rarely change cluster
-/// membership and would only burn CPU.
+/// `iters` controls the number of reassignment passes. Two passes are
+/// enough for the histograms to settle on most natural images at K ≤ 4;
+/// larger K benefits from 3-4 passes (more centroids → slower
+/// convergence on the cluster boundaries). Driven by
+/// [`kmeans_iters_for_k`].
 ///
 /// Centroids carry the **mean** histogram per cluster (sum ÷ count) so
 /// that L1 distance against a single tile is meaningful — otherwise a
 /// 50-tile cluster's centroid would dwarf any per-tile histogram and
 /// the comparison would degenerate to "which cluster has more tiles".
-fn cluster_tiles_kmeans(tile_green: &[Vec<u32>], num_tiles: usize, k: usize) -> Vec<u32> {
+fn cluster_tiles_kmeans(
+    tile_green: &[Vec<u32>],
+    num_tiles: usize,
+    k: usize,
+    iters: usize,
+) -> Vec<u32> {
     let alpha = tile_green.first().map(|h| h.len()).unwrap_or(0);
     if num_tiles < k || alpha == 0 || k < 2 {
         return vec![0u32; num_tiles];
@@ -1581,7 +1690,7 @@ fn cluster_tiles_kmeans(tile_green: &[Vec<u32>], num_tiles: usize, k: usize) -> 
     let mut centroids: Vec<Vec<u32>> = seeds.iter().map(|&s| tile_green[s].clone()).collect();
     let mut assignments = vec![0u32; num_tiles];
 
-    for _iter in 0..2 {
+    for _iter in 0..iters.max(1) {
         // Reassign every tile to its nearest centroid.
         for (t, h) in tile_green.iter().enumerate() {
             let mut best = 0u32;

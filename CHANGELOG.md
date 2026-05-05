@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(vp8l-enc)* **EntropyImage tile-bits sweep + smart tile-boundary
+  switching.** The meta-Huffman per-tile-grouping path (RFC 9649
+  §3.7.2.2 EntropyImage / "prefix code groups") used to hard-code
+  `meta_bits = 4` (16-pixel tiles); it now sweeps `meta_bits ∈
+  {3, 4, 5}` (8 / 16 / 32-pixel tiles) per K trial and keeps the
+  byte-smallest (K, meta_bits) tuple. Smaller tiles capture sharper
+  per-region histogram differences (text overlays, line-art-heavy
+  photos), bigger tiles save the meta-image-overhead bits on
+  broad-region content (landscapes with large sky / sand bands).
+  K-means iteration count also now scales with K
+  (`kmeans_iters_for_k`: 2 for K = 2, 3 for K = 4, 4 for K ≥ 8) so
+  the cluster boundaries actually settle on multi-region content
+  instead of collapsing to a smaller-K baseline. Closes the
+  "lacks EntropyImage transform + smart tile-boundary switching"
+  tail noted in the WebP VP8L row of the workspace README.
+  Measured win on a synthetic three-region 256×256 photo:
+  **−286 bytes (−0.43 %)** vs the fixed-16-px-tile baseline,
+  achieving byte-parity with cwebp 1.6.0 (`-lossless -m 6 -z 9`).
+  Smaller / more uniform fixtures see no change (the single-group
+  baseline still wins, as the meta-Huffman trial path cleanly bails
+  out via the `bw.restore` rollback). Heavy 256×256 content with
+  several visually distinct regions is where the entropy-image
+  sweep pays off.
+- *(test)* `entropy_image_tile_bits_lands_in_swept_range_on_three_region_256`
+  asserts the encoder picks one of `{3, 4, 5}` for `meta_bits` on the
+  three-region fixture (gradient + bars + noise stacked vertically) and
+  that the resulting bitstream round-trips through the in-crate decoder.
+  `entropy_image_tile_bits_sweep_does_not_inflate_uniform_noise_64`
+  asserts the sweep adds no bytes on uniform-noise 64×64 input where
+  the single-group baseline always wins.
+
 - *(vp8-enc)* psy-RDO source analysis + per-frame target-size rate
   control. Each `send_frame` on the non-explicit factories
   ([`make_encoder`] / [`make_encoder_with_quality`] /

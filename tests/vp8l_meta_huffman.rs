@@ -148,6 +148,40 @@ fn main_image_is_meta_huffman(bitstream: &[u8]) -> bool {
     br.read_bits(1u8).unwrap() != 0
 }
 
+/// Like [`main_image_is_meta_huffman`] but, when meta-Huffman is enabled,
+/// also returns the entropy-image `meta_bits` value (2..=9) the encoder
+/// picked for the active variant. Returns `None` when the main image is
+/// single-group; otherwise `Some(meta_bits)`.
+fn main_image_meta_bits(bitstream: &[u8]) -> Option<u32> {
+    use vp8l::bit_reader::BitReader;
+    let mut br = BitReader::new(bitstream);
+    let _ = br.read_bits(8u8).unwrap();
+    let _ = br.read_bits(14u8).unwrap();
+    let _ = br.read_bits(14u8).unwrap();
+    let _ = br.read_bits(1u8).unwrap();
+    let _ = br.read_bits(3u8).unwrap();
+    let mut transforms = 0;
+    while br.read_bits(1u8).unwrap() != 0 {
+        transforms += 1;
+        assert!(transforms <= 4, "too many transforms");
+        let ttype = br.read_bits(2u8).unwrap();
+        match ttype {
+            2 => { /* subtract-green: no payload */ }
+            other => {
+                panic!("main_image_meta_bits: transform type {other} not supported by this parser")
+            }
+        }
+    }
+    if br.read_bits(1u8).unwrap() != 0 {
+        let _ = br.read_bits(4u8).unwrap();
+    }
+    if br.read_bits(1u8).unwrap() == 0 {
+        return None;
+    }
+    let bits = br.read_bits(3u8).unwrap() + 2;
+    Some(bits)
+}
+
 /// Round-trip helper.
 fn assert_roundtrip(w: u32, h: u32, rgba: &[u8], opts: EncoderOptions) -> Vec<u8> {
     let pixels = rgba_bytes_to_argb_pixels(rgba);
@@ -681,6 +715,110 @@ fn meta_huffman_does_not_inflate_uniform_image() {
     assert!(
         !main_image_is_meta_huffman(&bs),
         "uniform-noise field should NOT pick meta-Huffman ({} bytes)",
+        bs.len()
+    );
+}
+
+/// Build a 256×256 image with three vertically-stacked regions (gradient,
+/// vertical bars, noise) — distinct enough that the entropy-image
+/// tile-bits sweep should pick *some* legal entropy-image tile size and
+/// the bitstream should round-trip.
+///
+/// We don't lock down which `meta_bits` the encoder picks: the byte-
+/// optimum is content-dependent and fluctuates by a few bytes between
+/// runs of the cost model. The critical invariants are (a) the picked
+/// size lives in the swept range `META_BITS_SWEEP = {3, 4, 5}` and
+/// (b) round-trip pixel equality.
+fn three_region_256(w: u32, h: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let mut s: u32 = 0xC0DE_F00D;
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            if y < h / 3 {
+                rgba[i] = ((x + y) as u8).wrapping_mul(2);
+                rgba[i + 1] = ((x + 2 * y) as u8).wrapping_mul(2);
+                rgba[i + 2] = ((2 * x + y) as u8).wrapping_mul(2);
+            } else if y < 2 * h / 3 {
+                let on = (x / 8) & 1 == 0;
+                let v = if on { 0xff } else { 0x00 };
+                rgba[i] = v;
+                rgba[i + 1] = v / 2;
+                rgba[i + 2] = v / 4;
+            } else {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                rgba[i] = (s & 0xff) as u8;
+                rgba[i + 1] = ((s >> 8) & 0xff) as u8;
+                rgba[i + 2] = ((s >> 16) & 0xff) as u8;
+            }
+            rgba[i + 3] = 0xff;
+        }
+    }
+    rgba
+}
+
+#[test]
+fn entropy_image_tile_bits_lands_in_swept_range_on_three_region_256() {
+    let w = 256u32;
+    let h = 256u32;
+    let rgba = three_region_256(w, h);
+    let opts = EncoderOptions {
+        use_subtract_green: false,
+        use_color_transform: false,
+        use_predictor: false,
+        use_color_index: false,
+        use_color_cache: true,
+        ..EncoderOptions::default()
+    };
+    let bs = assert_roundtrip(w, h, &rgba, opts);
+    let bits = main_image_meta_bits(&bs).expect(
+        "three-region 256x256 fixture should pick the meta-Huffman variant — the three regions \
+         have distinctly different statistics that the K-group split captures cleanly",
+    );
+    assert!(
+        (3u32..=5).contains(&bits),
+        "encoder picked meta_bits={} which is outside the swept range {{3, 4, 5}} (= 8/16/32 px tiles)",
+        bits
+    );
+}
+
+#[test]
+fn entropy_image_tile_bits_sweep_does_not_inflate_uniform_noise_64() {
+    // The sweep widens the per-K trial count 3× but should never grow
+    // the output on content where meta-Huffman doesn't pay off — the
+    // baseline single-group bytes are always preserved as a fallback.
+    let w = 64u32;
+    let h = 64u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let mut s: u32 = 0xDEAD_BEEF;
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            rgba[i] = (s & 0xff) as u8;
+            rgba[i + 1] = ((s >> 8) & 0xff) as u8;
+            rgba[i + 2] = ((s >> 16) & 0xff) as u8;
+            rgba[i + 3] = 0xff;
+        }
+    }
+    let opts = EncoderOptions {
+        use_subtract_green: false,
+        use_color_transform: false,
+        use_predictor: false,
+        use_color_index: false,
+        use_color_cache: true,
+        ..EncoderOptions::default()
+    };
+    let bs = assert_roundtrip(w, h, &rgba, opts);
+    // Baseline single-group always wins on uniform noise: meta-Huffman
+    // is pure overhead because every tile's histogram looks the same.
+    assert!(
+        !main_image_is_meta_huffman(&bs),
+        "uniform-noise 64x64 should NOT trigger meta-Huffman ({} bytes)",
         bs.len()
     );
 }

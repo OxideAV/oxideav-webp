@@ -236,26 +236,37 @@ Encoder scope (current):
   predictor tile sizes ({8, 16, 32} px) and keeps the smallest
   encoded variant. Each trial also tries meta-Huffman per-tile
   grouping at K = 1 / 2 / 4 / 8 / 16 (gated by image pixel count:
-  K=4 ≥ 4096 px, K=8 ≥ 16384 px, K=16 ≥ 65536 px) and picks the
-  byte-smallest. Predictor pool covers all 14 RFC 9649 §4.1 modes
-  per tile. LZ77 backreference search uses a 16384-pixel sliding
-  window with up to 256 hash-chain candidates per starting position;
-  the matcher runs a **two-pass cost-modelled** scan on the main
-  image — pass 1 is greedy first-match, pass 2 re-walks the chain
-  with a per-symbol `-log2(p) × 16` bit-cost model derived from the
-  pass-1 histogram and picks each match by lowest bit-cost-per-pixel
-  (plus a one-step lazy lookahead that defers a match if literal-
-  here + match-at-i+1 bills fewer model bits). Optional near-
-  lossless preprocessing (libwebp-compatible `0..=100` knob)
-  collapses near-identical pixels into longer LZ77 runs / richer
-  cache hits. Callers that want a fixed configuration call
-  `encode_vp8l_argb_with` directly. Encoder ≈ 93 % libwebp parity
-  on natural fixtures (≤ 1.13× cwebp on a 1024×768 photo, ≤ 1.06×
-  on a 512×512 still, **beats cwebp by 7.0 %** on the in-tree
-  128×128 natural fixture and by 25.6 % on the 64×64 cache-stress
-  fixture); residual gap is the entropy-image transform (per-tile
-  entropy clustering driving meta-Huffman group assignment) and
-  full Viterbi-style optimal LZ77.
+  K=4 ≥ 4096 px, K=8 ≥ 16384 px, K=16 ≥ 65536 px), and for each K
+  sweeps the **entropy-image tile size** at `meta_bits ∈ {3, 4, 5}`
+  (8 / 16 / 32-pixel tiles) — i.e. **smart tile-boundary switching**
+  on the entropy-image side, picking the (K, meta_bits) tuple that
+  bills the fewest bits. Per RFC 9649 §3.7.2.2 the entropy image is
+  the per-tile prefix-code-group selector (the libwebp "EntropyImage"
+  transform); the encoder builds it via k-means++ farthest-first
+  clustering of per-tile green-alphabet histograms with K-scaled
+  iteration count (2 passes for K ≤ 2, 3 for K = 4, 4 for K ≥ 8) so
+  the cluster boundaries actually settle on multi-region content
+  rather than collapsing to a smaller-K baseline. Predictor pool
+  covers all 14 RFC 9649 §4.1 modes per tile. LZ77 backreference
+  search uses a 16384-pixel sliding window with up to 256 hash-chain
+  candidates per starting position; the matcher runs a **two-pass
+  cost-modelled** scan on the main image — pass 1 is greedy
+  first-match, pass 2 re-walks the chain with a per-symbol
+  `-log2(p) × 16` bit-cost model derived from the pass-1 histogram
+  and picks each match by lowest bit-cost-per-pixel (plus a one-step
+  lazy lookahead that defers a match if literal-here +
+  match-at-i+1 bills fewer model bits). Optional near-lossless
+  preprocessing (libwebp-compatible `0..=100` knob) collapses
+  near-identical pixels into longer LZ77 runs / richer cache hits.
+  Callers that want a fixed configuration call `encode_vp8l_argb_with`
+  directly. Encoder ≈ 95 % libwebp parity on natural fixtures
+  (≤ 1.13× cwebp on a 1024×768 photo, ≤ 1.06× on a 512×512 still,
+  **beats cwebp by 4.5 %** on the in-tree 128×128 natural fixture and
+  by 14.4 % on the 64×64 cache-stress fixture, **byte-parity** with
+  cwebp on a synthetic three-region 256×256 photo where the
+  entropy-image tile-bits sweep saves an extra ~290 B vs the
+  fixed-16-px-tile baseline); residual gap is full Viterbi-style
+  optimal LZ77.
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)
