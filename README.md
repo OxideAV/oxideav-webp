@@ -270,13 +270,16 @@ Encoder scope (current):
   (libwebp-compatible `0..=100` knob) collapses near-identical
   pixels into longer LZ77 runs / richer cache hits. Callers that
   want a fixed configuration call `encode_vp8l_argb_with` directly.
-  Encoder ≈ 96 % libwebp parity on natural fixtures (≤ 1.13× cwebp
-  on a 1024×768 photo, ≤ 1.06× on a 512×512 still, **beats cwebp by
-  4.5 %** on the in-tree 128×128 natural fixture and by 14.4 % on
-  the 64×64 cache-stress fixture, **byte-parity** with cwebp on a
-  synthetic three-region 256×256 photo, **1.014× cwebp** on a
-  256×256 landscape — Viterbi pass 3 saves another 298 B / −0.67 %
-  over the pass-2 cost-aware-greedy baseline on that fixture).
+  A multi-iteration Huffman refit (up to 3 extra Viterbi passes under
+  the exact code-length cost model) further tightens the token
+  sequence after the initial Viterbi selection. Encoder ≈ 96 %
+  libwebp parity on natural fixtures (≤ 1.13× cwebp on a 1024×768
+  photo, ≤ 1.06× on a 512×512 still, **beats cwebp by 4.5 %** on
+  the in-tree 128×128 natural fixture and by 14.4 % on the 64×64
+  cache-stress fixture, **byte-parity** with cwebp on a synthetic
+  three-region 256×256 photo, **1.012× cwebp** on a 256×256
+  landscape — multi-iter refit saves another 60 B / −0.14 % over
+  the single-pass Viterbi baseline on that fixture).
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)

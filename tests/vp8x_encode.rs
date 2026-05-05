@@ -55,7 +55,7 @@ fn make_vp8l_encoder() -> Box<dyn Encoder> {
     params.width = Some(W);
     params.height = Some(H);
     params.pixel_format = Some(PixelFormat::Rgba);
-    ctx.codecs.make_encoder(&params).expect("make_encoder")
+    ctx.codecs.first_encoder(&params).expect("make_encoder")
 }
 
 #[test]

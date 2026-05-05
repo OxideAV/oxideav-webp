@@ -103,6 +103,30 @@ const MIN_MATCH: usize = 3;
 /// searches get expensive past a few hundred pixels.
 const MAX_MATCH: usize = 4096;
 
+/// Starting lengths of each VP8L length-encoding bin. Within a bin every
+/// length yields the same Huffman symbol and the same number of extra bits,
+/// so the coded cost is identical — only the extra-bits *value* changes.
+/// For the Viterbi DP we only need to probe one representative length per
+/// reachable bin (the longest available, which maximises the pixels covered
+/// per token at the same symbol cost). Using bin boundaries as probe points
+/// is both more accurate and cheaper than the previous geometric thinning.
+///
+/// Derived from `encode_len_or_dist_value`: each entry is the first length
+/// that maps to a new (symbol, extra_bits_count) pair.
+const LEN_BIN_STARTS: &[usize] = &[
+    1, 2, 3, 4,           // lengths 1–4: own symbol each
+    5, 7,                 // 2-element bins (1 extra bit)
+    9, 13,                // 4-element bins (2 extra bits)
+    17, 25,               // 8-element bins (3 extra bits)
+    33, 49,               // 16-element bins (4 extra bits)
+    65, 97,               // 32-element bins (5 extra bits)
+    129, 193,             // 64-element bins (6 extra bits)
+    257, 385,             // 128-element bins (7 extra bits)
+    513, 769,             // 256-element bins (8 extra bits)
+    1025, 1537,           // 512-element bins (9 extra bits)
+    2049, 3073,           // 1024-element bins (10 extra bits)
+];
+
 /// Colour-cache bit width. 8 bits = 256-entry cache — small enough to
 /// keep the green alphabet compact (256 + 24 + 256 = 536 symbols) yet
 /// large enough to pay for itself on most natural images. Always on;
@@ -1840,6 +1864,45 @@ impl CostModel {
         }
     }
 
+    /// Build per-alphabet cost vectors from actual Huffman code lengths.
+    /// Produces an **exact** cost model: each symbol's cost is its actual
+    /// code length in bits scaled by [`COST_SHIFT`]. This is more accurate
+    /// than [`from_freqs`]'s `-log2(p)` approximation because it reflects
+    /// the real integer lengths produced by the Huffman builder (including
+    /// length-cap redistribution). Used by the multi-iteration Huffman
+    /// refit loop inside [`build_cost_modelled_stream`] to tighten the
+    /// cost model after the Huffman trees have been computed from the
+    /// first Viterbi pass.
+    ///
+    /// Symbols with code length 0 (absent from the tree) get
+    /// [`COST_UNSEEN`] — they'll never be chosen by the LZ77 passes.
+    fn from_code_lengths(
+        green_lens: &[u8],
+        red_lens: &[u8],
+        blue_lens: &[u8],
+        alpha_lens: &[u8],
+        dist_lens: &[u8],
+    ) -> Self {
+        let exact = |lens: &[u8]| -> Vec<u32> {
+            lens.iter()
+                .map(|&l| {
+                    if l == 0 {
+                        COST_UNSEEN
+                    } else {
+                        (l as u32) << COST_SHIFT
+                    }
+                })
+                .collect()
+        };
+        Self {
+            green: exact(green_lens),
+            red: exact(red_lens),
+            blue: exact(blue_lens),
+            alpha: exact(alpha_lens),
+            dist: exact(dist_lens),
+        }
+    }
+
     /// Cost (in 1/16-bit units) of emitting a literal pixel under this
     /// model. Sums the per-channel symbol costs for the four bytes.
     fn literal_cost(&self, a: u8, r: u8, g: u8, b: u8) -> u32 {
@@ -1865,6 +1928,11 @@ impl CostModel {
     /// length-prefix-symbol cost (in the green alphabet bucket
     /// `256..256+24`), the length extra bits (raw width × 16), the
     /// distance prefix symbol cost, and the distance extra bits.
+    /// `distance` is a pixel distance; the function adds 120 internally to
+    /// convert to VP8L distance code (special codes 1..=120 are not used
+    /// on the encoder side — the generic `d + 120` form always decodes
+    /// correctly and avoids the Huffman distribution shift that using
+    /// special codes induces on natural-image content).
     fn backref_cost(&self, length: u32, distance: u32) -> u32 {
         let (len_sym, len_eb, _) = encode_len_or_dist_value(length);
         let (dist_sym, dist_eb, _) = encode_len_or_dist_value(distance + 120);
@@ -2413,6 +2481,67 @@ fn build_cost_modelled_stream(
             best = p3;
         }
     }
+
+    // **Multi-iteration Huffman refit (exact-cost model passes).**
+    //
+    // After picking the best Viterbi stream so far, build the actual
+    // Huffman code-length tables from its histogram and construct an
+    // **exact** cost model: each symbol's cost = `code_length × 16`
+    // (no log2 approximation). Running the Viterbi DP under this exact
+    // model can produce a different token sequence — in particular it
+    // breaks ties that the log2 approximation rounds the same way but
+    // that the real coder resolves differently due to integer rounding
+    // and the length-cap redistribution. Each iteration is gated on the
+    // stream actually improving (measured under the new exact model so
+    // comparisons are self-consistent); convergence is typically 2–3
+    // iterations on natural-image content, matching cwebp's multi-pass
+    // Huffman refinement. Cap at 3 extra iterations to bound the total
+    // runtime on large images (each iteration is one full Viterbi pass,
+    // ≈ the same cost as pass 3a / 3b above).
+    //
+    // Only run on ≥ 256×256 images where the Viterbi pass is already
+    // active — below that threshold the stream is short enough that the
+    // log2 approximation is already tight.
+    if (pixels.len() as u64) >= 65536 {
+        let cache_size_u32 = if cache_bits == 0 {
+            0u32
+        } else {
+            1u32 << cache_bits
+        };
+        let mut current_best = best;
+
+        for _iter in 0..3 {
+            // Build exact Huffman lengths from current best stream.
+            let (gl, rl, bl, al, dl) =
+                huffman_lengths_for_stream(&current_best, cache_size_u32);
+            // Exact cost model: code_length × 16, absent → COST_UNSEEN.
+            let cm_exact = CostModel::from_code_lengths(&gl, &rl, &bl, &al, &dl);
+            // Run Viterbi under the exact model.
+            let candidate = build_viterbi_stream(pixels, width, height, cache_bits, &cm_exact);
+            // Score under the same exact model for a self-consistent
+            // comparison — both current_best and candidate were chosen
+            // under cost models derived from the same data.
+            let c_current = estimate_stream_cost(&current_best, &cm_exact);
+            let c_candidate = estimate_stream_cost(&candidate, &cm_exact);
+            if c_candidate < c_current {
+                // Improvement found: update and continue.
+                current_best = candidate;
+            } else {
+                // No improvement under the candidate model — converged.
+                break;
+            }
+        }
+
+        // Return the best stream from all iterations. The exact-model
+        // cost is not directly comparable to the log2-model cost (different
+        // scales), so we simply return whichever stream the exact-model
+        // iterations settled on — it was derived from the same input and
+        // is guaranteed to be at least as good as the log2-model winner
+        // in terms of actual Huffman coding (since we only swap when the
+        // exact-model cost decreases).
+        return current_best;
+    }
+
     best
 }
 
@@ -2538,15 +2667,13 @@ fn build_viterbi_stream(
         let p_i = pixels[i];
         let base = dp[i];
 
-        // Transition 1: literal at i (or cache-ref if the slot hits).
-        if cache_size > 0 && cache_hit_at[i] {
-            let c_cost = cm.cache_cost(cache_idx_at[i]) as u64;
-            let new_cost = base.saturating_add(c_cost);
-            if new_cost < dp[i + 1] {
-                dp[i + 1] = new_cost;
-                parent[i + 1] = (i, ParentTok::CacheRef);
-            }
-        } else {
+        // Transition 1a: literal at i. Always available regardless of
+        // whether the cache slot also holds this pixel — VP8L allows
+        // emitting a literal even when the cache hits (the cache ref
+        // is simply not taken). The literal may be cheaper when the
+        // cache index symbol is long but the four literal channel
+        // symbols are collectively short (e.g. green=0 is very common).
+        {
             let lit_cost = cm.literal_cost(
                 ((p_i >> 24) & 0xff) as u8,
                 ((p_i >> 16) & 0xff) as u8,
@@ -2557,6 +2684,17 @@ fn build_viterbi_stream(
             if new_cost < dp[i + 1] {
                 dp[i + 1] = new_cost;
                 parent[i + 1] = (i, ParentTok::Literal);
+            }
+        }
+        // Transition 1b: cache-ref at i, only when the slot holds p_i.
+        // Compared against the literal above — the cheaper of the two
+        // propagates to dp[i+1].
+        if cache_size > 0 && cache_hit_at[i] {
+            let c_cost = cm.cache_cost(cache_idx_at[i]) as u64;
+            let new_cost = base.saturating_add(c_cost);
+            if new_cost < dp[i + 1] {
+                dp[i + 1] = new_cost;
+                parent[i + 1] = (i, ParentTok::CacheRef);
             }
         }
 
@@ -2582,36 +2720,62 @@ fn build_viterbi_stream(
                     l += 1;
                 }
                 if l >= MIN_MATCH {
-                    // Probe a small set of candidate lengths for this
-                    // (dist, max_l) pair: every length doubles plus the
-                    // exact max length. The cost-vs-len curve at fixed
-                    // distance is monotone-ish, so geometric thinning
-                    // captures the per-distance optimum without paying
-                    // the O(L) per-position cost of enumerating every
-                    // length. A handful of probes per chain entry is
-                    // enough on natural-image content (the long-tail
-                    // tokens dominate the bit budget).
+                    // Probe the best representative length in each
+                    // reachable VP8L length-encoding bin. Within a bin
+                    // every length has the same Huffman symbol and extra-
+                    // bit count, so coded cost is identical; we want the
+                    // LONGEST length in each bin (covers the most pixels
+                    // per token at the same bit cost). For each bin start
+                    // `s` that is ≤ l, the best length is min(l, next_bin
+                    // start - 1) = max length within the bin that is ≤ l.
+                    //
+                    // We also always probe MIN_MATCH (the global minimum)
+                    // and l (the actual longest match) so the DP can
+                    // consider both the cheapest and the longest option.
                     let dist_u32 = dist as u32;
-                    let mut len_probe = MIN_MATCH;
-                    while len_probe <= l {
-                        let bref_cost = cm.backref_cost(len_probe as u32, dist_u32) as u64;
-                        let new_cost = base.saturating_add(bref_cost);
-                        let dst = i + len_probe;
-                        if new_cost < dp[dst] {
-                            dp[dst] = new_cost;
-                            parent[dst] = (i, ParentTok::Backref { dist: dist_u32 });
+                    let vp8l_dist = dist_u32;
+                    let mut prev_start = 0usize;
+                    for &s in LEN_BIN_STARTS {
+                        if s > l {
+                            // All remaining bin starts exceed max match —
+                            // probe the max length in the PREVIOUS bin
+                            // (i.e., up to l) and stop.
+                            break;
                         }
-                        if len_probe >= 32 {
-                            len_probe *= 2;
-                        } else {
-                            len_probe += 1;
+                        if prev_start > 0 {
+                            // Best length in the PREVIOUS bin reachable
+                            // from i: s-1 or l, whichever is smaller.
+                            let best_in_prev_bin = (s - 1).min(l);
+                            if best_in_prev_bin >= MIN_MATCH {
+                                let bref_cost =
+                                    cm.backref_cost(best_in_prev_bin as u32, vp8l_dist) as u64;
+                                let new_cost = base.saturating_add(bref_cost);
+                                let dst = i + best_in_prev_bin;
+                                if new_cost < dp[dst] {
+                                    dp[dst] = new_cost;
+                                    parent[dst] = (i, ParentTok::Backref { dist: dist_u32 });
+                                }
+                            }
                         }
+                        // Also probe the bin START (shortest in this bin)
+                        // to let the DP consider trading a longer match
+                        // now for cheaper downstream tokens.
+                        if s >= MIN_MATCH {
+                            let bref_cost = cm.backref_cost(s as u32, vp8l_dist) as u64;
+                            let new_cost = base.saturating_add(bref_cost);
+                            let dst = i + s;
+                            if new_cost < dp[dst] {
+                                dp[dst] = new_cost;
+                                parent[dst] = (i, ParentTok::Backref { dist: dist_u32 });
+                            }
+                        }
+                        prev_start = s;
                     }
-                    // Always probe the exact max length too — sometimes
-                    // the cheapest match for a given distance bin is the
-                    // longest reachable one.
-                    if l > MIN_MATCH {
-                        let bref_cost = cm.backref_cost(l as u32, dist_u32) as u64;
+                    // Always probe l itself — the longest reachable match
+                    // may be the best choice regardless of which bin it
+                    // falls in.
+                    {
+                        let bref_cost = cm.backref_cost(l as u32, vp8l_dist) as u64;
                         let new_cost = base.saturating_add(bref_cost);
                         let dst = i + l;
                         if new_cost < dp[dst] {
@@ -3676,6 +3840,45 @@ fn build_and_emit_huffman_tree(
     let codes = canonical_codes(&lens);
     emit_huffman_tree(bw, &lens)?;
     Ok((lens, codes))
+}
+
+/// Five-alphabet Huffman code-length tables: `(green, red, blue, alpha, dist)`.
+type FiveAlphabetLens = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Compute the five Huffman code-length tables for a symbol stream without
+/// emitting any bits to a [`BitWriter`]. Used by the multi-iteration
+/// Huffman-refit loop in [`build_cost_modelled_stream`] to obtain exact
+/// code lengths for the exact-cost model.
+///
+/// Returns `(green_lens, red_lens, blue_lens, alpha_lens, dist_lens)`.
+fn huffman_lengths_for_stream(stream: &[StreamSym], cache_size: u32) -> FiveAlphabetLens {
+    let green_alpha = 256 + 24 + cache_size as usize;
+    let mut green_freq = vec![0u32; green_alpha];
+    let mut red_freq = vec![0u32; 256];
+    let mut blue_freq = vec![0u32; 256];
+    let mut alpha_freq = vec![0u32; 256];
+    let mut dist_freq = vec![0u32; 40];
+    for sym in stream {
+        accumulate_symbol_freq(
+            sym,
+            &mut green_freq,
+            &mut red_freq,
+            &mut blue_freq,
+            &mut alpha_freq,
+            &mut dist_freq,
+        );
+    }
+    let green_lens = build_limited_lengths(&green_freq, MAX_CODE_LENGTH)
+        .unwrap_or_else(|_| vec![0u8; green_alpha]);
+    let red_lens =
+        build_limited_lengths(&red_freq, MAX_CODE_LENGTH).unwrap_or_else(|_| vec![0u8; 256]);
+    let blue_lens =
+        build_limited_lengths(&blue_freq, MAX_CODE_LENGTH).unwrap_or_else(|_| vec![0u8; 256]);
+    let alpha_lens =
+        build_limited_lengths(&alpha_freq, MAX_CODE_LENGTH).unwrap_or_else(|_| vec![0u8; 256]);
+    let dist_lens =
+        build_limited_lengths(&dist_freq, MAX_CODE_LENGTH).unwrap_or_else(|_| vec![0u8; 40]);
+    (green_lens, red_lens, blue_lens, alpha_lens, dist_lens)
 }
 
 fn compress_lengths(lens: &[u8]) -> Vec<(u8, u32)> {

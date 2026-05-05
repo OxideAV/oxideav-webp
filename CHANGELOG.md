@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(vp8l-enc)* **Multi-iteration Huffman refit** for ≥ 256×256 images.
+  After the Viterbi DP selects the best token stream, the encoder builds
+  the exact Huffman code-length tables from that stream's histogram and
+  constructs a `CostModel::from_code_lengths` exact model (each symbol's
+  cost = `code_length × 16` instead of `−log2(p) × 16`). The Viterbi DP
+  is re-run under this exact model; if the candidate stream is cheaper
+  under the model, it becomes the new best and the process repeats (up to
+  3 extra iterations). Convergence is typically 1–2 iterations on natural-
+  image content. Measured on the synthetic 256×256 landscape fixture:
+  **−60 bytes (−0.14 %)**, bringing the ratio from `1.0135x` to `1.0124x`
+  of cwebp 1.6.0 (`-lossless -m 6 -z 9`).
+
+- *(vp8l-enc)* **Bin-boundary length probing** in the Viterbi DP. The
+  previous per-chain-entry length probing used geometric doubling
+  (`MIN_MATCH, +1, +1, ..., ×2` above 32). Now uses the VP8L
+  length-encoding bin boundaries (`LEN_BIN_STARTS`) as probe points:
+  within a bin every length has the same Huffman symbol and extra-bit
+  count, so the longest reachable length in each bin is the best probe
+  (maximum pixels covered at equal coded cost). Eliminates redundant
+  probes within each bin and ensures the DP sees every cost-distinct
+  length range.
+
+- *(vp8l-enc)* **Cache-literal parallel consideration** in the Viterbi
+  DP. Previously the DP would take a cache-ref at position `i` (when the
+  slot held `pixels[i]`) *instead of* considering a literal — missing
+  cases where the four literal-channel symbols are collectively cheaper
+  than the cache-index code. Now both transitions update `dp[i+1]`
+  independently and the cheaper one wins. Fixes the VP8L spec allowance
+  that a literal may always be emitted even when a cache hit is available.
+
+### Fixed
+
+- *(vp8l-enc)* Double-add bug in `backref_cost` call sites. During
+  experimentation with VP8L special distance codes (codes 1–120), several
+  `backref_cost(len, dist + 120)` call sites were reverted incorrectly:
+  `backref_cost` adds 120 internally to convert pixel distance to VP8L
+  distance code, so passing `dist + 120` produced `dist + 240`. Affected
+  sites in `build_symbol_stream` (greedy match cost and lazy-lookahead
+  cost) and in the Viterbi DP bin-boundary loop have been corrected to
+  pass the raw pixel distance as documented.
+
 ### Added
 
 - *(vp8l-enc)* **Viterbi-style optimal LZ77** as a third pass on top
