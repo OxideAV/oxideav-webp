@@ -88,4 +88,4 @@ pub use vp8l::{encode_vp8l_argb, encode_vp8l_argb_with, EncoderOptions};
 #[cfg(feature = "registry")]
 pub use decoder::WebpDecoder;
 #[cfg(feature = "registry")]
-pub use registry::{register, register_codecs, register_containers};
+pub use registry::{__oxideav_entry, register, register_codecs, register_containers};
