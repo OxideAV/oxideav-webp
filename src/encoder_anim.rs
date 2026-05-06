@@ -51,6 +51,7 @@
 //! the existing per-frame VP8L encoder.
 
 use crate::error::{Result, WebpError as Error};
+use crate::riff::WebpMetadata;
 use crate::vp8l::encode_vp8l_argb;
 
 /// Per-frame mode-selection policy for [`build_animated_webp_with_options`].
@@ -75,21 +76,31 @@ pub enum AnimFrameMode {
 
 /// Knob bag for [`build_animated_webp_with_options`]. Defaults pick the
 /// per-frame mode-select strategy at quality 75 (libwebp's default).
-#[derive(Clone, Copy, Debug)]
-pub struct AnimEncoderOptions {
+///
+/// File-level metadata chunks (`ICCP` / `EXIF` / `XMP `) can be attached
+/// via [`metadata`](Self::metadata) — when any field of the inner
+/// [`WebpMetadata`] is `Some`, the matching VP8X flag bit is set and the
+/// chunk is written into the file body in the spec-mandated order
+/// (ICCP immediately after VP8X; EXIF / XMP after the last ANMF).
+#[derive(Clone, Debug)]
+pub struct AnimEncoderOptions<'a> {
     /// Per-frame mode-selection policy. Defaults to [`AnimFrameMode::Auto`]
     /// (per-frame byte-smallest wins).
     pub mode: AnimFrameMode,
     /// Quality for the lossy path, on libwebp's `0.0..=100.0` scale
     /// (higher = better). Ignored when `mode = Lossless`. Default 75.
     pub lossy_quality: f32,
+    /// Optional file-level auxiliary metadata (ICC profile, EXIF, XMP)
+    /// to attach to the animation's VP8X header. Defaults to all `None`.
+    pub metadata: WebpMetadata<'a>,
 }
 
-impl Default for AnimEncoderOptions {
+impl<'a> Default for AnimEncoderOptions<'a> {
     fn default() -> Self {
         Self {
             mode: AnimFrameMode::default(),
             lossy_quality: 75.0,
+            metadata: WebpMetadata::default(),
         }
     }
 }
@@ -156,7 +167,7 @@ pub fn build_animated_webp_with_options(
     background_bgra: [u8; 4],
     loop_count: u16,
     frames: &[AnimFrame<'_>],
-    options: AnimEncoderOptions,
+    options: AnimEncoderOptions<'_>,
 ) -> Result<Vec<u8>> {
     if canvas_w == 0 || canvas_h == 0 {
         return Err(Error::invalid("animated WebP: zero canvas size"));
@@ -170,7 +181,12 @@ pub fn build_animated_webp_with_options(
 
     // Pre-encode every frame's nested image sub-chunk(s) first. Doing
     // it up front lets us measure each chunk and lay out the RIFF body
-    // in a single pass without a second iteration.
+    // in a single pass without a second iteration. Track whether *any*
+    // frame carries non-opaque alpha — the VP8X ALPHA flag should only
+    // be set when at least one frame actually needs alpha, otherwise
+    // strict readers see the flag set with no real alpha and treat it
+    // as a malformed file.
+    let mut any_frame_has_alpha = false;
     let mut anmf_payloads: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
     for f in frames {
         if f.width == 0 || f.height == 0 {
@@ -200,11 +216,20 @@ pub fn build_animated_webp_with_options(
             ));
         }
 
+        // Detect non-opaque alpha for the canvas-level VP8X flag. We
+        // can't piggyback off the per-frame encode (the lossy path
+        // checks `any(!= 0xff)` inside encode_lossy_anmf) because the
+        // mode-select decision can drop that signal — scan once here
+        // so the canvas flag is correct regardless of mode.
+        if !any_frame_has_alpha && f.rgba.chunks_exact(4).any(|px| px[3] != 0xff) {
+            any_frame_has_alpha = true;
+        }
+
         // Per-frame mode selection: produce the requested encoding(s)
         // and pick whichever sub-chunk(s) lay out the smaller ANMF
         // payload. The choice is per-frame so an animation can mix
         // lossless and lossy frames depending on which wins on each.
-        let chosen = encode_one_anmf_image(f, options)?;
+        let chosen = encode_one_anmf_image(f, &options)?;
 
         // Build the ANMF payload (16-byte header + nested image sub-chunks).
         let nested_capacity = chosen.iter().map(|c| 8 + c.payload.len()).sum::<usize>();
@@ -235,14 +260,35 @@ pub fn build_animated_webp_with_options(
     }
 
     // Assemble the body that lives between "WEBP" and the end of the
-    // RIFF envelope: VP8X header + ANIM + N x ANMF.
+    // RIFF envelope: VP8X header + [ICCP] + ANIM + N x ANMF + [EXIF] + [XMP ].
     let mut body: Vec<u8> = Vec::new();
 
-    // VP8X chunk: ALPHA flag (0x10) + ANIM flag (0x02). We always set the
-    // ALPHA flag for animations — a per-frame VP8L chunk can carry alpha
-    // and the decoder only respects ALPHA at the canvas-header level.
-    let vp8x = vp8x_payload(0x12, canvas_w, canvas_h);
+    // VP8X flags byte:
+    //   bit 1 (0x02) = ANIM   — always set for an animation.
+    //   bit 4 (0x10) = ALPHA  — set iff any frame carries non-opaque alpha.
+    //   bit 5 (0x20) = ICCP   — set iff `meta.icc.is_some()`.
+    //   bit 3 (0x08) = EXIF   — set iff `meta.exif.is_some()`.
+    //   bit 2 (0x04) = XMP    — set iff `meta.xmp.is_some()`.
+    let mut flags: u8 = 0x02; // ANIM
+    if any_frame_has_alpha {
+        flags |= 0x10;
+    }
+    if options.metadata.icc.is_some() {
+        flags |= 0x20;
+    }
+    if options.metadata.exif.is_some() {
+        flags |= 0x08;
+    }
+    if options.metadata.xmp.is_some() {
+        flags |= 0x04;
+    }
+    let vp8x = vp8x_payload(flags, canvas_w, canvas_h);
     write_chunk(&mut body, b"VP8X", &vp8x);
+
+    // ICCP must come immediately after VP8X per the WebP container spec.
+    if let Some(icc) = options.metadata.icc {
+        write_chunk(&mut body, b"ICCP", icc);
+    }
 
     // ANIM chunk: 4 bytes BGRA + 2 bytes loop count.
     let mut anim = [0u8; 6];
@@ -257,6 +303,14 @@ pub fn build_animated_webp_with_options(
     // ANMF chunks.
     for payload in &anmf_payloads {
         write_chunk(&mut body, b"ANMF", payload);
+    }
+
+    // EXIF / XMP follow the image-data chunks per the WebP container spec.
+    if let Some(exif) = options.metadata.exif {
+        write_chunk(&mut body, b"EXIF", exif);
+    }
+    if let Some(xmp) = options.metadata.xmp {
+        write_chunk(&mut body, b"XMP ", xmp);
     }
 
     // RIFF envelope.
@@ -285,7 +339,7 @@ struct AnmfSubChunk {
 /// + payload, mirroring the on-disk cost).
 fn encode_one_anmf_image(
     f: &AnimFrame<'_>,
-    options: AnimEncoderOptions,
+    options: &AnimEncoderOptions<'_>,
 ) -> Result<Vec<AnmfSubChunk>> {
     // Always produce the lossless candidate first — it's the
     // historic behaviour and the fallback when the lossy encode fails

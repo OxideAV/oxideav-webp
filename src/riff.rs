@@ -19,7 +19,7 @@
 
 /// Optional auxiliary metadata attached alongside an image chunk. Any
 /// field being `Some` triggers the extended (`VP8X`) container layout.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct WebpMetadata<'a> {
     /// Raw ICC profile bytes, written into an `ICCP` chunk.
     pub icc: Option<&'a [u8]>,

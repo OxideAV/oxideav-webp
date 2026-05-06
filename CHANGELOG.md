@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(anim-enc)* **File-level metadata** (`ICCP` / `EXIF` / `XMP `) on
+  animated WebP encoder via the new `AnimEncoderOptions::metadata`
+  field (a `WebpMetadata` borrow). Chunks are written in the
+  spec-mandated order (ICCP immediately after VP8X; EXIF / XMP after
+  the last ANMF) and round-trip through both `extract_metadata` and
+  `decode_webp`. Closes a long-standing gap where animated output
+  could only carry pixel data, never a colour profile or sidecar
+  metadata.
+
+- *(encoder)* **`encode_vp8l_argb_with_metadata`** — one-shot std-only
+  public entry point that runs the VP8L encoder and wraps the output
+  with caller-supplied `ICCP` / `EXIF` / `XMP ` chunks attached.
+  Auto-promotes to the extended `VP8X` layout iff alpha or any
+  metadata field is present; stays on the simple `VP8L` layout
+  otherwise. Image-library consumers no longer need to assemble RIFF
+  chunks manually to attach a colour profile.
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-webp/compare/v0.1.2...v0.1.3) - 2026-05-05
 
 ### Added
@@ -29,6 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - auto-register via oxideav_core::register! macro (linkme distributed slice)
 
 ### Changed
+
+- *(anim-enc)* **VP8X canvas-level ALPHA flag** is now set per the
+  WebP container spec — only when at least one frame in the animation
+  carries non-opaque alpha. The previous code unconditionally set
+  `flags = 0x12` (ANIM | ALPHA) on every animation, which is
+  technically valid but wasteful and triggers strict-reader
+  malformation warnings on fully-opaque animations. Per-frame alpha
+  is detected with a single `chunks_exact(4).any(|px| px[3] != 0xff)`
+  scan during the existing pre-encode pass.
+
+- *(api)* `AnimEncoderOptions` is now lifetime-parameterised
+  (`AnimEncoderOptions<'a>`) to carry the borrowed `WebpMetadata<'a>`.
+  Existing callers that built it via `..Default::default()` and never
+  set `metadata` are source-compatible (the elided lifetime works on
+  the typical pattern); callers that pinned `AnimEncoderOptions` in a
+  struct field need to add the lifetime parameter.
 
 - *(vp8l-enc)* **Shannon-entropy colour-transform scoring** replaces
   sum-of-abs-residuals (SAD) in `choose_color_transform`. For each

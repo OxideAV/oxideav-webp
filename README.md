@@ -286,7 +286,11 @@ Encoder scope (current):
   three-region 256×256 photo, **sub-cwebp (0.995×)** on the 256×256
   landscape, **1.030×** on brick-wall-256, **1.040×** on
   portrait-textured-256 — all measured under full RDO vs cwebp
-  `-lossless -m 6 -z 9`).
+  `-lossless -m 6 -z 9`). Container-side: round-39 added an
+  `encode_vp8l_argb_with_metadata` one-shot that auto-promotes to the
+  extended VP8X layout when alpha *or* any ICCP/EXIF/XMP field is set,
+  staying on the simple `VP8L` layout otherwise — image-library
+  consumers can attach a colour profile in one call.
 - VP8 lossy from `Yuv420P`, `Yuva420P`, `Rgba`, or `Rgb24` (single
   frame). For `Yuva420P` and `Rgba` the alpha plane is emitted as a
   VP8L-compressed `ALPH` chunk inside the extended (`VP8X`)
@@ -334,13 +338,25 @@ Encoder scope (current):
   the `riff::WebpMetadata` helper.
 - Animated WebP encode via [`build_animated_webp`] /
   [`build_animated_webp_with_options`] — emits a
-  `VP8X + ANIM + ANMF...ANMF` file from a slice of `AnimFrame`s with
-  per-frame durations, x/y offsets, blend, and disposal flags. Per-frame
-  `AnimFrameMode::Auto` runs both VP8L and VP8+ALPH encoders and picks
-  whichever sub-chunk is byte-smaller — animations can mix lossless
-  and lossy frames, matching libwebp's `WebPAnimEncoderAdd` behaviour.
-  All four blend × dispose-to-background combinations round-trip
-  through the in-crate decoder.
+  `VP8X + [ICCP] + ANIM + ANMF...ANMF + [EXIF] + [XMP ]` file from a
+  slice of `AnimFrame`s with per-frame durations, x/y offsets, blend,
+  and disposal flags. Per-frame `AnimFrameMode::Auto` runs both VP8L
+  and VP8+ALPH encoders and picks whichever sub-chunk is byte-smaller
+  — animations can mix lossless and lossy frames, matching libwebp's
+  `WebPAnimEncoderAdd` behaviour. All four blend × dispose-to-background
+  combinations round-trip through the in-crate decoder. As of round 39
+  the canvas-level VP8X **ALPHA** flag is set only when at least one
+  frame actually carries non-opaque alpha (was unconditionally set
+  before — wasted a flag bit and broke strict readers on opaque
+  animations). File-level **ICCP / EXIF / XMP** chunks travel through
+  [`AnimEncoderOptions::metadata`] and round-trip via both
+  [`extract_metadata`] and the [`decode_webp`] full-decode path.
+- One-shot `encode_vp8l_argb_with_metadata(w, h, &argb, has_alpha,
+  &meta)` for std-only image-library consumers that want a lossless
+  `.webp` file with an attached colour profile / EXIF / XMP **without**
+  having to assemble the RIFF chunks themselves. Auto-promotes to the
+  extended `VP8X` layout iff alpha or any metadata field is present;
+  stays on the simple `VP8L` layout otherwise.
 
 Decoder scope:
 

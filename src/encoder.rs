@@ -214,14 +214,60 @@ fn encode_frame_rgb24(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>
 /// (`VP8L` only) when the frame is fully opaque and the extended
 /// `VP8X + VP8L` layout when it carries alpha.
 fn finalize_vp8l_file(width: u32, height: u32, pixels: &[u32], has_alpha: bool) -> Result<Vec<u8>> {
+    finalize_vp8l_file_with_meta(width, height, pixels, has_alpha, &WebpMetadata::default())
+}
+
+/// One-shot VP8L → `.webp` file builder with caller-supplied auxiliary
+/// metadata (`ICCP` / `EXIF` / `XMP `). Encodes the ARGB pixel buffer
+/// through [`encode_vp8l_argb`] and wraps the resulting bitstream in
+/// the RIFF/WEBP container, picking the simple layout when neither
+/// alpha nor metadata is present, and the extended `VP8X` layout
+/// otherwise (with the matching VP8X flag bits set per chunk).
+///
+/// This is the standalone public entry point for image-library
+/// consumers that want lossless `.webp` output **with** a colour
+/// profile / EXIF / XMP attached, without going through the registry
+/// trait dance. The lower-level [`crate::riff::build_webp_file`] /
+/// [`crate::riff::build_vp8l_with_alpha`] helpers stay available for
+/// callers that already hold a VP8L bitstream.
+pub fn encode_vp8l_argb_with_metadata(
+    width: u32,
+    height: u32,
+    pixels: &[u32],
+    has_alpha: bool,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
+    finalize_vp8l_file_with_meta(width, height, pixels, has_alpha, meta)
+}
+
+fn finalize_vp8l_file_with_meta(
+    width: u32,
+    height: u32,
+    pixels: &[u32],
+    has_alpha: bool,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
     let bitstream = encode_vp8l_argb(width, height, pixels, has_alpha)?;
-    let meta = WebpMetadata::default();
     if has_alpha {
         // When the frame carries alpha we *must* emit the extended layout
         // (VP8X) per the RIFF container spec — readers that parse only
-        // the simple form would otherwise miss the alpha flag.
+        // the simple form would otherwise miss the alpha flag. The same
+        // VP8X header carries any caller-supplied metadata flags.
         Ok(crate::riff::build_vp8l_with_alpha(
-            &bitstream, width, height, &meta,
+            &bitstream, width, height, meta,
+        ))
+    } else if meta.any() {
+        // Opaque + metadata → extended layout WITHOUT the ALPHA flag.
+        // `build_webp_file` honours the metadata fields and only forces
+        // ALPHA when an `ALPH` sidecar is supplied — perfect for this
+        // path.
+        Ok(build_webp_file(
+            ImageKind::Vp8lLossless,
+            &bitstream,
+            width,
+            height,
+            None,
+            meta,
         ))
     } else {
         Ok(build_webp_file(
@@ -230,7 +276,7 @@ fn finalize_vp8l_file(width: u32, height: u32, pixels: &[u32], has_alpha: bool) 
             width,
             height,
             None,
-            &meta,
+            meta,
         ))
     }
 }
