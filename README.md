@@ -351,7 +351,13 @@ Encoder scope (current):
   classifier).
 - `VP8X` extended header is emitted automatically whenever the output
   carries an `ALPH` sidecar or optional ICC / EXIF / XMP metadata via
-  the `riff::WebpMetadata` helper.
+  the `riff::WebpMetadata` helper. Registry-side callers wire metadata
+  through `encoder_vp8::make_encoder_with_qindex_and_metadata` /
+  `make_encoder_with_quality_and_metadata` (consumes a
+  `WebpMetadataOwned`); standalone callers pass a `&WebpMetadata`
+  borrow into `encode_vp8_lossy_yuv420p` /
+  `encode_vp8_lossy_yuva420p` / `encode_vp8_lossy_rgba` /
+  `encode_vp8_lossy_rgb24`.
 - Animated WebP encode via [`build_animated_webp`] /
   [`build_animated_webp_with_options`] — emits a
   `VP8X + [ICCP] + ANIM + ANMF...ANMF + [EXIF] + [XMP ]` file from a
@@ -385,6 +391,15 @@ Decoder scope:
   `icc` / `exif` / `xmp` byte vectors). For metadata-only access
   without decoding any pixels, call `oxideav_webp::extract_metadata`
   on the file bytes directly.
+- Animated WebP `ANIM`-chunk **background colour** + **loop count**
+  (RFC 9649 §2.5) are parsed and surfaced on `WebpImage` as
+  `anim_background_rgba: Option<[u8; 4]>` (BGRA on disk → RGBA on
+  the canvas) and `anim_loop_count: Option<u16>` (`0` = infinite).
+  The decoder honours the background colour when initialising its
+  RGBA canvas and when filling dispose-to-background regions, so
+  uncovered pixels and post-dispose bboxes show the encoder-supplied
+  backdrop instead of transparent black. Both fields are `None` for
+  non-animated files.
 - Default output pixel format is `Rgba`. For single-frame VP8+ALPH
   input, `WebpDecoder::new_yuva420p(w, h)` (or
   `set_prefer_yuva420p(true)` after construction) flips the output

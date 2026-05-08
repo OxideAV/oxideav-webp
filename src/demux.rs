@@ -130,6 +130,29 @@ pub(crate) struct ParsedContainer {
     /// simple-layout files that omitted them; populated whenever the
     /// container carries the matching FourCC.
     pub metadata: WebpFileMetadata,
+    /// Animated-WebP background colour as parsed from the `ANIM` chunk
+    /// (RFC 9649 §2.5). Stored exactly as the spec lays it down — `[B,
+    /// G, R, A]` byte order — so callers that want to surface the raw
+    /// chunk see the original bytes. `None` for non-animated files (no
+    /// `ANIM` chunk).
+    ///
+    /// The decoder converts these to RGBA when initialising the canvas
+    /// and when filling dispose-to-background regions; see
+    /// [`bgra_to_rgba`] for the conversion.
+    pub anim_background_bgra: Option<[u8; 4]>,
+    /// `loop_count` from the ANIM chunk (`0` = infinite). `None` for
+    /// non-animated files.
+    pub anim_loop_count: Option<u16>,
+}
+
+/// Convert a 4-byte ANIM-chunk background colour from the spec's `[B,
+/// G, R, A]` byte order to row-major RGBA. The decoder uses this to
+/// initialise the rendering canvas + fill dispose-to-background
+/// regions per RFC 9649 §2.5. Centralised so both the standalone
+/// [`crate::decode_webp`] path and the registry-side `WebpDecoder`
+/// agree on the byte order.
+pub(crate) fn bgra_to_rgba(bgra: [u8; 4]) -> [u8; 4] {
+    [bgra[2], bgra[1], bgra[0], bgra[3]]
 }
 
 /// Auxiliary `.webp` file-level metadata chunks. Values are the raw
@@ -232,9 +255,10 @@ impl ParsedContainer {
         let mut pkts = Vec::with_capacity(self.frames.len());
         let mut pts: i64 = 0;
         let canvas = self.canvas;
+        let bg = self.anim_background_bgra;
         for (i, f) in self.frames.into_iter().enumerate() {
             let duration = f.duration_ms;
-            let data = encode_frame_payload(&f, canvas);
+            let data = encode_frame_payload(&f, canvas, bg);
             let mut pkt = Packet::new(0, tb, data);
             pkt.pts = Some(pts);
             pkt.dts = Some(pts);
@@ -250,22 +274,34 @@ impl ParsedContainer {
 /// Serialise a parsed frame into a self-contained payload the decoder can
 /// consume without touching the original file. The layout is a tiny custom
 /// TLV — a 32-byte header followed by the VP8/VP8L bitstream and an
-/// optional ALPH payload.
+/// optional ALPH payload, then the optional ANIM background colour.
 ///
 /// This is local to the crate; it never escapes into `Packet::data`'s
 /// public consumers because WebP packets only travel from `WebpDemuxer` to
 /// `WebpDecoder` in the same process.
-pub(crate) fn encode_frame_payload(f: &ParsedFrame, canvas: (u32, u32)) -> Vec<u8> {
+///
+/// `anim_background_bgra` is the parsed ANIM chunk background (RFC 9649
+/// §2.5), `[B, G, R, A]` byte order. `None` for non-animated files; the
+/// decoder uses it for canvas init + dispose-to-background fills.
+pub(crate) fn encode_frame_payload(
+    f: &ParsedFrame,
+    canvas: (u32, u32),
+    anim_background_bgra: Option<[u8; 4]>,
+) -> Vec<u8> {
     let img_bytes = match &f.image {
         ImagePayload::Vp8(v) | ImagePayload::Vp8l(v) => v,
     };
     let mut out = Vec::with_capacity(
-        64 + img_bytes.len() + f.alph.as_ref().map(|a| a.data.len() + 16).unwrap_or(0),
+        64 + img_bytes.len() + f.alph.as_ref().map(|a| a.data.len() + 16).unwrap_or(0) + 8,
     );
-    // Magic "OWEB" + version byte.
+    // Magic "OWEB" + version byte. v2 adds the trailing
+    // ANIM-background block (1 flag byte + 4 BGRA bytes when present);
+    // a v1 reader on a v2 payload would error out — same in-process
+    // crate so version bumps are coordinated.
     out.extend_from_slice(b"OWEB");
-    out.push(1);
-    // Flags: bit0 = has_alph, bit1 = is_vp8l.
+    out.push(2);
+    // Flags: bit0 = has_alph, bit1 = is_vp8l, bit2 = dispose,
+    // bit3 = blend_with_previous, bit4 = anim_bg_present (v2+).
     let mut flags = 0u8;
     if f.alph.is_some() {
         flags |= 0x01;
@@ -278,6 +314,9 @@ pub(crate) fn encode_frame_payload(f: &ParsedFrame, canvas: (u32, u32)) -> Vec<u
     }
     if f.blend_with_previous {
         flags |= 0x08;
+    }
+    if anim_background_bgra.is_some() {
+        flags |= 0x10;
     }
     out.push(flags);
     // Canvas + frame bbox, 6 x u32.
@@ -299,6 +338,12 @@ pub(crate) fn encode_frame_payload(f: &ParsedFrame, canvas: (u32, u32)) -> Vec<u
         out.extend_from_slice(&(a.data.len() as u32).to_le_bytes());
         out.extend_from_slice(&a.data);
     }
+    // v2: optional ANIM background colour at the very end (4 bytes
+    // `[B, G, R, A]`). Gated on the `anim_bg_present` flag bit so
+    // non-animated files don't pay the trailing 4 bytes.
+    if let Some(bgra) = anim_background_bgra {
+        out.extend_from_slice(&bgra);
+    }
     out
 }
 
@@ -310,7 +355,8 @@ pub(crate) fn decode_frame_payload(buf: &[u8]) -> Result<DecodedPayload<'_>> {
     if &buf[0..4] != b"OWEB" {
         return Err(Error::invalid("WebP: bad frame payload magic"));
     }
-    if buf[4] != 1 {
+    let version = buf[4];
+    if version != 1 && version != 2 {
         return Err(Error::invalid("WebP: unknown frame payload version"));
     }
     let flags = buf[5];
@@ -346,12 +392,23 @@ pub(crate) fn decode_frame_payload(buf: &[u8]) -> Result<DecodedPayload<'_>> {
             return Err(Error::invalid("WebP: ALPH data extends past payload"));
         }
         let a = &buf[p..p + alen];
+        p += alen;
         Some(DecodedAlph {
             pre_processing: pre,
             filtering: filt,
             compression: comp,
             data: a,
         })
+    } else {
+        None
+    };
+    // v2 trailing ANIM-background block. Bit 4 of `flags` gates it; v1
+    // payloads always have the bit clear.
+    let anim_background_bgra = if version >= 2 && (flags & 0x10) != 0 {
+        if p + 4 > buf.len() {
+            return Err(Error::invalid("WebP: truncated ANIM bg in payload"));
+        }
+        Some([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]])
     } else {
         None
     };
@@ -367,6 +424,7 @@ pub(crate) fn decode_frame_payload(buf: &[u8]) -> Result<DecodedPayload<'_>> {
         duration_ms,
         image,
         alph,
+        anim_background_bgra,
     })
 }
 
@@ -383,6 +441,11 @@ pub(crate) struct DecodedPayload<'a> {
     pub duration_ms: u32,
     pub image: &'a [u8],
     pub alph: Option<DecodedAlph<'a>>,
+    /// ANIM background colour as parsed from the file's `ANIM` chunk
+    /// (`[B, G, R, A]` byte order; `None` for non-animated files).
+    /// The decoder converts this to RGBA when initialising the canvas
+    /// + filling dispose-to-background regions.
+    pub anim_background_bgra: Option<[u8; 4]>,
 }
 
 pub(crate) struct DecodedAlph<'a> {
@@ -421,6 +484,8 @@ pub(crate) fn parse_webp_body(body: &[u8]) -> Result<ParsedContainer> {
                 frames: vec![frame],
                 total_duration_ms: 0,
                 metadata: WebpFileMetadata::default(),
+                anim_background_bgra: None,
+                anim_loop_count: None,
             })
         }
         b"VP8L" => {
@@ -441,6 +506,8 @@ pub(crate) fn parse_webp_body(body: &[u8]) -> Result<ParsedContainer> {
                 frames: vec![frame],
                 total_duration_ms: 0,
                 metadata: WebpFileMetadata::default(),
+                anim_background_bgra: None,
+                anim_loop_count: None,
             })
         }
         b"VP8X" => parse_extended(first.data, &mut chunks),
@@ -467,6 +534,14 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
     let mut pending_alph: Option<AlphChunk> = None;
     let mut pending_image: Option<ImagePayload> = None;
     let mut metadata = WebpFileMetadata::default();
+    // ANIM chunk state (RFC 9649 §2.5). Only meaningful when the VP8X
+    // ANIM flag is set; we still capture it on flag-mismatch files
+    // (the spec says "MUST be ignored" on flag-clear, but a strict
+    // ignore would also drop a benign chunk on a malformed file —
+    // gating on `has_anim` below preserves the spec's "ignore" while
+    // still reading the chunk so a future loose-mode could surface it).
+    let mut anim_background_bgra: Option<[u8; 4]> = None;
+    let mut anim_loop_count: Option<u16> = None;
 
     let mut total_duration = 0u32;
 
@@ -507,11 +582,32 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
             b"ICCP" => metadata.icc = Some(c.data.to_vec()),
             b"EXIF" => metadata.exif = Some(c.data.to_vec()),
             b"XMP " => metadata.xmp = Some(c.data.to_vec()),
-            b"ANIM" => {}
+            // ANIM chunk: 4 bytes [B, G, R, A] background colour +
+            // 2 bytes little-endian loop count (RFC 9649 §2.5,
+            // "ANIM Chunk"). Per spec: "This chunk MUST appear if
+            // the Animation flag in the VP8X Chunk is set. If the
+            // Animation flag is not set and this chunk is present,
+            // it MUST be ignored." We capture it unconditionally
+            // and gate exposure on `has_anim` after the loop so a
+            // file with the flag clear still parses cleanly.
+            b"ANIM" if c.data.len() >= 6 => {
+                anim_background_bgra = Some([c.data[0], c.data[1], c.data[2], c.data[3]]);
+                anim_loop_count = Some(u16::from_le_bytes([c.data[4], c.data[5]]));
+            }
+            b"ANIM" => {
+                // Truncated ANIM payload — leave fields at None.
+            }
             _ => {
                 // Unknown chunk — skip silently per the spec.
             }
         }
+    }
+    // Per RFC 9649 §2.5, the ANIM chunk is meaningful only when the
+    // VP8X ANIM flag is set. Drop it when the flag is clear so callers
+    // see `None` — matches "MUST be ignored" wording.
+    if !has_anim {
+        anim_background_bgra = None;
+        anim_loop_count = None;
     }
 
     if !has_anim {
@@ -540,6 +636,8 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
         frames,
         total_duration_ms: total_duration,
         metadata,
+        anim_background_bgra,
+        anim_loop_count,
     })
 }
 

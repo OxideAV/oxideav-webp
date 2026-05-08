@@ -47,7 +47,17 @@ pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
     let body = &buf[12..end];
     let parsed = crate::demux::parse_webp_body(body)?;
     let (canvas_w, canvas_h) = parsed.canvas;
-    let mut canvas = vec![0u8; (canvas_w as usize) * (canvas_h as usize) * 4];
+    // RFC 9649 §2.5: the ANIM chunk's [B, G, R, A] background colour
+    // MAY be used to fill the unused canvas around frames + the
+    // dispose-to-background regions. The implementation converts to
+    // row-major RGBA up front and uses it for both. Non-animated
+    // files leave the canvas at all-zero (transparent black) — same
+    // as the pre-fix behaviour.
+    let bg_rgba = parsed
+        .anim_background_bgra
+        .map(crate::demux::bgra_to_rgba)
+        .unwrap_or([0, 0, 0, 0]);
+    let mut canvas = canvas_filled(canvas_w as usize, canvas_h as usize, bg_rgba);
     let mut frames = Vec::with_capacity(parsed.frames.len());
     for f in &parsed.frames {
         let tile_rgba = decode_parsed_frame_to_rgba(f)?;
@@ -77,10 +87,10 @@ pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
             for y in y0..y1 {
                 for x in x0..x1 {
                     let i = (y * w + x) * 4;
-                    canvas[i] = 0;
-                    canvas[i + 1] = 0;
-                    canvas[i + 2] = 0;
-                    canvas[i + 3] = 0;
+                    canvas[i] = bg_rgba[0];
+                    canvas[i + 1] = bg_rgba[1];
+                    canvas[i + 2] = bg_rgba[2];
+                    canvas[i + 3] = bg_rgba[3];
                 }
             }
         }
@@ -90,7 +100,26 @@ pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
         height: canvas_h,
         frames,
         metadata: parsed.metadata,
+        anim_background_rgba: parsed.anim_background_bgra.map(crate::demux::bgra_to_rgba),
+        anim_loop_count: parsed.anim_loop_count,
     })
+}
+
+/// Allocate a `w*h*4` RGBA canvas pre-filled with `rgba`. Centralises
+/// the "fill a fresh canvas with the ANIM background colour" pattern
+/// used by both [`decode_webp`] and the registry `WebpDecoder`. When
+/// `rgba == [0, 0, 0, 0]` (the default for non-animated files) this
+/// reduces to a `vec![0u8; ...]` allocation (the optimiser sees the
+/// memset).
+fn canvas_filled(w: usize, h: usize, rgba: [u8; 4]) -> Vec<u8> {
+    if rgba == [0, 0, 0, 0] {
+        return vec![0u8; w * h * 4];
+    }
+    let mut buf = Vec::with_capacity(w * h * 4);
+    for _ in 0..(w * h) {
+        buf.extend_from_slice(&rgba);
+    }
+    buf
 }
 
 /// Decode one `ParsedFrame` (image + optional ALPH) into a tightly-
@@ -167,6 +196,17 @@ pub struct WebpImage {
     /// fields are `None` for files that don't carry the matching chunk
     /// — including every simple-layout (no `VP8X` header) `.webp`.
     pub metadata: WebpFileMetadata,
+    /// Animated WebP background colour (RFC 9649 §2.5 ANIM chunk),
+    /// converted from the spec's on-disk `[B, G, R, A]` byte order to
+    /// row-major RGBA. `None` for non-animated files (no `ANIM`
+    /// chunk, or the VP8X ANIM flag is clear). Spec note: this is a
+    /// rendering hint — the decoder *does* honour it for canvas init
+    /// and dispose-to-background fills, so it's also informational
+    /// for callers that want to know what bg the encoder requested.
+    pub anim_background_rgba: Option<[u8; 4]>,
+    /// Animated WebP loop count (RFC 9649 §2.5 ANIM chunk). `0` means
+    /// infinite playback, `None` for non-animated files.
+    pub anim_loop_count: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +288,11 @@ pub struct WebpDecoder {
     canvas_w: u32,
     canvas_h: u32,
     canvas: Vec<u8>, // RGBA
+    /// ANIM chunk background colour (RFC 9649 §2.5) in RGBA byte
+    /// order. Fixed at the first packet (the demuxer threads it
+    /// through every packet for the same file) and used for both the
+    /// canvas init and dispose-to-background fills.
+    bg_rgba: [u8; 4],
     queued: VecDeque<VideoFrame>,
     pending_pts: Option<i64>,
     pending_tb: TimeBase,
@@ -271,6 +316,11 @@ impl WebpDecoder {
             canvas_w: w,
             canvas_h: h,
             canvas: vec![0; (w as usize) * (h as usize) * 4],
+            // No ANIM background until we've seen the first packet —
+            // historical default is transparent black for non-animated
+            // and pre-ANIM-fix files, and gets replaced from the
+            // packet's `anim_background_bgra` on the first send_packet.
+            bg_rgba: [0, 0, 0, 0],
             queued: VecDeque::new(),
             pending_pts: None,
             pending_tb: TimeBase::new(1, 1000),
@@ -313,13 +363,40 @@ impl Decoder for WebpDecoder {
         self.pending_pts = packet.pts;
         self.pending_tb = packet.time_base;
         let payload = decode_frame_payload(&packet.data)?;
+        // Capture the ANIM background once on the first packet and use
+        // it for the canvas init + every dispose-to-background fill in
+        // this stream. The demuxer threads the same value through every
+        // packet of the same file so there's no risk of drift; we keep
+        // the first-packet value to be defensive against future demuxer
+        // changes.
+        if self.first_frame {
+            if let Some(bgra) = payload.anim_background_bgra {
+                self.bg_rgba = crate::demux::bgra_to_rgba(bgra);
+            }
+        }
         if self.canvas_w == 0 || self.canvas_h == 0 {
             self.canvas_w = payload.canvas.0;
             self.canvas_h = payload.canvas.1;
-            self.canvas = vec![0; (self.canvas_w as usize) * (self.canvas_h as usize) * 4];
+            let n = (self.canvas_w as usize) * (self.canvas_h as usize);
+            self.canvas = if self.bg_rgba == [0, 0, 0, 0] {
+                vec![0u8; n * 4]
+            } else {
+                let mut c = Vec::with_capacity(n * 4);
+                for _ in 0..n {
+                    c.extend_from_slice(&self.bg_rgba);
+                }
+                c
+            };
+        } else if self.first_frame && self.bg_rgba != [0, 0, 0, 0] {
+            // Decoder was constructed with explicit dimensions (the
+            // standalone `WebpDecoder::new(w, h)` path) so the canvas
+            // exists already as a transparent-black `vec![0; ...]`. Fill
+            // it with the ANIM background so the first composite lands
+            // on the right backdrop.
+            for px in self.canvas.chunks_exact_mut(4) {
+                px.copy_from_slice(&self.bg_rgba);
+            }
         }
-
-        let _ = self.first_frame;
 
         // Yuva420P fast path: a non-animated VP8 chunk with an ALPH
         // sidecar that lines up with the canvas (i.e. a still file in
@@ -391,7 +468,11 @@ impl Decoder for WebpDecoder {
         };
         self.queued.push_back(vf);
 
-        // Post-frame disposal.
+        // Post-frame disposal — fill the frame's bbox with the ANIM
+        // background colour (RFC 9649 §2.5: "Dispose to the background
+        // color. Fill the rectangle on the canvas covered by the
+        // current frame with the background color specified in the
+        // ANIM Chunk"). Falls back to (0,0,0,0) for non-animated files.
         if payload.dispose_to_background {
             let x0 = payload.x_offset as usize;
             let y0 = payload.y_offset as usize;
@@ -401,10 +482,10 @@ impl Decoder for WebpDecoder {
             for y in y0..y1 {
                 for x in x0..x1 {
                     let i = (y * w + x) * 4;
-                    self.canvas[i] = 0;
-                    self.canvas[i + 1] = 0;
-                    self.canvas[i + 2] = 0;
-                    self.canvas[i + 3] = 0;
+                    self.canvas[i] = self.bg_rgba[0];
+                    self.canvas[i + 1] = self.bg_rgba[1];
+                    self.canvas[i + 2] = self.bg_rgba[2];
+                    self.canvas[i + 3] = self.bg_rgba[3];
                 }
             }
         }
@@ -431,8 +512,20 @@ impl Decoder for WebpDecoder {
         // the semantics of starting playback from the seek target.
         // `first_frame` returns true so a post-seek frame with
         // blend_with_previous doesn't mix into the pre-seek canvas.
+        // Re-fill with the ANIM background colour so post-reset frames
+        // composite onto the same backdrop the file requested rather
+        // than dropping back to transparent black.
         if self.canvas_w > 0 && self.canvas_h > 0 {
-            self.canvas = vec![0; (self.canvas_w as usize) * (self.canvas_h as usize) * 4];
+            let n = (self.canvas_w as usize) * (self.canvas_h as usize);
+            self.canvas = if self.bg_rgba == [0, 0, 0, 0] {
+                vec![0u8; n * 4]
+            } else {
+                let mut c = Vec::with_capacity(n * 4);
+                for _ in 0..n {
+                    c.extend_from_slice(&self.bg_rgba);
+                }
+                c
+            };
         } else {
             self.canvas.clear();
         }

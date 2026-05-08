@@ -37,6 +37,44 @@ impl WebpMetadata<'_> {
     }
 }
 
+/// Owned twin of [`WebpMetadata`] suitable for storage on long-lived
+/// state (e.g. the [`crate::encoder_vp8::Vp8WebpEncoder`] adapter that
+/// the codec registry hands out as `Box<dyn Encoder>`). Holds each
+/// metadata payload as a `Vec<u8>` so it doesn't borrow from the
+/// caller.
+///
+/// Use [`Self::as_borrow`] to project a borrowing [`WebpMetadata<'_>`]
+/// for the file builders without an extra allocation.
+#[derive(Default, Clone, Debug)]
+pub struct WebpMetadataOwned {
+    /// Raw ICC profile bytes. `None` when no ICC chunk should be written.
+    pub icc: Option<Vec<u8>>,
+    /// Raw EXIF payload. `None` when no EXIF chunk should be written.
+    pub exif: Option<Vec<u8>>,
+    /// Raw XMP payload (typically UTF-8 XML). `None` when no XMP chunk
+    /// should be written.
+    pub xmp: Option<Vec<u8>>,
+}
+
+impl WebpMetadataOwned {
+    /// True if any of the metadata fields is populated.
+    pub fn any(&self) -> bool {
+        self.icc.is_some() || self.exif.is_some() || self.xmp.is_some()
+    }
+
+    /// Borrow this owned-metadata instance as a [`WebpMetadata<'_>`]
+    /// for one-shot use with [`build_webp_file`] /
+    /// [`build_vp8l_with_alpha`]. Zero-copy — each field maps to the
+    /// matching `Option<&[u8]>` slice borrow.
+    pub fn as_borrow(&self) -> WebpMetadata<'_> {
+        WebpMetadata {
+            icc: self.icc.as_deref(),
+            exif: self.exif.as_deref(),
+            xmp: self.xmp.as_deref(),
+        }
+    }
+}
+
 /// The image chunk identity we're wrapping.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {

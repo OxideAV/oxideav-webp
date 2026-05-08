@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder-vp8)* **EXIF / XMP / ICC chunk passthrough on the
+  registry-side `Vp8WebpEncoder` adapter.** Two new factories —
+  `make_encoder_with_qindex_and_metadata` /
+  `make_encoder_with_quality_and_metadata` — accept a
+  `WebpMetadataOwned` whose contents land on every emitted `.webp`
+  file as `ICCP` / `EXIF` / `XMP ` chunks alongside the VP8 keyframe.
+  Until now only the standalone `encode_vp8_lossy_*` helpers could
+  attach metadata; the registry-side encoder hard-coded
+  `WebpMetadata::default()` so callers going through `Box<dyn
+  Encoder>` had no way to surface their colour profile / EXIF / XMP.
+  The factories layer the metadata on top of the same psy-RDO
+  / per-segment-tuned encode path; all-`None` metadata produces the
+  same simple-layout output the metadata-less factories produce.
+  New owned struct `WebpMetadataOwned` lives next to `WebpMetadata`
+  in `crate::riff` and re-exports at the crate root.
+- *(decoder, demux)* **Animated WebP `ANIM` chunk background-colour
+  fidelity** (RFC 9649 §2.5). The demuxer was reading the `ANIM`
+  chunk verbatim and discarding it; the decoder initialised its
+  RGBA canvas to all-zero and used `(0, 0, 0, 0)` for every
+  dispose-to-background fill, regardless of the encoder-supplied
+  `[B, G, R, A]` background. Both paths now honour the chunk: the
+  bytes are converted from BGRA to row-major RGBA via
+  `crate::demux::bgra_to_rgba` and used for the canvas init + every
+  dispose-to-background bbox fill. Two new fields on `WebpImage` —
+  `anim_background_rgba: Option<[u8; 4]>` and
+  `anim_loop_count: Option<u16>` — surface the parsed values to
+  callers (both `None` for non-animated files). The internal `OWEB`
+  packet envelope was bumped to v2 to carry the per-stream
+  background colour through the registry decoder.
 - *(encoder-vp8)* **Standalone (no `oxideav-core`) VP8 lossy WebP
   encoder API.** Four new public entry points on the unconditional
   surface — `encode_vp8_lossy_yuv420p`, `encode_vp8_lossy_yuva420p`,

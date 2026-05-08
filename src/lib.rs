@@ -81,7 +81,7 @@ pub use encoder_vp8::{
     encode_vp8_lossy_yuva420p, quality_to_qindex,
 };
 pub use error::{Result, WebpError};
-pub use riff::WebpMetadata;
+pub use riff::{WebpMetadata, WebpMetadataOwned};
 pub use vp8l::{encode_vp8l_argb, encode_vp8l_argb_with, EncoderOptions};
 
 // Public registry-gated API — keeps the framework integration surface

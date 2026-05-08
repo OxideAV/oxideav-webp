@@ -88,6 +88,8 @@ use oxideav_vp8::encoder::{
 };
 
 use crate::error::{Result, WebpError as Error};
+#[cfg(feature = "registry")]
+use crate::riff::WebpMetadataOwned;
 use crate::riff::{build_webp_file, AlphChunkBytes, ImageKind, WebpMetadata};
 use crate::vp8l::encode_vp8l_argb;
 #[cfg(feature = "registry")]
@@ -698,6 +700,7 @@ pub fn make_encoder_with_qindex(
         freq_deltas_for_qindex(qindex),
         /* psy_enabled */ true,
         /* target_bytes */ None,
+        WebpMetadataOwned::default(),
     )
 }
 
@@ -747,6 +750,7 @@ pub fn make_encoder_with_target_size(
         freq_deltas_for_qindex(DEFAULT_QINDEX),
         /* psy_enabled */ true,
         Some(target_bytes),
+        WebpMetadataOwned::default(),
     )
 }
 
@@ -783,13 +787,14 @@ pub fn make_encoder_with_qindex_and_freq_deltas(
         freq_deltas,
         /* psy_enabled */ false,
         /* target_bytes */ None,
+        WebpMetadataOwned::default(),
     )
 }
 
 /// Shared builder for every public `make_encoder_*` entry point.
 /// Centralises the parameter validation, the `output_params` derivation,
 /// and the [`Vp8WebpEncoder`] construction so each public factory only
-/// needs to express its psy / rate-control policy.
+/// needs to express its psy / rate-control / metadata policy.
 #[cfg(feature = "registry")]
 fn build_encoder(
     params: &CodecParameters,
@@ -797,6 +802,7 @@ fn build_encoder(
     freq_deltas: Vp8FreqDeltas,
     psy_enabled: bool,
     target_bytes: Option<usize>,
+    metadata: WebpMetadataOwned,
 ) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -843,6 +849,7 @@ fn build_encoder(
         time_base,
         pending: VecDeque::new(),
         eof: false,
+        metadata,
     }))
 }
 
@@ -857,6 +864,57 @@ pub fn make_encoder_with_quality_and_freq_deltas(
     freq_deltas: Vp8FreqDeltas,
 ) -> oxideav_core::Result<Box<dyn Encoder>> {
     make_encoder_with_qindex_and_freq_deltas(params, quality_to_qindex(quality), freq_deltas)
+}
+
+/// Build a VP8-lossy WebP encoder with an explicit qindex (`0..=127`)
+/// **and** caller-supplied auxiliary metadata chunks (`ICCP` / `EXIF`
+/// / `XMP `) that get attached to every emitted `.webp` file.
+///
+/// Same psy-RDO + per-segment + per-frequency tuning as the bare
+/// [`make_encoder_with_qindex`] (the metadata is layered on top of
+/// the same encode path) — any non-empty field in `metadata`
+/// promotes the output container to the extended `RIFF/WEBP/VP8X`
+/// layout and writes the matching auxiliary chunks alongside the VP8
+/// keyframe (and the optional `ALPH` sidecar for alpha-bearing
+/// inputs). All-`None` metadata produces byte-identical output to
+/// the metadata-less factory.
+///
+/// Mirrors the standalone [`encode_vp8_lossy_yuv420p`] /
+/// [`encode_vp8_lossy_rgba`] / [`encode_vp8_lossy_rgb24`] /
+/// [`encode_vp8_lossy_yuva420p`] entry points which already accept a
+/// `WebpMetadata<'_>` borrow — registry-side callers go through this
+/// factory instead so the metadata buffers can outlive the
+/// `send_frame` call (the encoder takes ownership of the bytes).
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_qindex_and_metadata(
+    params: &CodecParameters,
+    qindex: u8,
+    metadata: WebpMetadataOwned,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    build_encoder(
+        params,
+        qindex,
+        freq_deltas_for_qindex(qindex),
+        /* psy_enabled */ true,
+        /* target_bytes */ None,
+        metadata,
+    )
+}
+
+/// Build a VP8-lossy WebP encoder with a libwebp-style `quality`
+/// scalar (`0.0..=100.0`, higher = better) **and** caller-supplied
+/// auxiliary metadata chunks. Composes
+/// [`make_encoder_with_qindex_and_metadata`] with [`quality_to_qindex`]
+/// — identical to [`make_encoder_with_quality`] in encode behaviour
+/// but lets the caller attach `ICCP` / `EXIF` / `XMP ` chunks on the
+/// way out.
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_quality_and_metadata(
+    params: &CodecParameters,
+    quality: f32,
+    metadata: WebpMetadataOwned,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    make_encoder_with_qindex_and_metadata(params, quality_to_qindex(quality), metadata)
 }
 
 #[cfg(feature = "registry")]
@@ -884,6 +942,19 @@ struct Vp8WebpEncoder {
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
+    /// Caller-supplied auxiliary metadata (`ICCP` / `EXIF` / `XMP `)
+    /// to attach to every emitted `.webp` file. Defaults to all-`None`
+    /// so the historical factories (`make_encoder` /
+    /// `make_encoder_with_qindex` / `make_encoder_with_quality`) emit
+    /// the simple `RIFF/WEBP/VP8 ` layout for opaque inputs and the
+    /// `VP8X + ALPH + VP8 ` layout for alpha-bearing inputs without
+    /// any metadata chunks. The
+    /// [`make_encoder_with_qindex_and_metadata`] /
+    /// [`make_encoder_with_quality_and_metadata`] factories let
+    /// registry-side callers attach metadata; the standalone
+    /// `encode_vp8_lossy_*` entry points already accept a
+    /// `WebpMetadata<'_>` borrow and aren't affected.
+    metadata: WebpMetadataOwned,
 }
 
 #[cfg(feature = "registry")]
@@ -995,6 +1066,12 @@ impl Vp8WebpEncoder {
         } else {
             segment_quant_deltas_for_qindex(qindex.min(127))
         };
+        // Borrow the registry-side caller-supplied metadata into a
+        // short-lived `WebpMetadata<'_>` view so the per-format helpers
+        // can hand it to the RIFF builder. All-`None` (the historical
+        // factory default) keeps the simple-layout output byte-
+        // identical with the pre-#1 metadata-passthrough behaviour.
+        let meta = self.metadata.as_borrow();
         let bytes = match self.input_format {
             PixelFormat::Yuv420P => {
                 let vp8 = encode_keyframe_with_explicit_segments(
@@ -1012,7 +1089,7 @@ impl Vp8WebpEncoder {
                     self.width,
                     self.height,
                     None,
-                    &WebpMetadata::default(),
+                    &meta,
                 )
             }
             PixelFormat::Yuva420P => encode_yuva420_lossy_with_segments(
@@ -1022,6 +1099,7 @@ impl Vp8WebpEncoder {
                 freq_deltas,
                 segment_deltas,
                 v,
+                &meta,
             )
             .map_err(|e| oxideav_core::Error::invalid(format!("{e}")))?,
             PixelFormat::Rgba => encode_rgba_lossy_with_segments(
@@ -1031,6 +1109,7 @@ impl Vp8WebpEncoder {
                 freq_deltas,
                 segment_deltas,
                 v,
+                &meta,
             )
             .map_err(|e| oxideav_core::Error::invalid(format!("{e}")))?,
             PixelFormat::Rgb24 => encode_rgb24_lossy_with_segments(
@@ -1040,6 +1119,7 @@ impl Vp8WebpEncoder {
                 freq_deltas,
                 segment_deltas,
                 v,
+                &meta,
             )
             .map_err(|e| oxideav_core::Error::invalid(format!("{e}")))?,
             other => {
@@ -1248,6 +1328,7 @@ fn encode_yuva420_lossy_with_segments(
     freq_deltas: Vp8FreqDeltas,
     segment_deltas: [i32; 4],
     v: &VideoFrame,
+    meta: &WebpMetadata<'_>,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
@@ -1303,7 +1384,7 @@ fn encode_yuva420_lossy_with_segments(
         width,
         height,
         Some(&alph),
-        &WebpMetadata::default(),
+        meta,
     ))
 }
 
@@ -1323,6 +1404,7 @@ fn encode_rgb24_lossy_with_segments(
     freq_deltas: Vp8FreqDeltas,
     segment_deltas: [i32; 4],
     v: &VideoFrame,
+    meta: &WebpMetadata<'_>,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
@@ -1366,7 +1448,7 @@ fn encode_rgb24_lossy_with_segments(
         width,
         height,
         None,
-        &WebpMetadata::default(),
+        meta,
     ))
 }
 
@@ -1381,6 +1463,7 @@ fn encode_rgba_lossy_with_segments(
     freq_deltas: Vp8FreqDeltas,
     segment_deltas: [i32; 4],
     v: &VideoFrame,
+    meta: &WebpMetadata<'_>,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
@@ -1432,7 +1515,7 @@ fn encode_rgba_lossy_with_segments(
         width,
         height,
         Some(&alph),
-        &WebpMetadata::default(),
+        meta,
     ))
 }
 
