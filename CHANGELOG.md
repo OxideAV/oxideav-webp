@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-webp/compare/v0.1.3...v0.1.4) - 2026-05-08
+
+### Added
+
+- *(encoder-vp8,decoder)* metadata passthrough + ANIM bg colour fidelity
+- *(encoder-vp8)* standalone (no-`oxideav-core`) VP8 lossy encode API
+- *(anim,encoder)* file-level metadata + per-frame ALPHA flag fidelity
+
+### Other
+
+- drop dead `linkme` dep
+- re-export __oxideav_entry from registry sub-module
+
 ### Added
 
 - *(encoder-vp8)* **EXIF / XMP / ICC chunk passthrough on the
