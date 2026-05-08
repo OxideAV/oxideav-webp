@@ -284,12 +284,11 @@ pub(crate) struct AlphChunk {
 pub(crate) struct LazyParsedContainer {
     pub canvas: (u32, u32),
     pub frames: Vec<LazyParsedFrame>,
-    /// Sum of all `duration_ms` fields across `frames` — kept for
-    /// parity with [`ParsedContainer`] so the lazy path can produce
-    /// the same `StreamInfo::duration` whenever a future hookup wants
-    /// it. Currently unused by the streaming `WebpAnimDecoder`, which
-    /// surfaces duration on a per-frame basis.
-    #[allow(dead_code)]
+    /// Sum of all `duration_ms` fields across `frames`. Used by the
+    /// streaming `Demuxer` impl to populate `StreamInfo::duration` at
+    /// `open` time without re-walking the frames. The animated
+    /// `WebpAnimDecoder` still surfaces duration on a per-frame basis
+    /// and ignores this field.
     pub total_duration_ms: u32,
     pub metadata: WebpFileMetadata,
     pub anim_background_bgra: Option<[u8; 4]>,
