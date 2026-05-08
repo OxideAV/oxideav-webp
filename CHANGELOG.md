@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder-vp8)* **Standalone (no `oxideav-core`) VP8 lossy WebP
+  encoder API.** Four new public entry points on the unconditional
+  surface — `encode_vp8_lossy_yuv420p`, `encode_vp8_lossy_yuva420p`,
+  `encode_vp8_lossy_rgba`, `encode_vp8_lossy_rgb24` — accept raw
+  byte slices + a libwebp-style `quality: f32` (`0.0..=100.0`) +
+  an optional `&WebpMetadata` borrow and return a complete `.webp`
+  file. Image-library consumers building with
+  `default-features = false` (no `oxideav-core` dependency) can now
+  encode lossy WebP without going through the framework's
+  `Encoder` / `CodecParameters` / `VideoFrame` registry surface, in
+  the same shape `encode_vp8l_argb_with_metadata` already provides
+  for the lossless side. Auto-promotes to the extended `VP8X`
+  layout when alpha or any metadata field is present; stays on the
+  simple `VP8 ` layout otherwise. The Rgb24 variant streams
+  RGB→YUV420 three bytes at a time (no intermediate `Rgba` byte
+  buffer — same allocator-free shape as the registry-side path).
+  Underlying VP8 keyframe encode goes through the standalone
+  `oxideav_vp8::encoder::encode_vp8_keyframe` so the cross-crate
+  dependency chain stays free of `oxideav-core` end-to-end. The
+  per-segment / per-frequency quant deltas + psy-RDO modulation
+  remain registry-only (they require
+  `oxideav_vp8::encoder::make_encoder_with_config` which is itself
+  registry-gated); standalone callers that want that perceptual
+  curve should use `make_encoder_with_quality` on the registry side.
+- *(test)* `vp8_lossy_standalone` integration suite (10 tests):
+  every input pixel format end-to-end with `decode_webp`,
+  `extract_metadata` round-trip on the VP8X-extended layout,
+  ALPH bit-exactness check (≥ 99% byte-equal alpha after the
+  VP8L lossless ALPH compress/decompress round-trip),
+  byte-size-monotone-with-quality check, and four input-validation
+  rejection tests (zero dims / plane-length mismatch / short RGBA
+  / short RGB24 buffer).
+
 - *(anim-enc)* **File-level metadata** (`ICCP` / `EXIF` / `XMP `) on
   animated WebP encoder via the new `AnimEncoderOptions::metadata`
   field (a `WebpMetadata` borrow). Chunks are written in the

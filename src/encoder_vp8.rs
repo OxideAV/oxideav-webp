@@ -88,9 +88,7 @@ use oxideav_vp8::encoder::{
 };
 
 use crate::error::{Result, WebpError as Error};
-use crate::riff::AlphChunkBytes;
-#[cfg(feature = "registry")]
-use crate::riff::{build_webp_file, ImageKind, WebpMetadata};
+use crate::riff::{build_webp_file, AlphChunkBytes, ImageKind, WebpMetadata};
 use crate::vp8l::encode_vp8l_argb;
 #[cfg(feature = "registry")]
 use crate::CODEC_ID_VP8;
@@ -1738,6 +1736,240 @@ pub(crate) fn encode_alph_chunk(width: u32, height: u32, alpha: &[u8]) -> Result
         header_byte,
         payload,
     })
+}
+
+// ===========================================================================
+// Standalone (no-`registry`) VP8 lossy encode entry points.
+//
+// Mirror the standalone shape of `encode_vp8l_argb_with_metadata` for
+// image-library consumers that build `oxideav-webp` with
+// `default-features = false` (no `oxideav-core`). Each helper takes raw
+// byte slices + a libwebp-style `quality` knob + an optional
+// [`WebpMetadata`] borrow and returns a complete `.webp` file.
+//
+// The lossy encode goes through `oxideav_vp8::encoder::encode_vp8_keyframe`
+// (the standalone keyframe encoder added on the vp8 side). That entry
+// point is fed the basic `qindex` only — the per-segment / per-frequency
+// quant deltas + psy-RDO modulation that `Vp8WebpEncoder` layers on top
+// stay registry-only because `make_encoder_with_config` (the underlying
+// vp8 entry point that consumes [`Vp8EncoderConfig`]) is itself
+// registry-only. Callers that want the full perceptual tuning curve can
+// keep using `make_encoder_with_quality` / `make_encoder_with_qindex`
+// (registry-side, in `oxideav-core` via `Encoder` trait); the standalone
+// entry points stay deterministic + closed-form.
+// ===========================================================================
+
+/// One-shot standalone (no `oxideav-core`) lossy WebP encoder for
+/// `Yuv420P` input. Takes a tightly-strided `Y` plane (`w*h` bytes), a
+/// `U` plane and a `V` plane (each `((w+1)/2) * ((h+1)/2)` bytes), a
+/// libwebp-style `quality` scalar in `0.0..=100.0` (higher = better), and
+/// an optional [`WebpMetadata`] borrow.
+///
+/// Returns a complete `.webp` file in the simple `RIFF/WEBP/VP8 ` layout
+/// when `meta` is empty, or the extended `RIFF/WEBP/VP8X + VP8 ` layout
+/// (with the matching ICCP/EXIF/XMP chunks) when any metadata field is
+/// `Some`. No alpha — feed [`encode_vp8_lossy_yuva420p`] for that.
+pub fn encode_vp8_lossy_yuv420p(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    quality: f32,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
+    validate_yuv420(width, height, y, u, v)?;
+    let qindex = quality_to_qindex(quality);
+    let vp8_bytes = encode_vp8_keyframe_yuv420(width, height, qindex, y, u, v)?;
+    Ok(build_webp_file(
+        ImageKind::Vp8Lossy,
+        &vp8_bytes,
+        width,
+        height,
+        None,
+        meta,
+    ))
+}
+
+/// One-shot standalone lossy WebP encoder for `Yuva420P` input — three
+/// YUV planes plus a full-resolution alpha plane. The YUV planes feed
+/// straight into the VP8 keyframe (no RGB roundtrip) and the alpha
+/// plane is compressed into an `ALPH` sidecar chunk. Always emits the
+/// extended `RIFF/WEBP/VP8X + ALPH + VP8 ` layout (the ALPHA flag is
+/// always set — caller is expected to have a populated alpha plane).
+///
+/// Use this when you already have a YUV-with-alpha frame — it avoids
+/// the YUV→RGB→YUV roundtrip the [`encode_vp8_lossy_rgba`] path would
+/// run.
+pub fn encode_vp8_lossy_yuva420p(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    a: &[u8],
+    quality: f32,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
+    validate_yuv420(width, height, y, u, v)?;
+    let w = width as usize;
+    let h = height as usize;
+    if a.len() != w * h {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: Yuva420P alpha plane length must equal w*h",
+        ));
+    }
+    let qindex = quality_to_qindex(quality);
+    let vp8_bytes = encode_vp8_keyframe_yuv420(width, height, qindex, y, u, v)?;
+    let alph = encode_alph_chunk(width, height, a)?;
+    Ok(build_webp_file(
+        ImageKind::Vp8Lossy,
+        &vp8_bytes,
+        width,
+        height,
+        Some(&alph),
+        meta,
+    ))
+}
+
+/// One-shot standalone lossy WebP encoder for `Rgba` input. RGB → YUV
+/// 4:2:0 conversion uses the BT.601 limited-range coefficients (matching
+/// the decoder's inverse matrix). The alpha plane is compressed into an
+/// `ALPH` sidecar chunk; emits the extended `RIFF/WEBP/VP8X + ALPH +
+/// VP8 ` layout with the ALPHA flag set.
+///
+/// `rgba` is row-major, four bytes per pixel, `width * height * 4` long.
+pub fn encode_vp8_lossy_rgba(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    quality: f32,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if width == 0 || height == 0 || width > 16383 || height > 16383 {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: dimensions out of range (1..=16383)",
+        ));
+    }
+    if rgba.len() != w * h * 4 {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: rgba length must equal w*h*4",
+        ));
+    }
+    let mut alpha = Vec::with_capacity(w * h);
+    let (y_plane, u_plane, v_plane) = rgba_rows_to_yuv420(w, h, w * 4, rgba, &mut alpha);
+    let qindex = quality_to_qindex(quality);
+    let vp8_bytes =
+        encode_vp8_keyframe_yuv420(width, height, qindex, &y_plane, &u_plane, &v_plane)?;
+    let alph = encode_alph_chunk(width, height, &alpha)?;
+    Ok(build_webp_file(
+        ImageKind::Vp8Lossy,
+        &vp8_bytes,
+        width,
+        height,
+        Some(&alph),
+        meta,
+    ))
+}
+
+/// One-shot standalone lossy WebP encoder for `Rgb24` input — three
+/// bytes per pixel, no alpha. The RGB → YUV 4:2:0 conversion **streams**
+/// through the input three bytes at a time (matches the registry-side
+/// `Rgb24` path: no intermediate `Rgba` byte buffer is ever
+/// materialised). Always emits the simple `RIFF/WEBP/VP8 ` layout when
+/// `meta` is empty; promotes to `RIFF/WEBP/VP8X + VP8 ` when `meta`
+/// carries any field.
+///
+/// `rgb` is row-major, three bytes per pixel, `width * height * 3` long.
+pub fn encode_vp8_lossy_rgb24(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    quality: f32,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if width == 0 || height == 0 || width > 16383 || height > 16383 {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: dimensions out of range (1..=16383)",
+        ));
+    }
+    if rgb.len() != w * h * 3 {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: rgb length must equal w*h*3",
+        ));
+    }
+    let (y_plane, u_plane, v_plane) = rgb24_rows_to_yuv420(w, h, w * 3, rgb);
+    let qindex = quality_to_qindex(quality);
+    let vp8_bytes =
+        encode_vp8_keyframe_yuv420(width, height, qindex, &y_plane, &u_plane, &v_plane)?;
+    Ok(build_webp_file(
+        ImageKind::Vp8Lossy,
+        &vp8_bytes,
+        width,
+        height,
+        None,
+        meta,
+    ))
+}
+
+/// Validate `Yuv420P`-shaped plane dimensions. Used by the standalone
+/// `encode_vp8_lossy_*` entry points so the caller gets a clear error
+/// before the underlying VP8 keyframe encoder is invoked.
+fn validate_yuv420(width: u32, height: u32, y: &[u8], u: &[u8], v: &[u8]) -> Result<()> {
+    if width == 0 || height == 0 || width > 16383 || height > 16383 {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: dimensions out of range (1..=16383)",
+        ));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2 + (w & 1);
+    let ch = h / 2 + (h & 1);
+    if y.len() != w * h {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: Y plane length must equal w*h",
+        ));
+    }
+    if u.len() != cw * ch {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: U plane length must equal ((w+1)/2) * ((h+1)/2)",
+        ));
+    }
+    if v.len() != cw * ch {
+        return Err(Error::invalid(
+            "VP8 standalone encoder: V plane length must equal ((w+1)/2) * ((h+1)/2)",
+        ));
+    }
+    Ok(())
+}
+
+/// Run the standalone `oxideav_vp8::encoder::encode_vp8_keyframe`
+/// against a YUV 4:2:0 byte-slice triple. Allocates a [`Vp8Frame`]
+/// (clone-only — the encoder takes a `&Vp8Frame`).
+fn encode_vp8_keyframe_yuv420(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Result<Vec<u8>> {
+    let frame = oxideav_vp8::Vp8Frame {
+        width,
+        height,
+        pts: None,
+        y: y.to_vec(),
+        u: u.to_vec(),
+        v: v.to_vec(),
+        y_stride: width,
+        uv_stride: (width + 1) / 2,
+    };
+    oxideav_vp8::encoder::encode_vp8_keyframe(width, height, qindex, &frame)
+        .map_err(|e| Error::invalid(format!("VP8 standalone encoder: {e}")))
 }
 
 #[cfg(test)]

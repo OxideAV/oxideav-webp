@@ -55,12 +55,28 @@ std-primitive fields (`Vec<u8>` RGBA, `u32` dimensions). `WebpError`
 covers `InvalidData` / `Unsupported` / `Eof` / `NeedMore` and
 `From`-converts from `oxideav_vp8::Vp8Error` so the VP8 lossy path
 composes through cleanly. Encoder entry points
-(`encode_vp8l_argb` / `encode_vp8l_argb_with`,
-`build_animated_webp`) likewise stay available without
+(`encode_vp8l_argb` / `encode_vp8l_argb_with` /
+`encode_vp8l_argb_with_metadata` for lossless,
+`encode_vp8_lossy_yuv420p` / `encode_vp8_lossy_yuva420p` /
+`encode_vp8_lossy_rgba` / `encode_vp8_lossy_rgb24` for lossy,
+`build_animated_webp` for animations) likewise stay available without
 `oxideav-core`. Turning the `registry` feature back on adds the
 `Decoder` / `Encoder` / `Demuxer` trait implementations + the
 `register` helpers + the `WebpDecoder` streaming type so the crate
 plugs into the framework registry as before.
+
+```rust
+use oxideav_webp::{encode_vp8_lossy_rgba, WebpMetadata, WebpError};
+
+let webp_bytes: Vec<u8> = encode_vp8_lossy_rgba(
+    width,
+    height,
+    &rgba,        // row-major, 4 bytes per pixel, w*h*4 long
+    75.0,         // libwebp-style quality 0.0..=100.0
+    &WebpMetadata::default(),
+)?;
+# Ok::<_, WebpError>(())
+```
 
 ## Quick use
 
