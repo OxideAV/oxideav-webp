@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-decoder)* **`WebpAnimDecoder::next_frame_borrowed()`
+  zero-clone canvas view** — returns a `WebpAnimFrameRef<'_>` whose
+  `rgba: &[u8]` borrows directly into the decoder's persistent canvas,
+  saving the per-frame `canvas_w * canvas_h * 4` byte clone the owned
+  `next_frame()` path makes. Same scalar metadata as `WebpAnimFrame`
+  (`pts_ms` / `duration_ms` / `is_keyframe` / blend / dispose flags
+  + frame bbox); `to_owned()` adapter promotes the borrow into a
+  `WebpAnimFrame` for callers that want to retain a snapshot.
+  Lifetime is clamped to `&mut self`, so the borrow-checker stops
+  any later mutating call (`next_frame{,_borrowed}` / `seek_to_frame`
+  / `reset`) from invalidating the view under the caller's feet.
+  Disposal handling is consistent with `next_frame` — the previous
+  frame's deferred `dispose_to_background` bbox is wiped at the start
+  of the next pull, never under a live borrow.
+  Useful for callers that just blit each frame to a sink and discard
+  it (UI preview rendering, frame streaming over a socket, "convert
+  animation to a sequence of PNGs", etc).
+- *(demux)* **Streaming `Demuxer` impl** — the WebP container demuxer
+  now emits packets one-at-a-time from `next_packet()` instead of
+  pre-computing the full `Vec<Packet>` at `open` time. The lazy
+  RIFF parser (`parse_webp_body_lazy`) walks the chunk tree once;
+  per-packet OWEB payloads are materialised on demand from
+  `(offset, length)` ranges into the owned body buffer via the new
+  `encode_lazy_frame_payload` helper. Same wire format as before
+  (the registry-side `WebpDecoder` reads OWEB without caring whether
+  the producer was lazy or eager); same PTS/DTS/keyframe-flag
+  arithmetic. Working set during demuxing drops from O(N×payload)
+  to O(payload) for an N-frame animation. Pairs naturally with the
+  streaming `WebpAnimDecoder` so end-to-end demux+decode works at
+  one frame's-worth of memory.
+
 - *(anim-decoder)* **`WebpAnimDecoder::seek_to_frame(idx)` random-
   access** — positions the decoder so the next `next_frame()` call
   returns frame `idx`. Animated WebP carries cross-frame state

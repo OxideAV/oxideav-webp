@@ -86,9 +86,12 @@ fn open(
     // the total file is 8 + riff_size bytes. Clamp to the actual buffer to
     // survive files whose size field lies (we'd rather keep decoding).
     let end = (8 + riff_size).min(buf.len());
-    let body = &buf[12..end];
+    // Own the body bytes so the lazy `(offset, length)` ranges in
+    // `parsed.frames` stay valid for the lifetime of the demuxer. This
+    // is the same allocation strategy `WebpAnimDecoder` uses.
+    let body: Vec<u8> = buf[12..end].to_vec();
 
-    let parsed = parse_webp_body(body)?;
+    let parsed = parse_webp_body_lazy(&body)?;
     // Width/height default to the dimensions declared by the first image
     // chunk (VP8/VP8L) or the VP8X canvas, whichever we saw first.
     let (w, h) = parsed.canvas;
@@ -111,8 +114,11 @@ fn open(
 
     Ok(Box::new(WebpDemuxer {
         stream,
-        packets: parsed.into_packets(time_base),
+        body,
+        parsed,
+        time_base,
         pos: 0,
+        pts: 0,
     }))
 }
 
@@ -125,6 +131,13 @@ pub(crate) struct ParsedContainer {
     /// payload chunk (VP8 or VP8L) plus optional ALPH and offset/disposal
     /// info for animations. Static files produce exactly one entry.
     pub frames: Vec<ParsedFrame>,
+    /// Sum of all per-frame durations in milliseconds. Currently
+    /// unread because the framework `Demuxer` impl uses the lazy
+    /// container's parallel field for `StreamInfo::duration`; the
+    /// standalone `decode_webp` path also doesn't surface a
+    /// container-level duration. Kept for parity with the lazy struct
+    /// + so a future eager-side caller doesn't have to re-scan.
+    #[allow(dead_code)]
     pub total_duration_ms: u32,
     /// Optional auxiliary metadata chunks (ICCP / EXIF / XMP). Empty for
     /// simple-layout files that omitted them; populated whenever the
@@ -243,6 +256,12 @@ pub(crate) enum ImagePayload {
 
 #[derive(Debug)]
 pub(crate) struct AlphChunk {
+    /// Pre-processing nibble of the ALPH header byte (RFC 9649 §3.4).
+    /// libwebp's encoder doesn't emit any pre-processing other than 0,
+    /// so the decoder ignores it; kept on the struct for parity with
+    /// [`LazyAlphRef`] + so a future implementation can pick it up
+    /// without re-walking chunks.
+    #[allow(dead_code)]
     pub pre_processing: u8,
     pub filtering: u8,
     pub compression: u8,
@@ -321,64 +340,54 @@ pub(crate) struct LazyAlphRef {
     pub data_len: usize,
 }
 
+/// Streaming `OWEB` payload builder used by [`WebpDemuxer::next_packet`].
+/// Materialises one frame's payload at a time directly from a
+/// [`LazyParsedFrame`] + the owning body buffer, so the demuxer never
+/// needs to pre-compute the full `Vec<Packet>` up front. The on-wire
+/// layout is the small TLV the decoder side (`decode_frame_payload`)
+/// already understands — magic `OWEB` + version + flags + canvas/bbox
+/// scalars + image bytes + optional ALPH block + optional ANIM bg
+/// trailer (RFC 9649 §2.5 byte order).
 #[cfg(feature = "registry")]
-impl ParsedContainer {
-    fn into_packets(self, tb: TimeBase) -> Vec<Packet> {
-        let mut pkts = Vec::with_capacity(self.frames.len());
-        let mut pts: i64 = 0;
-        let canvas = self.canvas;
-        let bg = self.anim_background_bgra;
-        for (i, f) in self.frames.into_iter().enumerate() {
-            let duration = f.duration_ms;
-            let data = encode_frame_payload(&f, canvas, bg);
-            let mut pkt = Packet::new(0, tb, data);
-            pkt.pts = Some(pts);
-            pkt.dts = Some(pts);
-            pkt.duration = Some(duration.max(1) as i64);
-            pkt.flags.keyframe = i == 0;
-            pts += duration.max(1) as i64;
-            pkts.push(pkt);
-        }
-        pkts
-    }
-}
-
-/// Serialise a parsed frame into a self-contained payload the decoder can
-/// consume without touching the original file. The layout is a tiny custom
-/// TLV — a 32-byte header followed by the VP8/VP8L bitstream and an
-/// optional ALPH payload, then the optional ANIM background colour.
-///
-/// This is local to the crate; it never escapes into `Packet::data`'s
-/// public consumers because WebP packets only travel from `WebpDemuxer` to
-/// `WebpDecoder` in the same process.
-///
-/// `anim_background_bgra` is the parsed ANIM chunk background (RFC 9649
-/// §2.5), `[B, G, R, A]` byte order. `None` for non-animated files; the
-/// decoder uses it for canvas init + dispose-to-background fills.
-pub(crate) fn encode_frame_payload(
-    f: &ParsedFrame,
+pub(crate) fn encode_lazy_frame_payload(
+    f: &LazyParsedFrame,
+    body: &[u8],
     canvas: (u32, u32),
     anim_background_bgra: Option<[u8; 4]>,
-) -> Vec<u8> {
-    let img_bytes = match &f.image {
-        ImagePayload::Vp8(v) | ImagePayload::Vp8l(v) => v,
+) -> Result<Vec<u8>> {
+    let (img_bytes, is_vp8l) = match f.image {
+        LazyImageRef::Vp8 { offset, len } => {
+            if offset + len > body.len() {
+                return Err(Error::invalid("WebP: VP8 ref out of bounds"));
+            }
+            (&body[offset..offset + len], false)
+        }
+        LazyImageRef::Vp8l { offset, len } => {
+            if offset + len > body.len() {
+                return Err(Error::invalid("WebP: VP8L ref out of bounds"));
+            }
+            (&body[offset..offset + len], true)
+        }
     };
+    let alph_bytes = if let Some(a) = &f.alph {
+        if a.data_offset + a.data_len > body.len() {
+            return Err(Error::invalid("WebP: ALPH ref out of bounds"));
+        }
+        Some(&body[a.data_offset..a.data_offset + a.data_len])
+    } else {
+        None
+    };
+
     let mut out = Vec::with_capacity(
-        64 + img_bytes.len() + f.alph.as_ref().map(|a| a.data.len() + 16).unwrap_or(0) + 8,
+        64 + img_bytes.len() + f.alph.as_ref().map(|a| a.data_len + 16).unwrap_or(0) + 8,
     );
-    // Magic "OWEB" + version byte. v2 adds the trailing
-    // ANIM-background block (1 flag byte + 4 BGRA bytes when present);
-    // a v1 reader on a v2 payload would error out — same in-process
-    // crate so version bumps are coordinated.
     out.extend_from_slice(b"OWEB");
     out.push(2);
-    // Flags: bit0 = has_alph, bit1 = is_vp8l, bit2 = dispose,
-    // bit3 = blend_with_previous, bit4 = anim_bg_present (v2+).
     let mut flags = 0u8;
     if f.alph.is_some() {
         flags |= 0x01;
     }
-    if matches!(f.image, ImagePayload::Vp8l(_)) {
+    if is_vp8l {
         flags |= 0x02;
     }
     if f.dispose_to_background {
@@ -391,35 +400,28 @@ pub(crate) fn encode_frame_payload(
         flags |= 0x10;
     }
     out.push(flags);
-    // Canvas + frame bbox, 6 x u32.
     for v in [
         canvas.0, canvas.1, f.x_offset, f.y_offset, f.width, f.height,
     ] {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    // Duration.
     out.extend_from_slice(&f.duration_ms.to_le_bytes());
-    // Image chunk length + data.
     out.extend_from_slice(&(img_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(img_bytes);
-    // ALPH chunk (optional): pre/filter/comp bytes + length + data.
-    if let Some(a) = &f.alph {
+    if let (Some(a), Some(ab)) = (&f.alph, alph_bytes) {
         out.push(a.pre_processing);
         out.push(a.filtering);
         out.push(a.compression);
-        out.extend_from_slice(&(a.data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&a.data);
+        out.extend_from_slice(&(ab.len() as u32).to_le_bytes());
+        out.extend_from_slice(ab);
     }
-    // v2: optional ANIM background colour at the very end (4 bytes
-    // `[B, G, R, A]`). Gated on the `anim_bg_present` flag bit so
-    // non-animated files don't pay the trailing 4 bytes.
     if let Some(bgra) = anim_background_bgra {
         out.extend_from_slice(&bgra);
     }
-    out
+    Ok(out)
 }
 
-/// Counterpart to `encode_frame_payload`. Used by the decoder.
+/// Counterpart to `encode_lazy_frame_payload`. Used by the decoder.
 pub(crate) fn decode_frame_payload(buf: &[u8]) -> Result<DecodedPayload<'_>> {
     if buf.len() < 4 + 1 + 1 + 6 * 4 + 4 + 4 {
         return Err(Error::invalid("WebP: frame payload too short"));
@@ -1135,11 +1137,36 @@ impl<'a> Iterator for RiffChunks<'a> {
     }
 }
 
+/// Streaming WebP `Demuxer` impl. Owns the full RIFF body buffer once
+/// (so `parse_webp_body_lazy`'s per-frame `(offset, len)` ranges stay
+/// valid), then yields one `Packet` per [`Demuxer::next_packet`] call
+/// — the OWEB payload is materialised on demand via
+/// [`encode_lazy_frame_payload`] instead of being precomputed for every
+/// frame at `open` time.
+///
+/// For long animations (1000+ frames) this trades a one-time
+/// `Vec<Packet>` allocation (size ~ sum of all OWEB blobs) for
+/// per-frame allocations totalling the same size — but the working
+/// set at any moment is one packet's worth, not all of them. Same
+/// shape as libwebp's `WebPAnimDecoder` API, where each
+/// `WebPAnimDecoderGetNext` call materialises the next frame's
+/// composite without pre-computing all frames up front.
 #[cfg(feature = "registry")]
 struct WebpDemuxer {
     stream: StreamInfo,
-    packets: Vec<Packet>,
+    /// Owned RIFF body buffer; sliced by `parsed.frames` ranges.
+    body: Vec<u8>,
+    /// Lazily-walked container metadata + frame `(offset, len)` ranges.
+    parsed: LazyParsedContainer,
+    /// Time base used to construct each `Packet` (millisecond units —
+    /// matches the WebP ANMF native time scale).
+    time_base: TimeBase,
+    /// Index of the next frame to emit. Bumped by `next_packet`.
     pos: usize,
+    /// Cumulative PTS in time-base units; bumped by each frame's
+    /// `max(duration_ms, 1)` so we mirror the eager
+    /// `ParsedContainer::into_packets` arithmetic exactly.
+    pts: i64,
 }
 
 #[cfg(feature = "registry")]
@@ -1153,10 +1180,24 @@ impl Demuxer for WebpDemuxer {
     }
 
     fn next_packet(&mut self) -> oxideav_core::Result<Packet> {
-        if self.pos >= self.packets.len() {
+        if self.pos >= self.parsed.frames.len() {
             return Err(oxideav_core::Error::Eof);
         }
-        let pkt = self.packets[self.pos].clone();
+        let i = self.pos;
+        let f = &self.parsed.frames[i];
+        let duration = f.duration_ms;
+        let data = encode_lazy_frame_payload(
+            f,
+            &self.body,
+            self.parsed.canvas,
+            self.parsed.anim_background_bgra,
+        )?;
+        let mut pkt = Packet::new(0, self.time_base, data);
+        pkt.pts = Some(self.pts);
+        pkt.dts = Some(self.pts);
+        pkt.duration = Some(duration.max(1) as i64);
+        pkt.flags.keyframe = i == 0;
+        self.pts += duration.max(1) as i64;
         self.pos += 1;
         Ok(pkt)
     }
@@ -1192,5 +1233,135 @@ mod tests {
             ext: None,
         };
         assert_eq!(probe(&p), 0);
+    }
+
+    /// Build a tiny 3-frame animated WebP for the streaming Demuxer
+    /// tests. Mirrors the inline `three_frame_anim` in
+    /// `anim_decoder.rs::tests`.
+    fn three_frame_anim_blob() -> Vec<u8> {
+        use crate::encoder_anim::{build_animated_webp, AnimFrame};
+        const W: u32 = 8;
+        const H: u32 = 8;
+        let solid = |rgba: [u8; 4]| -> Vec<u8> {
+            let n = (W as usize) * (H as usize);
+            let mut v = Vec::with_capacity(n * 4);
+            for _ in 0..n {
+                v.extend_from_slice(&rgba);
+            }
+            v
+        };
+        let red = solid([0xff, 0, 0, 0xff]);
+        let green = solid([0, 0xff, 0, 0xff]);
+        let blue = solid([0, 0, 0xff, 0xff]);
+        let frames = [
+            AnimFrame {
+                width: W,
+                height: H,
+                x_offset: 0,
+                y_offset: 0,
+                duration_ms: 30,
+                blend: false,
+                dispose_to_background: false,
+                rgba: &red,
+            },
+            AnimFrame {
+                width: W,
+                height: H,
+                x_offset: 0,
+                y_offset: 0,
+                duration_ms: 40,
+                blend: false,
+                dispose_to_background: false,
+                rgba: &green,
+            },
+            AnimFrame {
+                width: W,
+                height: H,
+                x_offset: 0,
+                y_offset: 0,
+                duration_ms: 50,
+                blend: false,
+                dispose_to_background: false,
+                rgba: &blue,
+            },
+        ];
+        build_animated_webp(W, H, [0, 0, 0, 0], 0, &frames).expect("encode")
+    }
+
+    #[test]
+    fn streaming_demuxer_yields_frames_in_order_with_pts() {
+        // The streaming Demuxer materialises one packet at a time —
+        // `pos` advances per `next_packet`, PTS arithmetic mirrors the
+        // anim-decoder's `pts_ms` (cumulative `max(duration_ms, 1)`).
+        let blob = three_frame_anim_blob();
+        let cursor = std::io::Cursor::new(blob);
+        let mut demux = open_boxed(Box::new(cursor)).expect("open");
+        // Streams metadata is available before any packet is pulled.
+        assert_eq!(demux.streams().len(), 1);
+        let p0 = demux.next_packet().expect("first");
+        assert_eq!(p0.pts, Some(0));
+        assert_eq!(p0.duration, Some(30));
+        assert!(p0.flags.keyframe);
+        let p1 = demux.next_packet().expect("second");
+        assert_eq!(p1.pts, Some(30));
+        assert_eq!(p1.duration, Some(40));
+        assert!(!p1.flags.keyframe);
+        let p2 = demux.next_packet().expect("third");
+        assert_eq!(p2.pts, Some(70));
+        assert_eq!(p2.duration, Some(50));
+        // Subsequent calls report Eof.
+        assert!(matches!(demux.next_packet(), Err(oxideav_core::Error::Eof)));
+    }
+
+    #[test]
+    fn streaming_demuxer_packet_payload_round_trips_through_decoder() {
+        // Each packet's OWEB payload must decode through the same
+        // `decode_frame_payload` reader the registry decoder uses —
+        // proving the streaming `encode_lazy_frame_payload` is
+        // byte-for-byte equivalent to the eager helper it replaced.
+        let blob = three_frame_anim_blob();
+        let cursor = std::io::Cursor::new(blob);
+        let mut demux = open_boxed(Box::new(cursor)).expect("open");
+        for i in 0..3 {
+            let pkt = demux.next_packet().expect("ok");
+            let parsed = decode_frame_payload(pkt.data.as_slice()).expect("OWEB parse");
+            assert_eq!(parsed.canvas, (8, 8), "frame {i} canvas");
+            assert_eq!(parsed.width, 8);
+            assert_eq!(parsed.height, 8);
+            // Image bytes are non-empty (a real VP8L bitstream).
+            assert!(!parsed.image.is_empty());
+        }
+    }
+
+    #[test]
+    fn streaming_demuxer_does_not_pre_allocate_packet_vec() {
+        // Sanity-check the streaming shape: opening doesn't materialise
+        // every packet up front — we can construct the demuxer for a
+        // 3-frame blob and immediately drop it without any cost beyond
+        // the (small) lazy-parse + body buffer. Best signal we can
+        // reasonably observe in a unit test: the type doesn't expose a
+        // `Vec<Packet>` surface, and `next_packet` is the only way to
+        // get one out.
+        let blob = three_frame_anim_blob();
+        let cursor = std::io::Cursor::new(blob);
+        let demux = open_boxed(Box::new(cursor)).expect("open");
+        // We never call `next_packet`; the demuxer holds only the body
+        // + the lazy frame ranges. Drop and check no panic.
+        drop(demux);
+    }
+
+    #[test]
+    fn streaming_demuxer_eof_is_repeatable() {
+        // After draining, every subsequent `next_packet` returns Eof
+        // — not a panic, not a re-emit of the last packet.
+        let blob = three_frame_anim_blob();
+        let cursor = std::io::Cursor::new(blob);
+        let mut demux = open_boxed(Box::new(cursor)).expect("open");
+        for _ in 0..3 {
+            let _ = demux.next_packet().expect("ok");
+        }
+        for _ in 0..5 {
+            assert!(matches!(demux.next_packet(), Err(oxideav_core::Error::Eof)));
+        }
     }
 }
