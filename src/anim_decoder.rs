@@ -29,9 +29,14 @@
 //! canvas. Each `next_frame()` composites the just-decoded tile onto it
 //! per the ANMF flags (blend with previous canvas, or overwrite), then
 //! clones the canvas into the returned [`WebpAnimFrame`]. A
-//! `dispose_to_background` flag fills the just-rendered tile's bbox
-//! with the ANIM background colour *after* we hand the frame to the
-//! caller — exactly what the eager [`crate::decode_webp`] does.
+//! `dispose_to_background` flag is *deferred* — the wipe happens at the
+//! start of the next pull, not before this call returns, so the
+//! canvas state we just snapshotted matches what the caller sees in
+//! [`WebpAnimFrame::rgba`] and (more importantly) in the
+//! `&[u8]` view returned by [`WebpAnimDecoder::next_frame_borrowed`].
+//! Final observable behaviour matches the eager
+//! [`crate::decode_webp`] (each emitted frame's pixels are post-
+//! composite, pre-dispose; the dispose is visible to the next frame).
 //!
 //! # Memory shape: lazy demux
 //!
