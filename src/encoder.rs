@@ -34,6 +34,8 @@ use oxideav_core::{
 use crate::error::Result;
 #[cfg(feature = "registry")]
 use crate::error::WebpError as Error;
+#[cfg(feature = "registry")]
+use crate::riff::WebpMetadataOwned;
 use crate::riff::{build_webp_file, ImageKind, WebpMetadata};
 use crate::vp8l::encode_vp8l_argb;
 #[cfg(feature = "registry")]
@@ -41,6 +43,33 @@ use crate::CODEC_ID_VP8L;
 
 #[cfg(feature = "registry")]
 pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
+    make_encoder_with_metadata(params, WebpMetadataOwned::default())
+}
+
+/// Build a registry-side VP8L lossless WebP encoder with caller-
+/// supplied auxiliary metadata chunks (`ICCP` / `EXIF` / `XMP `).
+/// Mirrors the standalone [`encode_vp8l_argb_with_metadata`] entry
+/// point — registry-side callers go through this factory so the
+/// metadata buffers can outlive the `send_frame` call (the encoder
+/// takes ownership).
+///
+/// The lossy [`crate::encoder_vp8::make_encoder_with_qindex_and_metadata`]
+/// / [`crate::encoder_vp8::make_encoder_with_quality_and_metadata`]
+/// factories are the matching VP8 lossy entry points; this is the
+/// VP8L (lossless) parity.
+///
+/// Layout notes — same as [`encode_vp8l_argb_with_metadata`]:
+/// * Opaque + no metadata → simple `RIFF/WEBP/VP8L` layout.
+/// * Opaque + metadata    → extended `RIFF/WEBP/VP8X + VP8L` layout
+///   (no `ALPH` chunk, but the VP8X header gets the matching metadata
+///   flag bits and the chunks are written in the spec-mandated order).
+/// * Alpha (regardless of metadata) → extended `RIFF/WEBP/VP8X + …` —
+///   VP8X is mandatory for any frame carrying alpha.
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_metadata(
+    params: &CodecParameters,
+    metadata: WebpMetadataOwned,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
         .ok_or_else(|| oxideav_core::Error::invalid("VP8L encoder: missing width"))?;
@@ -71,6 +100,7 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
         time_base,
         pending: VecDeque::new(),
         eof: false,
+        metadata,
     }))
 }
 
@@ -83,6 +113,12 @@ struct Vp8lEncoder {
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
+    /// Caller-supplied auxiliary metadata (`ICCP` / `EXIF` / `XMP `)
+    /// to attach to every emitted `.webp` file. Defaults to all-`None`
+    /// for the historical [`make_encoder`] factory; the
+    /// [`make_encoder_with_metadata`] factory threads through caller-
+    /// supplied bytes.
+    metadata: WebpMetadataOwned,
 }
 
 #[cfg(feature = "registry")]
@@ -106,9 +142,10 @@ impl Encoder for Vp8lEncoder {
         };
         // Frame dimensions and pixel format are now stream-level — the
         // pipeline upstream is responsible for matching `output_params`.
+        let meta_borrow = self.metadata.as_borrow();
         let bytes = match self.input_format {
-            PixelFormat::Rgba => encode_frame_rgba(v, self.width, self.height)?,
-            PixelFormat::Rgb24 => encode_frame_rgb24(v, self.width, self.height)?,
+            PixelFormat::Rgba => encode_frame_rgba(v, self.width, self.height, &meta_borrow)?,
+            PixelFormat::Rgb24 => encode_frame_rgb24(v, self.width, self.height, &meta_borrow)?,
             other => {
                 return Err(oxideav_core::Error::unsupported(format!(
                     "VP8L encoder: pixel format {other:?} not supported"
@@ -141,9 +178,16 @@ impl Encoder for Vp8lEncoder {
 
 /// Pack an Rgba `VideoFrame` into ARGB u32 pixels and run the VP8L encoder.
 /// Returns a full `.webp` file — simple-layout when the frame is fully
-/// opaque, extended (VP8X + VP8L) when alpha carries data.
+/// opaque (and metadata is empty), extended (VP8X + VP8L, optionally with
+/// the caller-supplied metadata chunks) when alpha is present or
+/// metadata is non-empty.
 #[cfg(feature = "registry")]
-fn encode_frame_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>> {
+fn encode_frame_rgba(
+    v: &VideoFrame,
+    width: u32,
+    height: u32,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
     if v.planes.is_empty() {
@@ -168,7 +212,7 @@ fn encode_frame_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>>
             pixels.push((a << 24) | (r << 16) | (g << 8) | b);
         }
     }
-    finalize_vp8l_file(width, height, &pixels, has_alpha)
+    finalize_vp8l_file_with_meta(width, height, &pixels, has_alpha, meta)
 }
 
 /// Pack an Rgb24 `VideoFrame` directly into ARGB u32 pixels and run the
@@ -184,7 +228,12 @@ fn encode_frame_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>>
 /// Rgb24 input is implicitly opaque, so we never need the VP8X+ALPHA
 /// extension.
 #[cfg(feature = "registry")]
-fn encode_frame_rgb24(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>> {
+fn encode_frame_rgb24(
+    v: &VideoFrame,
+    width: u32,
+    height: u32,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
     if v.planes.is_empty() {
@@ -206,15 +255,7 @@ fn encode_frame_rgb24(v: &VideoFrame, width: u32, height: u32) -> Result<Vec<u8>
         }
     }
     // Rgb24 has no alpha plane, so the file is always fully opaque.
-    finalize_vp8l_file(width, height, &pixels, false)
-}
-
-/// Run the bare VP8L encoder over an ARGB pixel buffer and wrap the
-/// resulting bitstream in a RIFF `.webp` file. Picks the simple layout
-/// (`VP8L` only) when the frame is fully opaque and the extended
-/// `VP8X + VP8L` layout when it carries alpha.
-fn finalize_vp8l_file(width: u32, height: u32, pixels: &[u32], has_alpha: bool) -> Result<Vec<u8>> {
-    finalize_vp8l_file_with_meta(width, height, pixels, has_alpha, &WebpMetadata::default())
+    finalize_vp8l_file_with_meta(width, height, &pixels, false, meta)
 }
 
 /// One-shot VP8L → `.webp` file builder with caller-supplied auxiliary

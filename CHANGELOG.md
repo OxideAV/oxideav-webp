@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(anim-decoder)* **Streaming animated WebP decoder** —
+  `WebpAnimDecoder::new(bytes)` builds a pull-driven decoder that
+  yields one `WebpAnimFrame` per `next_frame()` call. Mirrors
+  libwebp's `WebPAnimDecoder` shape: `info()` returns
+  `WebpAnimInfo { canvas_width, canvas_height, frame_count,
+  loop_count, background_rgba, metadata }` up front, `next_frame()`
+  composites each ANMF tile against a persistent RGBA canvas
+  (honouring blend / dispose flags + the ANIM-chunk BG colour),
+  `reset()` rewinds to frame 0 (re-filling the canvas with the
+  RFC 9649 §2.5 background), `done()` flags end-of-animation. Each
+  emitted frame carries `pts_ms` (cumulative, with the spec-floored
+  `1`-ms minimum), `duration_ms`, the canvas-state RGBA snapshot,
+  the `is_keyframe` / `blend_with_previous` /
+  `dispose_to_background` flags, and the on-disk frame bbox. Lets
+  callers stop early (preview thumbnails, "show first 5 frames")
+  without paying the full-decode cost of `decode_webp`. Simple-
+  layout (non-animated) files surface as a 1-frame animation so
+  consumers can use one code path for both flavours. New types
+  re-exported at the crate root: `WebpAnimDecoder`, `WebpAnimFrame`,
+  `WebpAnimInfo`. Implementation in `src/anim_decoder.rs` reuses the
+  existing `parse_webp_body` + `decode_parsed_frame_to_rgba` +
+  `composite` helpers — no duplication of the disposal/blend state
+  machine.
+- *(encoder-vp8l)* **EXIF / XMP / ICC chunk passthrough on the
+  registry-side `Vp8lEncoder` adapter** — new
+  `crate::encoder::make_encoder_with_metadata(&CodecParameters,
+  WebpMetadataOwned)` factory mirrors the VP8 lossy
+  `make_encoder_with_qindex_and_metadata` /
+  `make_encoder_with_quality_and_metadata` factories on the
+  lossless side. Until now only the standalone
+  `encode_vp8l_argb_with_metadata` could attach metadata to a
+  lossless WebP through the registry; the registry-side encoder
+  hard-coded `WebpMetadata::default()` so callers going through
+  `Box<dyn Encoder>` had no way to surface their colour profile.
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-webp/compare/v0.1.3...v0.1.4) - 2026-05-08
 
 ### Added
@@ -19,87 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - drop dead `linkme` dep
 - re-export __oxideav_entry from registry sub-module
-
-### Added
-
-- *(encoder-vp8)* **EXIF / XMP / ICC chunk passthrough on the
-  registry-side `Vp8WebpEncoder` adapter.** Two new factories —
-  `make_encoder_with_qindex_and_metadata` /
-  `make_encoder_with_quality_and_metadata` — accept a
-  `WebpMetadataOwned` whose contents land on every emitted `.webp`
-  file as `ICCP` / `EXIF` / `XMP ` chunks alongside the VP8 keyframe.
-  Until now only the standalone `encode_vp8_lossy_*` helpers could
-  attach metadata; the registry-side encoder hard-coded
-  `WebpMetadata::default()` so callers going through `Box<dyn
-  Encoder>` had no way to surface their colour profile / EXIF / XMP.
-  The factories layer the metadata on top of the same psy-RDO
-  / per-segment-tuned encode path; all-`None` metadata produces the
-  same simple-layout output the metadata-less factories produce.
-  New owned struct `WebpMetadataOwned` lives next to `WebpMetadata`
-  in `crate::riff` and re-exports at the crate root.
-- *(decoder, demux)* **Animated WebP `ANIM` chunk background-colour
-  fidelity** (RFC 9649 §2.5). The demuxer was reading the `ANIM`
-  chunk verbatim and discarding it; the decoder initialised its
-  RGBA canvas to all-zero and used `(0, 0, 0, 0)` for every
-  dispose-to-background fill, regardless of the encoder-supplied
-  `[B, G, R, A]` background. Both paths now honour the chunk: the
-  bytes are converted from BGRA to row-major RGBA via
-  `crate::demux::bgra_to_rgba` and used for the canvas init + every
-  dispose-to-background bbox fill. Two new fields on `WebpImage` —
-  `anim_background_rgba: Option<[u8; 4]>` and
-  `anim_loop_count: Option<u16>` — surface the parsed values to
-  callers (both `None` for non-animated files). The internal `OWEB`
-  packet envelope was bumped to v2 to carry the per-stream
-  background colour through the registry decoder.
-- *(encoder-vp8)* **Standalone (no `oxideav-core`) VP8 lossy WebP
-  encoder API.** Four new public entry points on the unconditional
-  surface — `encode_vp8_lossy_yuv420p`, `encode_vp8_lossy_yuva420p`,
-  `encode_vp8_lossy_rgba`, `encode_vp8_lossy_rgb24` — accept raw
-  byte slices + a libwebp-style `quality: f32` (`0.0..=100.0`) +
-  an optional `&WebpMetadata` borrow and return a complete `.webp`
-  file. Image-library consumers building with
-  `default-features = false` (no `oxideav-core` dependency) can now
-  encode lossy WebP without going through the framework's
-  `Encoder` / `CodecParameters` / `VideoFrame` registry surface, in
-  the same shape `encode_vp8l_argb_with_metadata` already provides
-  for the lossless side. Auto-promotes to the extended `VP8X`
-  layout when alpha or any metadata field is present; stays on the
-  simple `VP8 ` layout otherwise. The Rgb24 variant streams
-  RGB→YUV420 three bytes at a time (no intermediate `Rgba` byte
-  buffer — same allocator-free shape as the registry-side path).
-  Underlying VP8 keyframe encode goes through the standalone
-  `oxideav_vp8::encoder::encode_vp8_keyframe` so the cross-crate
-  dependency chain stays free of `oxideav-core` end-to-end. The
-  per-segment / per-frequency quant deltas + psy-RDO modulation
-  remain registry-only (they require
-  `oxideav_vp8::encoder::make_encoder_with_config` which is itself
-  registry-gated); standalone callers that want that perceptual
-  curve should use `make_encoder_with_quality` on the registry side.
-- *(test)* `vp8_lossy_standalone` integration suite (10 tests):
-  every input pixel format end-to-end with `decode_webp`,
-  `extract_metadata` round-trip on the VP8X-extended layout,
-  ALPH bit-exactness check (≥ 99% byte-equal alpha after the
-  VP8L lossless ALPH compress/decompress round-trip),
-  byte-size-monotone-with-quality check, and four input-validation
-  rejection tests (zero dims / plane-length mismatch / short RGBA
-  / short RGB24 buffer).
-
-- *(anim-enc)* **File-level metadata** (`ICCP` / `EXIF` / `XMP `) on
-  animated WebP encoder via the new `AnimEncoderOptions::metadata`
-  field (a `WebpMetadata` borrow). Chunks are written in the
-  spec-mandated order (ICCP immediately after VP8X; EXIF / XMP after
-  the last ANMF) and round-trip through both `extract_metadata` and
-  `decode_webp`. Closes a long-standing gap where animated output
-  could only carry pixel data, never a colour profile or sidecar
-  metadata.
-
-- *(encoder)* **`encode_vp8l_argb_with_metadata`** — one-shot std-only
-  public entry point that runs the VP8L encoder and wraps the output
-  with caller-supplied `ICCP` / `EXIF` / `XMP ` chunks attached.
-  Auto-promotes to the extended `VP8X` layout iff alpha or any
-  metadata field is present; stays on the simple `VP8L` layout
-  otherwise. Image-library consumers no longer need to assemble RIFF
-  chunks manually to attach a colour profile.
 
 ## [0.1.3](https://github.com/OxideAV/oxideav-webp/compare/v0.1.2...v0.1.3) - 2026-05-05
 

@@ -46,6 +46,7 @@
 #![allow(clippy::manual_range_contains)]
 #![allow(clippy::manual_div_ceil)]
 
+pub mod anim_decoder;
 pub mod decoder;
 pub mod demux;
 pub mod encoder;
@@ -69,6 +70,7 @@ pub const CODEC_ID_VP8L: &str = "webp_vp8l";
 pub const CODEC_ID_VP8: &str = "webp_vp8";
 
 // Public unconditional API — works whether or not `registry` is enabled.
+pub use anim_decoder::{WebpAnimDecoder, WebpAnimFrame, WebpAnimInfo};
 pub use decoder::{decode_webp, WebpFrame, WebpImage};
 pub use demux::{extract_metadata, WebpFileMetadata};
 pub use encoder::encode_vp8l_argb_with_metadata;

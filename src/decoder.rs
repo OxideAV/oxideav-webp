@@ -111,7 +111,7 @@ pub fn decode_webp(buf: &[u8]) -> Result<WebpImage> {
 /// `rgba == [0, 0, 0, 0]` (the default for non-animated files) this
 /// reduces to a `vec![0u8; ...]` allocation (the optimiser sees the
 /// memset).
-fn canvas_filled(w: usize, h: usize, rgba: [u8; 4]) -> Vec<u8> {
+pub(crate) fn canvas_filled(w: usize, h: usize, rgba: [u8; 4]) -> Vec<u8> {
     if rgba == [0, 0, 0, 0] {
         return vec![0u8; w * h * 4];
     }
@@ -126,7 +126,7 @@ fn canvas_filled(w: usize, h: usize, rgba: [u8; 4]) -> Vec<u8> {
 /// packed RGBA tile sized `frame.width * frame.height * 4`. Used by
 /// the standalone [`decode_webp`] path, which never sees the framework
 /// `Decoder` / `Packet` envelope.
-fn decode_parsed_frame_to_rgba(f: &ParsedFrame) -> Result<Vec<u8>> {
+pub(crate) fn decode_parsed_frame_to_rgba(f: &ParsedFrame) -> Result<Vec<u8>> {
     let (image_bytes, is_vp8l) = match &f.image {
         ImagePayload::Vp8(b) => (b.as_slice(), false),
         ImagePayload::Vp8l(b) => (b.as_slice(), true),
@@ -1023,7 +1023,7 @@ fn unfilter_alpha(plane: &mut [u8], w: usize, h: usize, filt: u8) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn composite(
+pub(crate) fn composite(
     canvas: &mut [u8],
     canvas_w: u32,
     canvas_h: u32,
