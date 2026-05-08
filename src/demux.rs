@@ -249,6 +249,78 @@ pub(crate) struct AlphChunk {
     pub data: Vec<u8>,
 }
 
+/// Memory-tight counterpart to [`ParsedContainer`] used by
+/// [`crate::WebpAnimDecoder`]. Per-frame VP8/VP8L bitstreams + ALPH
+/// payloads are recorded as `(start_offset, length)` ranges into the
+/// buffer the decoder owns, instead of being copied into per-frame
+/// `Vec<u8>`s up front. For a 1000-frame animation that's ~1000 saved
+/// allocations + the file size's worth of memcpy traffic.
+///
+/// The decoder keeps the body buffer alive for the lifetime of the
+/// `WebpAnimDecoder` (it copies the caller's bytes once at
+/// construction), so the offsets stay valid until the decoder is
+/// dropped. This is the WebP analogue to libwebp's `WebPAnimDecoder`
+/// holding the file blob and resolving frame ranges lazily.
+#[derive(Debug)]
+pub(crate) struct LazyParsedContainer {
+    pub canvas: (u32, u32),
+    pub frames: Vec<LazyParsedFrame>,
+    /// Sum of all `duration_ms` fields across `frames` — kept for
+    /// parity with [`ParsedContainer`] so the lazy path can produce
+    /// the same `StreamInfo::duration` whenever a future hookup wants
+    /// it. Currently unused by the streaming `WebpAnimDecoder`, which
+    /// surfaces duration on a per-frame basis.
+    #[allow(dead_code)]
+    pub total_duration_ms: u32,
+    pub metadata: WebpFileMetadata,
+    pub anim_background_bgra: Option<[u8; 4]>,
+    pub anim_loop_count: Option<u16>,
+}
+
+/// Per-frame entry in [`LazyParsedContainer`]. `image` and `alph` carry
+/// only the kind tag + a `(offset, length)` pair into the body buffer
+/// — the actual VP8/VP8L/ALPH bytes stay in the buffer until the
+/// decoder slices them on demand.
+#[derive(Debug, Clone)]
+pub(crate) struct LazyParsedFrame {
+    pub image: LazyImageRef,
+    pub alph: Option<LazyAlphRef>,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u32,
+    pub dispose_to_background: bool,
+    pub blend_with_previous: bool,
+}
+
+/// Image-payload reference into the owning buffer. Same semantics as
+/// [`ImagePayload`] but byte-range instead of owned `Vec`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LazyImageRef {
+    Vp8 { offset: usize, len: usize },
+    Vp8l { offset: usize, len: usize },
+}
+
+/// ALPH-chunk reference into the owning buffer — the 3 header nibbles
+/// (`pre_processing` / `filtering` / `compression`) are still parsed
+/// eagerly because the VP8X parser uses them, but the (potentially
+/// large) compressed alpha plane stays in the body buffer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LazyAlphRef {
+    /// Pre-processing nibble of the ALPH header byte (RFC 9649 §3.4).
+    /// Currently unused by the decoder (libwebp's encoder doesn't emit
+    /// any pre-processing other than 0); kept for parity with
+    /// [`AlphChunk`] so a future implementation can pick it up without
+    /// re-walking the chunks.
+    #[allow(dead_code)]
+    pub pre_processing: u8,
+    pub filtering: u8,
+    pub compression: u8,
+    pub data_offset: usize,
+    pub data_len: usize,
+}
+
 #[cfg(feature = "registry")]
 impl ParsedContainer {
     fn into_packets(self, tb: TimeBase) -> Vec<Packet> {
@@ -752,6 +824,259 @@ fn parse_vp8l_dims(vp8l: &[u8]) -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
+/// Memory-tight counterpart to [`parse_webp_body`]. Walks the RIFF
+/// chunk tree once and returns a [`LazyParsedContainer`] whose frames
+/// reference VP8/VP8L/ALPH bytes via `(offset, len)` ranges into
+/// `body` instead of cloning each chunk into an owned `Vec<u8>`.
+///
+/// Returned offsets are relative to `body` (i.e. the slice the caller
+/// passed in), not the full RIFF file. Consumers that own the file
+/// buffer (e.g. [`crate::WebpAnimDecoder`]) need to remember the
+/// `body` start offset (it's always the byte after the 12-byte
+/// `RIFF/<size>/WEBP` preamble) when slicing.
+///
+/// This function is lossless w.r.t. [`parse_webp_body`] — the same set
+/// of frames in the same order, the same metadata, the same ANIM bg /
+/// loop-count, the same total duration. Only the per-frame storage
+/// shape changes from owned to borrowed-via-offset.
+pub(crate) fn parse_webp_body_lazy(body: &[u8]) -> Result<LazyParsedContainer> {
+    let mut chunks = RiffChunks::new(body);
+    let first = chunks
+        .next()
+        .transpose()?
+        .ok_or_else(|| Error::invalid("WebP: empty RIFF body"))?;
+
+    match &first.id {
+        b"VP8 " => {
+            let (w, h) = parse_vp8_keyframe_dims(first.data)?;
+            let frame = LazyParsedFrame {
+                image: LazyImageRef::Vp8 {
+                    offset: first.payload_offset,
+                    len: first.data.len(),
+                },
+                alph: None,
+                x_offset: 0,
+                y_offset: 0,
+                width: w,
+                height: h,
+                duration_ms: 0,
+                dispose_to_background: false,
+                blend_with_previous: false,
+            };
+            Ok(LazyParsedContainer {
+                canvas: (w, h),
+                frames: vec![frame],
+                total_duration_ms: 0,
+                metadata: WebpFileMetadata::default(),
+                anim_background_bgra: None,
+                anim_loop_count: None,
+            })
+        }
+        b"VP8L" => {
+            let (w, h) = parse_vp8l_dims(first.data)?;
+            let frame = LazyParsedFrame {
+                image: LazyImageRef::Vp8l {
+                    offset: first.payload_offset,
+                    len: first.data.len(),
+                },
+                alph: None,
+                x_offset: 0,
+                y_offset: 0,
+                width: w,
+                height: h,
+                duration_ms: 0,
+                dispose_to_background: false,
+                blend_with_previous: false,
+            };
+            Ok(LazyParsedContainer {
+                canvas: (w, h),
+                frames: vec![frame],
+                total_duration_ms: 0,
+                metadata: WebpFileMetadata::default(),
+                anim_background_bgra: None,
+                anim_loop_count: None,
+            })
+        }
+        b"VP8X" => parse_extended_lazy(first.data, &mut chunks),
+        other => Err(Error::invalid(format!(
+            "WebP: unexpected first chunk {:?}",
+            std::str::from_utf8(other).unwrap_or("???")
+        ))),
+    }
+}
+
+fn parse_extended_lazy(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<LazyParsedContainer> {
+    if vp8x.len() < 10 {
+        return Err(Error::invalid("WebP: VP8X chunk too short"));
+    }
+    let flags = vp8x[0];
+    let has_anim = flags & 0x02 != 0;
+    let canvas_w = (u32::from_le_bytes([vp8x[4], vp8x[5], vp8x[6], 0]) & 0x00FF_FFFF) + 1;
+    let canvas_h = (u32::from_le_bytes([vp8x[7], vp8x[8], vp8x[9], 0]) & 0x00FF_FFFF) + 1;
+
+    let mut frames: Vec<LazyParsedFrame> = Vec::new();
+    let mut pending_alph: Option<LazyAlphRef> = None;
+    let mut pending_image: Option<LazyImageRef> = None;
+    let mut metadata = WebpFileMetadata::default();
+    let mut anim_background_bgra: Option<[u8; 4]> = None;
+    let mut anim_loop_count: Option<u16> = None;
+    let mut total_duration = 0u32;
+
+    while let Some(c) = chunks.next().transpose()? {
+        match &c.id {
+            b"VP8 " => {
+                pending_image = Some(LazyImageRef::Vp8 {
+                    offset: c.payload_offset,
+                    len: c.data.len(),
+                });
+            }
+            b"VP8L" => {
+                pending_image = Some(LazyImageRef::Vp8l {
+                    offset: c.payload_offset,
+                    len: c.data.len(),
+                });
+            }
+            b"ALPH" => {
+                if c.data.is_empty() {
+                    return Err(Error::invalid("WebP: ALPH chunk empty"));
+                }
+                let hdr = c.data[0];
+                pending_alph = Some(LazyAlphRef {
+                    pre_processing: (hdr >> 4) & 0x3,
+                    filtering: (hdr >> 2) & 0x3,
+                    compression: hdr & 0x3,
+                    // Skip the 1-byte ALPH header — `data_offset`
+                    // points at the compressed alpha plane proper.
+                    data_offset: c.payload_offset + 1,
+                    data_len: c.data.len() - 1,
+                });
+            }
+            b"ANMF" => {
+                let f = parse_anmf_lazy(c.data, c.payload_offset)?;
+                total_duration = total_duration.saturating_add(f.duration_ms);
+                frames.push(f);
+            }
+            // The auxiliary metadata chunks are typically small (a few
+            // hundred bytes for ICCP, ~tens of KB for EXIF/XMP); we
+            // continue cloning them eagerly because consumers of
+            // `WebpAnimInfo` expect owned `Vec<u8>` and the savings
+            // wouldn't change the asymptotic memory shape (animations
+            // dwarf metadata).
+            b"ICCP" => metadata.icc = Some(c.data.to_vec()),
+            b"EXIF" => metadata.exif = Some(c.data.to_vec()),
+            b"XMP " => metadata.xmp = Some(c.data.to_vec()),
+            b"ANIM" if c.data.len() >= 6 => {
+                anim_background_bgra = Some([c.data[0], c.data[1], c.data[2], c.data[3]]);
+                anim_loop_count = Some(u16::from_le_bytes([c.data[4], c.data[5]]));
+            }
+            b"ANIM" => {}
+            _ => {}
+        }
+    }
+    if !has_anim {
+        anim_background_bgra = None;
+        anim_loop_count = None;
+    }
+    if !has_anim {
+        let image = pending_image
+            .ok_or_else(|| Error::invalid("WebP: extended file has no image chunk"))?;
+        // Compute width/height from the image bitstream, falling back
+        // to the canvas dims if the parse fails (matches the eager
+        // path's tolerance).
+        let body_full_view = chunks.body;
+        let (w, h) = match image {
+            LazyImageRef::Vp8 { offset, len } => {
+                parse_vp8_keyframe_dims(&body_full_view[offset..offset + len])
+                    .unwrap_or((canvas_w, canvas_h))
+            }
+            LazyImageRef::Vp8l { offset, len } => {
+                parse_vp8l_dims(&body_full_view[offset..offset + len])
+                    .unwrap_or((canvas_w, canvas_h))
+            }
+        };
+        frames.push(LazyParsedFrame {
+            image,
+            alph: pending_alph.take(),
+            x_offset: 0,
+            y_offset: 0,
+            width: w,
+            height: h,
+            duration_ms: 0,
+            dispose_to_background: false,
+            blend_with_previous: false,
+        });
+    }
+    Ok(LazyParsedContainer {
+        canvas: (canvas_w, canvas_h),
+        frames,
+        total_duration_ms: total_duration,
+        metadata,
+        anim_background_bgra,
+        anim_loop_count,
+    })
+}
+
+fn parse_anmf_lazy(data: &[u8], anmf_payload_offset: usize) -> Result<LazyParsedFrame> {
+    if data.len() < 16 {
+        return Err(Error::invalid("WebP: ANMF header too short"));
+    }
+    let x_off = u32::from_le_bytes([data[0], data[1], data[2], 0]) & 0x00FF_FFFF;
+    let y_off = u32::from_le_bytes([data[3], data[4], data[5], 0]) & 0x00FF_FFFF;
+    let w = (u32::from_le_bytes([data[6], data[7], data[8], 0]) & 0x00FF_FFFF) + 1;
+    let h = (u32::from_le_bytes([data[9], data[10], data[11], 0]) & 0x00FF_FFFF) + 1;
+    let dur = u32::from_le_bytes([data[12], data[13], data[14], 0]) & 0x00FF_FFFF;
+    let flags = data[15];
+    let blend_with_previous = flags & 0x01 == 0;
+    let dispose_to_background = flags & 0x02 != 0;
+
+    // The nested-chunk iterator walks `data[16..]`; offsets it produces
+    // are relative to that sub-slice. We add `anmf_payload_offset + 16`
+    // to translate them back to body-buffer offsets.
+    let mut chunks = RiffChunks::new(&data[16..]);
+    let mut image: Option<LazyImageRef> = None;
+    let mut alph: Option<LazyAlphRef> = None;
+    while let Some(c) = chunks.next().transpose()? {
+        let abs_offset = anmf_payload_offset + 16 + c.payload_offset;
+        match &c.id {
+            b"VP8 " => {
+                image = Some(LazyImageRef::Vp8 {
+                    offset: abs_offset,
+                    len: c.data.len(),
+                });
+            }
+            b"VP8L" => {
+                image = Some(LazyImageRef::Vp8l {
+                    offset: abs_offset,
+                    len: c.data.len(),
+                });
+            }
+            b"ALPH" if !c.data.is_empty() => {
+                let hdr = c.data[0];
+                alph = Some(LazyAlphRef {
+                    pre_processing: (hdr >> 4) & 0x3,
+                    filtering: (hdr >> 2) & 0x3,
+                    compression: hdr & 0x3,
+                    data_offset: abs_offset + 1,
+                    data_len: c.data.len() - 1,
+                });
+            }
+            _ => {}
+        }
+    }
+    let image = image.ok_or_else(|| Error::invalid("WebP: ANMF has no image chunk"))?;
+    Ok(LazyParsedFrame {
+        image,
+        alph,
+        x_offset: x_off * 2,
+        y_offset: y_off * 2,
+        width: w,
+        height: h,
+        duration_ms: dur,
+        dispose_to_background,
+        blend_with_previous,
+    })
+}
+
 /// Iterator over RIFF chunks inside a body. Borrows the body slice.
 struct RiffChunks<'a> {
     body: &'a [u8],
@@ -767,6 +1092,10 @@ impl<'a> RiffChunks<'a> {
 struct ChunkRef<'a> {
     id: [u8; 4],
     data: &'a [u8],
+    /// Offset of `data[0]` inside the iterator's `body` slice. Used by
+    /// the lazy demuxer to record `(offset, len)` ranges into the
+    /// owning buffer instead of cloning chunks.
+    payload_offset: usize,
 }
 
 impl<'a> Iterator for RiffChunks<'a> {
@@ -795,9 +1124,14 @@ impl<'a> Iterator for RiffChunks<'a> {
             return Some(Err(Error::invalid("WebP: chunk extends past RIFF body")));
         }
         let data = &self.body[payload_start..payload_end];
+        let payload_offset = payload_start;
         let padded = (size + (size & 1)).min(self.body.len().saturating_sub(payload_start));
         self.pos = payload_start + padded;
-        Some(Ok(ChunkRef { id, data }))
+        Some(Ok(ChunkRef {
+            id,
+            data,
+            payload_offset,
+        }))
     }
 }
 

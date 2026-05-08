@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-decoder)* **`WebpAnimDecoder::seek_to_frame(idx)` random-
+  access** — positions the decoder so the next `next_frame()` call
+  returns frame `idx`. Animated WebP carries cross-frame state
+  (each ANMF blends or overwrites onto a persistent canvas, with
+  optional dispose-to-background after rendering), so the
+  implementation rewinds to frame 0 and replays frames `0..idx`
+  against the canvas. Same shape + semantics as libwebp's
+  `WebPAnimDecoderReset` + N×`WebPAnimDecoderGetNext` sequence.
+  `target == 0` is equivalent to `reset()`; `target == frame_count`
+  lands at end-of-stream; `target > frame_count` is rejected.
+  Backward seeks reset and replay; forward seeks from current
+  position skip the rewind. The replay's intermediate frames are
+  consumed internally without queueing — memory cost is one
+  `WebpAnimFrame` worth + the persistent canvas at any moment.
+  Ergonomic API for UI scrubbers and "skip to keyframe" tooling
+  over animations whose loop count exceeds 1.
+- *(anim-decoder)* **Memory-tight streaming demux** — the lazy
+  parser (`crate::demux::parse_webp_body_lazy`) walks the RIFF
+  chunk tree once and records per-frame VP8/VP8L/ALPH bitstreams
+  as `(offset, length)` ranges into a single owned body buffer,
+  instead of cloning each chunk into per-frame `Vec<u8>`. For a
+  1000-frame animation the savings are ~1000 fewer allocations +
+  the file size's worth of avoided memcpy traffic; the actual
+  bitstream slice is handed to the codec (VP8 / VP8L / ALPH-VP8L)
+  zero-copy until the per-frame decode runs. The eager
+  `decode_webp` path keeps using the owned `parse_webp_body` so
+  existing callers see no observable change. Internal:
+  `LazyParsedContainer`, `LazyParsedFrame`, `LazyImageRef`,
+  `LazyAlphRef`, `decode_lazy_frame_to_rgba`. The `ChunkRef`
+  iterator now exposes `payload_offset` so both paths share the
+  same chunk walker.
+
 - *(anim-decoder)* **Streaming animated WebP decoder** —
   `WebpAnimDecoder::new(bytes)` builds a pull-driven decoder that
   yields one `WebpAnimFrame` per `next_frame()` call. Mirrors

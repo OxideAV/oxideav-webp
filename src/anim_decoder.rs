@@ -12,7 +12,7 @@
 //! but the implementation is wholly our own — the demuxer, VP8/VP8L
 //! decoders, alpha-overlay path, disposal/blend state machine, and
 //! `[B,G,R,A]`→RGBA conversion are all already present in this crate
-//! (`crate::demux::parse_webp_body`, `crate::decoder` helpers,
+//! (`crate::demux::parse_webp_body_lazy`, `crate::decoder` helpers,
 //! `crate::demux::bgra_to_rgba`).
 //!
 //! Example:
@@ -33,16 +33,31 @@
 //! with the ANIM background colour *after* we hand the frame to the
 //! caller — exactly what the eager [`crate::decode_webp`] does.
 //!
-//! The decoder takes the bytes by reference *and copies the bitstreams
-//! out into owned `ParsedFrame`s* (the existing `parse_webp_body`
-//! behaviour). The copy lets the decoder work after the caller's bytes
-//! buffer is gone — convenient for callers that read a `.webp` over
-//! the network and want to drop the response buffer eagerly. Memory
-//! cost is one allocation per ANMF chunk, ~equal to the file size for
-//! animation-heavy inputs.
+//! # Memory shape: lazy demux
+//!
+//! The decoder copies the caller's `bytes` into an internal buffer once
+//! at construction (so it can survive the caller dropping their slice),
+//! then walks the RIFF chunk tree via
+//! [`crate::demux::parse_webp_body_lazy`]. Each frame stores only
+//! `(offset, length)` ranges into the owned buffer rather than per-frame
+//! `Vec<u8>` clones. For a 1000-frame animation the savings are ~1000
+//! avoided allocations + the file-size's worth of avoided memcpy
+//! traffic; pulled bitstreams stay zero-copy until the actual VP8/VP8L
+//! decode runs.
+//!
+//! # Random access: `seek_to_frame`
+//!
+//! Animated WebP carries cross-frame state — each ANMF blends or
+//! overwrites onto the persistent canvas, and the dispose-to-background
+//! flag wipes regions to the file's ANIM background colour. There is no
+//! standalone "this frame's contents at PTS T" representation; you have
+//! to replay every preceding frame to land on a correct canvas.
+//! `seek_to_frame(idx)` replays frames `0..idx` from a clean canvas
+//! (mirroring libwebp's `WebPAnimDecoderReset` semantics) so the next
+//! `next_frame()` call returns frame `idx`.
 
-use crate::decoder::{canvas_filled, composite, decode_parsed_frame_to_rgba};
-use crate::demux::{bgra_to_rgba, parse_webp_body, ParsedContainer, WebpFileMetadata};
+use crate::decoder::{canvas_filled, composite, decode_lazy_frame_to_rgba};
+use crate::demux::{bgra_to_rgba, parse_webp_body_lazy, LazyParsedContainer, WebpFileMetadata};
 use crate::error::{Result, WebpError as Error};
 
 /// One frame emitted by [`WebpAnimDecoder::next_frame`]. The `rgba`
@@ -135,14 +150,21 @@ pub struct WebpAnimInfo {
 /// internally, so consumers don't need to track it separately.
 ///
 /// Cheap to construct (just walks the chunk list — no pixel decoding).
-/// Memory cost is `canvas_w * canvas_h * 4` for the canvas + the
-/// already-existing per-frame `ParsedFrame` storage from the demuxer.
+/// Memory cost is `canvas_w * canvas_h * 4` for the canvas + the owned
+/// copy of the input bytes (chunk byte-ranges are referenced via
+/// offsets, not cloned).
 pub struct WebpAnimDecoder {
     info: WebpAnimInfo,
-    /// Pre-parsed frames in presentation order — same data the eager
-    /// `decode_webp` path holds, stashed here so we can iterate
-    /// lazily.
-    parsed: ParsedContainer,
+    /// Owned copy of the RIFF body (everything after the 12-byte
+    /// `RIFF/<size>/WEBP` preamble). Held so the per-frame `(offset,
+    /// length)` ranges in `parsed.frames` stay valid through the
+    /// decoder's lifetime — the caller's `bytes` slice can be dropped
+    /// after [`Self::new`] returns.
+    body: Vec<u8>,
+    /// Pre-parsed frame metadata + offset/length ranges. The actual
+    /// VP8/VP8L/ALPH bitstream bytes stay in `body` and get sliced on
+    /// demand inside `next_frame()`.
+    parsed: LazyParsedContainer,
     /// Persistent RGBA canvas; mutated in place across `next_frame`
     /// calls per the ANMF blend/disposal rules.
     canvas: Vec<u8>,
@@ -178,8 +200,11 @@ impl WebpAnimDecoder {
         }
         let riff_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
         let end = (8 + riff_size).min(bytes.len());
-        let body = &bytes[12..end];
-        let parsed = parse_webp_body(body)?;
+        // Own the body bytes so per-frame offsets survive the caller
+        // dropping their slice. One allocation, sized to the body
+        // (typically `bytes.len() - 12`).
+        let body: Vec<u8> = bytes[12..end].to_vec();
+        let parsed = parse_webp_body_lazy(&body)?;
         let (canvas_w, canvas_h) = parsed.canvas;
         let bg_rgba = parsed
             .anim_background_bgra
@@ -196,6 +221,7 @@ impl WebpAnimDecoder {
         };
         Ok(Self {
             info,
+            body,
             parsed,
             canvas,
             bg_rgba,
@@ -249,21 +275,36 @@ impl WebpAnimDecoder {
             return Ok(None);
         }
         let frame_index = self.next_index;
-        let f = &self.parsed.frames[frame_index];
-        // Snapshot the per-frame fields we want to expose before we
-        // hand the &ParsedFrame to the helper that owns the borrow.
-        let duration_ms = f.duration_ms;
-        let blend_with_previous = f.blend_with_previous;
-        let dispose_to_background = f.dispose_to_background;
-        let frame_x = f.x_offset;
-        let frame_y = f.y_offset;
-        let frame_w = f.width;
-        let frame_h = f.height;
+        // Snapshot per-frame fields up front so we can release the &
+        // borrow before `decode_lazy_frame_to_rgba` runs (it borrows
+        // `&self.body` immutably — taking it after this scope keeps
+        // borrowck happy).
+        let (
+            duration_ms,
+            blend_with_previous,
+            dispose_to_background,
+            frame_x,
+            frame_y,
+            frame_w,
+            frame_h,
+        ) = {
+            let f = &self.parsed.frames[frame_index];
+            (
+                f.duration_ms,
+                f.blend_with_previous,
+                f.dispose_to_background,
+                f.x_offset,
+                f.y_offset,
+                f.width,
+                f.height,
+            )
+        };
 
-        // Decode the image chunk into a tile-sized RGBA buffer. This
-        // is the only really expensive bit of `next_frame` — it runs
-        // the VP8 / VP8L decoder + alpha-overlay path for *one* frame.
-        let tile_rgba = decode_parsed_frame_to_rgba(f)?;
+        // Decode the image chunk into a tile-sized RGBA buffer. Slices
+        // straight out of `self.body` via the per-frame offset/length —
+        // no per-frame `Vec<u8>` clone of the bitstream.
+        let f = &self.parsed.frames[frame_index];
+        let tile_rgba = decode_lazy_frame_to_rgba(f, &self.body)?;
 
         // Composite onto the persistent canvas, honouring the ANMF
         // blend flag.
@@ -292,20 +333,7 @@ impl WebpAnimDecoder {
         // the returned frame shows the rendered state and only the
         // *next* frame sees the disposed canvas.
         if dispose_to_background {
-            let x0 = frame_x as usize;
-            let y0 = frame_y as usize;
-            let x1 = (x0 + frame_w as usize).min(self.info.canvas_width as usize);
-            let y1 = (y0 + frame_h as usize).min(self.info.canvas_height as usize);
-            let cw = self.info.canvas_width as usize;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let i = (y * cw + x) * 4;
-                    self.canvas[i] = self.bg_rgba[0];
-                    self.canvas[i + 1] = self.bg_rgba[1];
-                    self.canvas[i + 2] = self.bg_rgba[2];
-                    self.canvas[i + 3] = self.bg_rgba[3];
-                }
-            }
+            self.fill_bbox_with_bg(frame_x, frame_y, frame_w, frame_h);
         }
 
         self.next_index += 1;
@@ -332,6 +360,125 @@ impl WebpAnimDecoder {
     /// extra counter.
     pub fn next_frame_index(&self) -> usize {
         self.next_index
+    }
+
+    /// Position the decoder so the next [`Self::next_frame`] call
+    /// returns frame `target`. Animated WebP carries cross-frame state
+    /// (each ANMF blends or overwrites onto a persistent canvas, with
+    /// optional dispose-to-background after rendering) so we can't skip
+    /// directly — the implementation rewinds to frame 0 and replays
+    /// frames `0..target` against the canvas. Same shape as libwebp's
+    /// `WebPAnimDecoderReset` + N×`WebPAnimDecoderGetNext` sequence.
+    ///
+    /// Replay cost is O(target) decodes; for callers that want to
+    /// scrub a long animation this is the spec-correct way to do it
+    /// (libwebp's animation-decoder API documents the same shape and
+    /// semantics).
+    ///
+    /// `target == 0` is equivalent to [`Self::reset`]. `target ==
+    /// info().frame_count` lands the decoder at end-of-stream;
+    /// `target > info().frame_count` is rejected as
+    /// [`Error::invalid`]. The function is a no-op (and reports
+    /// success) when the decoder is already positioned at `target` —
+    /// useful for callers driving the decoder from a UI scrubber that
+    /// re-issues the same seek per render frame.
+    ///
+    /// Frames produced during the replay are *consumed internally* —
+    /// the decoder doesn't queue them, so memory cost is one
+    /// [`WebpAnimFrame`] worth + the persistent canvas at any moment.
+    /// Errors from the replay (a corrupt frame mid-stream) are
+    /// surfaced verbatim and leave the decoder in the partially-
+    /// advanced state so the caller can choose to drop it or call
+    /// `reset` and try a different target.
+    pub fn seek_to_frame(&mut self, target: usize) -> Result<()> {
+        if target > self.parsed.frames.len() {
+            return Err(Error::invalid("WebP: seek_to_frame past end"));
+        }
+        // Already there.
+        if target == self.next_index {
+            return Ok(());
+        }
+        // Forward seek can replay from current position; backward seek
+        // needs a full reset because the canvas is one-way mutable.
+        if target < self.next_index {
+            self.reset();
+        }
+        // Replay frames `next_index..target` *without queueing* the
+        // intermediate snapshots. We re-implement `next_frame`'s body
+        // here but skip the `frame_rgba = self.canvas.clone()` step —
+        // that's the expensive bit on a wide canvas.
+        while self.next_index < target {
+            self.advance_one_frame_no_snapshot()?;
+        }
+        Ok(())
+    }
+
+    /// Same as `next_frame` but without cloning the canvas into a
+    /// returned `WebpAnimFrame` — used by the seek replay where we
+    /// only care that the canvas state is correct at `target`.
+    fn advance_one_frame_no_snapshot(&mut self) -> Result<()> {
+        debug_assert!(self.next_index < self.parsed.frames.len());
+        let frame_index = self.next_index;
+        let (
+            duration_ms,
+            blend_with_previous,
+            dispose_to_background,
+            frame_x,
+            frame_y,
+            frame_w,
+            frame_h,
+        ) = {
+            let f = &self.parsed.frames[frame_index];
+            (
+                f.duration_ms,
+                f.blend_with_previous,
+                f.dispose_to_background,
+                f.x_offset,
+                f.y_offset,
+                f.width,
+                f.height,
+            )
+        };
+        let f = &self.parsed.frames[frame_index];
+        let tile_rgba = decode_lazy_frame_to_rgba(f, &self.body)?;
+        composite(
+            &mut self.canvas,
+            self.info.canvas_width,
+            self.info.canvas_height,
+            &tile_rgba,
+            frame_x,
+            frame_y,
+            frame_w,
+            frame_h,
+            blend_with_previous,
+        );
+        self.pts_ms = self.pts_ms.saturating_add(duration_ms.max(1) as u64);
+        if dispose_to_background {
+            self.fill_bbox_with_bg(frame_x, frame_y, frame_w, frame_h);
+        }
+        self.next_index += 1;
+        Ok(())
+    }
+
+    /// Fill the canvas region `[x..x+w, y..y+h]` with the file's ANIM
+    /// background colour. Centralised so `next_frame` and
+    /// `advance_one_frame_no_snapshot` agree on the dispose-to-bg fill.
+    fn fill_bbox_with_bg(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        let cw = self.info.canvas_width as usize;
+        let ch = self.info.canvas_height as usize;
+        let x0 = (x as usize).min(cw);
+        let y0 = (y as usize).min(ch);
+        let x1 = (x as usize + w as usize).min(cw);
+        let y1 = (y as usize + h as usize).min(ch);
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let i = (yy * cw + xx) * 4;
+                self.canvas[i] = self.bg_rgba[0];
+                self.canvas[i + 1] = self.bg_rgba[1];
+                self.canvas[i + 2] = self.bg_rgba[2];
+                self.canvas[i + 3] = self.bg_rgba[3];
+            }
+        }
     }
 }
 
@@ -548,5 +695,126 @@ mod tests {
     fn rejects_malformed_magic() {
         let bad = b"junk junk junk junk".to_vec();
         assert!(WebpAnimDecoder::new(&bad).is_err());
+    }
+
+    // ---- seek_to_frame coverage ----
+
+    #[test]
+    fn seek_to_frame_zero_equals_reset() {
+        let blob = three_frame_anim();
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        // Pull a couple of frames so we're not already at 0.
+        let _ = dec.next_frame().expect("ok").expect("Some");
+        let _ = dec.next_frame().expect("ok").expect("Some");
+        dec.seek_to_frame(0).expect("seek");
+        assert_eq!(dec.next_frame_index(), 0);
+        let f0 = dec.next_frame().expect("ok").expect("Some");
+        assert!(f0.is_keyframe);
+        assert_eq!(f0.pts_ms, 0);
+        assert_eq!(&f0.rgba[0..4], &[0xff, 0, 0, 0xff], "back to red");
+    }
+
+    #[test]
+    fn seek_to_frame_jumps_forward_and_lands_correctly() {
+        let blob = three_frame_anim();
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        // Jump straight to frame 2 (blue) — replay should put canvas
+        // through red→green so the next pull is blue at PTS 70.
+        dec.seek_to_frame(2).expect("seek");
+        assert_eq!(dec.next_frame_index(), 2);
+        let f2 = dec.next_frame().expect("ok").expect("Some");
+        assert_eq!(f2.pts_ms, 70);
+        assert_eq!(&f2.rgba[0..4], &[0, 0, 0xff, 0xff], "F2 should be blue");
+        // After consuming frame 2 we should be at end.
+        assert!(dec.done());
+    }
+
+    #[test]
+    fn seek_to_frame_backward_resets_then_replays() {
+        let blob = three_frame_anim();
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        // Drain everything so we're at end.
+        while dec.next_frame().expect("ok").is_some() {}
+        assert!(dec.done());
+        // Backward seek should reset and replay frame 0.
+        dec.seek_to_frame(1).expect("seek");
+        assert_eq!(dec.next_frame_index(), 1);
+        let f1 = dec.next_frame().expect("ok").expect("Some");
+        assert_eq!(f1.pts_ms, 30);
+        assert_eq!(&f1.rgba[0..4], &[0, 0xff, 0, 0xff], "F1 should be green");
+    }
+
+    #[test]
+    fn seek_to_frame_at_end_is_done() {
+        let blob = three_frame_anim();
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        dec.seek_to_frame(3).expect("seek to end");
+        assert!(dec.done());
+        assert!(dec.next_frame().expect("ok").is_none());
+    }
+
+    #[test]
+    fn seek_to_frame_past_end_errors() {
+        let blob = three_frame_anim();
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        // 3 frames; index 4 is past the end (idx == frame_count is OK,
+        // it lands at end-of-stream).
+        assert!(dec.seek_to_frame(4).is_err());
+        // Decoder state should be unchanged.
+        assert_eq!(dec.next_frame_index(), 0);
+    }
+
+    #[test]
+    fn seek_to_frame_idempotent_at_current_position() {
+        let blob = three_frame_anim();
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        let _ = dec.next_frame().expect("ok").expect("Some");
+        // seek to same position should be a no-op + not advance.
+        dec.seek_to_frame(1).expect("seek");
+        assert_eq!(dec.next_frame_index(), 1);
+        let f1 = dec.next_frame().expect("ok").expect("Some");
+        assert_eq!(f1.pts_ms, 30);
+    }
+
+    #[test]
+    fn seek_preserves_dispose_to_background_canvas_state() {
+        // After `seek_to_frame(1)` the decoder should have already
+        // applied frame 0's dispose-to-background, so the next pull
+        // (frame 1, smaller bbox) sees the BG-painted backdrop.
+        let bg_bgra: [u8; 4] = [0x40, 0x50, 0x60, 0xff];
+        let bg_rgba_expected = [0x60, 0x50, 0x40, 0xff];
+        let f0_tile = solid(W, H, [0xff, 0, 0, 0xff]);
+        let f1_tile = solid(2, 2, [0, 0xff, 0, 0xff]);
+        let frames = [
+            AnimFrame {
+                width: W,
+                height: H,
+                x_offset: 0,
+                y_offset: 0,
+                duration_ms: 40,
+                blend: false,
+                dispose_to_background: true,
+                rgba: &f0_tile,
+            },
+            AnimFrame {
+                width: 2,
+                height: 2,
+                x_offset: 0,
+                y_offset: 0,
+                duration_ms: 40,
+                blend: false,
+                dispose_to_background: false,
+                rgba: &f1_tile,
+            },
+        ];
+        let blob = build_animated_webp(W, H, bg_bgra, 0, &frames).expect("encode");
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        dec.seek_to_frame(1).expect("seek");
+        let f1 = dec.next_frame().expect("ok").expect("Some");
+        let stride = (W as usize) * 4;
+        // BG region (outside the 2×2 green tile) should be the ANIM
+        // background colour, proving the dispose ran during replay.
+        let i = (3 * stride) + (5 * 4);
+        assert_eq!(&f1.rgba[i..i + 4], &bg_rgba_expected);
     }
 }

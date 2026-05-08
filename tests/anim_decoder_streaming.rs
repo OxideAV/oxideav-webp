@@ -125,6 +125,45 @@ fn pts_advances_with_one_ms_floor_for_zero_duration_frames() {
 }
 
 #[test]
+fn seek_to_frame_lands_on_correct_canvas_state() {
+    // End-to-end test: jump to frame 3 on a 5-frame animation and
+    // confirm the next pull returns frame 3 (yellow) at its expected
+    // PTS. The replay through frames 0..3 is verified by comparing
+    // each replayed frame against the eager `decode_webp` path.
+    let blob = five_frame_anim();
+    let eager = decode_webp(&blob).expect("eager decode");
+    let mut dec = WebpAnimDecoder::new(&blob).expect("streaming new");
+    dec.seek_to_frame(3).expect("seek");
+    assert_eq!(dec.next_frame_index(), 3);
+    let f3 = dec.next_frame().expect("ok").expect("Some");
+    assert_eq!(f3.pts_ms, 120);
+    assert_eq!(f3.duration_ms, 0);
+    assert_eq!(
+        f3.rgba, eager.frames[3].rgba,
+        "seek-then-pull lands on the same canvas as the eager path"
+    );
+}
+
+#[test]
+fn seek_round_trip_matches_eager_decoder_for_every_index() {
+    // For each index 0..frame_count, build a fresh decoder, seek to
+    // it, pull one frame, and confirm it matches the eager decoder's
+    // same-index frame. Catches off-by-one errors in the seek replay
+    // loop or in the PTS arithmetic across re-anchors.
+    let blob = five_frame_anim();
+    let eager = decode_webp(&blob).expect("eager decode");
+    for i in 0..eager.frames.len() {
+        let mut dec = WebpAnimDecoder::new(&blob).expect("new");
+        dec.seek_to_frame(i).expect("seek");
+        let frame = dec.next_frame().expect("ok").expect("Some");
+        assert_eq!(
+            frame.rgba, eager.frames[i].rgba,
+            "seek_to_frame({i}) + next_frame doesn't match eager.frames[{i}]"
+        );
+    }
+}
+
+#[test]
 fn info_metadata_matches_eager_webpimage_fields() {
     // Build with all three metadata chunks + a non-zero BG + non-default
     // loop count, then verify `WebpAnimDecoder::info` and

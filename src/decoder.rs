@@ -26,7 +26,10 @@ use oxideav_vp8::decode_vp8 as decode_vp8_frame;
 
 #[cfg(feature = "registry")]
 use crate::demux::{decode_frame_payload, DecodedAlph};
-use crate::demux::{AlphChunk, ImagePayload, ParsedFrame, WebpFileMetadata};
+use crate::demux::{
+    AlphChunk, ImagePayload, LazyAlphRef, LazyImageRef, LazyParsedFrame, ParsedFrame,
+    WebpFileMetadata,
+};
 use crate::error::{Result, WebpError as Error};
 use crate::vp8l;
 
@@ -145,6 +148,95 @@ pub(crate) fn decode_parsed_frame_to_rgba(f: &ParsedFrame) -> Result<Vec<u8>> {
         tile_rgba
     };
     Ok(tile_rgba)
+}
+
+/// Decode a [`LazyParsedFrame`] into a tightly-packed RGBA tile,
+/// resolving the image / ALPH `(offset, len)` ranges against the
+/// caller-owned `body` buffer. Memory-tight equivalent to
+/// [`decode_parsed_frame_to_rgba`] used by [`crate::WebpAnimDecoder`]
+/// — neither the image bitstream nor the (potentially large) ALPH
+/// payload is cloned before it's handed to the actual codec.
+pub(crate) fn decode_lazy_frame_to_rgba(f: &LazyParsedFrame, body: &[u8]) -> Result<Vec<u8>> {
+    let (image_bytes, is_vp8l) = match f.image {
+        LazyImageRef::Vp8 { offset, len } => {
+            if offset + len > body.len() {
+                return Err(Error::invalid("WebP: VP8 ref out of bounds"));
+            }
+            (&body[offset..offset + len], false)
+        }
+        LazyImageRef::Vp8l { offset, len } => {
+            if offset + len > body.len() {
+                return Err(Error::invalid("WebP: VP8L ref out of bounds"));
+            }
+            (&body[offset..offset + len], true)
+        }
+    };
+    let tile_rgba = if is_vp8l {
+        let img = vp8l::decode(image_bytes)?;
+        img.to_rgba()
+    } else {
+        decode_vp8_to_rgba(image_bytes, f.width, f.height)?
+    };
+    let tile_rgba = if let Some(alph) = &f.alph {
+        let alph_bytes = if alph.data_offset + alph.data_len > body.len() {
+            return Err(Error::invalid("WebP: ALPH ref out of bounds"));
+        } else {
+            &body[alph.data_offset..alph.data_offset + alph.data_len]
+        };
+        overlay_alpha_lazy(tile_rgba, f.width, f.height, alph, alph_bytes)?
+    } else if !is_vp8l {
+        set_alpha_opaque(tile_rgba)
+    } else {
+        tile_rgba
+    };
+    Ok(tile_rgba)
+}
+
+/// Slice-based ALPH decoder used by [`decode_lazy_frame_to_rgba`].
+/// Same algorithm as [`decode_alpha_plane_chunk`], but it never clones
+/// `alph_bytes` for the `compression == 0` (raw) branch — the only
+/// allocation is the synthetic VP8L wrapper used for compressed
+/// alpha planes (which is unavoidable without changing `vp8l::decode`).
+fn overlay_alpha_lazy(
+    mut rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    alph: &LazyAlphRef,
+    alph_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let alpha = decode_alpha_plane_lazy(width, height, alph, alph_bytes)?;
+    if alpha.len() != (width as usize) * (height as usize) {
+        return Err(Error::invalid("WebP: alpha plane size mismatch"));
+    }
+    for (i, &a) in alpha.iter().enumerate() {
+        rgba[i * 4 + 3] = a;
+    }
+    Ok(rgba)
+}
+
+fn decode_alpha_plane_lazy(
+    width: u32,
+    height: u32,
+    alph: &LazyAlphRef,
+    alph_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let mut plane = match alph.compression {
+        0 => alph_bytes.to_vec(),
+        1 => {
+            let mut synth = Vec::with_capacity(alph_bytes.len() + 5);
+            synth.push(0x2f);
+            let w = width.saturating_sub(1) & 0x3fff;
+            let h = height.saturating_sub(1) & 0x3fff;
+            let packed = w | (h << 14);
+            synth.extend_from_slice(&packed.to_le_bytes());
+            synth.extend_from_slice(alph_bytes);
+            let img = vp8l::decode(&synth)?;
+            img.pixels.iter().map(|p| ((p >> 8) & 0xff) as u8).collect()
+        }
+        _ => return Err(Error::invalid("WebP: unknown ALPH compression")),
+    };
+    unfilter_alpha(&mut plane, width as usize, height as usize, alph.filtering);
+    Ok(plane)
 }
 
 /// Variant of [`overlay_alpha`] that takes the owned [`AlphChunk`]
