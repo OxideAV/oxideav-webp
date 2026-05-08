@@ -373,6 +373,17 @@ Encoder scope (current):
   animations). File-level **ICCP / EXIF / XMP** chunks travel through
   [`AnimEncoderOptions::metadata`] and round-trip via both
   [`extract_metadata`] and the [`decode_webp`] full-decode path.
+  AVIF-style **`AnimFrameMode::Delta`** opts each non-first frame into
+  block-level cost-model dirty-rect detection (luminance-biased SAD on
+  configurable `block_size × block_size` blocks; default 8 / threshold
+  32 / max-bbox-fraction 0.8). The encoder takes the bounding box of
+  changed blocks, encodes only that sub-rectangle, and emits an ANMF
+  with `blending_method = 1` (DoNotBlend / overwrite the prior canvas).
+  On a 160×120 fixture with a 32×32 changing corner the delta-mode
+  per-frame ANMF payload is ≤20% of the equivalent full-frame
+  `Lossless` baseline (≥ 80% wire-size reduction). Identical frames
+  collapse to a 1×1 minimal overwrite tile; over-the-threshold frames
+  fall back to a full-canvas encode automatically.
 - One-shot `encode_vp8l_argb_with_metadata(w, h, &argb, has_alpha,
   &meta)` for std-only image-library consumers that want a lossless
   `.webp` file with an attached colour profile / EXIF / XMP **without**

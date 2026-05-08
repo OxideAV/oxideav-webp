@@ -76,7 +76,7 @@ pub use demux::{extract_metadata, WebpFileMetadata};
 pub use encoder::encode_vp8l_argb_with_metadata;
 pub use encoder_anim::{
     build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions, AnimFrame,
-    AnimFrameMode,
+    AnimFrameMode, DeltaConfig,
 };
 pub use encoder_vp8::{
     encode_vp8_lossy_rgb24, encode_vp8_lossy_rgba, encode_vp8_lossy_yuv420p,

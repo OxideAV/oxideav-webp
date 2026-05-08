@@ -55,7 +55,12 @@ use crate::riff::WebpMetadata;
 use crate::vp8l::encode_vp8l_argb;
 
 /// Per-frame mode-selection policy for [`build_animated_webp_with_options`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived because the `Delta` variant carries
+/// a `DeltaConfig` whose `max_bbox_fraction: f32` field doesn't satisfy
+/// the total-equality contract — `PartialEq` is sufficient for the
+/// mode-pattern matches the encoder relies on.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum AnimFrameMode {
     /// Always encode every frame as VP8L (lossless). Bit-exact, larger
     /// files. Matches the historical [`build_animated_webp`] behaviour.
@@ -72,6 +77,66 @@ pub enum AnimFrameMode {
     /// `WebPAnimEncoderAdd` per-frame mode decision.
     #[default]
     Auto,
+    /// **Delta** (AVIF-style perceptual frame-merge): each non-first frame
+    /// is compared against the prior frame on a block-by-block basis using
+    /// a luminance-biased SAD cost model
+    /// ([`DeltaConfig::block_cost`]). Blocks whose cost stays below
+    /// [`DeltaConfig::threshold`] are presumed unchanged; the encoder
+    /// computes the bounding box of all changed blocks, encodes only
+    /// that sub-rectangle, and emits an ANMF with `blending_method = 1`
+    /// (`DoNotBlend` — overwrite the prior canvas). Frames whose change
+    /// region is at most [`DeltaConfig::max_bbox_fraction`] of the
+    /// canvas (default 80%) take the delta path; otherwise the encoder
+    /// falls back to encoding the full frame in `Auto` mode.
+    ///
+    /// Constraints (caller responsibility — checked at encode time):
+    ///   * every frame must be canvas-sized (`width = canvas_w`,
+    ///     `height = canvas_h`, `x_offset = y_offset = 0`),
+    ///   * `dispose_to_background = false` and `blend = false`
+    ///     (delta-mode output forces overwrite, and a dispose-to-bg
+    ///     between frames invalidates the prior-canvas reference).
+    ///
+    /// The first frame is always emitted in full; subsequent frames may
+    /// be partial sub-rectangles.
+    Delta(DeltaConfig),
+}
+
+/// Tunable parameters for the [`AnimFrameMode::Delta`] frame-merge mode.
+///
+/// The cost model is a **luminance-biased sum-of-absolute-differences**
+/// over fixed-size blocks. For each `block_size × block_size` block we
+/// compute `sum_over_pixels |luma(prev) - luma(new)| + 0.25 * |R'-R| +
+/// 0.25 * |G'-G| + 0.25 * |B'-B| + |A'-A|`, where `luma = 0.299R + 0.587G
+/// + 0.114B` (BT.601). A block is considered **changed** if its cost
+/// exceeds [`Self::threshold`].
+///
+/// Defaults are tuned for 8×8 blocks at threshold 32 (≈1 LSB per pixel
+/// on a flat region — small enough to flag any real motion, large
+/// enough to absorb codec rounding noise).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeltaConfig {
+    /// Block side length in pixels. Default 8. The encoder rounds
+    /// the cost-model bbox up to a multiple of this and then up to
+    /// the WebP-mandated even offset.
+    pub block_size: u32,
+    /// Luminance-biased SAD threshold per block — blocks with cost
+    /// strictly greater than this are flagged as changed. Default 32.
+    pub threshold: u32,
+    /// If the changed-region bounding box covers more than this
+    /// fraction of the canvas, the encoder bails out of the delta
+    /// path for that frame and falls back to a full-frame encode in
+    /// `Auto` mode. Range `0.0..=1.0`; default `0.8`.
+    pub max_bbox_fraction: f32,
+}
+
+impl Default for DeltaConfig {
+    fn default() -> Self {
+        Self {
+            block_size: 8,
+            threshold: 32,
+            max_bbox_fraction: 0.8,
+        }
+    }
 }
 
 /// Knob bag for [`build_animated_webp_with_options`]. Defaults pick the
@@ -177,6 +242,22 @@ pub fn build_animated_webp_with_options(
     }
     if frames.is_empty() {
         return Err(Error::invalid("animated WebP: needs at least one frame"));
+    }
+
+    // Delta mode rewrites the input frame stream into per-frame sub-rect
+    // tiles + an internal "auto"-fallback policy before falling through
+    // to the standard layout loop. Doing the rewrite up front keeps the
+    // RIFF body assembly path identical for every mode.
+    if let AnimFrameMode::Delta(cfg) = options.mode {
+        return build_animated_webp_delta(
+            canvas_w,
+            canvas_h,
+            background_bgra,
+            loop_count,
+            frames,
+            &options,
+            cfg,
+        );
     }
 
     // Pre-encode every frame's nested image sub-chunk(s) first. Doing
@@ -343,15 +424,21 @@ fn encode_one_anmf_image(
 ) -> Result<Vec<AnmfSubChunk>> {
     // Always produce the lossless candidate first — it's the
     // historic behaviour and the fallback when the lossy encode fails
-    // (e.g. on too-small frames).
+    // (e.g. on too-small frames). `Delta` is rewritten upstream into
+    // per-frame `Auto`-equivalent encodes — it should never reach
+    // here, but treat it as `Auto` defensively.
     let lossless: Option<Vec<AnmfSubChunk>> = match options.mode {
         AnimFrameMode::Lossy => None,
-        AnimFrameMode::Lossless | AnimFrameMode::Auto => Some(encode_lossless_anmf(f)?),
+        AnimFrameMode::Lossless | AnimFrameMode::Auto | AnimFrameMode::Delta(_) => {
+            Some(encode_lossless_anmf(f)?)
+        }
     };
 
     let lossy: Option<Vec<AnmfSubChunk>> = match options.mode {
         AnimFrameMode::Lossless => None,
-        AnimFrameMode::Lossy | AnimFrameMode::Auto => encode_lossy_anmf(f, options.lossy_quality)?,
+        AnimFrameMode::Lossy | AnimFrameMode::Auto | AnimFrameMode::Delta(_) => {
+            encode_lossy_anmf(f, options.lossy_quality)?
+        }
     };
 
     match (lossless, lossy) {
@@ -462,6 +549,386 @@ fn encode_lossy_anmf(f: &AnimFrame<'_>, quality: f32) -> Result<Option<Vec<AnmfS
         payload: vp8_bytes,
     });
     Ok(Some(subs))
+}
+
+/// AVIF-style delta-merge entry point — see [`AnimFrameMode::Delta`].
+///
+/// Validates Delta-mode caller constraints (canvas-sized full frames,
+/// no per-frame disposal/blend), then for each non-first frame computes
+/// the changed-region bounding box via [`changed_block_bbox`] and emits
+/// either a sub-rect ANMF (cost-model says small change) or a full-frame
+/// ANMF (cost-model says full repaint, or first frame). The returned
+/// blob layout is byte-identical to the standard
+/// [`build_animated_webp_with_options`] output — the only difference is
+/// per-frame ANMF bbox/sub-rect placement and the `blending_method` bit.
+fn build_animated_webp_delta(
+    canvas_w: u32,
+    canvas_h: u32,
+    background_bgra: [u8; 4],
+    loop_count: u16,
+    frames: &[AnimFrame<'_>],
+    options: &AnimEncoderOptions<'_>,
+    cfg: DeltaConfig,
+) -> Result<Vec<u8>> {
+    // Validate cfg defensively first — caller-controlled.
+    if cfg.block_size == 0 {
+        return Err(Error::invalid(
+            "animated WebP delta: block_size must be ≥ 1",
+        ));
+    }
+    if !(cfg.max_bbox_fraction >= 0.0 && cfg.max_bbox_fraction <= 1.0) {
+        return Err(Error::invalid(
+            "animated WebP delta: max_bbox_fraction must be in [0.0, 1.0]",
+        ));
+    }
+
+    // Validate caller constraints + collect per-frame full-canvas RGBA
+    // for the cost-model comparison. We require frames that cover the
+    // whole canvas because we have to reconstruct "what the prior
+    // canvas looks like" to diff against, and the simplest invariant
+    // is `prior_canvas[i] == frames[i-1].rgba` (which only holds when
+    // each frame paints the entire canvas, blend=false, dispose=false).
+    for (i, f) in frames.iter().enumerate() {
+        if f.width != canvas_w || f.height != canvas_h {
+            return Err(Error::invalid(format!(
+                "animated WebP delta: frame {i} must be canvas-sized ({canvas_w}x{canvas_h}), got {}x{}",
+                f.width, f.height
+            )));
+        }
+        if f.x_offset != 0 || f.y_offset != 0 {
+            return Err(Error::invalid(format!(
+                "animated WebP delta: frame {i} must be at origin (0,0), got ({},{})",
+                f.x_offset, f.y_offset
+            )));
+        }
+        if f.blend {
+            return Err(Error::invalid(format!(
+                "animated WebP delta: frame {i} must have blend=false (Delta mode forces overwrite)"
+            )));
+        }
+        if f.dispose_to_background {
+            return Err(Error::invalid(format!(
+                "animated WebP delta: frame {i} must have dispose_to_background=false (would invalidate the prior-canvas reference)"
+            )));
+        }
+        if f.duration_ms > 0x00FF_FFFF {
+            return Err(Error::invalid(
+                "animated WebP delta: duration_ms exceeds 24-bit field",
+            ));
+        }
+        if f.rgba.len() != (f.width as usize) * (f.height as usize) * 4 {
+            return Err(Error::invalid(
+                "animated WebP delta: frame rgba length mismatch frame_w*frame_h*4",
+            ));
+        }
+    }
+
+    // Build the rewritten frame list. The first frame is always full-
+    // canvas; each subsequent frame is either (a) a sub-rect tile sized
+    // to the changed-block bbox, with `blend = false` so the decoder
+    // overwrites the matching canvas region, or (b) a full-canvas
+    // refresh when the cost-model bbox is too large to win.
+    //
+    // We carry the source RGBA for sub-rect frames in a transient
+    // `Vec<u8>` since the sub-rect doesn't exist as a contiguous slice
+    // in the original buffer (different stride). For full frames we
+    // reuse the caller's slice — no copy.
+    let max_pixels = (canvas_w as u64).saturating_mul(canvas_h as u64);
+    let max_bbox_pixels = ((max_pixels as f64) * (cfg.max_bbox_fraction as f64)) as u64;
+    let mut tile_storage: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+    // For each output frame, the layout (offset, width, height, blend,
+    // duration). The actual rgba slice is resolved at encode time from
+    // either the caller's frame.rgba (full-canvas) or `tile_storage`
+    // (sub-rect).
+    struct PlannedFrame {
+        x_offset: u32,
+        y_offset: u32,
+        width: u32,
+        height: u32,
+        duration_ms: u32,
+        blend: bool,
+        // index into either the caller's `frames` (rgba_kind=Full) or
+        // `tile_storage` (rgba_kind=Tile).
+        rgba_kind: RgbaKind,
+        rgba_idx: usize,
+    }
+    enum RgbaKind {
+        Full,
+        Tile,
+    }
+
+    let mut planned: Vec<PlannedFrame> = Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        if i == 0 {
+            // First frame: always full-canvas.
+            planned.push(PlannedFrame {
+                x_offset: 0,
+                y_offset: 0,
+                width: f.width,
+                height: f.height,
+                duration_ms: f.duration_ms,
+                blend: f.blend,
+                rgba_kind: RgbaKind::Full,
+                rgba_idx: i,
+            });
+            continue;
+        }
+        // Cost-model bbox against frame i-1.
+        let prior = &frames[i - 1];
+        let bbox = changed_block_bbox(prior.rgba, f.rgba, canvas_w, canvas_h, &cfg);
+        match bbox {
+            None => {
+                // Identical — emit a 1×1 (smallest the spec allows)
+                // overwrite at (0,0) with the prior pixel: zero visible
+                // change and the smallest possible payload.
+                let p0 = &prior.rgba[..4];
+                let mut tile = Vec::with_capacity(4);
+                tile.extend_from_slice(p0);
+                let tile_idx = tile_storage.len();
+                tile_storage.push(tile);
+                planned.push(PlannedFrame {
+                    x_offset: 0,
+                    y_offset: 0,
+                    width: 1,
+                    height: 1,
+                    duration_ms: f.duration_ms,
+                    blend: false, // overwrite (DoNotBlend)
+                    rgba_kind: RgbaKind::Tile,
+                    rgba_idx: tile_idx,
+                });
+            }
+            Some((bx, by, bw, bh)) => {
+                let bbox_pixels = (bw as u64) * (bh as u64);
+                if bbox_pixels > max_bbox_pixels {
+                    // Bbox too large — skip the delta path for this
+                    // frame and emit it full-canvas in the underlying
+                    // mode (Auto by default; respects caller's
+                    // lossy_quality).
+                    planned.push(PlannedFrame {
+                        x_offset: 0,
+                        y_offset: 0,
+                        width: f.width,
+                        height: f.height,
+                        duration_ms: f.duration_ms,
+                        blend: f.blend,
+                        rgba_kind: RgbaKind::Full,
+                        rgba_idx: i,
+                    });
+                } else {
+                    // Carve out the bbox sub-rectangle into a contiguous
+                    // RGBA buffer.
+                    let tile = extract_subrect(f.rgba, canvas_w, bx, by, bw, bh);
+                    let tile_idx = tile_storage.len();
+                    tile_storage.push(tile);
+                    planned.push(PlannedFrame {
+                        x_offset: bx,
+                        y_offset: by,
+                        width: bw,
+                        height: bh,
+                        duration_ms: f.duration_ms,
+                        blend: false, // overwrite (DoNotBlend)
+                        rgba_kind: RgbaKind::Tile,
+                        rgba_idx: tile_idx,
+                    });
+                }
+            }
+        }
+    }
+
+    // Drive the planned frames through the standard encoder path with
+    // mode = Auto (so each sub-rect tile picks lossy/lossless per the
+    // smaller-payload rule). We construct a fresh `AnimFrame` array
+    // borrowing into either the original input or `tile_storage`.
+    let rewritten: Vec<AnimFrame<'_>> = planned
+        .iter()
+        .map(|p| {
+            let rgba: &[u8] = match p.rgba_kind {
+                RgbaKind::Full => frames[p.rgba_idx].rgba,
+                RgbaKind::Tile => tile_storage[p.rgba_idx].as_slice(),
+            };
+            AnimFrame {
+                width: p.width,
+                height: p.height,
+                x_offset: p.x_offset,
+                y_offset: p.y_offset,
+                duration_ms: p.duration_ms,
+                blend: p.blend,
+                dispose_to_background: false,
+                rgba,
+            }
+        })
+        .collect();
+
+    // Drive the rewritten frames through the standard encoder path in
+    // `Lossless` mode: sub-rect tiles produced by Delta are typically
+    // tiny (≤ a few KB raw RGBA), so the VP8 keyframe overhead would
+    // win on byte count and the rebuild would also incur expensive
+    // RDO during the per-frame Auto-mode candidate evaluation. Forcing
+    // lossless keeps Delta-mode encodes deterministic + fast and
+    // preserves pixel-identical round-trip semantics.
+    let inner_options = AnimEncoderOptions {
+        mode: AnimFrameMode::Lossless,
+        lossy_quality: options.lossy_quality,
+        metadata: options.metadata.clone(),
+    };
+    build_animated_webp_with_options(
+        canvas_w,
+        canvas_h,
+        background_bgra,
+        loop_count,
+        &rewritten,
+        inner_options,
+    )
+}
+
+/// Copy the `bw × bh` sub-rectangle starting at `(bx, by)` out of an
+/// RGBA buffer with `canvas_w` pixels per row. Allocates a fresh
+/// `Vec<u8>` of length `bw * bh * 4`. Caller guarantees the bbox stays
+/// inside the canvas.
+fn extract_subrect(rgba: &[u8], canvas_w: u32, bx: u32, by: u32, bw: u32, bh: u32) -> Vec<u8> {
+    let canvas_w = canvas_w as usize;
+    let bx = bx as usize;
+    let by = by as usize;
+    let bw = bw as usize;
+    let bh = bh as usize;
+    let mut out = Vec::with_capacity(bw * bh * 4);
+    for row in 0..bh {
+        let src_off = ((by + row) * canvas_w + bx) * 4;
+        out.extend_from_slice(&rgba[src_off..src_off + bw * 4]);
+    }
+    out
+}
+
+/// Walk `prev` vs `curr` (both row-major canvas-sized RGBA) on
+/// `cfg.block_size`-sized blocks; for each block compute the
+/// luminance-biased SAD cost; return the bounding box (in pixels,
+/// even-aligned + clipped to canvas) of all blocks whose cost exceeds
+/// `cfg.threshold`. Returns `None` when no block is changed (frame
+/// is bit-identical or the cost-model says it's all under threshold).
+///
+/// Output bbox is `(x, y, w, h)` with `x`/`y` rounded down to even
+/// (WebP ANMF spec mandates even offsets) and `w`/`h` adjusted so the
+/// bbox still encloses every changed block.
+fn changed_block_bbox(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    cfg: &DeltaConfig,
+) -> Option<(u32, u32, u32, u32)> {
+    let bs = cfg.block_size;
+    let cw = canvas_w as usize;
+
+    // Block-grid extents (last block may be shorter than `bs` on the
+    // right/bottom edge — count it as a regular block, just iterate
+    // fewer pixels in that case).
+    let n_bx = canvas_w.div_ceil(bs);
+    let n_by = canvas_h.div_ceil(bs);
+
+    let mut min_bx = u32::MAX;
+    let mut min_by = u32::MAX;
+    let mut max_bx: i64 = -1;
+    let mut max_by: i64 = -1;
+
+    for by in 0..n_by {
+        let y0 = (by * bs) as usize;
+        let y1 = ((by + 1) * bs).min(canvas_h) as usize;
+        for bx in 0..n_bx {
+            let x0 = (bx * bs) as usize;
+            let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
+            let cost = block_cost(prev, curr, cw, x0, y0, x1, y1);
+            if cost > cfg.threshold as u64 {
+                if bx < min_bx {
+                    min_bx = bx;
+                }
+                if by < min_by {
+                    min_by = by;
+                }
+                if bx as i64 > max_bx {
+                    max_bx = bx as i64;
+                }
+                if by as i64 > max_by {
+                    max_by = by as i64;
+                }
+            }
+        }
+    }
+    if max_bx < 0 || max_by < 0 {
+        return None;
+    }
+
+    // Pixel bbox from block-grid bbox.
+    let mut px = min_bx * bs;
+    let mut py = min_by * bs;
+    let mut pw = ((max_bx as u32 + 1) * bs).min(canvas_w) - px;
+    let mut ph = ((max_by as u32 + 1) * bs).min(canvas_h) - py;
+
+    // ANMF spec mandates even offsets — round (px, py) down to even,
+    // and grow (pw, ph) to compensate.
+    if px % 2 != 0 {
+        px -= 1;
+        pw += 1;
+    }
+    if py % 2 != 0 {
+        py -= 1;
+        ph += 1;
+    }
+    // Clamp width/height in case rounding pushed past the canvas.
+    if px + pw > canvas_w {
+        pw = canvas_w - px;
+    }
+    if py + ph > canvas_h {
+        ph = canvas_h - py;
+    }
+    Some((px, py, pw, ph))
+}
+
+/// Luminance-biased SAD over a block in two RGBA canvas buffers. Both
+/// `prev` and `curr` are row-major with `canvas_w` pixels per row;
+/// the block spans `[x0, x1) × [y0, y1)`. Computes
+/// `sum |luma(prev) - luma(curr)| + 0.25 * (|R'-R| + |G'-G| + |B'-B|) +
+/// |A'-A|` per pixel using fixed-point integer math (the 0.25 weight is
+/// a `>> 2`). Returns the accumulated cost as `u64` to avoid overflow on
+/// 8×8 blocks of fully-saturated 8-bit deltas (max ≈ 8×8×(255+3*64+255)
+/// ≈ 45k — fits in u32, but use u64 for safety vs larger blocks).
+fn block_cost(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> u64 {
+    let mut acc: u64 = 0;
+    for y in y0..y1 {
+        let row_off = y * canvas_w * 4;
+        for x in x0..x1 {
+            let off = row_off + x * 4;
+            let pr = prev[off] as i32;
+            let pg = prev[off + 1] as i32;
+            let pb = prev[off + 2] as i32;
+            let pa = prev[off + 3] as i32;
+            let cr = curr[off] as i32;
+            let cg = curr[off + 1] as i32;
+            let cb = curr[off + 2] as i32;
+            let ca = curr[off + 3] as i32;
+            // BT.601 luma (integer-scaled): 0.299R + 0.587G + 0.114B
+            // → (77*R + 150*G + 29*B + 128) >> 8 (sums to 256).
+            let lp = (77 * pr + 150 * pg + 29 * pb + 128) >> 8;
+            let lc = (77 * cr + 150 * cg + 29 * cb + 128) >> 8;
+            let dl = (lp - lc).unsigned_abs() as u64;
+            let dr = (pr - cr).unsigned_abs() as u64;
+            let dg = (pg - cg).unsigned_abs() as u64;
+            let db = (pb - cb).unsigned_abs() as u64;
+            let da = (pa - ca).unsigned_abs() as u64;
+            // Luma carries the bulk of the weight; chroma contributes
+            // a quarter (>> 2) each; alpha gets full weight so changes
+            // in transparency are flagged immediately.
+            acc += dl + ((dr + dg + db) >> 2) + da;
+        }
+    }
+    acc
 }
 
 /// VP8X payload: 1 byte flags, 3 bytes reserved, 3 bytes canvas_w-1,

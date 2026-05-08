@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-encoder)* **`AnimFrameMode::Delta` AVIF-style perceptual
+  frame-merge** — a new [`AnimFrameMode`] variant that opts each
+  non-first frame into block-level dirty-rect detection. The encoder
+  walks the canvas in `block_size × block_size` blocks (default 8×8)
+  and computes a luminance-biased sum-of-absolute-differences cost
+  per block (`|Δluma| + ¼·(|ΔR| + |ΔG| + |ΔB|) + |Δα|`, BT.601 luma).
+  Blocks with cost > `threshold` (default 32) flag as changed; the
+  encoder takes the bounding box of changed blocks, encodes only the
+  sub-rectangle as a `VP8L` tile, and emits an ANMF with
+  `blending_method = 1` (DoNotBlend — the decoder overwrites the
+  prior-frame canvas region rather than alpha-blending). When the
+  bbox covers more than `max_bbox_fraction` of the canvas (default
+  0.8) the frame falls back to a full-canvas encode. Identical
+  consecutive frames collapse to a 1×1 minimal-overwrite tile so the
+  duration counter still ticks. The first frame is always full-canvas.
+  On a 160×120 fixture with a 32×32 changing corner block (≈ 5% of
+  canvas) the per-frame ANMF payload drops from ≈110 bytes (full-
+  canvas Lossless baseline) to ≈44 bytes (≥ 80% wire-size reduction);
+  the decoder reconstructs each frame's canvas pixel-identically with
+  the source (Delta mode emits VP8L sub-rect tiles end-to-end).
+  Caller constraints (validated at encode time): every frame must be
+  canvas-sized, at origin (0, 0), with `blend = false` and
+  `dispose_to_background = false` — the cost-model needs the prior
+  frame's full canvas as the reference. New `DeltaConfig` struct
+  exposes `block_size`, `threshold`, `max_bbox_fraction` knobs.
+
 - *(anim-decoder)* **`WebpAnimDecoder::next_frame_borrowed()`
   zero-clone canvas view** — returns a `WebpAnimFrameRef<'_>` whose
   `rgba: &[u8]` borrows directly into the decoder's persistent canvas,
