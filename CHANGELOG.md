@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-encoder)* **adaptive `max_components` budget for
+  `AnimFrameMode::Delta`** — replaces the fixed `max_components: u32 = 8`
+  field on `DeltaConfig` with `max_components_override: Option<u32>`
+  (None = adaptive, the new default). The adaptive path computes a
+  per-frame `cluster_density = sum(cluster_pixels) / canvas_pixels`
+  and maps it to a content-aware sub-rect cap: density ≤ 5% → 16
+  rects (scattered tiny clusters benefit from more rects), density ≥
+  30% → 4 rects (one big cluster → small budget, super-rect collapse
+  cheap), linear interpolation in between. Callers that need a fixed
+  budget call the new `DeltaConfig::max_components_override(n)`
+  builder-style setter (or set the field directly). The 3-cluster
+  scattered-stamps fixture (cluster density ≈ 4%) keeps all 3 clusters
+  separate with the new adaptive default — wire-size unchanged from
+  the previous fixed-8 default. Test
+  `delta_mode_adaptive_budget_keeps_low_density_clusters_separate`
+  pins the behaviour; `adaptive_max_components_pins_documented_density_band`
+  unit-tests the density → budget mapping.
+
+- *(anim-encoder)* **auto inner-encode lossy fallback for Delta-mode
+  sub-rect tiles** — new `DeltaConfig::auto_inner_threshold_bytes:
+  Option<u32>` (default `None`) opts each Delta-mode sub-rect tile
+  into a lossless-vs-lossy candidate race when the tile's lossless
+  VP8L payload exceeds the threshold. Tiles below the cutoff stay
+  lossless (no quality loss for the common-case small-tile path);
+  tiles above the cutoff produce both a lossless and a lossy VP8 +
+  ALPH (at the new `DeltaConfig::auto_inner_quality: f32` knob,
+  default 75) candidate and the byte-smaller wins on disk. Full-
+  canvas frames (the always-full first frame + cost-model bbox-too-
+  large fallback) ignore the threshold and always stay lossless to
+  preserve canvas-baseline round-trip semantics. Closes the "lossless
+  for small tiles, lossy for large busy tiles" common-case wire-size
+  win — on a 64×64 fixture with a noisy 32×32 delta sub-rect the
+  file shrinks from 3328 B (lossless-only baseline) to 1244 B
+  (auto-inner with threshold = 256 B) — ≈ 63% reduction. Tests
+  `delta_mode_auto_inner_encode_picks_lossy_for_busy_tile` and
+  `delta_mode_auto_inner_encode_keeps_small_tiles_lossless`.
+
 - *(anim-encoder)* **multi-rect ANMF for `AnimFrameMode::Delta`** —
   the per-frame cost-model now runs a 4-connected-component pass on
   the changed-block grid and emits one ANMF sub-rect per disjoint
@@ -154,6 +191,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lossless WebP through the registry; the registry-side encoder
   hard-coded `WebpMetadata::default()` so callers going through
   `Box<dyn Encoder>` had no way to surface their colour profile.
+
+### Changed
+
+- *(anim-encoder)* **`DeltaConfig::max_components: u32` removed,
+  replaced with `max_components_override: Option<u32>`**. Source-level
+  break (no on-disk format change). Callers passing
+  `max_components: 1` (force single-bbox) now write
+  `DeltaConfig::default().max_components_override(1)`. Default
+  behaviour switches from the previous fixed cap of 8 to the
+  cluster-density-aware adaptive ramp described in the new
+  "adaptive `max_components` budget" Added entry above.
 
 ## [0.1.4](https://github.com/OxideAV/oxideav-webp/compare/v0.1.3...v0.1.4) - 2026-05-08
 

@@ -383,7 +383,19 @@ Encoder scope (current):
   per-frame ANMF payload is ≤20% of the equivalent full-frame
   `Lossless` baseline (≥ 80% wire-size reduction). Identical frames
   collapse to a 1×1 minimal overwrite tile; over-the-threshold frames
-  fall back to a full-canvas encode automatically.
+  fall back to a full-canvas encode automatically. Multi-rect emission
+  splits scattered-change frames into one ANMF sub-rect per disjoint
+  cluster (4-connected flood-fill on the dirty-block grid); the per-
+  frame sub-rect cap is **adaptive by default** — `cluster_density`
+  (sum of cluster pixel-areas / canvas area) maps to budget = 16 at
+  density ≤ 5%, 4 at density ≥ 30% (linear interpolation in between).
+  Override with `DeltaConfig::max_components_override(n)`.
+  Auto-inner-encode (`DeltaConfig::auto_inner_threshold_bytes(t)`)
+  re-encodes any sub-rect tile whose lossless VP8L bytes exceed `t`
+  through VP8 + ALPH at quality 75 (configurable) and picks the byte-
+  smaller candidate — closes the "lossless for small tiles, lossy for
+  large busy tiles" common-case win (observed 64×64 fixture with a
+  noisy 32×32 sub-rect: 3.3 KB → 1.2 KB, ≈63% reduction).
 - One-shot `encode_vp8l_argb_with_metadata(w, h, &argb, has_alpha,
   &meta)` for std-only image-library consumers that want a lossless
   `.webp` file with an attached colour profile / EXIF / XMP **without**

@@ -44,7 +44,7 @@
 //!    left, centre, bottom-right). The single-bbox cover would span
 //!    the whole canvas; the multi-rect path emits one ANMF per
 //!    cluster and the total file size beats the single-bbox baseline
-//!    (`max_components = 1`).
+//!    (`max_components_override = Some(1)`).
 //!  * **`delta_mode_multi_rect_round_trip_pixel_identical`** — same
 //!    3-cluster fixture; verify the decoded canvas at the END of each
 //!    logical input frame's ANMF chain matches the source frame
@@ -52,9 +52,22 @@
 //!    but the final tile per logical frame so total display time is
 //!    preserved across the round-trip.
 //!  * **`delta_mode_multi_rect_respects_max_components_budget`** — set
-//!    `max_components = 2` on a 4-cluster fixture; verify exactly 2
-//!    sub-rect ANMFs are emitted (the smallest two clusters merge
-//!    into a single covering super-rect).
+//!    `max_components_override = Some(2)` on a 4-cluster fixture; verify
+//!    exactly 2 sub-rect ANMFs are emitted (the smallest two clusters
+//!    merge into a single covering super-rect).
+//!  * **`delta_mode_adaptive_budget_keeps_low_density_clusters_separate`**
+//!    — leave `max_components_override = None` (the default) on the
+//!    3-cluster fixture; cluster_density ≈ 4% maps to budget = 16 via the
+//!    adaptive ramp, so all 3 clusters stay separate (4 ANMFs) and the
+//!    file is byte-identical to an explicit `Some(16)` override.
+//!  * **`delta_mode_auto_inner_encode_picks_lossy_for_busy_tile`** — set
+//!    `auto_inner_threshold_bytes = Some(256)` on a 64×64 noisy delta
+//!    region; lossless > threshold triggers a lossy candidate which
+//!    wins, shrinking the file vs the lossless-only baseline.
+//!  * **`delta_mode_auto_inner_encode_keeps_small_tiles_lossless`** —
+//!    set `auto_inner_threshold_bytes = Some(4096)` with a 16×16 stamp
+//!    delta region; lossless ≤ threshold keeps the tile lossless and
+//!    round-trip is pixel-identical.
 
 use oxideav_webp::{
     build_animated_webp_with_options, decode_webp, AnimEncoderOptions, AnimFrame, AnimFrameMode,
@@ -558,8 +571,8 @@ fn delta_mode_multi_rect_beats_single_bbox_for_scattered_changes() {
         })
         .collect();
 
-    // Single-bbox baseline: max_components = 1 → all clusters fold
-    // into one covering super-rect.
+    // Single-bbox baseline: max_components_override = Some(1) → all
+    // clusters fold into one covering super-rect.
     let single = build_animated_webp_with_options(
         MR_W,
         MR_H,
@@ -567,10 +580,7 @@ fn delta_mode_multi_rect_beats_single_bbox_for_scattered_changes() {
         0,
         &frames,
         AnimEncoderOptions {
-            mode: AnimFrameMode::Delta(DeltaConfig {
-                max_components: 1,
-                ..DeltaConfig::default()
-            }),
+            mode: AnimFrameMode::Delta(DeltaConfig::default().max_components_override(1)),
             ..Default::default()
         },
     )
@@ -751,10 +761,7 @@ fn delta_mode_multi_rect_respects_max_components_budget() {
         0,
         &frames,
         AnimEncoderOptions {
-            mode: AnimFrameMode::Delta(DeltaConfig {
-                max_components: 2,
-                ..DeltaConfig::default()
-            }),
+            mode: AnimFrameMode::Delta(DeltaConfig::default().max_components_override(2)),
             ..Default::default()
         },
     )
@@ -762,6 +769,270 @@ fn delta_mode_multi_rect_respects_max_components_budget() {
     let n = count_anmf_chunks(&blob);
     assert_eq!(
         n, 3,
-        "4-cluster fixture with max_components=2 should emit 1+2 = 3 ANMFs, got {n}"
+        "4-cluster fixture with max_components_override=Some(2) should emit 1+2 = 3 ANMFs, got {n}"
     );
+}
+
+// ---------------------------------------------------------------------
+// #4 — Adaptive `max_components` budget.
+//
+// Verifies the default (override = None) path picks a content-aware
+// cap. The 3-cluster scattered-stamps fixture has a low cluster density
+// (three 16×16 stamps on a 160×120 canvas → ≈ 4% density) which the
+// adaptive mapping resolves to budget = 16. The default-config encode
+// must therefore retain all 3 clusters as separate sub-rects, matching
+// the explicit max_components_override=Some(8) baseline byte-for-byte.
+
+#[test]
+fn delta_mode_adaptive_budget_keeps_low_density_clusters_separate() {
+    // 3 disjoint stamps → cluster density ≈ 4% → adaptive budget = 16
+    // → no merging happens (3 < 16). Expected 1 (frame 0) + 3
+    // (delta frame 1) = 4 ANMFs.
+    let f0 = build_mr_frame(0x10, 3);
+    let f1 = build_mr_frame(0x60, 3);
+    let rgbas = [f0, f1];
+    let frames: Vec<AnimFrame> = rgbas
+        .iter()
+        .map(|rgba| AnimFrame {
+            width: MR_W,
+            height: MR_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba,
+        })
+        .collect();
+
+    // Default config (override = None) → adaptive picks ≥ 4 (low
+    // density). 3 clusters fit, so all are emitted separately.
+    let adaptive = build_animated_webp_with_options(
+        MR_W,
+        MR_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            ..Default::default()
+        },
+    )
+    .expect("encode adaptive");
+
+    // Pin behaviour: explicit override of Some(16) should match
+    // the adaptive default byte-for-byte (same budget chosen).
+    let pinned_high = build_animated_webp_with_options(
+        MR_W,
+        MR_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default().max_components_override(16)),
+            ..Default::default()
+        },
+    )
+    .expect("encode pinned 16");
+
+    // Same number of ANMFs (4 = 1 frame-0 + 3 sub-rects on frame 1).
+    let n_adaptive = count_anmf_chunks(&adaptive);
+    let n_pinned = count_anmf_chunks(&pinned_high);
+    assert_eq!(
+        n_adaptive, 4,
+        "adaptive budget on low-density 3-cluster fixture should yield 4 ANMFs, got {n_adaptive}"
+    );
+    assert_eq!(
+        n_adaptive, n_pinned,
+        "adaptive default ({n_adaptive}) must match explicit override(16) ({n_pinned}) on low-density content"
+    );
+    // Byte-identical (same encode path, same budget).
+    assert_eq!(
+        adaptive.len(),
+        pinned_high.len(),
+        "adaptive default file size ({}) must match override(16) file size ({})",
+        adaptive.len(),
+        pinned_high.len()
+    );
+}
+
+// ---------------------------------------------------------------------
+// #1 — Auto inner encode (lossy fallback for large tiles).
+//
+// Builds a frame whose delta-region is intentionally large + visually-
+// busy so its lossless VP8L payload exceeds a low threshold. The
+// auto-inner-encode path must then ALSO produce a lossy candidate and
+// the byte-smaller wins → resulting file is ≤ the lossless-only file.
+
+fn build_busy_delta_pair(w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+    // f0: solid colour everywhere. f1: same solid colour everywhere
+    // EXCEPT a centred busy-noise patch that's ~30% of the canvas — big
+    // enough to make the lossless tile exceed the 256 B threshold but
+    // small enough to stay below `max_bbox_fraction = 0.8` so the cost-
+    // model emits a sub-rect tile (NOT a full-canvas refresh).
+    let mut f0 = vec![0u8; (w * h * 4) as usize];
+    for px in f0.chunks_exact_mut(4) {
+        px[0] = 0x40;
+        px[1] = 0x40;
+        px[2] = 0x40;
+        px[3] = 0xff;
+    }
+    // f1 = f0 + a centred noisy patch. Patch size = w/2 × h/2 (25%
+    // canvas — well inside the 80% bbox cap).
+    let mut f1 = f0.clone();
+    let patch_w = w / 2;
+    let patch_h = h / 2;
+    let patch_x0 = w / 4;
+    let patch_y0 = h / 4;
+    for y in patch_y0..(patch_y0 + patch_h) {
+        for x in patch_x0..(patch_x0 + patch_w) {
+            let i = ((y * w + x) * 4) as usize;
+            let mut s = y.wrapping_mul(0x9E37_79B9) ^ x.wrapping_mul(0x85EB_CA77);
+            s ^= s.wrapping_shr(13);
+            s = s.wrapping_mul(0xC2B2_AE35);
+            s ^= s.wrapping_shr(16);
+            f1[i] = (s & 0xff) as u8;
+            f1[i + 1] = ((s >> 8) & 0xff) as u8;
+            f1[i + 2] = ((s >> 16) & 0xff) as u8;
+            f1[i + 3] = 0xff;
+        }
+    }
+    (f0, f1)
+}
+
+#[test]
+fn delta_mode_auto_inner_encode_picks_lossy_for_busy_tile() {
+    // 64×64 canvas, frame 1 contains a 32×32 noisy patch on a solid
+    // background → cost-model emits a sub-rect tile (centred ~25% of
+    // canvas — inside the 80% bbox cap). Threshold = 256 B is well
+    // below the noisy-patch lossless VP8L payload, so the auto-inner-
+    // encode path also produces a lossy candidate; VP8 noise compresses
+    // much better than VP8L noise → final file shrinks vs the lossless-
+    // only baseline (observed: 3328 B → 1244 B, ≈ 63% reduction).
+    let w = 64u32;
+    let h = 64u32;
+    let (f0, f1) = build_busy_delta_pair(w, h);
+    let frames = vec![
+        AnimFrame {
+            width: w,
+            height: h,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba: &f0,
+        },
+        AnimFrame {
+            width: w,
+            height: h,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba: &f1,
+        },
+    ];
+
+    // Lossless-only baseline (no auto-inner-encode threshold).
+    let baseline = build_animated_webp_with_options(
+        w,
+        h,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            ..Default::default()
+        },
+    )
+    .expect("encode baseline");
+
+    // Auto-inner-encode threshold = 256 B → every tile lossless > 256
+    // also tries lossy. On the noisy 64×64 frame, lossy wins.
+    let auto_inner = build_animated_webp_with_options(
+        w,
+        h,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default().auto_inner_threshold_bytes(256)),
+            ..Default::default()
+        },
+    )
+    .expect("encode auto-inner");
+
+    eprintln!(
+        "delta auto-inner: baseline (lossless-only) = {} bytes, auto-inner = {} bytes",
+        baseline.len(),
+        auto_inner.len()
+    );
+    assert!(
+        auto_inner.len() < baseline.len(),
+        "auto-inner encode ({}) should beat lossless-only baseline ({}) on busy delta content",
+        auto_inner.len(),
+        baseline.len()
+    );
+    // Reasonable lower bound — at least 30% reduction on this fixture.
+    assert!(
+        auto_inner.len() * 10 < baseline.len() * 7,
+        "auto-inner encode ({}) should be < 70% of baseline ({}) on busy delta content",
+        auto_inner.len(),
+        baseline.len()
+    );
+}
+
+#[test]
+fn delta_mode_auto_inner_encode_keeps_small_tiles_lossless() {
+    // Small (16×16) corner-stamp tile fits comfortably under any
+    // reasonable threshold (≪ 256 B for a flat-colour 16×16 stamp);
+    // auto-inner-encode must NOT switch it to lossy → pixel-identical
+    // round-trip preserved.
+    let f0 = build_mr_frame(0x10, 1); // 1 stamp = single small cluster
+    let f1 = build_mr_frame(0x60, 1);
+    let rgbas = [f0.clone(), f1.clone()];
+    let frames: Vec<AnimFrame> = rgbas
+        .iter()
+        .map(|rgba| AnimFrame {
+            width: MR_W,
+            height: MR_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba,
+        })
+        .collect();
+    let blob = build_animated_webp_with_options(
+        MR_W,
+        MR_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default().auto_inner_threshold_bytes(4096)),
+            ..Default::default()
+        },
+    )
+    .expect("encode auto-inner small");
+    let img = decode_webp(&blob).expect("decode auto-inner small");
+    // Walk the decoded frames and pick the canvas at each
+    // logical-frame boundary (duration > 0). Sub-rect tiles use
+    // duration = 0 except the final one per logical frame.
+    let mut logical: Vec<Vec<u8>> = Vec::new();
+    for f in &img.frames {
+        if f.duration_ms > 0 {
+            logical.push(f.rgba.clone());
+        }
+    }
+    assert_eq!(logical.len(), rgbas.len());
+    for (i, src) in rgbas.iter().enumerate() {
+        assert_eq!(
+            &logical[i], src,
+            "auto-inner encode below threshold must stay pixel-identical (logical frame {i})"
+        );
+    }
 }

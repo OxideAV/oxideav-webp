@@ -57,9 +57,9 @@ use crate::vp8l::encode_vp8l_argb;
 /// Per-frame mode-selection policy for [`build_animated_webp_with_options`].
 ///
 /// `Eq` is intentionally not derived because the `Delta` variant carries
-/// a `DeltaConfig` whose `max_bbox_fraction: f32` field doesn't satisfy
-/// the total-equality contract — `PartialEq` is sufficient for the
-/// mode-pattern matches the encoder relies on.
+/// a `DeltaConfig` whose `max_bbox_fraction: f32` (and `auto_inner_quality`)
+/// fields don't satisfy the total-equality contract — `PartialEq` is
+/// sufficient for the mode-pattern matches the encoder relies on.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum AnimFrameMode {
     /// Always encode every frame as VP8L (lossless). Bit-exact, larger
@@ -119,12 +119,30 @@ pub enum AnimFrameMode {
 /// When the changed blocks form **multiple disjoint clusters** (e.g. a
 /// UI with two independently-spinning indicators on a static
 /// background), the encoder runs a 4-connected-component pass on the
-/// dirty-block grid and emits **one ANMF sub-rect per cluster**, up to
-/// [`Self::max_components`] (default 8). When the cluster count exceeds
-/// the budget, the smallest clusters are iteratively merged with their
-/// nearest-neighbour cluster (axis-aligned bbox-of-pair) until the count
-/// fits. This keeps wire size tight on scattered-change content where a
-/// single cost-model bounding box would cover almost the whole canvas.
+/// dirty-block grid and emits **one ANMF sub-rect per cluster**.
+///
+/// The per-frame sub-rect cap is **adaptive by default**: the encoder
+/// computes a `cluster_density = sum(cluster_pixels) / canvas_pixels`
+/// metric per frame and picks a budget that scales inversely — lots of
+/// scattered tiny clusters (low density) get a high budget (more rects
+/// retained), one big near-canvas-wide cluster (high density) gets a
+/// low budget (the merger squashes the long tail aggressively because
+/// the super-rect collapse is cheap). Mapping (linear interpolation
+/// inside the band):
+///
+/// ```text
+///   density ≤ 5%   →  16 rects
+///   density ≥ 30%  →   4 rects
+/// ```
+///
+/// Callers can override the adaptive budget with a fixed value via
+/// [`Self::max_components_override`] — when `Some(n)`, the cluster-density
+/// branch is skipped and the budget is `n` regardless of frame content.
+/// Set to `Some(1)` to force the historical single-bbox behaviour.
+///
+/// When the cluster count exceeds the effective budget, the smallest
+/// clusters are iteratively merged with their nearest-neighbour cluster
+/// (axis-aligned bbox-of-pair) until the count fits.
 ///
 /// Each component within a logical input frame becomes a separate ANMF
 /// in the output stream. Non-final sub-rects carry `duration_ms = 0`
@@ -132,6 +150,18 @@ pub enum AnimFrameMode {
 /// floor); the final sub-rect carries the input frame's `duration_ms`
 /// so total display time stays correct. Decoded `WebpFrame` count will
 /// therefore exceed the input frame count when multi-rect kicks in.
+///
+/// # Auto inner-encode (lossy fallback for large tiles)
+///
+/// By default Delta-mode sub-rects re-encode losslessly (VP8L) — the
+/// tiles are typically tiny (a few KB raw RGBA) and the VP8 keyframe
+/// fixed overhead would dominate. When a delta region is visually-busy
+/// enough that lossless costs more than acceptable lossy bytes, set
+/// [`Self::auto_inner_threshold_bytes`] to a byte cutoff: tiles whose
+/// lossless payload exceeds the cutoff are also encoded as VP8 + ALPH
+/// at [`Self::auto_inner_quality`] (default 75) and the byte-smaller
+/// candidate wins on disk. Tiles below the cutoff stay lossless — no
+/// quality loss for the common-case small-tile path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeltaConfig {
     /// Block side length in pixels. Default 8. The encoder rounds
@@ -146,14 +176,30 @@ pub struct DeltaConfig {
     /// path for that frame and falls back to a full-frame encode in
     /// `Auto` mode. Range `0.0..=1.0`; default `0.8`.
     pub max_bbox_fraction: f32,
-    /// Cap on the number of disjoint sub-rect ANMFs the encoder may
-    /// emit per logical input frame. Default 8. When the connected-
-    /// component pass finds more clusters than this, the smallest
-    /// clusters are iteratively merged with their nearest neighbour
-    /// (by inter-bbox axis-aligned distance) until the cluster count
-    /// drops to `max_components`. Set to 1 to force the historical
-    /// single-bbox behaviour.
-    pub max_components: u32,
+    /// Optional fixed cap on the number of disjoint sub-rect ANMFs
+    /// the encoder may emit per logical input frame. When `None`
+    /// (the default), the encoder picks the cap **adaptively** from
+    /// the per-frame `cluster_density = sum_cluster_pixels /
+    /// canvas_pixels` metric: density ≤ 5% → 16, density ≥ 30% → 4,
+    /// linear interpolation in between. When `Some(n)`, the budget
+    /// is `n` regardless of frame content. Set to `Some(1)` to force
+    /// the historical single-bbox behaviour.
+    pub max_components_override: Option<u32>,
+    /// Optional byte cutoff on Delta-mode sub-rect tiles' lossless
+    /// VP8L payload — tiles whose lossless bytes exceed this cutoff
+    /// are *also* encoded via VP8 + ALPH at
+    /// [`Self::auto_inner_quality`] and the byte-smaller candidate
+    /// wins on disk. Tiles whose lossless bytes ≤ cutoff stay
+    /// lossless (no quality loss). When `None` (the default), every
+    /// tile stays lossless regardless of size — preserves pixel-
+    /// identical round-trip semantics.
+    pub auto_inner_threshold_bytes: Option<u32>,
+    /// Quality knob for the lossy-fallback encode triggered by
+    /// [`Self::auto_inner_threshold_bytes`] — same scale as
+    /// [`AnimEncoderOptions::lossy_quality`] (`0.0..=100.0`, higher =
+    /// better). Default 75. Ignored when `auto_inner_threshold_bytes`
+    /// is `None`.
+    pub auto_inner_quality: f32,
 }
 
 impl Default for DeltaConfig {
@@ -162,9 +208,57 @@ impl Default for DeltaConfig {
             block_size: 8,
             threshold: 32,
             max_bbox_fraction: 0.8,
-            max_components: 8,
+            max_components_override: None,
+            auto_inner_threshold_bytes: None,
+            auto_inner_quality: 75.0,
         }
     }
+}
+
+impl DeltaConfig {
+    /// Builder-style setter for [`Self::max_components_override`] —
+    /// sets a fixed per-frame sub-rect cap, bypassing the adaptive
+    /// cluster-density branch.
+    #[must_use]
+    pub fn max_components_override(mut self, n: u32) -> Self {
+        self.max_components_override = Some(n);
+        self
+    }
+
+    /// Builder-style setter for [`Self::auto_inner_threshold_bytes`] —
+    /// enables the lossy-fallback inner-encode path for sub-rect tiles
+    /// whose lossless VP8L payload exceeds `bytes`.
+    #[must_use]
+    pub fn auto_inner_threshold_bytes(mut self, bytes: u32) -> Self {
+        self.auto_inner_threshold_bytes = Some(bytes);
+        self
+    }
+}
+
+/// Map a per-frame `cluster_density` (sum of cluster pixel-areas
+/// divided by total canvas area, in `[0.0, 1.0]`) to an effective
+/// per-frame `max_components` budget. Linear ramp from `16` (at
+/// `density ≤ 0.05`) down to `4` (at `density ≥ 0.30`); flat outside
+/// the band. Pulled out as a freestanding helper so the test suite can
+/// pin the mapping without going through the encoder.
+fn adaptive_max_components(density: f32) -> u32 {
+    // Clamp to the documented range.
+    let d = density.clamp(0.0, 1.0);
+    const LO_DENSITY: f32 = 0.05;
+    const HI_DENSITY: f32 = 0.30;
+    const LO_BUDGET: f32 = 16.0;
+    const HI_BUDGET: f32 = 4.0;
+    if d <= LO_DENSITY {
+        return LO_BUDGET as u32;
+    }
+    if d >= HI_DENSITY {
+        return HI_BUDGET as u32;
+    }
+    // Linear interpolation in the band — `t = 0` at LO_DENSITY,
+    // `t = 1` at HI_DENSITY. Round to nearest u32.
+    let t = (d - LO_DENSITY) / (HI_DENSITY - LO_DENSITY);
+    let budget = LO_BUDGET + t * (HI_BUDGET - LO_BUDGET);
+    budget.round() as u32
 }
 
 /// Knob bag for [`build_animated_webp_with_options`]. Defaults pick the
@@ -609,9 +703,27 @@ fn build_animated_webp_delta(
             "animated WebP delta: max_bbox_fraction must be in [0.0, 1.0]",
         ));
     }
-    if cfg.max_components == 0 {
+    if let Some(n) = cfg.max_components_override {
+        if n == 0 {
+            return Err(Error::invalid(
+                "animated WebP delta: max_components_override must be ≥ 1",
+            ));
+        }
+    }
+    if let Some(t) = cfg.auto_inner_threshold_bytes {
+        // Disallow a 0-byte threshold (would force every tile through
+        // lossy and defeat the lossless-default round-trip semantics).
+        if t == 0 {
+            return Err(Error::invalid(
+                "animated WebP delta: auto_inner_threshold_bytes must be ≥ 1",
+            ));
+        }
+    }
+    if cfg.auto_inner_threshold_bytes.is_some()
+        && !(cfg.auto_inner_quality >= 0.0 && cfg.auto_inner_quality <= 100.0)
+    {
         return Err(Error::invalid(
-            "animated WebP delta: max_components must be ≥ 1",
+            "animated WebP delta: auto_inner_quality must be in [0.0, 100.0]",
         ));
     }
 
@@ -707,11 +819,42 @@ fn build_animated_webp_delta(
             continue;
         }
         // Multi-rect cost-model: find the connected components of the
-        // changed-block grid, capped at `cfg.max_components` (smallest
-        // components iteratively merged with their nearest neighbour
-        // when over budget).
+        // changed-block grid, capped at the per-frame budget (either
+        // `cfg.max_components_override` if set, else
+        // `adaptive_max_components(cluster_density)` chosen from the
+        // raw cluster pixel-area sum returned by the cost-model walk).
+        // We need the raw density to pick the budget, but the merge
+        // step itself depends on the budget — chain the helper so the
+        // walk runs once and the budget is plumbed through.
         let prior = &frames[i - 1];
-        let components = changed_block_components(prior.rgba, f.rgba, canvas_w, canvas_h, &cfg);
+        let budget = match cfg.max_components_override {
+            Some(n) => n,
+            None => {
+                // Probe density first by running the flood-fill with
+                // an "infinite" budget — `u32::MAX` skips the merge
+                // loop entirely and we get the pre-merge cluster
+                // pixel area for the density mapping. This is one
+                // extra walk per frame, but it's pure-pixel-arith on
+                // a block-grid (block-grid is canvas / block_size² in
+                // size — a few hundred entries on typical content).
+                let (_, raw_pixels) = changed_block_components_with_density(
+                    prior.rgba,
+                    f.rgba,
+                    canvas_w,
+                    canvas_h,
+                    &cfg,
+                    u32::MAX,
+                );
+                let density = if max_pixels == 0 {
+                    0.0
+                } else {
+                    (raw_pixels as f32) / (max_pixels as f32)
+                };
+                adaptive_max_components(density)
+            }
+        };
+        let components =
+            changed_block_components(prior.rgba, f.rgba, canvas_w, canvas_h, &cfg, budget);
 
         if components.is_empty() {
             // Identical — emit a 1×1 (smallest the spec allows)
@@ -815,10 +958,13 @@ fn build_animated_webp_delta(
         }
     }
 
-    // Drive the planned frames through the standard encoder path with
-    // mode = Auto (so each sub-rect tile picks lossy/lossless per the
-    // smaller-payload rule). We construct a fresh `AnimFrame` array
-    // borrowing into either the original input or `tile_storage`.
+    // Construct the rewritten frame list, borrowing into either the
+    // original input slice (full-canvas frames) or the per-tile
+    // `tile_storage` buffer (sub-rect frames). Track per-frame
+    // "is sub-rect tile" alongside it — the auto-inner-encode threshold
+    // only applies to sub-rect tiles, never to full-canvas frames (which
+    // include the always-full first frame and the cost-model fallback
+    // full-canvas refresh).
     let rewritten: Vec<AnimFrame<'_>> = planned
         .iter()
         .map(|p| {
@@ -838,27 +984,214 @@ fn build_animated_webp_delta(
             }
         })
         .collect();
+    let is_subrect_tile: Vec<bool> = planned
+        .iter()
+        .map(|p| matches!(p.rgba_kind, RgbaKind::Tile))
+        .collect();
 
-    // Drive the rewritten frames through the standard encoder path in
-    // `Lossless` mode: sub-rect tiles produced by Delta are typically
-    // tiny (≤ a few KB raw RGBA), so the VP8 keyframe overhead would
-    // win on byte count and the rebuild would also incur expensive
-    // RDO during the per-frame Auto-mode candidate evaluation. Forcing
-    // lossless keeps Delta-mode encodes deterministic + fast and
+    // Without the auto-inner-encode threshold, every sub-rect re-encodes
+    // losslessly (the historical behaviour). Sub-rect tiles produced by
+    // Delta are typically tiny (≤ a few KB raw RGBA), so the VP8 keyframe
+    // overhead would win on byte count and the rebuild would also incur
+    // expensive RDO during the per-frame Auto-mode candidate evaluation.
+    // Forcing lossless keeps Delta-mode encodes deterministic + fast and
     // preserves pixel-identical round-trip semantics.
-    let inner_options = AnimEncoderOptions {
-        mode: AnimFrameMode::Lossless,
-        lossy_quality: options.lossy_quality,
-        metadata: options.metadata.clone(),
-    };
-    build_animated_webp_with_options(
+    if cfg.auto_inner_threshold_bytes.is_none() {
+        let inner_options = AnimEncoderOptions {
+            mode: AnimFrameMode::Lossless,
+            lossy_quality: options.lossy_quality,
+            metadata: options.metadata.clone(),
+        };
+        return build_animated_webp_with_options(
+            canvas_w,
+            canvas_h,
+            background_bgra,
+            loop_count,
+            &rewritten,
+            inner_options,
+        );
+    }
+
+    // Auto-inner-encode path: per-tile, encode lossless first; if the
+    // payload exceeds `cfg.auto_inner_threshold_bytes`, also encode
+    // lossy at `cfg.auto_inner_quality` and pick the byte-smaller
+    // candidate. Tiles below the cutoff stay lossless (no quality loss
+    // for the common-case small-tile path). The body assembly mirrors
+    // `build_animated_webp_with_options` — kept inline because the
+    // mode decision is per-tile, not per-call.
+    let threshold = cfg.auto_inner_threshold_bytes.unwrap();
+    let lossy_inner_quality = cfg.auto_inner_quality;
+    build_animated_webp_inner_per_tile(
         canvas_w,
         canvas_h,
         background_bgra,
         loop_count,
         &rewritten,
-        inner_options,
+        &is_subrect_tile,
+        &options.metadata,
+        threshold,
+        lossy_inner_quality,
     )
+}
+
+/// Inner-assembly path for the [`AnimFrameMode::Delta`] flow when
+/// `cfg.auto_inner_threshold_bytes` is set. Mirrors
+/// [`build_animated_webp_with_options`]'s body-assembly loop, but the
+/// per-tile encoding decision uses the Delta-mode "lossless first,
+/// lossy only if lossless > threshold" rule. The `is_subrect_tile[i]`
+/// flag gates the threshold per-frame: full-canvas frames (the first
+/// frame + cost-model fallback) always stay lossless regardless of
+/// size, only genuine sub-rect tiles can be promoted to the lossy
+/// candidate.
+#[allow(clippy::too_many_arguments)]
+fn build_animated_webp_inner_per_tile(
+    canvas_w: u32,
+    canvas_h: u32,
+    background_bgra: [u8; 4],
+    loop_count: u16,
+    frames: &[AnimFrame<'_>],
+    is_subrect_tile: &[bool],
+    metadata: &WebpMetadata<'_>,
+    auto_inner_threshold_bytes: u32,
+    auto_inner_quality: f32,
+) -> Result<Vec<u8>> {
+    debug_assert_eq!(
+        frames.len(),
+        is_subrect_tile.len(),
+        "frames and is_subrect_tile must be parallel"
+    );
+    let mut any_frame_has_alpha = false;
+    let mut anmf_payloads: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+    for (frame_idx, f) in frames.iter().enumerate() {
+        // Validate identical to `build_animated_webp_with_options`'s
+        // pre-loop. We've already validated the source frames upstream
+        // — this loop sees the rewritten Delta tiles which the planner
+        // built from validated inputs, so the bbox / size checks are
+        // structural assertions here, not user-facing errors.
+        if f.width == 0 || f.height == 0 {
+            return Err(Error::invalid("animated WebP delta-inner: zero tile size"));
+        }
+        if f.x_offset
+            .checked_add(f.width)
+            .map(|r| r > canvas_w)
+            .unwrap_or(true)
+            || f.y_offset
+                .checked_add(f.height)
+                .map(|r| r > canvas_h)
+                .unwrap_or(true)
+        {
+            return Err(Error::invalid(
+                "animated WebP delta-inner: tile bbox extends past canvas",
+            ));
+        }
+        if f.rgba.len() != (f.width as usize) * (f.height as usize) * 4 {
+            return Err(Error::invalid(
+                "animated WebP delta-inner: tile rgba length mismatch",
+            ));
+        }
+        if !any_frame_has_alpha && f.rgba.chunks_exact(4).any(|px| px[3] != 0xff) {
+            any_frame_has_alpha = true;
+        }
+
+        // Per-tile encode: always produce the lossless candidate.
+        let lossless = encode_lossless_anmf(f)?;
+        let lossless_bytes: usize = lossless
+            .iter()
+            .map(|s| 8 + s.payload.len() + (s.payload.len() & 1))
+            .sum();
+        // Only spend cycles on the lossy candidate when (a) this is a
+        // genuine sub-rect tile (full-canvas frames always stay
+        // lossless to preserve round-trip semantics on the canvas
+        // baseline) AND (b) the lossless payload exceeds the threshold
+        // (the common-case small tile skips lossy entirely → fast +
+        // pixel-identical).
+        let chosen: Vec<AnmfSubChunk> =
+            if is_subrect_tile[frame_idx] && lossless_bytes > auto_inner_threshold_bytes as usize {
+                match encode_lossy_anmf(f, auto_inner_quality)? {
+                    Some(lossy) => {
+                        let lossy_bytes: usize = lossy
+                            .iter()
+                            .map(|s| 8 + s.payload.len() + (s.payload.len() & 1))
+                            .sum();
+                        if lossy_bytes < lossless_bytes {
+                            lossy
+                        } else {
+                            lossless
+                        }
+                    }
+                    None => lossless,
+                }
+            } else {
+                lossless
+            };
+
+        // Build the ANMF payload (same wire format as the standard
+        // assembly loop).
+        let nested_capacity = chosen.iter().map(|c| 8 + c.payload.len()).sum::<usize>();
+        let mut payload = Vec::with_capacity(16 + nested_capacity);
+        write_u24_le(&mut payload, (f.x_offset / 2) & 0x00FF_FFFF);
+        write_u24_le(&mut payload, (f.y_offset / 2) & 0x00FF_FFFF);
+        write_u24_le(&mut payload, (f.width - 1) & 0x00FF_FFFF);
+        write_u24_le(&mut payload, (f.height - 1) & 0x00FF_FFFF);
+        write_u24_le(&mut payload, f.duration_ms & 0x00FF_FFFF);
+        let mut flags: u8 = 0;
+        if !f.blend {
+            flags |= 0x01;
+        }
+        if f.dispose_to_background {
+            flags |= 0x02;
+        }
+        payload.push(flags);
+        for sub in &chosen {
+            write_chunk(&mut payload, &sub.fourcc, &sub.payload);
+        }
+        anmf_payloads.push(payload);
+    }
+
+    // Body assembly identical to `build_animated_webp_with_options`.
+    let mut body: Vec<u8> = Vec::new();
+    let mut flags: u8 = 0x02; // ANIM
+    if any_frame_has_alpha {
+        flags |= 0x10;
+    }
+    if metadata.icc.is_some() {
+        flags |= 0x20;
+    }
+    if metadata.exif.is_some() {
+        flags |= 0x08;
+    }
+    if metadata.xmp.is_some() {
+        flags |= 0x04;
+    }
+    let vp8x = vp8x_payload(flags, canvas_w, canvas_h);
+    write_chunk(&mut body, b"VP8X", &vp8x);
+    if let Some(icc) = metadata.icc {
+        write_chunk(&mut body, b"ICCP", icc);
+    }
+    let mut anim = [0u8; 6];
+    anim[0] = background_bgra[0];
+    anim[1] = background_bgra[1];
+    anim[2] = background_bgra[2];
+    anim[3] = background_bgra[3];
+    anim[4] = (loop_count & 0xff) as u8;
+    anim[5] = ((loop_count >> 8) & 0xff) as u8;
+    write_chunk(&mut body, b"ANIM", &anim);
+    for payload in &anmf_payloads {
+        write_chunk(&mut body, b"ANMF", payload);
+    }
+    if let Some(exif) = metadata.exif {
+        write_chunk(&mut body, b"EXIF", exif);
+    }
+    if let Some(xmp) = metadata.xmp {
+        write_chunk(&mut body, b"XMP ", xmp);
+    }
+    let riff_size = 4 + body.len();
+    let mut out = Vec::with_capacity(8 + riff_size);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    out.extend_from_slice(b"WEBP");
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 /// Copy the `bw × bh` sub-rectangle starting at `(bx, by)` out of an
@@ -948,30 +1281,45 @@ fn block_bbox_to_pixel_bbox(
     (px, py, pw, ph)
 }
 
-/// Find the 4-connected components on the changed-block grid and
-/// return a list of pixel bboxes (one per component). Components are
-/// merged down to `cfg.max_components` by iteratively combining the
-/// smallest-area component with its nearest neighbour (axis-aligned
-/// inter-bbox distance, ties broken by neighbour bbox area).
+/// Find the 4-connected components on the changed-block grid + apply
+/// the merge-to-budget pass. Returns a list of even-aligned pixel
+/// bboxes suitable for direct ANMF emission.
 ///
-/// Returns an empty `Vec` when no block exceeds threshold (frame is
-/// effectively unchanged).
-///
-/// Each returned bbox is `(x, y, w, h)` already even-aligned + clipped
-/// to the canvas — it is suitable for direct ANMF emission.
+/// The `max_components` budget is determined by the caller (either the
+/// explicit [`DeltaConfig::max_components_override`] or the adaptive
+/// [`adaptive_max_components`] of the per-frame cluster density). To
+/// pick the adaptive budget the caller needs the raw cluster area sum
+/// — see [`changed_block_components_with_density`].
 fn changed_block_components(
     prev: &[u8],
     curr: &[u8],
     canvas_w: u32,
     canvas_h: u32,
     cfg: &DeltaConfig,
+    max_components: u32,
 ) -> Vec<(u32, u32, u32, u32)> {
+    changed_block_components_with_density(prev, curr, canvas_w, canvas_h, cfg, max_components).0
+}
+
+/// Same as [`changed_block_components`] but also returns the raw
+/// (pre-merge) cluster pixel-area sum. The density-aware caller can
+/// recompute the budget from this sum and re-call with a different
+/// `max_components` value if needed (and we provide the
+/// [`adaptive_max_components`] helper for that).
+fn changed_block_components_with_density(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    cfg: &DeltaConfig,
+    max_components: u32,
+) -> (Vec<(u32, u32, u32, u32)>, u64) {
     let bs = cfg.block_size;
     let (grid, n_bx, n_by) = compute_changed_grid(prev, curr, canvas_w, canvas_h, cfg);
     let nx = n_bx as usize;
     let ny = n_by as usize;
     if nx == 0 || ny == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     // 4-connected flood fill — `label[i]` is the component id of
@@ -1043,12 +1391,25 @@ fn changed_block_components(
         }
     }
 
+    // Sum up the pre-merge cluster pixel-area (cluster_density numerator)
+    // *before* the merge step rewrites bboxes. Each cluster's pixel area
+    // is the bbox-on-pixel-grid area (clipped to canvas), which gives the
+    // caller the right metric for the adaptive-budget mapping.
+    let raw_cluster_pixels: u64 = bboxes
+        .iter()
+        .map(|&(mnx, mny, mxx, mxy)| {
+            let (_, _, pw, ph) =
+                block_bbox_to_pixel_bbox(mnx, mny, mxx, mxy, canvas_w, canvas_h, bs);
+            (pw as u64) * (ph as u64)
+        })
+        .sum();
+
     // Budget enforcement: while we have more components than allowed,
     // pick the smallest (by block-area) component and merge it into
     // its nearest neighbour (axis-aligned inter-bbox Manhattan-style
     // distance — if the bboxes overlap, distance = 0 and that pair
     // wins immediately). Repeat until at-budget.
-    while bboxes.len() > cfg.max_components as usize && bboxes.len() > 1 {
+    while bboxes.len() > max_components as usize && bboxes.len() > 1 {
         // Find smallest by area.
         let smallest_idx = bboxes
             .iter()
@@ -1100,12 +1461,13 @@ fn changed_block_components(
     }
 
     // Convert each block-grid bbox to a pixel bbox.
-    bboxes
+    let pixel_rects: Vec<(u32, u32, u32, u32)> = bboxes
         .into_iter()
         .map(|(mnx, mny, mxx, mxy)| {
             block_bbox_to_pixel_bbox(mnx, mny, mxx, mxy, canvas_w, canvas_h, bs)
         })
-        .collect()
+        .collect();
+    (pixel_rects, raw_cluster_pixels)
 }
 
 /// One-dimensional gap between two intervals `[a0, a1]` and `[b0, b1]`
@@ -1535,6 +1897,32 @@ mod tests {
             auto.len(),
             lossless.len(),
             "auto mode failed to pick lossless on a flat-colour fixture"
+        );
+    }
+
+    #[test]
+    fn adaptive_max_components_pins_documented_density_band() {
+        // Below LO_DENSITY (5%): clamps to LO_BUDGET (16).
+        assert_eq!(adaptive_max_components(0.0), 16);
+        assert_eq!(adaptive_max_components(0.01), 16);
+        assert_eq!(adaptive_max_components(0.05), 16);
+        // Above HI_DENSITY (30%): clamps to HI_BUDGET (4).
+        assert_eq!(adaptive_max_components(0.30), 4);
+        assert_eq!(adaptive_max_components(0.50), 4);
+        assert_eq!(adaptive_max_components(1.00), 4);
+        // Mid-band (linear interpolation): density = 0.175 → t = 0.5 →
+        // budget = 16 + 0.5*(4-16) = 10.
+        assert_eq!(adaptive_max_components(0.175), 10);
+        // Just inside the band on each end.
+        let near_lo = adaptive_max_components(0.06);
+        let near_hi = adaptive_max_components(0.29);
+        assert!(
+            near_lo > near_hi,
+            "monotonic: lower density yields larger budget, got {near_lo} vs {near_hi}"
+        );
+        assert!(
+            (4..=16).contains(&near_lo) && (4..=16).contains(&near_hi),
+            "in-band budgets stay inside [4, 16]"
         );
     }
 
