@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-webp/compare/v0.1.4...v0.1.5) - 2026-05-09
+
+### Added
+
+- *(anim-encoder)* real Gaussian downsample + auto-inner-threshold default flip
+- *(anim-encoder)* opt-in MS-SSIM-lite + slow-tests gated 320x240 fixture
+- *(anim-encoder)* opt-in SSIM-lite cost model + mid-density ramp validation
+- *(anim-encoder)* adaptive max_components + auto inner-encode for Delta mode
+- *(anim-encoder)* multi-rect ANMF for Delta mode (per-block decision)
+- *(anim-encoder)* AVIF-style perceptual delta-merge for animation
+- *(anim-decoder,demux)* zero-clone next_frame_borrowed + streaming Demuxer impl
+- *(anim-decoder)* seek_to_frame random-access + memory-tight streaming demux
+- *(anim-decoder,encoder-vp8l)* streaming WebpAnimDecoder + VP8L metadata factory
+
+### Other
+
+- *(anim-encoder)* downsize multi-rect Delta fixture from 320x240 to 160x120
+- doc the deferred dispose-to-background semantics
+- drop stale dead_code on LazyParsedContainer.total_duration_ms
+
 ### Added
 
 - *(anim-encoder)* **opt-in real Gaussian downsample kernel for the
