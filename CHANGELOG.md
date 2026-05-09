@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-encoder)* **multi-rect ANMF for `AnimFrameMode::Delta`** —
+  the per-frame cost-model now runs a 4-connected-component pass on
+  the changed-block grid and emits one ANMF sub-rect per disjoint
+  cluster (instead of a single bounding box of all changes). Wins on
+  scattered-change content like a UI with two independent spinners or
+  a HUD with three separate counters where the single-bbox cover
+  would span almost the full canvas. New `DeltaConfig::max_components`
+  knob (default 8) caps the per-frame sub-rect count; when the
+  cost-model finds more clusters than the budget, the smallest are
+  iteratively merged with their nearest neighbour (axis-aligned
+  inter-bbox squared-distance). Sub-rects within a logical input
+  frame use `duration_ms = 0` for every tile except the last (which
+  carries the input frame's duration), so total display time is
+  preserved across the round-trip — decoded `WebpFrame` count exceeds
+  the input frame count when multi-rect kicks in. On a 320×240
+  3-cluster fixture (16×16 stamps at three corners), file size drops
+  from 583 870 B (single-bbox baseline) to 228 762 B (~ 60 % saving).
+  Single-cluster frames degrade gracefully to the historical single-
+  bbox path. Set `max_components = 1` to force the historical
+  behaviour.
+
 - *(anim-encoder)* **`AnimFrameMode::Delta` AVIF-style perceptual
   frame-merge** — a new [`AnimFrameMode`] variant that opts each
   non-first frame into block-level dirty-rect detection. The encoder

@@ -39,6 +39,22 @@
 //!    frame N == frame N-1, the cost-model bbox is empty; the encoder
 //!    emits a 1×1 overwrite tile so the duration counter still ticks
 //!    without any visible canvas change.
+//!  * **`delta_mode_multi_rect_beats_single_bbox_for_scattered_changes`** —
+//!    320×240 canvas with three disjoint changing 16×16 blocks (top-
+//!    left, centre, bottom-right). The single-bbox cover would span
+//!    the whole canvas; the multi-rect path emits one ANMF per
+//!    cluster and the total file size beats the single-bbox baseline
+//!    (`max_components = 1`).
+//!  * **`delta_mode_multi_rect_round_trip_pixel_identical`** — same
+//!    3-cluster fixture; verify the decoded canvas at the END of each
+//!    logical input frame's ANMF chain matches the source frame
+//!    pixel-identically. Sub-rect ANMFs use `duration_ms = 0` for all
+//!    but the final tile per logical frame so total display time is
+//!    preserved across the round-trip.
+//!  * **`delta_mode_multi_rect_respects_max_components_budget`** — set
+//!    `max_components = 2` on a 4-cluster fixture; verify exactly 2
+//!    sub-rect ANMFs are emitted (the smallest two clusters merge
+//!    into a single covering super-rect).
 
 use oxideav_webp::{
     build_animated_webp_with_options, decode_webp, AnimEncoderOptions, AnimFrame, AnimFrameMode,
@@ -455,5 +471,294 @@ fn delta_mode_identical_frame_emits_minimal_sub_rect() {
     assert_eq!(
         img.frames[1].rgba, f0,
         "identical-frame round-trip must produce f0 unchanged"
+    );
+}
+
+// --- Multi-rect ANMF (per-block decision) ---------------------------------
+//
+// The 3-cluster fixture is dimensioned so the changing regions stay
+// **disjoint** under the default block_size = 8 cost model: three
+// 16×16 stamps placed at 3 corners of a 320×240 canvas. Each cluster
+// is a separate connected component, so the multi-rect path emits
+// 3 sub-rect ANMFs per delta frame, while the single-bbox path emits
+// one near-canvas-sized ANMF that covers all three clusters.
+
+const MR_W: u32 = 320;
+const MR_H: u32 = 240;
+const MR_STAMP: u32 = 16;
+// 3 disjoint stamps: top-left, centre, bottom-right. Each is far
+// enough from the others that a default block_size = 8 grid cannot
+// fuse them via a 4-connected flood fill.
+const MR_STAMP_POSITIONS: &[(u32, u32)] = &[
+    (16, 16),
+    (MR_W / 2, MR_H / 2),
+    (MR_W - MR_STAMP - 16, MR_H - MR_STAMP - 16),
+];
+
+fn build_mr_frame(counter: u8, n_stamps: usize) -> Vec<u8> {
+    let mut v = vec![0u8; (MR_W * MR_H * 4) as usize];
+    // Background pseudo-noise (deterministic, identical between frames).
+    for y in 0..MR_H {
+        for x in 0..MR_W {
+            let i = ((y * MR_W + x) * 4) as usize;
+            let mut s = y.wrapping_mul(0x9E37_79B9) ^ x.wrapping_mul(0x85EB_CA77);
+            s ^= s.wrapping_shr(13);
+            s = s.wrapping_mul(0xC2B2_AE35);
+            s ^= s.wrapping_shr(16);
+            v[i] = (s & 0xff) as u8;
+            v[i + 1] = ((s >> 8) & 0xff) as u8;
+            v[i + 2] = ((s >> 16) & 0xff) as u8;
+            v[i + 3] = 0xff;
+        }
+    }
+    // Stamp the changing blocks — `n_stamps` of them at the
+    // pre-defined corner / centre positions.
+    for &(sx, sy) in MR_STAMP_POSITIONS.iter().take(n_stamps) {
+        for y in sy..(sy + MR_STAMP) {
+            for x in sx..(sx + MR_STAMP) {
+                let i = ((y * MR_W + x) * 4) as usize;
+                v[i] = counter;
+                v[i + 1] = 0xff - counter;
+                v[i + 2] = 0x80;
+                v[i + 3] = 0xff;
+            }
+        }
+    }
+    v
+}
+
+fn count_anmf_chunks(blob: &[u8]) -> usize {
+    anmf_payload_sizes(blob).len()
+}
+
+#[test]
+fn delta_mode_multi_rect_beats_single_bbox_for_scattered_changes() {
+    // 3 logical frames (frame 0 + 2 delta frames). Each delta frame
+    // changes the 3 disjoint stamp blocks vs the previous frame's
+    // stamp colour.
+    let f0 = build_mr_frame(0x10, 3);
+    let f1 = build_mr_frame(0x60, 3);
+    let f2 = build_mr_frame(0xa0, 3);
+    let rgbas = [f0, f1, f2];
+    let frames: Vec<AnimFrame> = rgbas
+        .iter()
+        .map(|rgba| AnimFrame {
+            width: MR_W,
+            height: MR_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba,
+        })
+        .collect();
+
+    // Single-bbox baseline: max_components = 1 → all clusters fold
+    // into one covering super-rect.
+    let single = build_animated_webp_with_options(
+        MR_W,
+        MR_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig {
+                max_components: 1,
+                ..DeltaConfig::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("encode single");
+
+    // Multi-rect: default budget (8) — 3 components emitted as-is.
+    let multi = build_animated_webp_with_options(
+        MR_W,
+        MR_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            ..Default::default()
+        },
+    )
+    .expect("encode multi");
+
+    let single_anmf_count = count_anmf_chunks(&single);
+    let multi_anmf_count = count_anmf_chunks(&multi);
+    eprintln!(
+        "3-cluster scattered-change anim: single-bbox file = {} bytes ({} ANMFs); multi-rect file = {} bytes ({} ANMFs)",
+        single.len(), single_anmf_count, multi.len(), multi_anmf_count,
+    );
+
+    // Multi-rect emits 1 (frame 0) + 3 (frame 1) + 3 (frame 2) = 7
+    // ANMFs vs single-bbox's 1 + 1 + 1 = 3 ANMFs.
+    assert_eq!(
+        single_anmf_count, 3,
+        "single-bbox path should emit 1 ANMF per logical frame"
+    );
+    assert_eq!(
+        multi_anmf_count, 7,
+        "multi-rect path should emit 3 ANMFs for each of 2 delta frames"
+    );
+    // Multi-rect total file size beats single-bbox.
+    assert!(
+        multi.len() < single.len(),
+        "multi-rect ({}) should beat single-bbox ({}) on scattered-change content",
+        multi.len(),
+        single.len(),
+    );
+}
+
+#[test]
+fn delta_mode_multi_rect_round_trip_pixel_identical() {
+    // Same fixture as the wire-size test — 3 disjoint stamps on each
+    // delta frame. The decoder paints each sub-rect onto the
+    // persistent canvas; after the LAST sub-rect of each input frame
+    // the canvas must match the source rgba pixel-identically.
+    let f0 = build_mr_frame(0x10, 3);
+    let f1 = build_mr_frame(0x60, 3);
+    let f2 = build_mr_frame(0xa0, 3);
+    let rgbas = [f0.clone(), f1.clone(), f2.clone()];
+    let frames: Vec<AnimFrame> = rgbas
+        .iter()
+        .map(|rgba| AnimFrame {
+            width: MR_W,
+            height: MR_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba,
+        })
+        .collect();
+    let multi = build_animated_webp_with_options(
+        MR_W,
+        MR_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            ..Default::default()
+        },
+    )
+    .expect("encode multi");
+    let img = decode_webp(&multi).expect("decode multi");
+
+    // The decoded frame stream is longer than the input frame stream
+    // (multi-rect emits ≥1 sub-rect per logical frame). The end of
+    // each logical frame is the sub-rect carrying `duration_ms > 0`
+    // (non-final sub-rects within a logical frame use duration = 0).
+    // Walk the decoded frames and pick the canvas at each
+    // logical-frame boundary.
+    let mut logical: Vec<Vec<u8>> = Vec::new();
+    for f in &img.frames {
+        if f.duration_ms > 0 {
+            logical.push(f.rgba.clone());
+        }
+    }
+    assert_eq!(
+        logical.len(),
+        rgbas.len(),
+        "expected one logical-frame boundary (duration>0) per input frame"
+    );
+    for (i, src) in rgbas.iter().enumerate() {
+        if &logical[i] != src {
+            let mismatch_idx = logical[i].iter().zip(src.iter()).position(|(a, b)| a != b);
+            panic!(
+                "multi-rect round-trip mismatch at logical frame {i}, byte {:?}",
+                mismatch_idx
+            );
+        }
+    }
+}
+
+#[test]
+fn delta_mode_multi_rect_respects_max_components_budget() {
+    // 4 disjoint stamps placed in the four corners. With
+    // max_components = 2, the two smallest-area clusters get merged
+    // with their nearest neighbour until the cluster count drops to
+    // 2 → exactly 2 sub-rect ANMFs per delta frame. Total = 1 (frame
+    // 0) + 2 (delta frame 1) = 3 ANMFs.
+    fn build_4corner_frame(counter: u8) -> Vec<u8> {
+        let mut v = vec![0u8; (MR_W * MR_H * 4) as usize];
+        // Static noise background.
+        for y in 0..MR_H {
+            for x in 0..MR_W {
+                let i = ((y * MR_W + x) * 4) as usize;
+                let s = y.wrapping_mul(7919) ^ x.wrapping_mul(104729);
+                v[i] = (s & 0xff) as u8;
+                v[i + 1] = ((s >> 8) & 0xff) as u8;
+                v[i + 2] = ((s >> 16) & 0xff) as u8;
+                v[i + 3] = 0xff;
+            }
+        }
+        // 4 corner stamps.
+        let stamps = [
+            (16u32, 16u32),
+            (MR_W - MR_STAMP - 16, 16),
+            (16, MR_H - MR_STAMP - 16),
+            (MR_W - MR_STAMP - 16, MR_H - MR_STAMP - 16),
+        ];
+        for (sx, sy) in stamps {
+            for y in sy..(sy + MR_STAMP) {
+                for x in sx..(sx + MR_STAMP) {
+                    let i = ((y * MR_W + x) * 4) as usize;
+                    v[i] = counter;
+                    v[i + 1] = 0xff - counter;
+                    v[i + 2] = 0x80;
+                    v[i + 3] = 0xff;
+                }
+            }
+        }
+        v
+    }
+    let f0 = build_4corner_frame(0x10);
+    let f1 = build_4corner_frame(0x90);
+    let frames = vec![
+        AnimFrame {
+            width: MR_W,
+            height: MR_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba: &f0,
+        },
+        AnimFrame {
+            width: MR_W,
+            height: MR_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba: &f1,
+        },
+    ];
+    let blob = build_animated_webp_with_options(
+        MR_W,
+        MR_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig {
+                max_components: 2,
+                ..DeltaConfig::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("encode budget=2");
+    let n = count_anmf_chunks(&blob);
+    assert_eq!(
+        n, 3,
+        "4-cluster fixture with max_components=2 should emit 1+2 = 3 ANMFs, got {n}"
     );
 }

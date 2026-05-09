@@ -113,6 +113,25 @@ pub enum AnimFrameMode {
 /// Defaults are tuned for 8×8 blocks at threshold 32 (≈1 LSB per pixel
 /// on a flat region — small enough to flag any real motion, large
 /// enough to absorb codec rounding noise).
+///
+/// # Multi-rect emission
+///
+/// When the changed blocks form **multiple disjoint clusters** (e.g. a
+/// UI with two independently-spinning indicators on a static
+/// background), the encoder runs a 4-connected-component pass on the
+/// dirty-block grid and emits **one ANMF sub-rect per cluster**, up to
+/// [`Self::max_components`] (default 8). When the cluster count exceeds
+/// the budget, the smallest clusters are iteratively merged with their
+/// nearest-neighbour cluster (axis-aligned bbox-of-pair) until the count
+/// fits. This keeps wire size tight on scattered-change content where a
+/// single cost-model bounding box would cover almost the whole canvas.
+///
+/// Each component within a logical input frame becomes a separate ANMF
+/// in the output stream. Non-final sub-rects carry `duration_ms = 0`
+/// (the decoder interprets this as "show for 1 ms", per the spec's
+/// floor); the final sub-rect carries the input frame's `duration_ms`
+/// so total display time stays correct. Decoded `WebpFrame` count will
+/// therefore exceed the input frame count when multi-rect kicks in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeltaConfig {
     /// Block side length in pixels. Default 8. The encoder rounds
@@ -127,6 +146,14 @@ pub struct DeltaConfig {
     /// path for that frame and falls back to a full-frame encode in
     /// `Auto` mode. Range `0.0..=1.0`; default `0.8`.
     pub max_bbox_fraction: f32,
+    /// Cap on the number of disjoint sub-rect ANMFs the encoder may
+    /// emit per logical input frame. Default 8. When the connected-
+    /// component pass finds more clusters than this, the smallest
+    /// clusters are iteratively merged with their nearest neighbour
+    /// (by inter-bbox axis-aligned distance) until the cluster count
+    /// drops to `max_components`. Set to 1 to force the historical
+    /// single-bbox behaviour.
+    pub max_components: u32,
 }
 
 impl Default for DeltaConfig {
@@ -135,6 +162,7 @@ impl Default for DeltaConfig {
             block_size: 8,
             threshold: 32,
             max_bbox_fraction: 0.8,
+            max_components: 8,
         }
     }
 }
@@ -581,6 +609,11 @@ fn build_animated_webp_delta(
             "animated WebP delta: max_bbox_fraction must be in [0.0, 1.0]",
         ));
     }
+    if cfg.max_components == 0 {
+        return Err(Error::invalid(
+            "animated WebP delta: max_components must be ≥ 1",
+        ));
+    }
 
     // Validate caller constraints + collect per-frame full-canvas RGBA
     // for the cost-model comparison. We require frames that cover the
@@ -673,65 +706,112 @@ fn build_animated_webp_delta(
             });
             continue;
         }
-        // Cost-model bbox against frame i-1.
+        // Multi-rect cost-model: find the connected components of the
+        // changed-block grid, capped at `cfg.max_components` (smallest
+        // components iteratively merged with their nearest neighbour
+        // when over budget).
         let prior = &frames[i - 1];
-        let bbox = changed_block_bbox(prior.rgba, f.rgba, canvas_w, canvas_h, &cfg);
-        match bbox {
-            None => {
-                // Identical — emit a 1×1 (smallest the spec allows)
-                // overwrite at (0,0) with the prior pixel: zero visible
-                // change and the smallest possible payload.
-                let p0 = &prior.rgba[..4];
-                let mut tile = Vec::with_capacity(4);
-                tile.extend_from_slice(p0);
-                let tile_idx = tile_storage.len();
-                tile_storage.push(tile);
+        let components = changed_block_components(prior.rgba, f.rgba, canvas_w, canvas_h, &cfg);
+
+        if components.is_empty() {
+            // Identical — emit a 1×1 (smallest the spec allows)
+            // overwrite at (0,0) with the prior pixel: zero visible
+            // change and the smallest possible payload.
+            let p0 = &prior.rgba[..4];
+            let mut tile = Vec::with_capacity(4);
+            tile.extend_from_slice(p0);
+            let tile_idx = tile_storage.len();
+            tile_storage.push(tile);
+            planned.push(PlannedFrame {
+                x_offset: 0,
+                y_offset: 0,
+                width: 1,
+                height: 1,
+                duration_ms: f.duration_ms,
+                blend: false, // overwrite (DoNotBlend)
+                rgba_kind: RgbaKind::Tile,
+                rgba_idx: tile_idx,
+            });
+            continue;
+        }
+
+        // Compute the union bbox (the single-bbox cover). If that
+        // covers more than `max_bbox_fraction` of the canvas AND the
+        // multi-rect total area is also that big, fall back to a
+        // full-canvas refresh — neither shape is going to win.
+        let union_bbox = bbox_union(&components);
+        let union_pixels = (union_bbox.2 as u64) * (union_bbox.3 as u64);
+        let multi_pixels: u64 = components
+            .iter()
+            .map(|&(_, _, w, h)| (w as u64) * (h as u64))
+            .sum();
+
+        // Multi-rect wins on wire when the sum of per-component
+        // pixel counts is materially smaller than the single-bbox
+        // cover (≥ 25% saving) AND we have more than one component.
+        // Otherwise the per-ANMF chunk overhead + per-tile VP8L
+        // header outweigh the bbox savings.
+        let use_multi = components.len() > 1
+            && multi_pixels.saturating_mul(4) < union_pixels.saturating_mul(3)
+            && multi_pixels <= max_bbox_pixels;
+
+        if !use_multi {
+            // Single-bbox path (historical) or fall-back.
+            if union_pixels > max_bbox_pixels {
+                // Bbox too large — emit full-canvas refresh.
                 planned.push(PlannedFrame {
                     x_offset: 0,
                     y_offset: 0,
-                    width: 1,
-                    height: 1,
+                    width: f.width,
+                    height: f.height,
+                    duration_ms: f.duration_ms,
+                    blend: f.blend,
+                    rgba_kind: RgbaKind::Full,
+                    rgba_idx: i,
+                });
+            } else {
+                let (bx, by, bw, bh) = union_bbox;
+                let tile = extract_subrect(f.rgba, canvas_w, bx, by, bw, bh);
+                let tile_idx = tile_storage.len();
+                tile_storage.push(tile);
+                planned.push(PlannedFrame {
+                    x_offset: bx,
+                    y_offset: by,
+                    width: bw,
+                    height: bh,
                     duration_ms: f.duration_ms,
                     blend: false, // overwrite (DoNotBlend)
                     rgba_kind: RgbaKind::Tile,
                     rgba_idx: tile_idx,
                 });
             }
-            Some((bx, by, bw, bh)) => {
-                let bbox_pixels = (bw as u64) * (bh as u64);
-                if bbox_pixels > max_bbox_pixels {
-                    // Bbox too large — skip the delta path for this
-                    // frame and emit it full-canvas in the underlying
-                    // mode (Auto by default; respects caller's
-                    // lossy_quality).
-                    planned.push(PlannedFrame {
-                        x_offset: 0,
-                        y_offset: 0,
-                        width: f.width,
-                        height: f.height,
-                        duration_ms: f.duration_ms,
-                        blend: f.blend,
-                        rgba_kind: RgbaKind::Full,
-                        rgba_idx: i,
-                    });
-                } else {
-                    // Carve out the bbox sub-rectangle into a contiguous
-                    // RGBA buffer.
-                    let tile = extract_subrect(f.rgba, canvas_w, bx, by, bw, bh);
-                    let tile_idx = tile_storage.len();
-                    tile_storage.push(tile);
-                    planned.push(PlannedFrame {
-                        x_offset: bx,
-                        y_offset: by,
-                        width: bw,
-                        height: bh,
-                        duration_ms: f.duration_ms,
-                        blend: false, // overwrite (DoNotBlend)
-                        rgba_kind: RgbaKind::Tile,
-                        rgba_idx: tile_idx,
-                    });
-                }
-            }
+            continue;
+        }
+
+        // Multi-rect emission: one ANMF per component, with
+        // `duration_ms = 0` on every sub-rect except the last
+        // (which carries the input frame's duration so total display
+        // time is preserved). The decoder paints each tile in turn,
+        // composing them onto the persistent canvas.
+        let n = components.len();
+        for (k, &(bx, by, bw, bh)) in components.iter().enumerate() {
+            let tile = extract_subrect(f.rgba, canvas_w, bx, by, bw, bh);
+            let tile_idx = tile_storage.len();
+            tile_storage.push(tile);
+            // Last sub-rect carries the input frame's duration; the
+            // earlier ones are zero-duration "instant overwrites" so
+            // the human-perceived frame timing is unchanged.
+            let dur = if k + 1 == n { f.duration_ms } else { 0 };
+            planned.push(PlannedFrame {
+                x_offset: bx,
+                y_offset: by,
+                width: bw,
+                height: bh,
+                duration_ms: dur,
+                blend: false, // overwrite (DoNotBlend)
+                rgba_kind: RgbaKind::Tile,
+                rgba_idx: tile_idx,
+            });
         }
     }
 
@@ -799,6 +879,276 @@ fn extract_subrect(rgba: &[u8], canvas_w: u32, bx: u32, by: u32, bw: u32, bh: u3
     out
 }
 
+/// Compute the boolean `n_bx × n_by` "changed" grid for the cost-model
+/// (true ⇔ block cost > `cfg.threshold`). Pulled out of
+/// [`changed_block_bbox`] / [`changed_block_components`] so both share
+/// one walk over the canvas pixels.
+fn compute_changed_grid(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    cfg: &DeltaConfig,
+) -> (Vec<bool>, u32, u32) {
+    let bs = cfg.block_size;
+    let cw = canvas_w as usize;
+    let n_bx = canvas_w.div_ceil(bs);
+    let n_by = canvas_h.div_ceil(bs);
+    let mut grid = vec![false; (n_bx as usize) * (n_by as usize)];
+    for by in 0..n_by {
+        let y0 = (by * bs) as usize;
+        let y1 = ((by + 1) * bs).min(canvas_h) as usize;
+        for bx in 0..n_bx {
+            let x0 = (bx * bs) as usize;
+            let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
+            let cost = block_cost(prev, curr, cw, x0, y0, x1, y1);
+            if cost > cfg.threshold as u64 {
+                grid[(by as usize) * (n_bx as usize) + bx as usize] = true;
+            }
+        }
+    }
+    (grid, n_bx, n_by)
+}
+
+/// Convert a block-grid bbox `(min_bx, min_by, max_bx, max_by)` (all
+/// inclusive) into a pixel bbox `(px, py, pw, ph)` with even-aligned
+/// offsets and dimensions clipped to the canvas. Centralises the
+/// "block-grid → ANMF-spec-compliant pixel rect" step shared by every
+/// component.
+fn block_bbox_to_pixel_bbox(
+    min_bx: u32,
+    min_by: u32,
+    max_bx: u32,
+    max_by: u32,
+    canvas_w: u32,
+    canvas_h: u32,
+    bs: u32,
+) -> (u32, u32, u32, u32) {
+    let mut px = min_bx * bs;
+    let mut py = min_by * bs;
+    let mut pw = ((max_bx + 1) * bs).min(canvas_w) - px;
+    let mut ph = ((max_by + 1) * bs).min(canvas_h) - py;
+
+    // ANMF spec mandates even offsets — round (px, py) down to even,
+    // and grow (pw, ph) to compensate.
+    if px % 2 != 0 {
+        px -= 1;
+        pw += 1;
+    }
+    if py % 2 != 0 {
+        py -= 1;
+        ph += 1;
+    }
+    if px + pw > canvas_w {
+        pw = canvas_w - px;
+    }
+    if py + ph > canvas_h {
+        ph = canvas_h - py;
+    }
+    (px, py, pw, ph)
+}
+
+/// Find the 4-connected components on the changed-block grid and
+/// return a list of pixel bboxes (one per component). Components are
+/// merged down to `cfg.max_components` by iteratively combining the
+/// smallest-area component with its nearest neighbour (axis-aligned
+/// inter-bbox distance, ties broken by neighbour bbox area).
+///
+/// Returns an empty `Vec` when no block exceeds threshold (frame is
+/// effectively unchanged).
+///
+/// Each returned bbox is `(x, y, w, h)` already even-aligned + clipped
+/// to the canvas — it is suitable for direct ANMF emission.
+fn changed_block_components(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    cfg: &DeltaConfig,
+) -> Vec<(u32, u32, u32, u32)> {
+    let bs = cfg.block_size;
+    let (grid, n_bx, n_by) = compute_changed_grid(prev, curr, canvas_w, canvas_h, cfg);
+    let nx = n_bx as usize;
+    let ny = n_by as usize;
+    if nx == 0 || ny == 0 {
+        return Vec::new();
+    }
+
+    // 4-connected flood fill — `label[i]` is the component id of
+    // grid cell i (or `u32::MAX` for unset / non-changed).
+    let mut label = vec![u32::MAX; nx * ny];
+    let mut bboxes: Vec<(u32, u32, u32, u32)> = Vec::new(); // (min_bx, min_by, max_bx, max_by) per component
+    let mut stack: Vec<(u32, u32)> = Vec::new();
+    for sy in 0..n_by {
+        for sx in 0..n_bx {
+            let idx = (sy as usize) * nx + sx as usize;
+            if !grid[idx] || label[idx] != u32::MAX {
+                continue;
+            }
+            // New component — flood-fill from (sx, sy).
+            let comp_id = bboxes.len() as u32;
+            let mut min_bx = sx;
+            let mut min_by = sy;
+            let mut max_bx = sx;
+            let mut max_by = sy;
+            stack.clear();
+            stack.push((sx, sy));
+            label[idx] = comp_id;
+            while let Some((x, y)) = stack.pop() {
+                if x < min_bx {
+                    min_bx = x;
+                }
+                if x > max_bx {
+                    max_bx = x;
+                }
+                if y < min_by {
+                    min_by = y;
+                }
+                if y > max_by {
+                    max_by = y;
+                }
+                // 4-neighbours.
+                let ux = x as usize;
+                let uy = y as usize;
+                if ux + 1 < nx {
+                    let n = uy * nx + ux + 1;
+                    if grid[n] && label[n] == u32::MAX {
+                        label[n] = comp_id;
+                        stack.push((x + 1, y));
+                    }
+                }
+                if ux > 0 {
+                    let n = uy * nx + ux - 1;
+                    if grid[n] && label[n] == u32::MAX {
+                        label[n] = comp_id;
+                        stack.push((x - 1, y));
+                    }
+                }
+                if uy + 1 < ny {
+                    let n = (uy + 1) * nx + ux;
+                    if grid[n] && label[n] == u32::MAX {
+                        label[n] = comp_id;
+                        stack.push((x, y + 1));
+                    }
+                }
+                if uy > 0 {
+                    let n = (uy - 1) * nx + ux;
+                    if grid[n] && label[n] == u32::MAX {
+                        label[n] = comp_id;
+                        stack.push((x, y - 1));
+                    }
+                }
+            }
+            bboxes.push((min_bx, min_by, max_bx, max_by));
+        }
+    }
+
+    // Budget enforcement: while we have more components than allowed,
+    // pick the smallest (by block-area) component and merge it into
+    // its nearest neighbour (axis-aligned inter-bbox Manhattan-style
+    // distance — if the bboxes overlap, distance = 0 and that pair
+    // wins immediately). Repeat until at-budget.
+    while bboxes.len() > cfg.max_components as usize && bboxes.len() > 1 {
+        // Find smallest by area.
+        let smallest_idx = bboxes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| {
+                let w = (b.2 - b.0 + 1) as u64;
+                let h = (b.3 - b.1 + 1) as u64;
+                w * h
+            })
+            .map(|(i, _)| i)
+            .unwrap();
+        let small = bboxes[smallest_idx];
+        // Find nearest neighbour by axis-aligned bbox gap.
+        let mut best_other = usize::MAX;
+        let mut best_dist = u64::MAX;
+        for (j, b) in bboxes.iter().enumerate() {
+            if j == smallest_idx {
+                continue;
+            }
+            // Axis-aligned gap on each axis (0 if overlapping/touching).
+            let gx = axis_gap(small.0, small.2, b.0, b.2);
+            let gy = axis_gap(small.1, small.3, b.1, b.3);
+            // Use squared-distance-like metric so a (1,1) gap beats
+            // a (2,0) gap (the (2,0) merger creates a long thin bbox).
+            let d = (gx as u64) * (gx as u64) + (gy as u64) * (gy as u64);
+            if d < best_dist {
+                best_dist = d;
+                best_other = j;
+            }
+        }
+        if best_other == usize::MAX {
+            break; // shouldn't happen given len > 1 check
+        }
+        let other = bboxes[best_other];
+        let merged = (
+            small.0.min(other.0),
+            small.1.min(other.1),
+            small.2.max(other.2),
+            small.3.max(other.3),
+        );
+        // Remove the higher index first to keep the lower one valid.
+        let (hi, lo) = if smallest_idx > best_other {
+            (smallest_idx, best_other)
+        } else {
+            (best_other, smallest_idx)
+        };
+        bboxes.swap_remove(hi);
+        bboxes[lo] = merged;
+    }
+
+    // Convert each block-grid bbox to a pixel bbox.
+    bboxes
+        .into_iter()
+        .map(|(mnx, mny, mxx, mxy)| {
+            block_bbox_to_pixel_bbox(mnx, mny, mxx, mxy, canvas_w, canvas_h, bs)
+        })
+        .collect()
+}
+
+/// One-dimensional gap between two intervals `[a0, a1]` and `[b0, b1]`
+/// (block-grid coordinates, both ends inclusive). Zero when the
+/// intervals touch or overlap.
+fn axis_gap(a0: u32, a1: u32, b0: u32, b1: u32) -> u32 {
+    if a1 + 1 < b0 {
+        b0 - a1 - 1
+    } else if b1 + 1 < a0 {
+        a0 - b1 - 1
+    } else {
+        0
+    }
+}
+
+/// Bounding box of a list of pixel bboxes (the tightest axis-aligned
+/// rect that contains every input rect). Caller guarantees non-empty
+/// input. Used for the "single-bbox cover" fallback.
+fn bbox_union(bboxes: &[(u32, u32, u32, u32)]) -> (u32, u32, u32, u32) {
+    let mut x0 = u32::MAX;
+    let mut y0 = u32::MAX;
+    let mut x1 = 0u32;
+    let mut y1 = 0u32;
+    for &(x, y, w, h) in bboxes {
+        if x < x0 {
+            x0 = x;
+        }
+        if y < y0 {
+            y0 = y;
+        }
+        if x + w > x1 {
+            x1 = x + w;
+        }
+        if y + h > y1 {
+            y1 = y + h;
+        }
+    }
+    // Ensure x0 stays even (matches block_bbox_to_pixel_bbox output).
+    let x0 = x0 & !1;
+    let y0 = y0 & !1;
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
 /// Walk `prev` vs `curr` (both row-major canvas-sized RGBA) on
 /// `cfg.block_size`-sized blocks; for each block compute the
 /// luminance-biased SAD cost; return the bounding box (in pixels,
@@ -809,6 +1159,7 @@ fn extract_subrect(rgba: &[u8], canvas_w: u32, bx: u32, by: u32, bw: u32, bh: u3
 /// Output bbox is `(x, y, w, h)` with `x`/`y` rounded down to even
 /// (WebP ANMF spec mandates even offsets) and `w`/`h` adjusted so the
 /// bbox still encloses every changed block.
+#[allow(dead_code)]
 fn changed_block_bbox(
     prev: &[u8],
     curr: &[u8],
