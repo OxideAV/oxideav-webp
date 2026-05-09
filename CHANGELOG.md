@@ -23,9 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame use `duration_ms = 0` for every tile except the last (which
   carries the input frame's duration), so total display time is
   preserved across the round-trip — decoded `WebpFrame` count exceeds
-  the input frame count when multi-rect kicks in. On a 320×240
-  3-cluster fixture (16×16 stamps at three corners), file size drops
-  from 583 870 B (single-bbox baseline) to 228 762 B (~ 60 % saving).
+  the input frame count when multi-rect kicks in. On a 160×120
+  3-cluster fixture (16×16 stamps at top-left/centre/bottom-right),
+  file size drops from 98 532 B (single-bbox baseline) to 56 256 B
+  (≈ 43 % saving).
   Single-cluster frames degrade gracefully to the historical single-
   bbox path. Set `max_components = 1` to force the historical
   behaviour.

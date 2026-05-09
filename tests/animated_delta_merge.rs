@@ -478,21 +478,25 @@ fn delta_mode_identical_frame_emits_minimal_sub_rect() {
 //
 // The 3-cluster fixture is dimensioned so the changing regions stay
 // **disjoint** under the default block_size = 8 cost model: three
-// 16×16 stamps placed at 3 corners of a 320×240 canvas. Each cluster
-// is a separate connected component, so the multi-rect path emits
-// 3 sub-rect ANMFs per delta frame, while the single-bbox path emits
-// one near-canvas-sized ANMF that covers all three clusters.
+// 16×16 stamps placed at top-left, centre, bottom-right of a 160×120
+// canvas (same canvas as the corner-change test above — keeps RDO
+// VP8L cost predictable). Each stamp is far enough from the others
+// that a default block_size = 8 grid cannot fuse them via a
+// 4-connected flood fill.
+//
+// Canvas size matches the corner-change test so total CI runtime
+// stays within the existing budget — a 320×240 fixture pushed
+// per-job CI to 47+ minutes (each multi-rect tile re-encodes through
+// VP8L RDO).
 
-const MR_W: u32 = 320;
-const MR_H: u32 = 240;
+const MR_W: u32 = 160;
+const MR_H: u32 = 120;
 const MR_STAMP: u32 = 16;
-// 3 disjoint stamps: top-left, centre, bottom-right. Each is far
-// enough from the others that a default block_size = 8 grid cannot
-// fuse them via a 4-connected flood fill.
+// 3 disjoint stamps: top-left, centre, bottom-right.
 const MR_STAMP_POSITIONS: &[(u32, u32)] = &[
-    (16, 16),
-    (MR_W / 2, MR_H / 2),
-    (MR_W - MR_STAMP - 16, MR_H - MR_STAMP - 16),
+    (8, 8),
+    (MR_W / 2 - MR_STAMP / 2, MR_H / 2 - MR_STAMP / 2),
+    (MR_W - MR_STAMP - 8, MR_H - MR_STAMP - 8),
 ];
 
 fn build_mr_frame(counter: u8, n_stamps: usize) -> Vec<u8> {
@@ -533,13 +537,13 @@ fn count_anmf_chunks(blob: &[u8]) -> usize {
 
 #[test]
 fn delta_mode_multi_rect_beats_single_bbox_for_scattered_changes() {
-    // 3 logical frames (frame 0 + 2 delta frames). Each delta frame
-    // changes the 3 disjoint stamp blocks vs the previous frame's
-    // stamp colour.
+    // 2 logical frames (frame 0 + 1 delta frame). The delta frame
+    // changes the 3 disjoint stamp blocks vs frame 0's stamp colour.
+    // Two frames is enough to demonstrate the wire-size win without
+    // multiplying VP8L re-encode cost on each CI matrix entry.
     let f0 = build_mr_frame(0x10, 3);
     let f1 = build_mr_frame(0x60, 3);
-    let f2 = build_mr_frame(0xa0, 3);
-    let rgbas = [f0, f1, f2];
+    let rgbas = [f0, f1];
     let frames: Vec<AnimFrame> = rgbas
         .iter()
         .map(|rgba| AnimFrame {
@@ -593,15 +597,15 @@ fn delta_mode_multi_rect_beats_single_bbox_for_scattered_changes() {
         single.len(), single_anmf_count, multi.len(), multi_anmf_count,
     );
 
-    // Multi-rect emits 1 (frame 0) + 3 (frame 1) + 3 (frame 2) = 7
-    // ANMFs vs single-bbox's 1 + 1 + 1 = 3 ANMFs.
+    // Multi-rect emits 1 (frame 0) + 3 (delta frame 1) = 4 ANMFs vs
+    // single-bbox's 1 + 1 = 2 ANMFs.
     assert_eq!(
-        single_anmf_count, 3,
+        single_anmf_count, 2,
         "single-bbox path should emit 1 ANMF per logical frame"
     );
     assert_eq!(
-        multi_anmf_count, 7,
-        "multi-rect path should emit 3 ANMFs for each of 2 delta frames"
+        multi_anmf_count, 4,
+        "multi-rect path should emit 3 ANMFs for the delta frame + 1 for frame 0"
     );
     // Multi-rect total file size beats single-bbox.
     assert!(
@@ -614,14 +618,13 @@ fn delta_mode_multi_rect_beats_single_bbox_for_scattered_changes() {
 
 #[test]
 fn delta_mode_multi_rect_round_trip_pixel_identical() {
-    // Same fixture as the wire-size test — 3 disjoint stamps on each
+    // Same fixture as the wire-size test — 3 disjoint stamps on the
     // delta frame. The decoder paints each sub-rect onto the
     // persistent canvas; after the LAST sub-rect of each input frame
     // the canvas must match the source rgba pixel-identically.
     let f0 = build_mr_frame(0x10, 3);
     let f1 = build_mr_frame(0x60, 3);
-    let f2 = build_mr_frame(0xa0, 3);
-    let rgbas = [f0.clone(), f1.clone(), f2.clone()];
+    let rgbas = [f0.clone(), f1.clone()];
     let frames: Vec<AnimFrame> = rgbas
         .iter()
         .map(|rgba| AnimFrame {
