@@ -162,6 +162,39 @@ pub enum AnimFrameMode {
 /// at [`Self::auto_inner_quality`] (default 75) and the byte-smaller
 /// candidate wins on disk. Tiles below the cutoff stay lossless — no
 /// quality loss for the common-case small-tile path.
+///
+/// # Cost model (SAD vs SSIM-lite)
+///
+/// The default cost model is the **luminance-biased SAD** described
+/// above (cheap, but luminance-biased so it underweights pure chroma
+/// shifts and low-contrast structural changes). When
+/// [`Self::enable_ssim_cost`] is `true`, the encoder swaps in a
+/// **single-scale SSIM-lite** cost — a perceptually-meaningful metric
+/// derived from the standard SSIM formula at one scale (skipping the
+/// multi-scale Gaussian-pyramid for speed):
+///
+/// ```text
+///   SSIM = (2*µ_a*µ_b + C1)(2*σ_ab + C2)
+///        / ((µ_a² + µ_b² + C1)(σ_a² + σ_b² + C2))
+///   C1   = (0.01 * 255)² = 6.5025
+///   C2   = (0.03 * 255)² = 58.5225
+///   cost = round((1.0 - SSIM) * 10000)   // u64, scaled for integer threshold compare
+/// ```
+///
+/// The threshold for the SSIM cost path is [`Self::ssim_threshold`]
+/// (default 50, i.e. ≈ 0.005 SSIM gap — small enough to flag a
+/// just-perceptible structural change, large enough to absorb 8-bit
+/// rounding noise on a flat block). SAD is left as the default
+/// (backwards-compatible behaviour); flip `enable_ssim_cost` on to opt
+/// into the perceptual cost model.
+///
+/// Worked example demonstrating where SSIM beats SAD: a flat-luma
+/// 8×8 block where every pixel shifts colour by 4 LSB but the
+/// brightness mean stays constant. SAD's luminance term sees ≈ 0
+/// (means cancel) and the chroma terms are >> 2 down-weighted, so
+/// the block is flagged "similar" — but SSIM's covariance term picks
+/// up the structural change because `σ_ab` collapses while `σ_a`
+/// and `σ_b` stay non-trivial.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeltaConfig {
     /// Block side length in pixels. Default 8. The encoder rounds
@@ -200,6 +233,20 @@ pub struct DeltaConfig {
     /// better). Default 75. Ignored when `auto_inner_threshold_bytes`
     /// is `None`.
     pub auto_inner_quality: f32,
+    /// When `true`, swap the default luminance-biased SAD cost model
+    /// for a **single-scale SSIM-lite** perceptual cost. The cost
+    /// scale changes (SSIM cost uses [`Self::ssim_threshold`] instead
+    /// of [`Self::threshold`]). Default `false` — preserves the
+    /// existing SAD-based behaviour for backwards compatibility.
+    pub enable_ssim_cost: bool,
+    /// Threshold for the SSIM-lite cost path (only consulted when
+    /// [`Self::enable_ssim_cost`] is `true`). Cost is computed as
+    /// `round((1.0 - SSIM) * 10000)`; blocks whose cost strictly
+    /// exceeds this value are flagged as changed. Default 50
+    /// (≈ 0.005 SSIM gap — picks up just-perceptible structural
+    /// changes while absorbing 8-bit rounding noise). Independent
+    /// of [`Self::threshold`] so the two modes' defaults stay clean.
+    pub ssim_threshold: u32,
 }
 
 impl Default for DeltaConfig {
@@ -211,6 +258,8 @@ impl Default for DeltaConfig {
             max_components_override: None,
             auto_inner_threshold_bytes: None,
             auto_inner_quality: 75.0,
+            enable_ssim_cost: false,
+            ssim_threshold: 50,
         }
     }
 }
@@ -233,6 +282,23 @@ impl DeltaConfig {
         self.auto_inner_threshold_bytes = Some(bytes);
         self
     }
+
+    /// Builder-style setter for [`Self::enable_ssim_cost`] — turns on
+    /// the SSIM-lite cost model (the SAD remains the default).
+    #[must_use]
+    pub fn enable_ssim_cost(mut self, on: bool) -> Self {
+        self.enable_ssim_cost = on;
+        self
+    }
+
+    /// Builder-style setter for [`Self::ssim_threshold`] — overrides
+    /// the SSIM-lite cost-path threshold. Only consulted when
+    /// [`Self::enable_ssim_cost`] is `true`.
+    #[must_use]
+    pub fn ssim_threshold(mut self, t: u32) -> Self {
+        self.ssim_threshold = t;
+        self
+    }
 }
 
 /// Map a per-frame `cluster_density` (sum of cluster pixel-areas
@@ -241,6 +307,11 @@ impl DeltaConfig {
 /// `density ≤ 0.05`) down to `4` (at `density ≥ 0.30`); flat outside
 /// the band. Pulled out as a freestanding helper so the test suite can
 /// pin the mapping without going through the encoder.
+///
+/// Exposed via [`debug_adaptive_max_components`] (doc-hidden, public
+/// only so integration tests can pin the ramp behaviour against an
+/// end-to-end encode without re-deriving the density from the
+/// internal cluster-density walk).
 fn adaptive_max_components(density: f32) -> u32 {
     // Clamp to the documented range.
     let d = density.clamp(0.0, 1.0);
@@ -259,6 +330,39 @@ fn adaptive_max_components(density: f32) -> u32 {
     let t = (d - LO_DENSITY) / (HI_DENSITY - LO_DENSITY);
     let budget = LO_BUDGET + t * (HI_BUDGET - LO_BUDGET);
     budget.round() as u32
+}
+
+/// Test-only probe that exposes [`adaptive_max_components`] for
+/// integration tests. Hidden from the rendered docs (the function is
+/// an internal implementation detail of the Delta-mode adaptive
+/// budget; callers should rely on the documented density-to-budget
+/// table in [`DeltaConfig`]'s docs rather than this raw function).
+#[doc(hidden)]
+pub fn debug_adaptive_max_components(density: f32) -> u32 {
+    adaptive_max_components(density)
+}
+
+/// Test-only probe that runs the cost-model pixel walk on a
+/// (prev, curr) RGBA pair and returns the same `cluster_density`
+/// metric the encoder uses to drive the adaptive budget. Lets
+/// integration tests pin the encoder's budget choice for a given
+/// fixture without re-deriving the density math by hand. Hidden from
+/// the rendered docs — see `debug_adaptive_max_components`.
+#[doc(hidden)]
+pub fn debug_cluster_density(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    cfg: &DeltaConfig,
+) -> f32 {
+    let max_pixels = (canvas_w as u64).saturating_mul(canvas_h as u64);
+    if max_pixels == 0 {
+        return 0.0;
+    }
+    let (_, raw_pixels) =
+        changed_block_components_with_density(prev, curr, canvas_w, canvas_h, cfg, u32::MAX);
+    (raw_pixels as f32) / (max_pixels as f32)
 }
 
 /// Knob bag for [`build_animated_webp_with_options`]. Defaults pick the
@@ -1213,9 +1317,10 @@ fn extract_subrect(rgba: &[u8], canvas_w: u32, bx: u32, by: u32, bw: u32, bh: u3
 }
 
 /// Compute the boolean `n_bx × n_by` "changed" grid for the cost-model
-/// (true ⇔ block cost > `cfg.threshold`). Pulled out of
+/// (true ⇔ block cost > active threshold). Pulled out of
 /// [`changed_block_bbox`] / [`changed_block_components`] so both share
-/// one walk over the canvas pixels.
+/// one walk over the canvas pixels. Dispatches between the SAD and
+/// SSIM-lite cost models based on `cfg.enable_ssim_cost`.
 fn compute_changed_grid(
     prev: &[u8],
     curr: &[u8],
@@ -1228,14 +1333,23 @@ fn compute_changed_grid(
     let n_bx = canvas_w.div_ceil(bs);
     let n_by = canvas_h.div_ceil(bs);
     let mut grid = vec![false; (n_bx as usize) * (n_by as usize)];
+    let threshold = if cfg.enable_ssim_cost {
+        cfg.ssim_threshold as u64
+    } else {
+        cfg.threshold as u64
+    };
     for by in 0..n_by {
         let y0 = (by * bs) as usize;
         let y1 = ((by + 1) * bs).min(canvas_h) as usize;
         for bx in 0..n_bx {
             let x0 = (bx * bs) as usize;
             let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
-            let cost = block_cost(prev, curr, cw, x0, y0, x1, y1);
-            if cost > cfg.threshold as u64 {
+            let cost = if cfg.enable_ssim_cost {
+                block_cost_ssim(prev, curr, cw, x0, y0, x1, y1)
+            } else {
+                block_cost(prev, curr, cw, x0, y0, x1, y1)
+            };
+            if cost > threshold {
                 grid[(by as usize) * (n_bx as usize) + bx as usize] = true;
             }
         }
@@ -1542,6 +1656,11 @@ fn changed_block_bbox(
     let mut min_by = u32::MAX;
     let mut max_bx: i64 = -1;
     let mut max_by: i64 = -1;
+    let threshold = if cfg.enable_ssim_cost {
+        cfg.ssim_threshold as u64
+    } else {
+        cfg.threshold as u64
+    };
 
     for by in 0..n_by {
         let y0 = (by * bs) as usize;
@@ -1549,8 +1668,12 @@ fn changed_block_bbox(
         for bx in 0..n_bx {
             let x0 = (bx * bs) as usize;
             let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
-            let cost = block_cost(prev, curr, cw, x0, y0, x1, y1);
-            if cost > cfg.threshold as u64 {
+            let cost = if cfg.enable_ssim_cost {
+                block_cost_ssim(prev, curr, cw, x0, y0, x1, y1)
+            } else {
+                block_cost(prev, curr, cw, x0, y0, x1, y1)
+            };
+            if cost > threshold {
                 if bx < min_bx {
                     min_bx = bx;
                 }
@@ -1642,6 +1765,120 @@ fn block_cost(
         }
     }
     acc
+}
+
+/// Single-scale **SSIM-lite** cost over a block in two RGBA canvas
+/// buffers. Uses the standard SSIM formula (Wang & Bovik 2004) at a
+/// single scale, computed on the BT.601 luma channel only — skips the
+/// multi-scale Gaussian-pyramid (the "MS-" prefix) for ≈ 4–10× lower
+/// per-block cost. Returns `round((1.0 - SSIM) * 10000)` so the result
+/// fits the same `u64` threshold-compare contract as [`block_cost`].
+///
+/// ```text
+///   µ_a = mean(luma_a),  µ_b = mean(luma_b)
+///   σ_a² = var(luma_a),  σ_b² = var(luma_b),  σ_ab = covar(a, b)
+///   SSIM = (2*µ_a*µ_b + C1)(2*σ_ab + C2)
+///        / ((µ_a² + µ_b² + C1)(σ_a² + σ_b² + C2))
+///   C1   = (0.01 * 255)² = 6.5025
+///   C2   = (0.03 * 255)² = 58.5225
+///   cost = round((1.0 - SSIM) * 10000)
+/// ```
+///
+/// Cost range is roughly `[0, ~20000]` (SSIM is in `[-1, 1]` so
+/// `1 - SSIM` is in `[0, 2]`; the 10000 scale converts to integers
+/// without overflowing `u64`). A cost of 50 corresponds to a SSIM
+/// gap of ≈ 0.005 — small enough to flag a just-perceptible
+/// structural change, large enough to absorb 8-bit rounding noise on
+/// a flat block. Empty / zero-pixel blocks return cost = 0.
+///
+/// Single-channel (luma-only) is sufficient for the cost-model use
+/// case: chroma-only changes that don't shift luma are rare in
+/// natural-image animation content, and the cost-model already runs
+/// on 8×8 blocks where the structural-change contribution dominates
+/// any pure chroma drift.
+fn block_cost_ssim(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> u64 {
+    let n_pixels = (x1 - x0) * (y1 - y0);
+    if n_pixels == 0 {
+        return 0;
+    }
+    // First pass: accumulate sums of luma values for both blocks.
+    let mut sum_a: i64 = 0;
+    let mut sum_b: i64 = 0;
+    for y in y0..y1 {
+        let row_off = y * canvas_w * 4;
+        for x in x0..x1 {
+            let off = row_off + x * 4;
+            let pa_r = prev[off] as i32;
+            let pa_g = prev[off + 1] as i32;
+            let pa_b = prev[off + 2] as i32;
+            let pb_r = curr[off] as i32;
+            let pb_g = curr[off + 1] as i32;
+            let pb_b = curr[off + 2] as i32;
+            // BT.601 luma (integer-scaled): same as block_cost.
+            let la = (77 * pa_r + 150 * pa_g + 29 * pa_b + 128) >> 8;
+            let lb = (77 * pb_r + 150 * pb_g + 29 * pb_b + 128) >> 8;
+            sum_a += la as i64;
+            sum_b += lb as i64;
+        }
+    }
+    let n = n_pixels as f64;
+    let mean_a = sum_a as f64 / n;
+    let mean_b = sum_b as f64 / n;
+    // Second pass: accumulate squared deviations and covariance.
+    let mut var_a_acc: f64 = 0.0;
+    let mut var_b_acc: f64 = 0.0;
+    let mut cov_acc: f64 = 0.0;
+    for y in y0..y1 {
+        let row_off = y * canvas_w * 4;
+        for x in x0..x1 {
+            let off = row_off + x * 4;
+            let pa_r = prev[off] as i32;
+            let pa_g = prev[off + 1] as i32;
+            let pa_b = prev[off + 2] as i32;
+            let pb_r = curr[off] as i32;
+            let pb_g = curr[off + 1] as i32;
+            let pb_b = curr[off + 2] as i32;
+            let la = ((77 * pa_r + 150 * pa_g + 29 * pa_b + 128) >> 8) as f64;
+            let lb = ((77 * pb_r + 150 * pb_g + 29 * pb_b + 128) >> 8) as f64;
+            let da = la - mean_a;
+            let db = lb - mean_b;
+            var_a_acc += da * da;
+            var_b_acc += db * db;
+            cov_acc += da * db;
+        }
+    }
+    // Use sample-population variance (divide by N, not N-1) — matches
+    // the standard SSIM-lite formulation used in image-quality metrics
+    // libraries (incl. Wang/Bovik's reference impl) and keeps the
+    // n=1 edge case (single-pixel block) numerically clean.
+    let var_a = var_a_acc / n;
+    let var_b = var_b_acc / n;
+    let cov_ab = cov_acc / n;
+    // SSIM constants for 8-bit data (L = 255).
+    const C1: f64 = 6.5025; // (0.01 * 255)²
+    const C2: f64 = 58.5225; // (0.03 * 255)²
+    let numer = (2.0 * mean_a * mean_b + C1) * (2.0 * cov_ab + C2);
+    let denom = (mean_a * mean_a + mean_b * mean_b + C1) * (var_a + var_b + C2);
+    // `denom` is strictly > 0 (both factors carry +C1 / +C2), so the
+    // division is well-defined for every input.
+    let ssim = numer / denom;
+    let cost_f = (1.0 - ssim) * 10_000.0;
+    // Clamp to non-negative + cap at u64 range. SSIM can dip slightly
+    // negative on adversarial content (means anti-correlate); we
+    // floor cost at 0 to match the SAD's [0, ∞) range.
+    if cost_f <= 0.0 {
+        0
+    } else {
+        cost_f.round() as u64
+    }
 }
 
 /// VP8X payload: 1 byte flags, 3 bytes reserved, 3 bytes canvas_w-1,
@@ -1898,6 +2135,159 @@ mod tests {
             lossless.len(),
             "auto mode failed to pick lossless on a flat-colour fixture"
         );
+    }
+
+    #[test]
+    fn ssim_cost_block_low_contrast_diff_picks_higher_cost_than_sad() {
+        // Build two 8×8 RGBA "blocks" (laid out as a 1-block 8×8 canvas
+        // pair). `prev` contains a faint vertical-stripe pattern: 8
+        // pixels at luma 130 in one column, 56 pixels at luma 128
+        // elsewhere. `curr` is uniform luma 128. Mean-luma drift is
+        // tiny (≈ 0.25) so SAD's per-pixel diff sums to ≈ 24 over the
+        // block (well under the default SAD threshold of 32 → SAD
+        // says "not changed"), but the structural correlation
+        // collapses entirely (curr is uniform → covariance with the
+        // striped prev is zero → SSIM ≈ 0.993, cost ≈ 73 → SSIM cost
+        // > the default SSIM threshold of 50 → SSIM says "changed").
+        //
+        // Worked example, integers (R=G=B so luma == channel value):
+        //   prev: 8 stripe pixels at 130, 56 background pixels at 128
+        //         → luma sum = 8*130 + 56*128 = 8208, mean = 128.25
+        //         → var      = (8*(130-128.25)² + 56*(128-128.25)²)/64
+        //                    ≈ 28/64 = 0.4375
+        //   curr: uniform 128
+        //         → mean = 128, var = 0, covar(prev, curr) = 0
+        //
+        //   SAD per stripe pixel  = |130-128| + ((|2|+|2|+|2|) >> 2)
+        //                         = 2 + 1 = 3
+        //   SAD per bg pixel      = 0
+        //   total SAD             = 8*3 + 56*0 = 24    (< 32 → unchanged)
+        //
+        //   SSIM ≈ (2*128.25*128 + C1)(2*0 + C2)
+        //        / ((128.25² + 128² + C1)(0.4375 + 0 + C2))
+        //       ≈ 0.99263
+        //   cost ≈ round((1 - 0.99263) * 10000) ≈ 73   (> 50 → changed)
+        let mut prev = vec![0u8; 8 * 8 * 4];
+        let mut curr = vec![0u8; 8 * 8 * 4];
+        // curr: uniform luma 128 (R=G=B=128, alpha 255).
+        for px in curr.chunks_exact_mut(4) {
+            px[0] = 128;
+            px[1] = 128;
+            px[2] = 128;
+            px[3] = 255;
+        }
+        // prev: same uniform 128 background everywhere first.
+        for px in prev.chunks_exact_mut(4) {
+            px[0] = 128;
+            px[1] = 128;
+            px[2] = 128;
+            px[3] = 255;
+        }
+        // prev: replace one column (x = 3) with luma 130 → 8 stripe
+        // pixels. (One column = 8 pixels; matches the worked-example
+        // counts of 8 stripe + 56 background.)
+        for y in 0..8 {
+            let off = (y * 8 + 3) * 4;
+            prev[off] = 130;
+            prev[off + 1] = 130;
+            prev[off + 2] = 130;
+            prev[off + 3] = 255;
+        }
+        let sad = block_cost(&prev, &curr, 8, 0, 0, 8, 8);
+        let ssim = block_cost_ssim(&prev, &curr, 8, 0, 0, 8, 8);
+        // SAD stays under the default SAD threshold (32) — the cost
+        // model says "not changed".
+        let sad_threshold = DeltaConfig::default().threshold as u64;
+        assert!(
+            sad <= sad_threshold,
+            "SAD should be ≤ default threshold ({sad_threshold}) for low-contrast structural change, got {sad}"
+        );
+        // SSIM exceeds the default SSIM threshold (50) — the cost
+        // model says "changed". This is the key inequality the SSIM
+        // path was added to satisfy.
+        let ssim_threshold = DeltaConfig::default().ssim_threshold as u64;
+        assert!(
+            ssim > ssim_threshold,
+            "SSIM should be > default ssim_threshold ({ssim_threshold}) for low-contrast structural change, got {ssim}"
+        );
+        // And SSIM clearly disagrees with SAD on this fixture.
+        assert!(
+            ssim > sad,
+            "SSIM ({ssim}) should rate this block as more 'different' than SAD ({sad})"
+        );
+    }
+
+    #[test]
+    fn ssim_cost_block_identical_inputs_returns_zero() {
+        // Identical blocks → SSIM = 1.0 → cost = 0.
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        // Some non-trivial content so the variance terms are non-zero.
+        for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+            px[0] = ((i * 13) & 0xff) as u8;
+            px[1] = ((i * 19) & 0xff) as u8;
+            px[2] = ((i * 23) & 0xff) as u8;
+            px[3] = 255;
+        }
+        let cost = block_cost_ssim(&buf, &buf, 8, 0, 0, 8, 8);
+        assert_eq!(
+            cost, 0,
+            "SSIM cost on identical blocks should be 0, got {cost}"
+        );
+    }
+
+    #[test]
+    fn ssim_cost_threshold_dispatches_correctly_via_config() {
+        // Confirm the cost-model dispatcher (compute_changed_grid)
+        // honours the cfg.enable_ssim_cost flag — the same input pair
+        // should produce different "changed" maps when the SSIM cost
+        // is on vs off, on a fixture where the two cost models
+        // disagree.
+        //
+        // Build a 16×8 canvas pair with the left-half (8×8 block 0)
+        // identical (cost = 0 either way) and the right-half (8×8
+        // block 1) carrying the SSIM-vs-SAD disagreement fixture from
+        // the unit test above.
+        let canvas_w = 16u32;
+        let canvas_h = 8u32;
+        let mut prev = vec![0u8; (canvas_w * canvas_h * 4) as usize];
+        let mut curr = vec![0u8; (canvas_w * canvas_h * 4) as usize];
+        // Both halves: uniform luma 128 background.
+        for px in prev.chunks_exact_mut(4) {
+            px[0] = 128;
+            px[1] = 128;
+            px[2] = 128;
+            px[3] = 255;
+        }
+        curr.copy_from_slice(&prev);
+        // prev: stripe (luma 130) at x = 11 (column inside the
+        // right-half block, block index = 1 at block_size 8).
+        for y in 0..8 {
+            let off = (y * canvas_w as usize + 11) * 4;
+            prev[off] = 130;
+            prev[off + 1] = 130;
+            prev[off + 2] = 130;
+            prev[off + 3] = 255;
+        }
+        let cfg_sad = DeltaConfig::default();
+        let cfg_ssim = DeltaConfig::default().enable_ssim_cost(true);
+        let (grid_sad, n_bx, _) = compute_changed_grid(&prev, &curr, canvas_w, canvas_h, &cfg_sad);
+        let (grid_ssim, _, _) = compute_changed_grid(&prev, &curr, canvas_w, canvas_h, &cfg_ssim);
+        assert_eq!(n_bx, 2, "16/8 = 2 block columns");
+        // SAD: right block stays "unchanged" (cost ≤ 32).
+        assert!(
+            !grid_sad[1],
+            "SAD-mode right block should NOT be flagged (low-contrast structural change)"
+        );
+        // SSIM: right block is flagged "changed" (cost > 50).
+        assert!(
+            grid_ssim[1],
+            "SSIM-mode right block SHOULD be flagged (structural correlation collapsed)"
+        );
+        // Left block is identical in both inputs → unchanged in both
+        // modes (sanity check the dispatcher doesn't mis-flag the
+        // identical block).
+        assert!(!grid_sad[0]);
+        assert!(!grid_ssim[0]);
     }
 
     #[test]

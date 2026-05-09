@@ -78,6 +78,10 @@ pub use encoder_anim::{
     build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions, AnimFrame,
     AnimFrameMode, DeltaConfig,
 };
+// Test-only probes for the Delta-mode adaptive ramp (doc-hidden — see
+// the `#[doc(hidden)]` annotations on the underlying functions).
+#[doc(hidden)]
+pub use encoder_anim::{debug_adaptive_max_components, debug_cluster_density};
 pub use encoder_vp8::{
     encode_vp8_lossy_rgb24, encode_vp8_lossy_rgba, encode_vp8_lossy_yuv420p,
     encode_vp8_lossy_yuva420p, quality_to_qindex,

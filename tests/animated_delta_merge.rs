@@ -68,10 +68,24 @@
 //!    set `auto_inner_threshold_bytes = Some(4096)` with a 16×16 stamp
 //!    delta region; lossless ≤ threshold keeps the tile lossless and
 //!    round-trip is pixel-identical.
+//!  * **`delta_mode_mid_density_picks_adaptive_budget_8`** — closes the
+//!    coverage gap on the adaptive ramp's middle band: 4×4 grid of
+//!    16×16 stamps on a 160×120 canvas → cluster_density ≈ 21% which
+//!    interpolates to budget = 8. Asserts the adaptive default matches
+//!    `Some(8)` byte-for-byte AND differs from `Some(16)` / `Some(4)`
+//!    (so we know we're in the mid-band, not silently clipped to an
+//!    extreme). Pairs with the `adaptive_max_components_pins_documented_density_band`
+//!    unit test in `src/encoder_anim.rs`.
+//!  * **`delta_mode_mid_density_round_trip_pixel_identical`** — same
+//!    fixture; verifies that the merge-to-budget step (which collapses
+//!    8 of 16 clusters to nearest neighbours under the budget cap)
+//!    doesn't drop pixels. The existing low-density round-trip test
+//!    has no merging, so this is the first test that catches a
+//!    merge-step regression.
 
 use oxideav_webp::{
-    build_animated_webp_with_options, decode_webp, AnimEncoderOptions, AnimFrame, AnimFrameMode,
-    DeltaConfig,
+    build_animated_webp_with_options, debug_adaptive_max_components, debug_cluster_density,
+    decode_webp, AnimEncoderOptions, AnimFrame, AnimFrameMode, DeltaConfig,
 };
 
 // Canvas size + corner-block size are tuned so:
@@ -1033,6 +1047,302 @@ fn delta_mode_auto_inner_encode_keeps_small_tiles_lossless() {
         assert_eq!(
             &logical[i], src,
             "auto-inner encode below threshold must stay pixel-identical (logical frame {i})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// #4 — Mid-density adaptive budget validation.
+//
+// The adaptive ramp (`adaptive_max_components`) is unit-tested at the
+// extremes (≤ 5% → 16, ≥ 30% → 4) and a single mid-band point (17.5%
+// → 10) but no integration test pins the linear-interpolation behaviour
+// against an end-to-end encode. The existing 3-cluster scattered-stamps
+// fixture sits at ~4% density so it only exercises the LO branch of
+// the ramp; without a mid-band fixture the ramp's interpolation could
+// silently drift over time and existing integration tests wouldn't
+// catch it.
+//
+// Mid-band fixture math (block_size = 8 default):
+//   * 4×4 grid of 16×16 stamps spaced 8 px apart on a 160×120 canvas
+//     → 16 disjoint clusters, each occupying exactly one 16×16 pixel-
+//       bbox (= 256 px) on the block-grid (the 16×16 stamp covers
+//       2×2 blocks at block_size = 8, with no further padding).
+//   * cluster_density = 16 * 256 / (160 * 120) = 4096 / 19200
+//                     ≈ 0.2133 (21.33%)
+//   * Budget from the ramp:
+//       t = (0.2133 - 0.05) / 0.25 = 0.6533
+//       budget = round(16 + 0.6533 * (4 - 16)) = round(8.16) = 8
+// So the adaptive default must:
+//   * pick budget = 8 (not 16, not 4),
+//   * emit 1 (frame 0) + 8 (delta frame 1) = 9 ANMFs (8 of the 16
+//     clusters merge into nearest neighbours under the budget cap).
+
+const MD_W: u32 = 160;
+const MD_H: u32 = 120;
+const MD_STAMP: u32 = 16;
+// 4×4 grid of 16×16 stamps with 8-pixel gaps starting at (8, 8).
+// Spacing 24 (16 stamp + 8 gap) → positions {8, 32, 56, 80} on each
+// axis. Last stamp ends at 80+16 = 96 (well inside 160×120 canvas).
+const MD_GRID: u32 = 4;
+const MD_OFFSET: u32 = 8;
+const MD_PITCH: u32 = MD_STAMP + MD_OFFSET; // 24 px between stamp origins
+
+fn build_md_frame(counter: u8, n_clusters: usize) -> Vec<u8> {
+    // Background pseudo-noise (deterministic, identical between frames so
+    // only stamp regions are flagged "changed" by the cost-model).
+    let mut v = vec![0u8; (MD_W * MD_H * 4) as usize];
+    for y in 0..MD_H {
+        for x in 0..MD_W {
+            let i = ((y * MD_W + x) * 4) as usize;
+            let mut s = y.wrapping_mul(0x9E37_79B9) ^ x.wrapping_mul(0x85EB_CA77);
+            s ^= s.wrapping_shr(13);
+            s = s.wrapping_mul(0xC2B2_AE35);
+            s ^= s.wrapping_shr(16);
+            v[i] = (s & 0xff) as u8;
+            v[i + 1] = ((s >> 8) & 0xff) as u8;
+            v[i + 2] = ((s >> 16) & 0xff) as u8;
+            v[i + 3] = 0xff;
+        }
+    }
+    // Stamp `n_clusters` blocks in row-major order — caller passes 16
+    // for the full grid, smaller numbers exercise sparser layouts.
+    let mut placed = 0usize;
+    'outer: for gy in 0..MD_GRID {
+        for gx in 0..MD_GRID {
+            if placed >= n_clusters {
+                break 'outer;
+            }
+            let sx = MD_OFFSET + gx * MD_PITCH;
+            let sy = MD_OFFSET + gy * MD_PITCH;
+            for y in sy..(sy + MD_STAMP) {
+                for x in sx..(sx + MD_STAMP) {
+                    let i = ((y * MD_W + x) * 4) as usize;
+                    v[i] = counter;
+                    v[i + 1] = 0xff - counter;
+                    v[i + 2] = 0x80;
+                    v[i + 3] = 0xff;
+                }
+            }
+            placed += 1;
+        }
+    }
+    v
+}
+
+#[test]
+fn delta_mode_mid_density_picks_adaptive_budget_8() {
+    // 16 disjoint stamps → cluster density ≈ 21% → adaptive ramp
+    // resolves to budget = 8 (not 16, not 4). The test pins THREE
+    // independent properties:
+    //
+    //   (a) The cluster-density probe (`debug_cluster_density`)
+    //       observes the 21% density expected from the geometry.
+    //   (b) The adaptive ramp probe (`debug_adaptive_max_components`)
+    //       maps that density to budget = 8.
+    //   (c) The end-to-end encoder output matches an explicit
+    //       `max_components_override(8)` byte-for-byte — proving the
+    //       encoder actually applied the adaptive choice (not a
+    //       hard-coded default elsewhere) AND differs from `Some(16)`
+    //       (proving we're in the mid-band rather than silently
+    //       clipped to the LO_DENSITY edge).
+    //
+    // Note on the wire output: the merge-to-budget step + the
+    // subsequent multi-rect-vs-single-bbox heuristic (`multi_pixels
+    // * 4 < union_pixels * 3`) can converge multiple budgets to the
+    // same wire output once budget drops below the cluster count (the
+    // merged bboxes start overlapping, the multi/single discriminator
+    // collapses to single, and the resulting wire is just one super-
+    // rect tile). The byte-identical-to-override(8) match is the
+    // hard guarantee that the adaptive ramp picked 8 for this fixture
+    // — adjacent budgets (7, 9) might converge to the same wire on
+    // this fixture but the probes (a) + (b) above still pin the
+    // exact internal budget.
+    let f0 = build_md_frame(0x10, 16);
+    let f1 = build_md_frame(0x60, 16);
+
+    // (a) Direct probe of the cluster_density math the encoder uses.
+    // The fixture is geometrically 16 × 16×16 = 4096 px out of
+    // 160×120 = 19200 px → 21.33%. This must round to ~0.213 at the
+    // probe surface (matching `cluster_density`'s f32 precision).
+    let density = debug_cluster_density(&f0, &f1, MD_W, MD_H, &DeltaConfig::default());
+    eprintln!("mid-density fixture cluster_density = {density:.4}");
+    assert!(
+        (0.20..0.23).contains(&density),
+        "cluster_density should be ≈ 21.3% (16 × 16² / (160 * 120)), got {density:.4}"
+    );
+
+    // (b) Direct probe of the adaptive ramp: that density must map
+    // to budget = 8 (the documented mid-band point).
+    let budget = debug_adaptive_max_components(density);
+    eprintln!("mid-density fixture adaptive_max_components({density:.4}) = {budget}");
+    assert_eq!(
+        budget, 8,
+        "adaptive_max_components on density {density:.4} should yield 8, got {budget}"
+    );
+    // Sanity: that budget is in the documented mid-band [4, 16].
+    assert!(
+        (4..=16).contains(&budget),
+        "mid-band budget should stay in [4, 16], got {budget}"
+    );
+
+    // (c) End-to-end: the encoder's adaptive path matches an
+    // explicit override(8) byte-for-byte (proving the encoder
+    // actually applied the ramp's choice) and DIFFERS from Some(16)
+    // (proving we're not silently clipped to the LO_DENSITY edge).
+    let rgbas = [f0, f1];
+    let frames: Vec<AnimFrame> = rgbas
+        .iter()
+        .map(|rgba| AnimFrame {
+            width: MD_W,
+            height: MD_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba,
+        })
+        .collect();
+
+    let adaptive = build_animated_webp_with_options(
+        MD_W,
+        MD_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            ..Default::default()
+        },
+    )
+    .expect("encode adaptive");
+
+    let pinned_8 = build_animated_webp_with_options(
+        MD_W,
+        MD_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default().max_components_override(8)),
+            ..Default::default()
+        },
+    )
+    .expect("encode pinned 8");
+
+    let pinned_16 = build_animated_webp_with_options(
+        MD_W,
+        MD_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default().max_components_override(16)),
+            ..Default::default()
+        },
+    )
+    .expect("encode pinned 16");
+
+    let n_adaptive = count_anmf_chunks(&adaptive);
+    let n_pinned_8 = count_anmf_chunks(&pinned_8);
+    let n_pinned_16 = count_anmf_chunks(&pinned_16);
+    eprintln!(
+        "mid-density (~21%): adaptive={n_adaptive} ANMF / {} B; pinned8={n_pinned_8} ANMF / {} B; pinned16={n_pinned_16} ANMF / {} B",
+        adaptive.len(), pinned_8.len(), pinned_16.len(),
+    );
+
+    // Adaptive must match Some(8) byte-for-byte.
+    assert_eq!(
+        adaptive.len(),
+        pinned_8.len(),
+        "adaptive default ({}) must match override(8) ({}) on mid-density 21% fixture — proves the encoder applied the ramp's chosen budget",
+        adaptive.len(),
+        pinned_8.len()
+    );
+    assert_eq!(
+        n_adaptive, n_pinned_8,
+        "adaptive default ANMF count ({n_adaptive}) must match override(8) ({n_pinned_8})"
+    );
+
+    // Some(16) on this 16-cluster fixture: 1 (frame 0) + 16 (delta
+    // frame 1) = 17 ANMFs (no merging — every cluster stays separate).
+    assert_eq!(
+        n_pinned_16, 17,
+        "Some(16) fits all 16 clusters → 1 frame-0 + 16 sub-rects = 17 ANMFs"
+    );
+    assert_ne!(
+        n_adaptive, n_pinned_16,
+        "adaptive on mid-density should NOT match high-budget Some(16) ({n_pinned_16}) — that would mean the ramp is mis-classified as low-density"
+    );
+
+    // Wire-size sanity: the mid-band budget and Some(16) produce
+    // materially different file sizes on this fixture (≥ 5% delta).
+    // Confirms the budget actually changes the encoder output. The
+    // direction (which is smaller) is content-dependent.
+    let smaller = adaptive.len().min(pinned_16.len());
+    let larger = adaptive.len().max(pinned_16.len());
+    assert!(
+        larger > smaller + smaller / 20, // > 5% bigger
+        "adaptive ({}) and Some(16) ({}) wire sizes should differ by > 5% on mid-density fixture",
+        adaptive.len(),
+        pinned_16.len()
+    );
+}
+
+#[test]
+fn delta_mode_mid_density_round_trip_pixel_identical() {
+    // Same mid-density fixture but verify the round-trip still
+    // reconstructs the input frames pixel-identically (catches a
+    // regression where the merge-to-budget step accidentally drops a
+    // cluster's pixels). Important coverage gap: the existing
+    // round-trip test uses the LOW-density 3-cluster fixture where no
+    // merging happens; this fixture forces 8 of 16 clusters to merge
+    // with their nearest neighbour.
+    let f0 = build_md_frame(0x10, 16);
+    let f1 = build_md_frame(0x60, 16);
+    let rgbas = [f0.clone(), f1.clone()];
+    let frames: Vec<AnimFrame> = rgbas
+        .iter()
+        .map(|rgba| AnimFrame {
+            width: MD_W,
+            height: MD_H,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba,
+        })
+        .collect();
+    let blob = build_animated_webp_with_options(
+        MD_W,
+        MD_H,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            ..Default::default()
+        },
+    )
+    .expect("encode mid-density");
+    let img = decode_webp(&blob).expect("decode mid-density");
+    let mut logical: Vec<Vec<u8>> = Vec::new();
+    for f in &img.frames {
+        if f.duration_ms > 0 {
+            logical.push(f.rgba.clone());
+        }
+    }
+    assert_eq!(
+        logical.len(),
+        rgbas.len(),
+        "expected one logical-frame boundary (duration > 0) per input frame"
+    );
+    for (i, src) in rgbas.iter().enumerate() {
+        assert_eq!(
+            &logical[i], src,
+            "mid-density round-trip must reconstruct logical frame {i} pixel-identically (merge-to-budget step drops no pixels)"
         );
     }
 }

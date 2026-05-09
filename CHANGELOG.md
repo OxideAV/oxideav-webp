@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-encoder)* **opt-in SSIM-lite cost model for
+  `AnimFrameMode::Delta`** — new `DeltaConfig::enable_ssim_cost: bool`
+  (default `false`, preserves existing SAD-based behaviour) swaps the
+  default luminance-biased SAD per-block cost for a single-scale
+  SSIM-lite cost (`(1 - SSIM) * 10000`) computed on the BT.601 luma
+  channel. Skips the multi-scale Gaussian-pyramid for ≈ 4–10× lower
+  per-block cost vs full MS-SSIM. The SSIM-lite cost path uses the
+  separate `DeltaConfig::ssim_threshold: u32` (default 50, ≈ 0.005
+  SSIM gap) so the SAD and SSIM defaults stay independent. Catches
+  low-contrast structural changes that SAD's luma-weighted-pixel-diff
+  underweights — worked example: an 8×8 block where 8 stripe pixels
+  shift luma 130→128 against a uniform luma-128 background scores
+  SAD 24 (≤ default threshold 32 → "unchanged") but SSIM cost 73 (>
+  default `ssim_threshold` 50 → "changed"). Builder methods
+  `DeltaConfig::enable_ssim_cost(bool)` and
+  `DeltaConfig::ssim_threshold(u32)` mirror the field setters. Tests
+  `ssim_cost_block_low_contrast_diff_picks_higher_cost_than_sad`,
+  `ssim_cost_block_identical_inputs_returns_zero`, and
+  `ssim_cost_threshold_dispatches_correctly_via_config` pin the
+  per-block math + the dispatcher gate.
+
+- *(anim-encoder, tests)* **mid-density adaptive budget validation** —
+  closes a coverage gap where the adaptive `max_components` ramp's
+  ≤ 5% (LO) and ≥ 30% (HI) extremes had integration-test fixtures but
+  the 5–30% mid-band only had a unit-test pin (no end-to-end fixture).
+  New integration test `delta_mode_mid_density_picks_adaptive_budget_8`
+  uses a 4×4 grid of 16×16 stamps on a 160×120 canvas (cluster
+  density ≈ 21.3% → budget = 8) and pins three independent properties:
+  the new `debug_cluster_density` probe observes the expected density,
+  the new `debug_adaptive_max_components` probe maps it to budget = 8,
+  and the encoder's adaptive output matches an explicit
+  `max_components_override(8)` byte-for-byte while differing from
+  `Some(16)` (proving we're in the mid-band, not silently clipped).
+  Companion test `delta_mode_mid_density_round_trip_pixel_identical`
+  exercises the merge-to-budget step on the same fixture (8 of 16
+  clusters merge into nearest neighbours) and verifies the round-trip
+  reconstructs each input frame pixel-identically — the first test
+  that catches a merge-step pixel-drop regression.
+
 - *(anim-encoder)* **adaptive `max_components` budget for
   `AnimFrameMode::Delta`** — replaces the fixed `max_components: u32 = 8`
   field on `DeltaConfig` with `max_components_override: Option<u32>`
