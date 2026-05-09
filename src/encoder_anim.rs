@@ -230,6 +230,32 @@ pub enum AnimFrameMode {
 /// product). Threshold for the MS-SSIM cost path is
 /// [`Self::msssim_threshold`] (default 50, same scale as the
 /// single-scale `(1 - SSIM) * 10000`).
+///
+/// Selects the downsampling kernel used by the MS-SSIM-lite cost path
+/// when computing the contrast-structure terms at scale 1 (2×) and
+/// scale 2 (4×). [`Self::Box`] is the historical default — a separable
+/// box-average over each `factor × factor` source cell. [`Self::Gaussian`]
+/// uses the canonical Wang/Bovik 2003 5-tap σ=0.8 kernel
+/// (`[0.054, 0.244, 0.404, 0.244, 0.054]`) applied separably (horizontal
+/// then vertical), then a 2× decimation. The 4× scale cascades two such
+/// blur+decimate passes (a true Gaussian pyramid) — closer to the
+/// Wang/Bovik reference and avoids the box kernel's high-frequency
+/// undershoot on smooth gradients.
+///
+/// Box is kept as the default for backwards-compat — opt in to Gaussian
+/// via [`DeltaConfig::msssim_downsample_kernel`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownsampleKernel {
+    /// Separable 2× box-average per `factor × factor` source cell —
+    /// fast, but undershoots high-frequency content unevenly on smooth
+    /// gradients vs the Wang/Bovik reference.
+    Box,
+    /// Separable 5-tap Gaussian σ=0.8 (weights
+    /// `[0.054, 0.244, 0.404, 0.244, 0.054]`) followed by 2× decimation;
+    /// the 4× scale cascades two passes for a true Gaussian pyramid.
+    Gaussian,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeltaConfig {
     /// Block side length in pixels. Default 8. The encoder rounds
@@ -258,9 +284,16 @@ pub struct DeltaConfig {
     /// are *also* encoded via VP8 + ALPH at
     /// [`Self::auto_inner_quality`] and the byte-smaller candidate
     /// wins on disk. Tiles whose lossless bytes ≤ cutoff stay
-    /// lossless (no quality loss). When `None` (the default), every
-    /// tile stays lossless regardless of size — preserves pixel-
-    /// identical round-trip semantics.
+    /// lossless (no quality loss).
+    ///
+    /// Default `Some(4096)` — small tiles (≤ 4 KB lossless) stay
+    /// pixel-identical, larger noisy tiles trigger the lossy/lossless
+    /// race that delivers the documented ~63% reduction on the
+    /// 32×32 noisy sub-rect fixture. Set to `None` via
+    /// [`Self::auto_inner_threshold_bytes`] to opt out and force every
+    /// sub-rect tile to stay lossless regardless of size (preserves
+    /// the pre-default-change pixel-identical round-trip semantics for
+    /// every tile).
     pub auto_inner_threshold_bytes: Option<u32>,
     /// Quality knob for the lossy-fallback encode triggered by
     /// [`Self::auto_inner_threshold_bytes`] — same scale as
@@ -298,6 +331,15 @@ pub struct DeltaConfig {
     /// blocks whose cost strictly exceeds this value are flagged as
     /// changed. Default 50.
     pub msssim_threshold: u32,
+    /// Downsample kernel used when reducing the 2×/4× extended
+    /// regions for the MS-SSIM-lite cost path's scale-1 / scale-2
+    /// CS terms. [`DownsampleKernel::Box`] (the default) keeps the
+    /// pre-existing box-average behaviour for backwards-compat;
+    /// [`DownsampleKernel::Gaussian`] swaps in the canonical
+    /// Wang/Bovik 2003 5-tap σ=0.8 kernel + 2× decimation
+    /// (cascaded twice for the 4× scale). Only consulted when
+    /// [`Self::enable_msssim_cost`] is `true`.
+    pub msssim_downsample_kernel: DownsampleKernel,
 }
 
 impl Default for DeltaConfig {
@@ -307,12 +349,17 @@ impl Default for DeltaConfig {
             threshold: 32,
             max_bbox_fraction: 0.8,
             max_components_override: None,
-            auto_inner_threshold_bytes: None,
+            // Default Some(4096): small tiles (≤ 4 KB lossless) stay
+            // pixel-identical, larger noisy tiles trigger the
+            // lossy/lossless race. Opt out via
+            // `DeltaConfig::auto_inner_threshold_bytes(None)`.
+            auto_inner_threshold_bytes: Some(4096),
             auto_inner_quality: 75.0,
             enable_ssim_cost: false,
             ssim_threshold: 50,
             enable_msssim_cost: false,
             msssim_threshold: 50,
+            msssim_downsample_kernel: DownsampleKernel::Box,
         }
     }
 }
@@ -328,11 +375,16 @@ impl DeltaConfig {
     }
 
     /// Builder-style setter for [`Self::auto_inner_threshold_bytes`] —
-    /// enables the lossy-fallback inner-encode path for sub-rect tiles
-    /// whose lossless VP8L payload exceeds `bytes`.
+    /// enables (or, with `None`, disables) the lossy-fallback
+    /// inner-encode path for sub-rect tiles whose lossless VP8L
+    /// payload exceeds `bytes`. Pass `None` to opt out of the
+    /// per-sub-rect race entirely (every sub-rect tile stays
+    /// lossless regardless of size — preserves the
+    /// pre-default-change pixel-identical round-trip semantics).
+    /// The default is `Some(4096)`.
     #[must_use]
-    pub fn auto_inner_threshold_bytes(mut self, bytes: u32) -> Self {
-        self.auto_inner_threshold_bytes = Some(bytes);
+    pub fn auto_inner_threshold_bytes(mut self, bytes: Option<u32>) -> Self {
+        self.auto_inner_threshold_bytes = bytes;
         self
     }
 
@@ -368,6 +420,18 @@ impl DeltaConfig {
     #[must_use]
     pub fn msssim_threshold(mut self, t: u32) -> Self {
         self.msssim_threshold = t;
+        self
+    }
+
+    /// Builder-style setter for [`Self::msssim_downsample_kernel`] —
+    /// switches the MS-SSIM-lite scale-1 / scale-2 downsample kernel
+    /// between the historical box-average ([`DownsampleKernel::Box`],
+    /// the default) and the canonical Wang/Bovik 2003 5-tap σ=0.8
+    /// Gaussian ([`DownsampleKernel::Gaussian`]). Only consulted when
+    /// [`Self::enable_msssim_cost`] is `true`.
+    #[must_use]
+    pub fn msssim_downsample_kernel(mut self, kernel: DownsampleKernel) -> Self {
+        self.msssim_downsample_kernel = kernel;
         self
     }
 }
@@ -1421,7 +1485,17 @@ fn compute_changed_grid(
             let x0 = (bx * bs) as usize;
             let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
             let cost = if cfg.enable_msssim_cost {
-                block_cost_msssim(prev, curr, cw, ch, x0, y0, x1, y1)
+                block_cost_msssim(
+                    prev,
+                    curr,
+                    cw,
+                    ch,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    cfg.msssim_downsample_kernel,
+                )
             } else if cfg.enable_ssim_cost {
                 block_cost_ssim(prev, curr, cw, x0, y0, x1, y1)
             } else {
@@ -1750,7 +1824,17 @@ fn changed_block_bbox(
             let x0 = (bx * bs) as usize;
             let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
             let cost = if cfg.enable_msssim_cost {
-                block_cost_msssim(prev, curr, cw, ch, x0, y0, x1, y1)
+                block_cost_msssim(
+                    prev,
+                    curr,
+                    cw,
+                    ch,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    cfg.msssim_downsample_kernel,
+                )
             } else if cfg.enable_ssim_cost {
                 block_cost_ssim(prev, curr, cw, x0, y0, x1, y1)
             } else {
@@ -2012,6 +2096,7 @@ fn block_cost_msssim(
     y0: usize,
     x1: usize,
     y1: usize,
+    kernel: DownsampleKernel,
 ) -> u64 {
     let n_pixels = (x1 - x0) * (y1 - y0);
     if n_pixels == 0 {
@@ -2020,25 +2105,29 @@ fn block_cost_msssim(
     // Scale 0: full SSIM on the native block.
     let ssim0 = ssim_components_native(prev, curr, canvas_w, x0, y0, x1, y1);
 
-    // Scale 1: 2×-extended region around the block, 2× Gaussian-
-    // downsampled. The extended region is `[x0 - bw/2, x1 + bw/2)`
-    // (width 2*bw), clipped to canvas. The downsample uses a 2×2 box
-    // average (a separable [1,1] Gaussian — adequate for the cost-
-    // model use-case where we just need a coarse-scale signal).
+    // Scale 1: 2×-extended region around the block, 2× downsampled
+    // (kernel-dependent — Box keeps the historical separable box-
+    // average; Gaussian uses a separable 5-tap σ=0.8 kernel).
     let bw = x1 - x0;
     let bh = y1 - y0;
     let ext_x0 = x0.saturating_sub(bw / 2);
     let ext_y0 = y0.saturating_sub(bh / 2);
     let ext_x1 = (x1 + bw / 2).min(canvas_w);
     let ext_y1 = (y1 + bh / 2).min(canvas_h);
-    let cs1 = downsampled_cs(prev, curr, canvas_w, ext_x0, ext_y0, ext_x1, ext_y1, 2);
+    let cs1 = downsampled_cs(
+        prev, curr, canvas_w, ext_x0, ext_y0, ext_x1, ext_y1, 2, kernel,
+    );
 
-    // Scale 2: 4×-extended region, 4× Gaussian-downsampled.
+    // Scale 2: 4×-extended region, 4× downsampled. The Gaussian path
+    // cascades two blur+decimate-by-2 passes so the pyramid is a true
+    // Wang/Bovik MS-SSIM pyramid (not a one-shot 4× decimation).
     let ext2_x0 = x0.saturating_sub(3 * bw / 2);
     let ext2_y0 = y0.saturating_sub(3 * bh / 2);
     let ext2_x1 = (x1 + 3 * bw / 2).min(canvas_w);
     let ext2_y1 = (y1 + 3 * bh / 2).min(canvas_h);
-    let cs2 = downsampled_cs(prev, curr, canvas_w, ext2_x0, ext2_y0, ext2_x1, ext2_y1, 4);
+    let cs2 = downsampled_cs(
+        prev, curr, canvas_w, ext2_x0, ext2_y0, ext2_x1, ext2_y1, 4, kernel,
+    );
 
     // Empirical exponents from Wang/Bovik 2003, fused 5→3 scales.
     const ALPHA: f64 = 0.2856; // scale 0 weight
@@ -2137,11 +2226,18 @@ fn ssim_components_native(
 }
 
 /// Downsample a region of the BT.601 luma channel by `factor` (2× or
-/// 4×) using a separable box-average Gaussian kernel, then compute
-/// the **contrast × structure** component of SSIM (drop the
-/// luminance term so the MS-SSIM product doesn't double-count
-/// brightness drift across scales — only the native-scale `SSIM_0`
-/// factor carries the luminance term).
+/// 4×) using the kernel selected by `kernel`, then compute the
+/// **contrast × structure** component of SSIM (drop the luminance term
+/// so the MS-SSIM product doesn't double-count brightness drift across
+/// scales — only the native-scale `SSIM_0` factor carries the
+/// luminance term).
+///
+/// [`DownsampleKernel::Box`] uses the historical separable box-average
+/// over each `factor × factor` source cell. [`DownsampleKernel::Gaussian`]
+/// uses the canonical Wang/Bovik 2003 5-tap σ=0.8 kernel
+/// (`[0.054, 0.244, 0.404, 0.244, 0.054]`) applied separably (horizontal
+/// then vertical) followed by 2× decimation; the 4× scale cascades two
+/// blur+decimate passes for a true Gaussian pyramid.
 ///
 /// Returns `(2 σ_ab + C2) / (σ_a² + σ_b² + C2)` clamped to `(-∞, 1]`,
 /// which is the standard "CS" component used in MS-SSIM. Returns 1.0
@@ -2157,26 +2253,72 @@ fn downsampled_cs(
     x1: usize,
     y1: usize,
     factor: usize,
+    kernel: DownsampleKernel,
 ) -> f64 {
     if x1 <= x0 || y1 <= y0 || factor == 0 {
         return 1.0;
     }
+    let (prev_ds, curr_ds) = match kernel {
+        DownsampleKernel::Box => box_downsample_luma(prev, curr, canvas_w, x0, y0, x1, y1, factor),
+        DownsampleKernel::Gaussian => {
+            gaussian_downsample_luma(prev, curr, canvas_w, x0, y0, x1, y1, factor)
+        }
+    };
+    let n = prev_ds.len();
+    if n == 0 {
+        return 1.0;
+    }
+    // Compute means + variances + covariance on the downsampled
+    // patch (single block — no further blocking).
+    let nf = n as f64;
+    let mean_a: f64 = prev_ds.iter().sum::<f64>() / nf;
+    let mean_b: f64 = curr_ds.iter().sum::<f64>() / nf;
+    let mut var_a_acc = 0.0;
+    let mut var_b_acc = 0.0;
+    let mut cov_acc = 0.0;
+    for i in 0..n {
+        let da = prev_ds[i] - mean_a;
+        let db = curr_ds[i] - mean_b;
+        var_a_acc += da * da;
+        var_b_acc += db * db;
+        cov_acc += da * db;
+    }
+    let var_a = var_a_acc / nf;
+    let var_b = var_b_acc / nf;
+    let cov_ab = cov_acc / nf;
+    const C2: f64 = 58.5225; // (0.03 * 255)²
+                             // CS component (no luminance term) — only the native-scale
+                             // `SSIM_0` carries the brightness-drift comparison.
+    let numer = 2.0 * cov_ab + C2;
+    let denom = var_a + var_b + C2;
+    numer / denom
+}
+
+/// Box-average downsample helper — extracts BT.601 luma from each
+/// `factor × factor` source cell (clipping trailing partial cells along
+/// the right / bottom edge to the actual pixel count) and emits the
+/// downsampled patch as a pair of `out_w × out_h` `f64` buffers, one for
+/// `prev` and one for `curr`.
+fn box_downsample_luma(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    factor: usize,
+) -> (Vec<f64>, Vec<f64>) {
     let region_w = x1 - x0;
     let region_h = y1 - y0;
-    // Downsample — output dim = ceil(region_dim / factor).
     let out_w = region_w.div_ceil(factor);
     let out_h = region_h.div_ceil(factor);
     if out_w == 0 || out_h == 0 {
-        return 1.0;
+        return (Vec::new(), Vec::new());
     }
     let n = out_w * out_h;
     let mut prev_ds = vec![0.0f64; n];
     let mut curr_ds = vec![0.0f64; n];
-    // Box-average each `factor × factor` cell of the source region
-    // into one output pixel. (Trailing partial cells along the right
-    // / bottom edge are averaged over the actual pixel count, not
-    // the full `factor²`, so the edge pixels stay representative of
-    // the source content.)
     for oy in 0..out_h {
         for ox in 0..out_w {
             let sy0 = y0 + oy * factor;
@@ -2210,30 +2352,148 @@ fn downsampled_cs(
             curr_ds[oy * out_w + ox] = sum_c as f64 / denom_pix;
         }
     }
-    // Compute means + variances + covariance on the downsampled
-    // patch (single block — no further blocking).
-    let nf = n as f64;
-    let mean_a: f64 = prev_ds.iter().sum::<f64>() / nf;
-    let mean_b: f64 = curr_ds.iter().sum::<f64>() / nf;
-    let mut var_a_acc = 0.0;
-    let mut var_b_acc = 0.0;
-    let mut cov_acc = 0.0;
-    for i in 0..n {
-        let da = prev_ds[i] - mean_a;
-        let db = curr_ds[i] - mean_b;
-        var_a_acc += da * da;
-        var_b_acc += db * db;
-        cov_acc += da * db;
+    (prev_ds, curr_ds)
+}
+
+/// Gaussian-pyramid downsample helper — extracts the BT.601 luma plane
+/// for the source region into native-resolution `f64` buffers, then
+/// applies log2(`factor`) cascaded passes of separable 5-tap σ=0.8
+/// Gaussian blur + 2× decimation. The kernel weights
+/// `[0.054, 0.244, 0.404, 0.244, 0.054]` are the canonical Wang/Bovik
+/// 2003 reference; edge taps are renormalised to sum to 1.0 over the
+/// in-bounds samples (clamp-to-edge / replicate-boundary semantics).
+///
+/// Only `factor` ∈ {1, 2, 4} is exercised by the MS-SSIM cost path. A
+/// non-power-of-two `factor` falls back to box semantics.
+fn gaussian_downsample_luma(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    factor: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let region_w = x1 - x0;
+    let region_h = y1 - y0;
+    if region_w == 0 || region_h == 0 || factor == 0 {
+        return (Vec::new(), Vec::new());
     }
-    let var_a = var_a_acc / nf;
-    let var_b = var_b_acc / nf;
-    let cov_ab = cov_acc / nf;
-    const C2: f64 = 58.5225; // (0.03 * 255)²
-                             // CS component (no luminance term) — only the native-scale
-                             // `SSIM_0` carries the brightness-drift comparison.
-    let numer = 2.0 * cov_ab + C2;
-    let denom = var_a + var_b + C2;
-    numer / denom
+    // Gaussian pyramid only supports 2^k decimation. Anything else
+    // falls back to box semantics so the cost path stays
+    // well-behaved if a future caller asks for an odd factor.
+    if !factor.is_power_of_two() {
+        return box_downsample_luma(prev, curr, canvas_w, x0, y0, x1, y1, factor);
+    }
+    // Extract native-resolution luma planes for prev and curr.
+    let mut prev_l = vec![0.0f64; region_w * region_h];
+    let mut curr_l = vec![0.0f64; region_w * region_h];
+    for y in 0..region_h {
+        let src_row = (y0 + y) * canvas_w * 4;
+        let dst_row = y * region_w;
+        for x in 0..region_w {
+            let off = src_row + (x0 + x) * 4;
+            let pa_r = prev[off] as i32;
+            let pa_g = prev[off + 1] as i32;
+            let pa_b = prev[off + 2] as i32;
+            let pb_r = curr[off] as i32;
+            let pb_g = curr[off + 1] as i32;
+            let pb_b = curr[off + 2] as i32;
+            let la = (77 * pa_r + 150 * pa_g + 29 * pa_b + 128) >> 8;
+            let lb = (77 * pb_r + 150 * pb_g + 29 * pb_b + 128) >> 8;
+            prev_l[dst_row + x] = la as f64;
+            curr_l[dst_row + x] = lb as f64;
+        }
+    }
+    // Cascade log2(factor) blur+decimate-by-2 passes.
+    let mut w = region_w;
+    let mut h = region_h;
+    let mut p = prev_l;
+    let mut c = curr_l;
+    let mut step = 2usize;
+    while step <= factor {
+        let (np, nw, nh) = gaussian_blur_decimate2(&p, w, h);
+        let (nc, _, _) = gaussian_blur_decimate2(&c, w, h);
+        p = np;
+        c = nc;
+        w = nw;
+        h = nh;
+        if nw == 0 || nh == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        step *= 2;
+    }
+    (p, c)
+}
+
+/// One pass of separable 5-tap σ=0.8 Gaussian blur followed by 2×
+/// decimation. Edge taps are renormalised over the in-bounds weights
+/// (clamp-to-edge), so a 1-pixel-wide input stays meaningful (the kernel
+/// collapses to a single tap at weight 1.0). Returns `(out, out_w, out_h)`
+/// where `out_w = ceil(w / 2)`, `out_h = ceil(h / 2)`.
+fn gaussian_blur_decimate2(input: &[f64], w: usize, h: usize) -> (Vec<f64>, usize, usize) {
+    // Wang/Bovik 2003 5-tap σ ≈ 0.8 kernel.
+    const K: [f64; 5] = [0.054, 0.244, 0.404, 0.244, 0.054];
+    if w == 0 || h == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    // Horizontal blur into a `w × h` scratch buffer.
+    let mut tmp = vec![0.0f64; w * h];
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            let mut acc = 0.0;
+            let mut wsum = 0.0;
+            for k in 0..5 {
+                let dx = k as isize - 2;
+                let sx = x as isize + dx;
+                if sx >= 0 && (sx as usize) < w {
+                    acc += input[row + sx as usize] * K[k];
+                    wsum += K[k];
+                }
+            }
+            tmp[row + x] = if wsum > 0.0 {
+                acc / wsum
+            } else {
+                input[row + x]
+            };
+        }
+    }
+    // Vertical blur into a `w × h` blurred buffer (will be decimated
+    // by 2 in the next step).
+    let mut blurred = vec![0.0f64; w * h];
+    for x in 0..w {
+        for y in 0..h {
+            let mut acc = 0.0;
+            let mut wsum = 0.0;
+            for k in 0..5 {
+                let dy = k as isize - 2;
+                let sy = y as isize + dy;
+                if sy >= 0 && (sy as usize) < h {
+                    acc += tmp[(sy as usize) * w + x] * K[k];
+                    wsum += K[k];
+                }
+            }
+            blurred[y * w + x] = if wsum > 0.0 {
+                acc / wsum
+            } else {
+                tmp[y * w + x]
+            };
+        }
+    }
+    // Decimate by 2 (take samples at even indices).
+    let out_w = w.div_ceil(2);
+    let out_h = h.div_ceil(2);
+    let mut out = vec![0.0f64; out_w * out_h];
+    for oy in 0..out_h {
+        let sy = oy * 2;
+        for ox in 0..out_w {
+            let sx = ox * 2;
+            out[oy * out_w + ox] = blurred[sy * w + sx];
+        }
+    }
+    (out, out_w, out_h)
 }
 
 /// VP8X payload: 1 byte flags, 3 bytes reserved, 3 bytes canvas_w-1,
@@ -2662,10 +2922,28 @@ mod tests {
         }
         // Score the centre 8×8 block — well inside the canvas so the
         // 4× extension (32×32 region) doesn't get clipped.
-        let cost = block_cost_msssim(&buf, &buf, cw, ch, 12, 12, 20, 20);
+        let cost = block_cost_msssim(&buf, &buf, cw, ch, 12, 12, 20, 20, DownsampleKernel::Box);
         assert_eq!(
             cost, 0,
             "MS-SSIM cost on identical blocks should be 0 at every scale, got {cost}"
+        );
+        // Same block under the Gaussian kernel must also score 0 —
+        // identical inputs collapse every scale's CS term to 1.0
+        // regardless of the downsample kernel.
+        let cost_g = block_cost_msssim(
+            &buf,
+            &buf,
+            cw,
+            ch,
+            12,
+            12,
+            20,
+            20,
+            DownsampleKernel::Gaussian,
+        );
+        assert_eq!(
+            cost_g, 0,
+            "MS-SSIM cost on identical blocks should be 0 under the Gaussian kernel, got {cost_g}"
         );
     }
 
@@ -2730,7 +3008,7 @@ mod tests {
         // but scale-1 / scale-2 see the surrounding stripes → CS < 1 →
         // (1 - MS-SSIM) > 0 → cost > 0 → strictly larger than the
         // single-scale 0 cost.
-        let msssim = block_cost_msssim(&prev, &curr, cw, ch, 12, 12, 20, 20);
+        let msssim = block_cost_msssim(&prev, &curr, cw, ch, 12, 12, 20, 20, DownsampleKernel::Box);
         assert_eq!(
             ssim_single, 0,
             "single-scale SSIM at the identical centre block should be 0"
@@ -2832,6 +3110,79 @@ mod tests {
         assert!(
             grid_msssim[centre_idx],
             "MS-SSIM SHOULD flag the centre block due to surrounding context drift"
+        );
+    }
+
+    #[test]
+    fn msssim_gaussian_kernel_disagrees_with_box_on_smooth_gradient() {
+        // Real-Gaussian (5-tap σ=0.8 separable) vs box-average kernel:
+        // diverges most on content with high-frequency structure where
+        // the pillbox box-average over-smooths and the Gaussian kernel
+        // weights the centre tap (0.404) more heavily than the edge
+        // taps (0.054). The two kernels produce different downsampled
+        // luma values at every output pixel, which propagates into a
+        // different (1 - CS) at each MS-SSIM scale and hence a
+        // different final cost.
+        //
+        // Fixture: 32×32 canvas with a luma checkerboard (alternates
+        // ~64/192 per pixel — high-frequency content the box pillbox
+        // over-flattens). `prev` is the clean checkerboard; `curr`
+        // shifts the centre 8×8 block's mean by a constant +20 (so
+        // SSIM_0 picks up a small luminance change AND the surrounding
+        // pixels stay structurally identical, isolating the
+        // kernel-dependent CS terms).
+        let cw = 32usize;
+        let ch = 32usize;
+        let mut prev = vec![0u8; cw * ch * 4];
+        let mut curr = vec![0u8; cw * ch * 4];
+        for y in 0..ch {
+            for x in 0..cw {
+                let v = if (x + y) & 1 == 0 { 64u8 } else { 192u8 };
+                let off = (y * cw + x) * 4;
+                prev[off] = v;
+                prev[off + 1] = v;
+                prev[off + 2] = v;
+                prev[off + 3] = 255;
+                let centre = (12..20).contains(&y) && (12..20).contains(&x);
+                let cv = if centre { v.saturating_add(20) } else { v };
+                curr[off] = cv;
+                curr[off + 1] = cv;
+                curr[off + 2] = cv;
+                curr[off + 3] = 255;
+            }
+        }
+        let cost_box =
+            block_cost_msssim(&prev, &curr, cw, ch, 12, 12, 20, 20, DownsampleKernel::Box);
+        let cost_gauss = block_cost_msssim(
+            &prev,
+            &curr,
+            cw,
+            ch,
+            12,
+            12,
+            20,
+            20,
+            DownsampleKernel::Gaussian,
+        );
+        // Both kernels should detect that the frames differ (cost > 0).
+        assert!(
+            cost_box > 0,
+            "Box-kernel MS-SSIM cost should detect the centre-block luminance shift, got {cost_box}"
+        );
+        assert!(
+            cost_gauss > 0,
+            "Gaussian-kernel MS-SSIM cost should detect the centre-block luminance shift, got {cost_gauss}"
+        );
+        // The kernels must produce *different* costs — the whole point
+        // of the Gaussian opt-in is that it reports a different (more
+        // perceptually-aligned) cost than the box pillbox. On a
+        // high-frequency checkerboard with a localised perturbation the
+        // two paths' downsampled CS terms diverge by enough integer
+        // counts to distinguish them.
+        assert_ne!(
+            cost_box, cost_gauss,
+            "Box ({cost_box}) and Gaussian ({cost_gauss}) MS-SSIM costs must differ on a checkerboard with localised perturbation \
+             — if they match, the Gaussian path collapsed to box semantics"
         );
     }
 

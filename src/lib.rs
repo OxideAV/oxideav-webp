@@ -76,7 +76,7 @@ pub use demux::{extract_metadata, WebpFileMetadata};
 pub use encoder::encode_vp8l_argb_with_metadata;
 pub use encoder_anim::{
     build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions, AnimFrame,
-    AnimFrameMode, DeltaConfig,
+    AnimFrameMode, DeltaConfig, DownsampleKernel,
 };
 // Test-only probes for the Delta-mode adaptive ramp (doc-hidden — see
 // the `#[doc(hidden)]` annotations on the underlying functions).

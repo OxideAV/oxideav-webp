@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-encoder)* **opt-in real Gaussian downsample kernel for the
+  3-scale MS-SSIM-lite cost path** — new
+  `DeltaConfig::msssim_downsample_kernel: DownsampleKernel` field
+  (default `DownsampleKernel::Box`, preserves existing box-average
+  behaviour) selects the kernel used to reduce the scale-1 / scale-2
+  extended regions before the contrast/structure components are
+  computed. `DownsampleKernel::Gaussian` swaps in the canonical
+  Wang/Bovik 2003 5-tap σ=0.8 kernel
+  (`[0.054, 0.244, 0.404, 0.244, 0.054]`) applied separably (horizontal
+  then vertical) followed by 2× decimation; the 4× scale cascades two
+  blur+decimate passes for a true Gaussian pyramid. Closes a real
+  perceptual undershoot the box pillbox over-smooths on smooth
+  gradients (the box average is a degenerate σ ≈ ∞ pillbox filter).
+  Builder method `DeltaConfig::msssim_downsample_kernel(kernel)` and
+  the new `DownsampleKernel` enum are re-exported from the crate root.
+  Test `msssim_gaussian_kernel_disagrees_with_box_on_smooth_gradient`
+  pins that the two kernels report different MS-SSIM costs on a
+  high-frequency checkerboard with a localised perturbation;
+  `msssim_cost_block_identical_inputs_returns_zero` extended to cover
+  both kernels.
+
 - *(anim-encoder)* **opt-in 3-scale MS-SSIM-lite cost model for
   `AnimFrameMode::Delta`** — new `DeltaConfig::enable_msssim_cost: bool`
   (default `false`, preserves existing SAD/single-scale-SSIM behaviour)
@@ -282,6 +303,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Box<dyn Encoder>` had no way to surface their colour profile.
 
 ### Changed
+
+- *(anim-encoder)* **`DeltaConfig::auto_inner_threshold_bytes` default
+  flipped from `None` to `Some(4096)`** — out-of-the-box Delta-mode
+  encodes now run the per-sub-rect lossy/lossless race for any
+  sub-rect tile whose lossless VP8L payload exceeds 4 KB. Real-world
+  animations with noisy delta regions benefit (~63% reduction observed
+  on a 128×128 fixture with a noisy 64×64 sub-rect: 12.5 KB → 4.6 KB).
+  Pixel-identical round-trip semantics are preserved for sub-rect
+  tiles that fit in 4 KB lossless. The builder
+  `DeltaConfig::auto_inner_threshold_bytes(...)` now takes
+  `Option<u32>` (was `u32` for "set to `Some(bytes)`"); pass `None` to
+  opt out and force every sub-rect tile to stay lossless regardless of
+  size (preserves the pre-default-change semantics for every tile).
+  New test
+  `delta_mode_default_auto_inner_threshold_beats_explicit_none_baseline_on_busy_tile`
+  pins the wire-size win of the new default vs explicit `None`.
 
 - *(anim-encoder)* **`DeltaConfig::max_components: u32` removed,
   replaced with `max_components_override: Option<u32>`**. Source-level

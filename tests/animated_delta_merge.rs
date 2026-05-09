@@ -949,7 +949,12 @@ fn delta_mode_auto_inner_encode_picks_lossy_for_busy_tile() {
         },
     ];
 
-    // Lossless-only baseline (no auto-inner-encode threshold).
+    // Lossless-only baseline — explicit `None` to opt out of the
+    // default per-sub-rect lossy/lossless race (which is now
+    // `Some(4096)` by default). Without this opt-out, the "baseline"
+    // would already include the auto-inner race and the comparison
+    // below would compare apples-to-apples lossy variants instead of
+    // lossless-only-vs-with-race.
     let baseline = build_animated_webp_with_options(
         w,
         h,
@@ -957,7 +962,7 @@ fn delta_mode_auto_inner_encode_picks_lossy_for_busy_tile() {
         0,
         &frames,
         AnimEncoderOptions {
-            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            mode: AnimFrameMode::Delta(DeltaConfig::default().auto_inner_threshold_bytes(None)),
             ..Default::default()
         },
     )
@@ -972,7 +977,9 @@ fn delta_mode_auto_inner_encode_picks_lossy_for_busy_tile() {
         0,
         &frames,
         AnimEncoderOptions {
-            mode: AnimFrameMode::Delta(DeltaConfig::default().auto_inner_threshold_bytes(256)),
+            mode: AnimFrameMode::Delta(
+                DeltaConfig::default().auto_inner_threshold_bytes(Some(256)),
+            ),
             ..Default::default()
         },
     )
@@ -1027,7 +1034,9 @@ fn delta_mode_auto_inner_encode_keeps_small_tiles_lossless() {
         0,
         &frames,
         AnimEncoderOptions {
-            mode: AnimFrameMode::Delta(DeltaConfig::default().auto_inner_threshold_bytes(4096)),
+            mode: AnimFrameMode::Delta(
+                DeltaConfig::default().auto_inner_threshold_bytes(Some(4096)),
+            ),
             ..Default::default()
         },
     )
@@ -1049,6 +1058,84 @@ fn delta_mode_auto_inner_encode_keeps_small_tiles_lossless() {
             "auto-inner encode below threshold must stay pixel-identical (logical frame {i})"
         );
     }
+}
+
+#[test]
+fn delta_mode_default_auto_inner_threshold_beats_explicit_none_baseline_on_busy_tile() {
+    // Pin the new `auto_inner_threshold_bytes: Some(4096)` default
+    // behaviour: on a 128×128 canvas with a noisy 64×64 sub-rect, the
+    // out-of-the-box `DeltaConfig::default()` produces a *smaller*
+    // file than an explicit `auto_inner_threshold_bytes: None`
+    // (which forces every sub-rect to stay lossless regardless of
+    // size). The default Some(4096) lets the busy 64×64 tile take
+    // the lossy candidate via the per-sub-rect race; the
+    // explicit-None baseline keeps it lossless and pays the byte
+    // cost.
+    //
+    // Sized so the lossless VP8L payload of the noisy 64×64 tile
+    // strictly exceeds 4096 bytes (the new default cutoff) — anything
+    // smaller would fall under the threshold and the default would
+    // collapse to "stay lossless", making the test a no-op.
+    let w = 128u32;
+    let h = 128u32;
+    let (f0, f1) = build_busy_delta_pair(w, h);
+    let frames = vec![
+        AnimFrame {
+            width: w,
+            height: h,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba: &f0,
+        },
+        AnimFrame {
+            width: w,
+            height: h,
+            x_offset: 0,
+            y_offset: 0,
+            duration_ms: 50,
+            blend: false,
+            dispose_to_background: false,
+            rgba: &f1,
+        },
+    ];
+    let lossless_only = build_animated_webp_with_options(
+        w,
+        h,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default().auto_inner_threshold_bytes(None)),
+            ..Default::default()
+        },
+    )
+    .expect("encode lossless-only baseline");
+    let with_default_threshold = build_animated_webp_with_options(
+        w,
+        h,
+        [0u8; 4],
+        0,
+        &frames,
+        AnimEncoderOptions {
+            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            ..Default::default()
+        },
+    )
+    .expect("encode default Some(4096) threshold");
+    eprintln!(
+        "delta default-threshold: lossless-only = {} bytes, default Some(4096) = {} bytes",
+        lossless_only.len(),
+        with_default_threshold.len()
+    );
+    assert!(
+        with_default_threshold.len() < lossless_only.len(),
+        "default Some(4096) auto-inner threshold ({}) should beat the explicit-None lossless-only baseline ({}) on the busy 32×32 fixture",
+        with_default_threshold.len(),
+        lossless_only.len()
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1315,6 +1402,14 @@ fn delta_mode_mid_density_round_trip_pixel_identical() {
             rgba,
         })
         .collect();
+    // Opt out of the new `auto_inner_threshold_bytes: Some(4096)`
+    // default for this test — the merge-to-budget step collapses 16
+    // clusters into 8, and the resulting super-rects cover stripes of
+    // pseudo-noise background whose lossless VP8L payload can exceed
+    // 4 KB on individual tiles, which would otherwise trigger the
+    // lossy candidate and break this test's pixel-identical
+    // assertion. The test's purpose is to pin the merge-step
+    // arithmetic, not the auto-inner-encode race.
     let blob = build_animated_webp_with_options(
         MD_W,
         MD_H,
@@ -1322,7 +1417,7 @@ fn delta_mode_mid_density_round_trip_pixel_identical() {
         0,
         &frames,
         AnimEncoderOptions {
-            mode: AnimFrameMode::Delta(DeltaConfig::default()),
+            mode: AnimFrameMode::Delta(DeltaConfig::default().auto_inner_threshold_bytes(None)),
             ..Default::default()
         },
     )

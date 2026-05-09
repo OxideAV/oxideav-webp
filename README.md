@@ -390,12 +390,22 @@ Encoder scope (current):
   (sum of cluster pixel-areas / canvas area) maps to budget = 16 at
   density ≤ 5%, 4 at density ≥ 30% (linear interpolation in between).
   Override with `DeltaConfig::max_components_override(n)`.
-  Auto-inner-encode (`DeltaConfig::auto_inner_threshold_bytes(t)`)
+  Auto-inner-encode (`DeltaConfig::auto_inner_threshold_bytes(Some(t))`)
   re-encodes any sub-rect tile whose lossless VP8L bytes exceed `t`
   through VP8 + ALPH at quality 75 (configurable) and picks the byte-
   smaller candidate — closes the "lossless for small tiles, lossy for
   large busy tiles" common-case win (observed 64×64 fixture with a
-  noisy 32×32 sub-rect: 3.3 KB → 1.2 KB, ≈63% reduction).
+  noisy 32×32 sub-rect: 3.3 KB → 1.2 KB, ≈63% reduction). Default is
+  now `Some(4096)` — small tiles (≤ 4 KB lossless) stay
+  pixel-identical, larger noisy tiles take the lossy candidate
+  (observed 128×128 fixture with a noisy 64×64 sub-rect: 12.5 KB →
+  4.6 KB, ≈63% reduction). Pass `None` to opt out and force every
+  sub-rect tile to stay lossless. The MS-SSIM-lite cost path's
+  scale-1/scale-2 downsample kernel is `DownsampleKernel::Box` by
+  default; opt in to the canonical Wang/Bovik 2003 5-tap σ=0.8
+  Gaussian via `DeltaConfig::msssim_downsample_kernel(DownsampleKernel::Gaussian)`
+  for closer alignment with the reference MS-SSIM pyramid on smooth
+  gradients.
 - One-shot `encode_vp8l_argb_with_metadata(w, h, &argb, has_alpha,
   &meta)` for std-only image-library consumers that want a lossless
   `.webp` file with an attached colour profile / EXIF / XMP **without**
