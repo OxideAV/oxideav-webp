@@ -195,6 +195,41 @@ pub enum AnimFrameMode {
 /// the block is flagged "similar" — but SSIM's covariance term picks
 /// up the structural change because `σ_ab` collapses while `σ_a`
 /// and `σ_b` stay non-trivial.
+///
+/// # MS-SSIM (multi-scale, 3 scales)
+///
+/// When [`Self::enable_msssim_cost`] is `true`, the encoder swaps in a
+/// **3-scale MS-SSIM-lite** cost — a multi-scale generalisation of the
+/// single-scale cost above, per Wang/Bovik 2003 ("Multi-scale
+/// structural similarity for image quality assessment"):
+///
+/// ```text
+///   scale 0: full SSIM at native block resolution (lum * contrast * struct)
+///   scale 1: contrast * struct on a 2x-extended-region 2x-Gaussian-downsampled patch
+///   scale 2: contrast * struct on a 4x-extended-region 4x-Gaussian-downsampled patch
+///   MS-SSIM = SSIM_0^α * CS_1^β * CS_2^γ
+///   cost    = round((1.0 - MS-SSIM) * 10000)
+/// ```
+///
+/// The 3-scale empirical exponents (`α=0.2856, β=0.3001, γ=0.4143`,
+/// summing to 1.0) are derived from the canonical 5-scale series
+/// `{0.0448, 0.2856, 0.3001, 0.2363, 0.1333}` by fusing the bottom two
+/// scales into γ (so the 5-scale weights collapse cleanly to a
+/// 3-scale subset that still favours the larger spatial extents).
+///
+/// MS-SSIM catches **low-frequency structural drift** that single-scale
+/// SSIM at 8×8 blocks can miss: a global gradient shift from one frame
+/// to the next that perturbs the mean inside every 8×8 block by ≈ 0
+/// but accumulates a clear DC change at the 32×32 (scale-2) extent.
+/// Single-scale SSIM-lite scores ≈ 0 (no per-block change), but the
+/// scale-2 contrast/structure terms collapse and MS-SSIM flags the
+/// block as changed.
+///
+/// MS-SSIM supersedes [`Self::enable_ssim_cost`] when both are on (the
+/// single-scale cost is the `SSIM_0` component of the multi-scale
+/// product). Threshold for the MS-SSIM cost path is
+/// [`Self::msssim_threshold`] (default 50, same scale as the
+/// single-scale `(1 - SSIM) * 10000`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeltaConfig {
     /// Block side length in pixels. Default 8. The encoder rounds
@@ -247,6 +282,22 @@ pub struct DeltaConfig {
     /// changes while absorbing 8-bit rounding noise). Independent
     /// of [`Self::threshold`] so the two modes' defaults stay clean.
     pub ssim_threshold: u32,
+    /// When `true`, swap the cost model for the **3-scale MS-SSIM-lite**
+    /// perceptual cost (Wang/Bovik 2003). Supersedes
+    /// [`Self::enable_ssim_cost`] when both are on — the single-scale
+    /// cost becomes the `SSIM_0` component of the multi-scale product.
+    /// Cost scale matches the single-scale path
+    /// (`round((1.0 - MS-SSIM) * 10000)`) and uses
+    /// [`Self::msssim_threshold`]. Default `false` — preserves the
+    /// existing SAD/single-scale-SSIM behaviour for backwards
+    /// compatibility.
+    pub enable_msssim_cost: bool,
+    /// Threshold for the MS-SSIM cost path (only consulted when
+    /// [`Self::enable_msssim_cost`] is `true`). Same scale as
+    /// [`Self::ssim_threshold`] (`round((1.0 - MS-SSIM) * 10000)`);
+    /// blocks whose cost strictly exceeds this value are flagged as
+    /// changed. Default 50.
+    pub msssim_threshold: u32,
 }
 
 impl Default for DeltaConfig {
@@ -260,6 +311,8 @@ impl Default for DeltaConfig {
             auto_inner_quality: 75.0,
             enable_ssim_cost: false,
             ssim_threshold: 50,
+            enable_msssim_cost: false,
+            msssim_threshold: 50,
         }
     }
 }
@@ -297,6 +350,24 @@ impl DeltaConfig {
     #[must_use]
     pub fn ssim_threshold(mut self, t: u32) -> Self {
         self.ssim_threshold = t;
+        self
+    }
+
+    /// Builder-style setter for [`Self::enable_msssim_cost`] — turns
+    /// on the 3-scale MS-SSIM-lite cost model. Supersedes
+    /// [`Self::enable_ssim_cost`] when both are on.
+    #[must_use]
+    pub fn enable_msssim_cost(mut self, on: bool) -> Self {
+        self.enable_msssim_cost = on;
+        self
+    }
+
+    /// Builder-style setter for [`Self::msssim_threshold`] —
+    /// overrides the MS-SSIM cost-path threshold. Only consulted when
+    /// [`Self::enable_msssim_cost`] is `true`.
+    #[must_use]
+    pub fn msssim_threshold(mut self, t: u32) -> Self {
+        self.msssim_threshold = t;
         self
     }
 }
@@ -1319,8 +1390,10 @@ fn extract_subrect(rgba: &[u8], canvas_w: u32, bx: u32, by: u32, bw: u32, bh: u3
 /// Compute the boolean `n_bx × n_by` "changed" grid for the cost-model
 /// (true ⇔ block cost > active threshold). Pulled out of
 /// [`changed_block_bbox`] / [`changed_block_components`] so both share
-/// one walk over the canvas pixels. Dispatches between the SAD and
-/// SSIM-lite cost models based on `cfg.enable_ssim_cost`.
+/// one walk over the canvas pixels. Dispatches between the SAD,
+/// single-scale SSIM-lite, and 3-scale MS-SSIM-lite cost models based
+/// on `cfg.enable_msssim_cost` / `cfg.enable_ssim_cost` (MS-SSIM
+/// supersedes single-scale when both are on).
 fn compute_changed_grid(
     prev: &[u8],
     curr: &[u8],
@@ -1330,10 +1403,13 @@ fn compute_changed_grid(
 ) -> (Vec<bool>, u32, u32) {
     let bs = cfg.block_size;
     let cw = canvas_w as usize;
+    let ch = canvas_h as usize;
     let n_bx = canvas_w.div_ceil(bs);
     let n_by = canvas_h.div_ceil(bs);
     let mut grid = vec![false; (n_bx as usize) * (n_by as usize)];
-    let threshold = if cfg.enable_ssim_cost {
+    let threshold = if cfg.enable_msssim_cost {
+        cfg.msssim_threshold as u64
+    } else if cfg.enable_ssim_cost {
         cfg.ssim_threshold as u64
     } else {
         cfg.threshold as u64
@@ -1344,7 +1420,9 @@ fn compute_changed_grid(
         for bx in 0..n_bx {
             let x0 = (bx * bs) as usize;
             let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
-            let cost = if cfg.enable_ssim_cost {
+            let cost = if cfg.enable_msssim_cost {
+                block_cost_msssim(prev, curr, cw, ch, x0, y0, x1, y1)
+            } else if cfg.enable_ssim_cost {
                 block_cost_ssim(prev, curr, cw, x0, y0, x1, y1)
             } else {
                 block_cost(prev, curr, cw, x0, y0, x1, y1)
@@ -1656,7 +1734,10 @@ fn changed_block_bbox(
     let mut min_by = u32::MAX;
     let mut max_bx: i64 = -1;
     let mut max_by: i64 = -1;
-    let threshold = if cfg.enable_ssim_cost {
+    let ch = canvas_h as usize;
+    let threshold = if cfg.enable_msssim_cost {
+        cfg.msssim_threshold as u64
+    } else if cfg.enable_ssim_cost {
         cfg.ssim_threshold as u64
     } else {
         cfg.threshold as u64
@@ -1668,7 +1749,9 @@ fn changed_block_bbox(
         for bx in 0..n_bx {
             let x0 = (bx * bs) as usize;
             let x1 = ((bx + 1) * bs).min(canvas_w) as usize;
-            let cost = if cfg.enable_ssim_cost {
+            let cost = if cfg.enable_msssim_cost {
+                block_cost_msssim(prev, curr, cw, ch, x0, y0, x1, y1)
+            } else if cfg.enable_ssim_cost {
                 block_cost_ssim(prev, curr, cw, x0, y0, x1, y1)
             } else {
                 block_cost(prev, curr, cw, x0, y0, x1, y1)
@@ -1879,6 +1962,278 @@ fn block_cost_ssim(
     } else {
         cost_f.round() as u64
     }
+}
+
+/// 3-scale **MS-SSIM-lite** cost over a block in two RGBA canvas
+/// buffers. Per Wang/Bovik 2003 "Multi-scale structural similarity
+/// for image quality assessment" — cascade SSIM at three spatial
+/// scales (the canonical 5-scale series collapsed to 3 by fusing
+/// the bottom-two empirical exponents into the largest scale's γ),
+/// fuse via the standard `prod(...)^weight` form. Computed on the
+/// BT.601 luma channel only (single-channel matches the single-scale
+/// path's design choice).
+///
+/// ```text
+///   scale 0: native block — full SSIM (luminance × contrast × structure)
+///   scale 1: 2×-extended region around the block, downsampled 2× via separable Gaussian
+///            → contrast × structure
+///   scale 2: 4×-extended region, downsampled 4× → contrast × structure
+///   MS-SSIM = SSIM_0^α * CS_1^β * CS_2^γ
+///   α = 0.2856, β = 0.3001, γ = 0.4143  (sum = 1.0)
+///   cost = round((1.0 - MS-SSIM) * 10000)
+/// ```
+///
+/// Empirical-exponent derivation: the Wang/Bovik 5-scale series is
+/// `{0.0448, 0.2856, 0.3001, 0.2363, 0.1333}` (sum 1.0). Our 3-scale
+/// subset takes scales 1, 2, and {3+4+5} fused: `α = 0.2856,
+/// β = 0.3001, γ = 0.0448 + 0.2363 + 0.1333 = 0.4144` (rounded to
+/// 0.4143 to keep the trio at sum = 1.0). The largest-scale γ is
+/// dominant — multi-scale weighting deliberately biases toward the
+/// coarse spatial extents because that's where single-scale SSIM
+/// blind spots live (low-frequency global drift).
+///
+/// Returns `round((1.0 - MS-SSIM) * 10000)` (same scale as the
+/// single-scale path's `(1 - SSIM) * 10000`); blocks whose cost
+/// strictly exceeds [`DeltaConfig::msssim_threshold`] are flagged
+/// changed.
+///
+/// Edge clipping: when the block is near the canvas edge and the
+/// 2×/4× extended region would extend past the canvas, the extended
+/// region is clipped to canvas bounds rather than mirrored / padded.
+/// Pixel counts inside the clipped region are tracked so the
+/// downsampled patch still has the right size for the per-scale
+/// SSIM/CS computation.
+fn block_cost_msssim(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: usize,
+    canvas_h: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> u64 {
+    let n_pixels = (x1 - x0) * (y1 - y0);
+    if n_pixels == 0 {
+        return 0;
+    }
+    // Scale 0: full SSIM on the native block.
+    let ssim0 = ssim_components_native(prev, curr, canvas_w, x0, y0, x1, y1);
+
+    // Scale 1: 2×-extended region around the block, 2× Gaussian-
+    // downsampled. The extended region is `[x0 - bw/2, x1 + bw/2)`
+    // (width 2*bw), clipped to canvas. The downsample uses a 2×2 box
+    // average (a separable [1,1] Gaussian — adequate for the cost-
+    // model use-case where we just need a coarse-scale signal).
+    let bw = x1 - x0;
+    let bh = y1 - y0;
+    let ext_x0 = x0.saturating_sub(bw / 2);
+    let ext_y0 = y0.saturating_sub(bh / 2);
+    let ext_x1 = (x1 + bw / 2).min(canvas_w);
+    let ext_y1 = (y1 + bh / 2).min(canvas_h);
+    let cs1 = downsampled_cs(prev, curr, canvas_w, ext_x0, ext_y0, ext_x1, ext_y1, 2);
+
+    // Scale 2: 4×-extended region, 4× Gaussian-downsampled.
+    let ext2_x0 = x0.saturating_sub(3 * bw / 2);
+    let ext2_y0 = y0.saturating_sub(3 * bh / 2);
+    let ext2_x1 = (x1 + 3 * bw / 2).min(canvas_w);
+    let ext2_y1 = (y1 + 3 * bh / 2).min(canvas_h);
+    let cs2 = downsampled_cs(prev, curr, canvas_w, ext2_x0, ext2_y0, ext2_x1, ext2_y1, 4);
+
+    // Empirical exponents from Wang/Bovik 2003, fused 5→3 scales.
+    const ALPHA: f64 = 0.2856; // scale 0 weight
+    const BETA: f64 = 0.3001; // scale 1 weight
+    const GAMMA: f64 = 0.4143; // scale 2 weight (absorbs scales 3+4 of the 5-scale series)
+
+    // Clamp components to (0, 1] for the powf — SSIM/CS in (-∞, 1]
+    // theoretically, but our integer-noise content keeps them in
+    // [~0, 1]. Negative or zero values would make the powf return
+    // NaN / 0, collapsing the product; clamp to a tiny epsilon so
+    // the cost stays in a usable range on adversarial content.
+    let s0 = ssim0.clamp(1e-6, 1.0);
+    let s1 = cs1.clamp(1e-6, 1.0);
+    let s2 = cs2.clamp(1e-6, 1.0);
+    let msssim = s0.powf(ALPHA) * s1.powf(BETA) * s2.powf(GAMMA);
+    let cost_f = (1.0 - msssim) * 10_000.0;
+    if cost_f <= 0.0 {
+        0
+    } else {
+        cost_f.round() as u64
+    }
+}
+
+/// Compute the **full SSIM** value (luminance × contrast × structure)
+/// over a native-resolution block in two RGBA canvas buffers, on the
+/// BT.601 luma channel. Returns SSIM in `(-∞, 1]` — caller is
+/// responsible for clamping if it needs a positive value.
+///
+/// Shares the per-block math with [`block_cost_ssim`] but returns the
+/// raw SSIM scalar (rather than the `(1-SSIM)*10000` cost) so the
+/// MS-SSIM cost can fold it into the multi-scale product.
+fn ssim_components_native(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) -> f64 {
+    let n_pixels = (x1 - x0) * (y1 - y0);
+    if n_pixels == 0 {
+        return 1.0;
+    }
+    let mut sum_a: i64 = 0;
+    let mut sum_b: i64 = 0;
+    for y in y0..y1 {
+        let row_off = y * canvas_w * 4;
+        for x in x0..x1 {
+            let off = row_off + x * 4;
+            let pa_r = prev[off] as i32;
+            let pa_g = prev[off + 1] as i32;
+            let pa_b = prev[off + 2] as i32;
+            let pb_r = curr[off] as i32;
+            let pb_g = curr[off + 1] as i32;
+            let pb_b = curr[off + 2] as i32;
+            let la = (77 * pa_r + 150 * pa_g + 29 * pa_b + 128) >> 8;
+            let lb = (77 * pb_r + 150 * pb_g + 29 * pb_b + 128) >> 8;
+            sum_a += la as i64;
+            sum_b += lb as i64;
+        }
+    }
+    let n = n_pixels as f64;
+    let mean_a = sum_a as f64 / n;
+    let mean_b = sum_b as f64 / n;
+    let mut var_a_acc: f64 = 0.0;
+    let mut var_b_acc: f64 = 0.0;
+    let mut cov_acc: f64 = 0.0;
+    for y in y0..y1 {
+        let row_off = y * canvas_w * 4;
+        for x in x0..x1 {
+            let off = row_off + x * 4;
+            let pa_r = prev[off] as i32;
+            let pa_g = prev[off + 1] as i32;
+            let pa_b = prev[off + 2] as i32;
+            let pb_r = curr[off] as i32;
+            let pb_g = curr[off + 1] as i32;
+            let pb_b = curr[off + 2] as i32;
+            let la = ((77 * pa_r + 150 * pa_g + 29 * pa_b + 128) >> 8) as f64;
+            let lb = ((77 * pb_r + 150 * pb_g + 29 * pb_b + 128) >> 8) as f64;
+            let da = la - mean_a;
+            let db = lb - mean_b;
+            var_a_acc += da * da;
+            var_b_acc += db * db;
+            cov_acc += da * db;
+        }
+    }
+    let var_a = var_a_acc / n;
+    let var_b = var_b_acc / n;
+    let cov_ab = cov_acc / n;
+    const C1: f64 = 6.5025;
+    const C2: f64 = 58.5225;
+    let numer = (2.0 * mean_a * mean_b + C1) * (2.0 * cov_ab + C2);
+    let denom = (mean_a * mean_a + mean_b * mean_b + C1) * (var_a + var_b + C2);
+    numer / denom
+}
+
+/// Downsample a region of the BT.601 luma channel by `factor` (2× or
+/// 4×) using a separable box-average Gaussian kernel, then compute
+/// the **contrast × structure** component of SSIM (drop the
+/// luminance term so the MS-SSIM product doesn't double-count
+/// brightness drift across scales — only the native-scale `SSIM_0`
+/// factor carries the luminance term).
+///
+/// Returns `(2 σ_ab + C2) / (σ_a² + σ_b² + C2)` clamped to `(-∞, 1]`,
+/// which is the standard "CS" component used in MS-SSIM. Returns 1.0
+/// for empty / single-pixel-after-downsample regions (no contrast
+/// signal available — treat as "matches" to keep the multi-scale
+/// product well-behaved).
+fn downsampled_cs(
+    prev: &[u8],
+    curr: &[u8],
+    canvas_w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    factor: usize,
+) -> f64 {
+    if x1 <= x0 || y1 <= y0 || factor == 0 {
+        return 1.0;
+    }
+    let region_w = x1 - x0;
+    let region_h = y1 - y0;
+    // Downsample — output dim = ceil(region_dim / factor).
+    let out_w = region_w.div_ceil(factor);
+    let out_h = region_h.div_ceil(factor);
+    if out_w == 0 || out_h == 0 {
+        return 1.0;
+    }
+    let n = out_w * out_h;
+    let mut prev_ds = vec![0.0f64; n];
+    let mut curr_ds = vec![0.0f64; n];
+    // Box-average each `factor × factor` cell of the source region
+    // into one output pixel. (Trailing partial cells along the right
+    // / bottom edge are averaged over the actual pixel count, not
+    // the full `factor²`, so the edge pixels stay representative of
+    // the source content.)
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let sy0 = y0 + oy * factor;
+            let sy1 = (sy0 + factor).min(y1);
+            let sx0 = x0 + ox * factor;
+            let sx1 = (sx0 + factor).min(x1);
+            let cell_pixels = (sy1 - sy0) * (sx1 - sx0);
+            if cell_pixels == 0 {
+                continue;
+            }
+            let mut sum_p: u64 = 0;
+            let mut sum_c: u64 = 0;
+            for y in sy0..sy1 {
+                let row_off = y * canvas_w * 4;
+                for x in sx0..sx1 {
+                    let off = row_off + x * 4;
+                    let pa_r = prev[off] as i32;
+                    let pa_g = prev[off + 1] as i32;
+                    let pa_b = prev[off + 2] as i32;
+                    let pb_r = curr[off] as i32;
+                    let pb_g = curr[off + 1] as i32;
+                    let pb_b = curr[off + 2] as i32;
+                    let la = (77 * pa_r + 150 * pa_g + 29 * pa_b + 128) >> 8;
+                    let lb = (77 * pb_r + 150 * pb_g + 29 * pb_b + 128) >> 8;
+                    sum_p += la as u64;
+                    sum_c += lb as u64;
+                }
+            }
+            let denom_pix = cell_pixels as f64;
+            prev_ds[oy * out_w + ox] = sum_p as f64 / denom_pix;
+            curr_ds[oy * out_w + ox] = sum_c as f64 / denom_pix;
+        }
+    }
+    // Compute means + variances + covariance on the downsampled
+    // patch (single block — no further blocking).
+    let nf = n as f64;
+    let mean_a: f64 = prev_ds.iter().sum::<f64>() / nf;
+    let mean_b: f64 = curr_ds.iter().sum::<f64>() / nf;
+    let mut var_a_acc = 0.0;
+    let mut var_b_acc = 0.0;
+    let mut cov_acc = 0.0;
+    for i in 0..n {
+        let da = prev_ds[i] - mean_a;
+        let db = curr_ds[i] - mean_b;
+        var_a_acc += da * da;
+        var_b_acc += db * db;
+        cov_acc += da * db;
+    }
+    let var_a = var_a_acc / nf;
+    let var_b = var_b_acc / nf;
+    let cov_ab = cov_acc / nf;
+    const C2: f64 = 58.5225; // (0.03 * 255)²
+                             // CS component (no luminance term) — only the native-scale
+                             // `SSIM_0` carries the brightness-drift comparison.
+    let numer = 2.0 * cov_ab + C2;
+    let denom = var_a + var_b + C2;
+    numer / denom
 }
 
 /// VP8X payload: 1 byte flags, 3 bytes reserved, 3 bytes canvas_w-1,
@@ -2288,6 +2643,196 @@ mod tests {
         // identical block).
         assert!(!grid_sad[0]);
         assert!(!grid_ssim[0]);
+    }
+
+    #[test]
+    fn msssim_cost_block_identical_inputs_returns_zero() {
+        // Identical inputs at every scale → MS-SSIM = 1.0 → cost = 0.
+        // Build a 32×32 canvas (large enough for the 4×-extended scale-2
+        // region to fit) with non-trivial content so the variance terms
+        // are non-zero at every scale.
+        let cw = 32usize;
+        let ch = 32usize;
+        let mut buf = vec![0u8; cw * ch * 4];
+        for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+            px[0] = ((i * 13) & 0xff) as u8;
+            px[1] = ((i * 19) & 0xff) as u8;
+            px[2] = ((i * 23) & 0xff) as u8;
+            px[3] = 255;
+        }
+        // Score the centre 8×8 block — well inside the canvas so the
+        // 4× extension (32×32 region) doesn't get clipped.
+        let cost = block_cost_msssim(&buf, &buf, cw, ch, 12, 12, 20, 20);
+        assert_eq!(
+            cost, 0,
+            "MS-SSIM cost on identical blocks should be 0 at every scale, got {cost}"
+        );
+    }
+
+    #[test]
+    fn msssim_cost_catches_low_freq_drift_single_scale_misses() {
+        // Construct a fixture where SINGLE-scale SSIM at the 8×8 block
+        // resolution scores ≈ 0 (no per-block change) but a coarse-scale
+        // (32×32) extent picks up a clear DC drift between prev and curr.
+        //
+        // Recipe: tile a 32×32 canvas with a high-frequency checkerboard
+        // pattern (luma alternates 0/255 per pixel). Then in `curr`,
+        // shift one half of the canvas (e.g. the left half) brightness
+        // up by a small amount that DOES NOT change the per-8×8 mean
+        // visibly (the checkerboard already has mean ≈ 127, and we
+        // shift by an amount that the modulo-channel-clip absorbs into
+        // the structural variance). At the COARSE scale (32×32 box-
+        // averaged → single value), the half-canvas DC step IS visible.
+        //
+        // Actually the cleanest construction: a 32×32 canvas with the
+        // 8×8 block at the centre (12..20, 12..20) IDENTICAL in prev
+        // vs curr (so single-scale at that block scores 0), but the
+        // SURROUNDING context (used by MS-SSIM's scale-1 / scale-2
+        // extended regions) carries a clear structural change that
+        // collapses the coarse-scale CS terms.
+        //
+        // Build this: prev = uniform luma 128 everywhere. curr = same
+        // 128 in the centre 8×8 block, but the surrounding ring carries
+        // a strong vertical-stripe pattern that wasn't there in prev.
+        // Single-scale SSIM on the centre 8×8 == 1.0 (identical pixels);
+        // MS-SSIM scale-1 (16×16 region) and scale-2 (32×32 region)
+        // both see the surrounding stripes → CS terms < 1 → MS-SSIM < 1.
+        let cw = 32usize;
+        let ch = 32usize;
+        let mut prev = vec![0u8; cw * ch * 4];
+        let mut curr = vec![0u8; cw * ch * 4];
+        // Both: uniform luma 128 base.
+        for px in prev.chunks_exact_mut(4) {
+            px[0] = 128;
+            px[1] = 128;
+            px[2] = 128;
+            px[3] = 255;
+        }
+        curr.copy_from_slice(&prev);
+        // curr: high-contrast stripes EVERYWHERE EXCEPT the centre 8×8
+        // block (12..20, 12..20). This puts a strong structural signal
+        // in the scale-1 and scale-2 extended regions while leaving
+        // the centre block bit-identical to prev.
+        for y in 0..ch {
+            for x in 0..cw {
+                let centre = (12..20).contains(&y) && (12..20).contains(&x);
+                if !centre && (x % 2 == 0) {
+                    let off = (y * cw + x) * 4;
+                    curr[off] = 200;
+                    curr[off + 1] = 200;
+                    curr[off + 2] = 200;
+                }
+            }
+        }
+        // Single-scale SSIM at the centre block: identical pixels → 0.
+        let ssim_single = block_cost_ssim(&prev, &curr, cw, 12, 12, 20, 20);
+        // MS-SSIM at the centre block: scale-0 = 0 (centre identical),
+        // but scale-1 / scale-2 see the surrounding stripes → CS < 1 →
+        // (1 - MS-SSIM) > 0 → cost > 0 → strictly larger than the
+        // single-scale 0 cost.
+        let msssim = block_cost_msssim(&prev, &curr, cw, ch, 12, 12, 20, 20);
+        assert_eq!(
+            ssim_single, 0,
+            "single-scale SSIM at the identical centre block should be 0"
+        );
+        assert!(
+            msssim > 0,
+            "MS-SSIM SHOULD pick up the surrounding-context structural change (cost > 0), got {msssim}"
+        );
+        // And the MS-SSIM cost should exceed the default ms-ssim
+        // threshold (50) — this is the key property the multi-scale
+        // path was added to demonstrate.
+        let msssim_threshold = DeltaConfig::default().msssim_threshold as u64;
+        assert!(
+            msssim > msssim_threshold,
+            "MS-SSIM cost ({msssim}) should exceed default msssim_threshold ({msssim_threshold})"
+        );
+    }
+
+    #[test]
+    fn msssim_cost_threshold_dispatches_correctly_via_config() {
+        // Confirm `compute_changed_grid` honours the `enable_msssim_cost`
+        // flag and that MS-SSIM supersedes single-scale SSIM when both
+        // are enabled.
+        //
+        // Use the same surrounding-context-stripes fixture as the
+        // per-block test above on a 32×32 canvas — the centre 8×8 block
+        // is identical in prev/curr (so single-scale SSIM scores 0,
+        // single-scale flag stays false), but the surrounding context
+        // carries the stripes (so MS-SSIM flags it).
+        let canvas_w = 32u32;
+        let canvas_h = 32u32;
+        let cw = canvas_w as usize;
+        let ch = canvas_h as usize;
+        let mut prev = vec![0u8; cw * ch * 4];
+        let mut curr = vec![0u8; cw * ch * 4];
+        for px in prev.chunks_exact_mut(4) {
+            px[0] = 128;
+            px[1] = 128;
+            px[2] = 128;
+            px[3] = 255;
+        }
+        curr.copy_from_slice(&prev);
+        for y in 0..ch {
+            for x in 0..cw {
+                let centre = (12..20).contains(&y) && (12..20).contains(&x);
+                if !centre && (x % 2 == 0) {
+                    let off = (y * cw + x) * 4;
+                    curr[off] = 200;
+                    curr[off + 1] = 200;
+                    curr[off + 2] = 200;
+                }
+            }
+        }
+        // Block layout: 32 / 8 = 4 columns × 4 rows = 16 blocks.
+        // Centre is block (1, 1) at (8..16, 8..16) — the centre 8×8 in
+        // the test fixture is at (12..20, 12..20), which crosses 4
+        // blocks: (1,1), (2,1), (1,2), (2,2). So we pick a different
+        // probe — block (1,1) IS partially identical (top-left quadrant
+        // of the centre identical region), partially noise. Move the
+        // identical region to align with block (1,1) for the test:
+        // identical at exactly (8..16, 8..16) instead of (12..20, 12..20).
+        let mut prev = vec![0u8; cw * ch * 4];
+        let mut curr = vec![0u8; cw * ch * 4];
+        for px in prev.chunks_exact_mut(4) {
+            px[0] = 128;
+            px[1] = 128;
+            px[2] = 128;
+            px[3] = 255;
+        }
+        curr.copy_from_slice(&prev);
+        for y in 0..ch {
+            for x in 0..cw {
+                let centre = (8..16).contains(&y) && (8..16).contains(&x);
+                if !centre && (x % 2 == 0) {
+                    let off = (y * cw + x) * 4;
+                    curr[off] = 200;
+                    curr[off + 1] = 200;
+                    curr[off + 2] = 200;
+                }
+            }
+        }
+        let cfg_ssim = DeltaConfig::default().enable_ssim_cost(true);
+        let cfg_msssim = DeltaConfig::default().enable_msssim_cost(true);
+        let (grid_ssim, n_bx, _) =
+            compute_changed_grid(&prev, &curr, canvas_w, canvas_h, &cfg_ssim);
+        let (grid_msssim, _, _) =
+            compute_changed_grid(&prev, &curr, canvas_w, canvas_h, &cfg_msssim);
+        assert_eq!(n_bx, 4, "32/8 = 4 block columns");
+        // Centre block (1,1): identical pixels in both → single-scale
+        // SSIM cost = 0 → flag = false.
+        let centre_idx = 1 * (n_bx as usize) + 1;
+        assert!(
+            !grid_ssim[centre_idx],
+            "single-scale SSIM should NOT flag identical centre block"
+        );
+        // Same centre block under MS-SSIM: surrounding stripes drive
+        // scale-1 / scale-2 CS terms below 1 → MS-SSIM cost > threshold
+        // → flag = true.
+        assert!(
+            grid_msssim[centre_idx],
+            "MS-SSIM SHOULD flag the centre block due to surrounding context drift"
+        );
     }
 
     #[test]

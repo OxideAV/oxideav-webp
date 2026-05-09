@@ -37,6 +37,16 @@ default = ["registry"]
 # just want the standalone `decode_webp` API.
 registry = ["dep:oxideav-core", "oxideav-vp8/registry"]
 
+# Opt-in slow / large-fixture tests that are too expensive to run on
+# every CI matrix entry. Default off — `cargo test` runs the fast
+# baseline test suite. Enable with `cargo test --features slow-tests`
+# to include the `tests/animated_delta_merge_320x240.rs`
+# headline-number benchmark (the original 320×240 multi-rect Delta
+# fixture downsized from the default test suite in commit `d2501a1`
+# to keep CI under 10 minutes per matrix entry — restored behind this
+# flag so the headline byte counts stay reproducible by hand).
+slow-tests = []
+
 [dev-dependencies]
 # `lossy_corpus` integration test compares our VP8-lossy decode of the
 # libwebp-encoded `tests/fixtures/lossy_corpus/*` corpus against the

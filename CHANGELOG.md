@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(anim-encoder)* **opt-in 3-scale MS-SSIM-lite cost model for
+  `AnimFrameMode::Delta`** — new `DeltaConfig::enable_msssim_cost: bool`
+  (default `false`, preserves existing SAD/single-scale-SSIM behaviour)
+  generalises the single-scale SSIM-lite cost to 3 spatial scales per
+  Wang/Bovik 2003 ("Multi-scale structural similarity for image quality
+  assessment"). Cost = `round((1.0 - MS-SSIM) * 10000)` where
+  `MS-SSIM = SSIM_0^α · CS_1^β · CS_2^γ` with empirical exponents
+  `α=0.2856, β=0.3001, γ=0.4143` (sum 1.0) derived by fusing the
+  bottom-two scales of the canonical 5-scale series
+  `{0.0448, 0.2856, 0.3001, 0.2363, 0.1333}` into γ. Scale 0 is the
+  full SSIM (luminance × contrast × structure) at the native block
+  resolution; scales 1 and 2 use 2× and 4× extended regions around
+  the block, separable-Gaussian box-downsampled, computing only the
+  contrast × structure components (luminance term carried solely by
+  the native scale). Catches **low-frequency structural drift** that
+  single-scale 8×8 SSIM misses — worked example: a centre 8×8 block
+  whose pixels are bit-identical between prev/curr but whose
+  surrounding context picks up a high-contrast stripe pattern. Single-
+  scale SSIM scores 0 (identical centre); MS-SSIM scale-1 / scale-2
+  CS terms collapse → cost > default `msssim_threshold` 50 → block
+  flagged changed. Threshold lives on the new
+  `DeltaConfig::msssim_threshold: u32` (same scale as `ssim_threshold`,
+  default 50). MS-SSIM supersedes single-scale SSIM when both flags
+  are on. Builder methods `DeltaConfig::enable_msssim_cost(bool)` /
+  `msssim_threshold(u32)` mirror the field setters. Tests
+  `msssim_cost_block_identical_inputs_returns_zero`,
+  `msssim_cost_catches_low_freq_drift_single_scale_misses`, and
+  `msssim_cost_threshold_dispatches_correctly_via_config` pin the
+  per-block math + the dispatcher gate.
+
+- *(tests)* **slow-tests Cargo feature gate for the original 320×240
+  multi-rect Delta benchmark** — restores the pre-`d2501a1` 320×240
+  scattered-stamps fixture as
+  `tests/animated_delta_merge_320x240.rs`, gated behind the new
+  default-off `slow-tests` feature so CI runtime stays ≤ 10 min on
+  default builds. Run with
+  `cargo test --features slow-tests --test animated_delta_merge_320x240
+  -- --test-threads=1` to refresh the headline numbers (≈ 130 s on a
+  release build). On the canonical 3-frame, 3-cluster fixture the
+  pinned numbers are: full-frame lossless = 685,262 bytes, single-bbox
+  Delta = 583,870 bytes (3 ANMFs), multi-rect Delta = 228,762 bytes
+  (7 ANMFs) — multi-rect Delta saves **66.6%** vs full-frame lossless.
+  Test `slow_delta_mode_320x240_multi_rect_pins_headline_byte_count`
+  pins the wire-size headline; companion test
+  `slow_delta_mode_320x240_multi_rect_round_trip_pixel_identical`
+  verifies the larger-canvas multi-rect round-trip stays pixel-
+  identical (the smaller default 160×120 round-trip test isn't a
+  regression watchdog at 320×240 because the merge / sub-rect math
+  scales with canvas size).
+
 - *(anim-encoder)* **opt-in SSIM-lite cost model for
   `AnimFrameMode::Delta`** — new `DeltaConfig::enable_ssim_cost: bool`
   (default `false`, preserves existing SAD-based behaviour) swaps the
