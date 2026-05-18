@@ -219,6 +219,15 @@ pub fn extract_metadata(buf: &[u8]) -> Result<WebpFileMetadata> {
         // Simple lossy/lossless layout — no metadata possible.
         return Ok(WebpFileMetadata::default());
     }
+    if first.data.len() < 10 {
+        return Err(Error::invalid("WebP: VP8X chunk too short"));
+    }
+    // Decode the VP8X flag byte so we can apply the same flag-gating
+    // pass `parse_extended` does. Per RFC 9649 §2.5.6 + §2.7.1.4/§2.7.1.5
+    // an ICCP / EXIF / XMP chunk whose corresponding VP8X flag is
+    // clear MUST be ignored — surfacing it would let a malformed file
+    // pollute consumers that trust the flag-driven advertise.
+    let flags = VP8xFlags::from_byte(first.data[0]);
     let mut meta = WebpFileMetadata::default();
     while let Some(c) = chunks.next().transpose()? {
         match &c.id {
@@ -227,6 +236,15 @@ pub fn extract_metadata(buf: &[u8]) -> Result<WebpFileMetadata> {
             b"XMP " => meta.xmp = Some(c.data.to_vec()),
             _ => {}
         }
+    }
+    if !flags.has_icc {
+        meta.icc = None;
+    }
+    if !flags.has_exif {
+        meta.exif = None;
+    }
+    if !flags.has_xmp {
+        meta.xmp = None;
     }
     Ok(meta)
 }
@@ -591,15 +609,123 @@ pub(crate) fn parse_webp_body(body: &[u8]) -> Result<ParsedContainer> {
     }
 }
 
+/// Decoded view of the VP8X header's flags byte (RFC 9649 §2.5.6
+/// Fig 7). The MSB-first bit layout is `|Rsv|Rsv|I|L|E|X|A|R|`; the
+/// reserved bits 7, 6, and 0 MUST be ignored per the spec, so we mask
+/// them out at parse time rather than asserting they're zero (asserting
+/// would itself be a spec violation — "Readers MUST ignore this field").
+#[derive(Clone, Copy, Debug)]
+struct VP8xFlags {
+    has_icc: bool,
+    has_alpha: bool,
+    has_exif: bool,
+    has_xmp: bool,
+    has_anim: bool,
+}
+
+impl VP8xFlags {
+    fn from_byte(b: u8) -> Self {
+        Self {
+            has_icc: b & 0x20 != 0,
+            has_alpha: b & 0x10 != 0,
+            has_exif: b & 0x08 != 0,
+            has_xmp: b & 0x04 != 0,
+            has_anim: b & 0x02 != 0,
+        }
+    }
+}
+
+/// Position in the spec-mandated chunk order for the reconstruction
+/// chunks (RFC 9649 §2.7). Inside a VP8X container the reconstruction
+/// chunks are required to appear in this fixed order:
+///
+/// ```text
+/// VP8X → [ICCP] → [ANIM] → ANMF*               (animated)
+/// VP8X → [ICCP] → [ALPH] → (VP8 | VP8L)        (still image)
+/// ```
+///
+/// `EXIF` / `XMP ` / unknown FourCCs may appear anywhere after VP8X
+/// per the same section ("Metadata and unknown chunks MAY appear out
+/// of order"), so they do NOT advance the stage.
+///
+/// The stage value monotonically increases through a single file; an
+/// attempt to move backwards (`AnmfSeen` → `IccpSeen`, say) is the
+/// spec-defined "out of order" condition the parser rejects with
+/// `WebP: chunk X out of order`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ChunkStage {
+    AfterVp8x,
+    IccpSeen,
+    AnimSeen,
+    AnmfSeen,
+    AlphSeen,
+    ImageSeen,
+}
+
+impl ChunkStage {
+    /// Try to advance to `target`. Returns an `out of order` error when
+    /// the current stage is already past `target` (i.e. the spec-named
+    /// chunk arrived too late). Idempotent moves (e.g. duplicate ICCP,
+    /// repeated ANMF tail chunks) are allowed because the spec only
+    /// constrains the relative order, not the multiplicity — the
+    /// "at most one" rule for ICCP / ANIM is a separate SHOULD that
+    /// readers MAY ignore extras for; we overwrite-on-duplicate per
+    /// the existing code path.
+    fn advance_to(&mut self, target: ChunkStage, fourcc: &[u8; 4]) -> Result<()> {
+        // Special-case the ANMF tail: once we've seen one ANMF the
+        // remaining frames stay at the same stage. ALPH inside an ANMF
+        // is handled by the per-frame parser (parse_anmf), not the
+        // top-level loop, so this is just the repeated-ANMF case.
+        if target == ChunkStage::AnmfSeen && *self == ChunkStage::AnmfSeen {
+            return Ok(());
+        }
+        if (*self as u8) > (target as u8) {
+            return Err(Error::invalid(format!(
+                "WebP: chunk {:?} out of order (stage {:?} → {:?})",
+                std::str::from_utf8(fourcc).unwrap_or("???"),
+                self,
+                target,
+            )));
+        }
+        *self = target;
+        Ok(())
+    }
+}
+
 fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedContainer> {
     if vp8x.len() < 10 {
         return Err(Error::invalid("WebP: VP8X chunk too short"));
     }
     // VP8X layout: 1 byte flags, 3 bytes reserved, 3 bytes canvas_w-1, 3 bytes canvas_h-1.
+    //
+    // Flag bits (MSB-first per RFC 9649 §2.5.6 "Extended File Header" Fig 7):
+    //   bit 7: Rsv  (reserved, MUST be 0; readers MUST ignore)
+    //   bit 6: Rsv  (reserved, MUST be 0; readers MUST ignore)
+    //   bit 5: I    (ICC profile)
+    //   bit 4: L    (aLpha)
+    //   bit 3: E    (Exif)
+    //   bit 2: X    (Xmp)
+    //   bit 1: A    (Animation)
+    //   bit 0: R    (reserved, MUST be 0; readers MUST ignore)
+    //
+    // Reserved bits are deliberately not validated per the explicit
+    // "Readers MUST ignore this field" wording, so a strict masking
+    // would be a spec violation in the other direction.
     let flags = vp8x[0];
-    let has_anim = flags & 0x02 != 0;
+    let flags = VP8xFlags::from_byte(flags);
     let canvas_w = (u32::from_le_bytes([vp8x[4], vp8x[5], vp8x[6], 0]) & 0x00FF_FFFF) + 1;
     let canvas_h = (u32::from_le_bytes([vp8x[7], vp8x[8], vp8x[9], 0]) & 0x00FF_FFFF) + 1;
+    // RFC 9649 §2.5.6: "The product of Canvas Width and Canvas Height
+    // MUST be at most 2^32 - 1." 24-bit canvas dimensions allow up to
+    // ~16 M per axis, so an overflow is a real malformation rather
+    // than a numeric corner case. The product of two 24-bit values
+    // fits in u64 without overflow (the cap is 2^48 = ~2.8e14, well
+    // under u64::MAX), so we can multiply directly and compare.
+    if (canvas_w as u64) * (canvas_h as u64) > u32::MAX as u64 {
+        return Err(Error::invalid(format!(
+            "WebP: VP8X canvas {canvas_w}×{canvas_h} exceeds 2^32 pixels"
+        )));
+    }
 
     let mut frames: Vec<ParsedFrame> = Vec::new();
     // Static extended WebP state — we accumulate the VP8/VP8L chunk and
@@ -611,22 +737,33 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
     // ANIM flag is set; we still capture it on flag-mismatch files
     // (the spec says "MUST be ignored" on flag-clear, but a strict
     // ignore would also drop a benign chunk on a malformed file —
-    // gating on `has_anim` below preserves the spec's "ignore" while
-    // still reading the chunk so a future loose-mode could surface it).
+    // gating on `flags.has_anim` below preserves the spec's "ignore"
+    // while still reading the chunk so a future loose-mode could
+    // surface it).
     let mut anim_background_bgra: Option<[u8; 4]> = None;
     let mut anim_loop_count: Option<u16> = None;
 
     let mut total_duration = 0u32;
+    // Track chunk-order state per RFC 9649 §2.7: the reconstruction
+    // chunks (VP8X / ICCP / ANIM / ANMF / ALPH / VP8 / VP8L) MUST
+    // appear in the order listed; readers SHOULD fail on out-of-order
+    // sequences. EXIF / XMP / unknown chunks MAY appear anywhere after
+    // the VP8X header and don't advance the stage.
+    let mut stage = ChunkStage::AfterVp8x;
 
     while let Some(c) = chunks.next().transpose()? {
         match &c.id {
             b"VP8 " => {
+                stage.advance_to(ChunkStage::ImageSeen, &c.id)?;
                 pending_image = Some(ImagePayload::Vp8(c.data.to_vec()));
             }
             b"VP8L" => {
+                stage.advance_to(ChunkStage::ImageSeen, &c.id)?;
                 pending_image = Some(ImagePayload::Vp8l(c.data.to_vec()));
             }
             b"ALPH" => {
+                // ALPH precedes VP8 / VP8L bitstream per spec Fig 15.
+                stage.advance_to(ChunkStage::AlphSeen, &c.id)?;
                 if c.data.is_empty() {
                     return Err(Error::invalid("WebP: ALPH chunk empty"));
                 }
@@ -642,6 +779,7 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
                 });
             }
             b"ANMF" => {
+                stage.advance_to(ChunkStage::AnmfSeen, &c.id)?;
                 let anmf = parse_anmf(c.data)?;
                 let f = anmf.into_frame();
                 total_duration = total_duration.saturating_add(f.duration_ms);
@@ -649,10 +787,13 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
             }
             // Auxiliary metadata chunks — captured into `metadata` so
             // callers can read them off `WebpImage::metadata` after
-            // decode. Unknown auxiliary FourCCs (and `ANIM` whose flags
-            // are already represented in the per-frame state) are
-            // skipped silently per the WebP container spec.
-            b"ICCP" => metadata.icc = Some(c.data.to_vec()),
+            // decode. Per RFC 9649 §2.7 "Metadata and unknown chunks
+            // MAY appear out of order", so EXIF / XMP / unknown FourCCs
+            // don't advance the chunk-stage state machine.
+            b"ICCP" => {
+                stage.advance_to(ChunkStage::IccpSeen, &c.id)?;
+                metadata.icc = Some(c.data.to_vec());
+            }
             b"EXIF" => metadata.exif = Some(c.data.to_vec()),
             b"XMP " => metadata.xmp = Some(c.data.to_vec()),
             // ANIM chunk: 4 bytes [B, G, R, A] background colour +
@@ -661,13 +802,15 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
             // the Animation flag in the VP8X Chunk is set. If the
             // Animation flag is not set and this chunk is present,
             // it MUST be ignored." We capture it unconditionally
-            // and gate exposure on `has_anim` after the loop so a
-            // file with the flag clear still parses cleanly.
+            // and gate exposure on `flags.has_anim` after the loop
+            // so a file with the flag clear still parses cleanly.
             b"ANIM" if c.data.len() >= 6 => {
+                stage.advance_to(ChunkStage::AnimSeen, &c.id)?;
                 anim_background_bgra = Some([c.data[0], c.data[1], c.data[2], c.data[3]]);
                 anim_loop_count = Some(u16::from_le_bytes([c.data[4], c.data[5]]));
             }
             b"ANIM" => {
+                stage.advance_to(ChunkStage::AnimSeen, &c.id)?;
                 // Truncated ANIM payload — leave fields at None.
             }
             _ => {
@@ -678,10 +821,30 @@ fn parse_extended(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<ParsedCont
     // Per RFC 9649 §2.5, the ANIM chunk is meaningful only when the
     // VP8X ANIM flag is set. Drop it when the flag is clear so callers
     // see `None` — matches "MUST be ignored" wording.
-    if !has_anim {
+    if !flags.has_anim {
         anim_background_bgra = None;
         anim_loop_count = None;
     }
+    // Per RFC 9649 §2.5.6 + §2.7.1.4 / §2.7.1.5 / §2.7.1.2: ICCP /
+    // EXIF / XMP / ALPH chunks are flag-gated like ANIM. Drop them
+    // silently when the corresponding VP8X flag is clear so consumers
+    // see a consistent (and spec-compliant) "flag wins" interpretation.
+    // For the still-image case, an alpha plane stripped this way
+    // surfaces as a fully-opaque image rather than a parse failure —
+    // matches the "MAY ignore" tolerance the spec permits.
+    if !flags.has_icc {
+        metadata.icc = None;
+    }
+    if !flags.has_exif {
+        metadata.exif = None;
+    }
+    if !flags.has_xmp {
+        metadata.xmp = None;
+    }
+    if !flags.has_alpha {
+        pending_alph = None;
+    }
+    let has_anim = flags.has_anim;
 
     if !has_anim {
         let image = pending_image
@@ -907,13 +1070,24 @@ pub(crate) fn parse_webp_body_lazy(body: &[u8]) -> Result<LazyParsedContainer> {
 }
 
 fn parse_extended_lazy(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<LazyParsedContainer> {
+    // See `parse_extended` for the spec-derived rationale behind each
+    // VP8X-side validation (flag decoding, canvas-product overflow,
+    // chunk-order state machine, flag-gated drop of metadata + ALPH).
+    // This path mirrors that logic byte-for-byte; both parsers walk
+    // the same chunk tree and must surface the same parse errors so
+    // streaming demux + eager decode agree on malformed-file
+    // rejection.
     if vp8x.len() < 10 {
         return Err(Error::invalid("WebP: VP8X chunk too short"));
     }
-    let flags = vp8x[0];
-    let has_anim = flags & 0x02 != 0;
+    let flags = VP8xFlags::from_byte(vp8x[0]);
     let canvas_w = (u32::from_le_bytes([vp8x[4], vp8x[5], vp8x[6], 0]) & 0x00FF_FFFF) + 1;
     let canvas_h = (u32::from_le_bytes([vp8x[7], vp8x[8], vp8x[9], 0]) & 0x00FF_FFFF) + 1;
+    if (canvas_w as u64) * (canvas_h as u64) > u32::MAX as u64 {
+        return Err(Error::invalid(format!(
+            "WebP: VP8X canvas {canvas_w}×{canvas_h} exceeds 2^32 pixels"
+        )));
+    }
 
     let mut frames: Vec<LazyParsedFrame> = Vec::new();
     let mut pending_alph: Option<LazyAlphRef> = None;
@@ -922,22 +1096,26 @@ fn parse_extended_lazy(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<LazyP
     let mut anim_background_bgra: Option<[u8; 4]> = None;
     let mut anim_loop_count: Option<u16> = None;
     let mut total_duration = 0u32;
+    let mut stage = ChunkStage::AfterVp8x;
 
     while let Some(c) = chunks.next().transpose()? {
         match &c.id {
             b"VP8 " => {
+                stage.advance_to(ChunkStage::ImageSeen, &c.id)?;
                 pending_image = Some(LazyImageRef::Vp8 {
                     offset: c.payload_offset,
                     len: c.data.len(),
                 });
             }
             b"VP8L" => {
+                stage.advance_to(ChunkStage::ImageSeen, &c.id)?;
                 pending_image = Some(LazyImageRef::Vp8l {
                     offset: c.payload_offset,
                     len: c.data.len(),
                 });
             }
             b"ALPH" => {
+                stage.advance_to(ChunkStage::AlphSeen, &c.id)?;
                 if c.data.is_empty() {
                     return Err(Error::invalid("WebP: ALPH chunk empty"));
                 }
@@ -953,6 +1131,7 @@ fn parse_extended_lazy(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<LazyP
                 });
             }
             b"ANMF" => {
+                stage.advance_to(ChunkStage::AnmfSeen, &c.id)?;
                 let f = parse_anmf_lazy(c.data, c.payload_offset)?;
                 total_duration = total_duration.saturating_add(f.duration_ms);
                 frames.push(f);
@@ -963,21 +1142,40 @@ fn parse_extended_lazy(vp8x: &[u8], chunks: &mut RiffChunks<'_>) -> Result<LazyP
             // `WebpAnimInfo` expect owned `Vec<u8>` and the savings
             // wouldn't change the asymptotic memory shape (animations
             // dwarf metadata).
-            b"ICCP" => metadata.icc = Some(c.data.to_vec()),
+            b"ICCP" => {
+                stage.advance_to(ChunkStage::IccpSeen, &c.id)?;
+                metadata.icc = Some(c.data.to_vec());
+            }
             b"EXIF" => metadata.exif = Some(c.data.to_vec()),
             b"XMP " => metadata.xmp = Some(c.data.to_vec()),
             b"ANIM" if c.data.len() >= 6 => {
+                stage.advance_to(ChunkStage::AnimSeen, &c.id)?;
                 anim_background_bgra = Some([c.data[0], c.data[1], c.data[2], c.data[3]]);
                 anim_loop_count = Some(u16::from_le_bytes([c.data[4], c.data[5]]));
             }
-            b"ANIM" => {}
+            b"ANIM" => {
+                stage.advance_to(ChunkStage::AnimSeen, &c.id)?;
+            }
             _ => {}
         }
     }
-    if !has_anim {
+    if !flags.has_anim {
         anim_background_bgra = None;
         anim_loop_count = None;
     }
+    if !flags.has_icc {
+        metadata.icc = None;
+    }
+    if !flags.has_exif {
+        metadata.exif = None;
+    }
+    if !flags.has_xmp {
+        metadata.xmp = None;
+    }
+    if !flags.has_alpha {
+        pending_alph = None;
+    }
+    let has_anim = flags.has_anim;
     if !has_anim {
         let image = pending_image
             .ok_or_else(|| Error::invalid("WebP: extended file has no image chunk"))?;

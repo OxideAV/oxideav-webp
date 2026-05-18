@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(demux)* **VP8X extended-header spec-conformance hardening on
+  decode** — three new RFC 9649 §2.5.6 + §2.7 invariants are enforced
+  at parse time on both the eager (`decode_webp` / `extract_metadata`)
+  and lazy (`WebpAnimDecoder` streaming) paths so malformed-or-
+  inconsistent files surface a clear error or silent-drop instead of
+  leaking garbage to consumers:
+
+  1. **Flag-chunk consistency** — `ICCP` / `EXIF` / `XMP ` / `ALPH`
+     chunks are now silently dropped at decode time when the matching
+     VP8X flag bit (`I` / `E` / `X` / `L`) is clear, mirroring the
+     existing behaviour for `ANIM` when the `A` flag is clear. Per
+     spec §2.7.1.4 / §2.7.1.5 readers SHOULD treat a flag-clear
+     auxiliary chunk as ignored; previously the decoder surfaced the
+     chunk regardless, letting a producer's encoding mistake (or a
+     hand-crafted hostile file) pollute the `WebpFileMetadata` /
+     alpha-plane state downstream.
+
+  2. **Chunk-order enforcement** — files where a reconstruction chunk
+     (`VP8X` / `ICCP` / `ANIM` / `ANMF` / `ALPH` / `VP8 ` / `VP8L`)
+     arrives out of the spec-mandated order (e.g. `ICCP` after
+     `VP8L`, `ANIM` after the first `ANMF`, `ALPH` after `VP8 `) are
+     now rejected with a `WebP: chunk X out of order (stage Y → Z)`
+     error. Spec §2.7: "Readers SHOULD fail when chunks necessary
+     for reconstruction and color correction are out of order."
+     `EXIF` / `XMP ` / unknown FourCCs MAY appear anywhere after the
+     `VP8X` header (per the same section's "Metadata and unknown
+     chunks MAY appear out of order" rule) and don't advance the
+     stage state machine.
+
+  3. **Canvas product overflow** — `VP8X` headers where
+     `canvas_w × canvas_h > 2^32 - 1` are now rejected with a clear
+     `WebP: VP8X canvas W×H exceeds 2^32 pixels` error. Per spec
+     §2.5.6: "The product of Canvas Width and Canvas Height MUST be
+     at most 2^32 - 1." 24-bit-per-axis dimensions allow up to ~16 M
+     each, so the product can legitimately overflow `u32` on a
+     pathological / hostile file.
+
+  Reserved bits in the VP8X flag byte (bits 7, 6 = `Rsv`, bit 0 =
+  `R`) continue to be ignored per the explicit "Readers MUST ignore
+  this field" wording — the parser doesn't validate them against
+  zero (which would itself be a spec violation in the other
+  direction).
+
+  Test coverage: 12-test `vp8x_spec_conformance` integration suite
+  covering each flag-gate (ICC / EXIF / XMP / ALPH), each
+  out-of-order scenario (ICCP-after-VP8L, ANIM-after-ANMF,
+  ALPH-after-VP8L), the EXIF-before-image legal path (proving the
+  metadata-out-of-order exception works), the unknown-chunk-anywhere
+  silent skip, the canvas-overflow rejection, the canvas-at-limit
+  acceptance (65535 × 65000 ≈ 4.26e9 < 2^32), the reserved-bit
+  ignore property, and the duplicate-ICCP last-wins tolerance.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-webp/compare/v0.1.4...v0.1.5) - 2026-05-09
 
 ### Added
