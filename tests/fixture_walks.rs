@@ -1,19 +1,23 @@
 //! Integration tests that drive [`oxideav_webp::parse_container`]
-//! against the fixed WebP corpus in `docs/image/webp/fixtures/`.
+//! against a small in-crate copy of the WebP fixture corpus.
 //!
-//! The fixtures here are *opaque* inputs to the round-1 walker:
-//! we only verify the RIFF/WEBP structural layer (FourCC, sizes,
-//! payload bounds). Pixel-level decode is not yet implemented and
-//! is explicitly out of scope for this test file.
+//! The three `tests/data/*.webp` files are byte-for-byte copies of
+//! `docs/image/webp/fixtures/{lossy-1x1, lossless-1x1,
+//! extended-with-exif}/input.webp`. They live inside the crate so
+//! that CI (which checks out only this repository, not the umbrella
+//! workspace) can reach them via `include_bytes!`.
+//!
+//! Fixtures here are *opaque* inputs to the round-1 walker: we only
+//! verify the RIFF/WEBP structural layer (FourCC, sizes, payload
+//! bounds). Pixel-level decode is not yet implemented and is
+//! explicitly out of scope for this test file.
 
 use oxideav_webp::container::fourcc;
 use oxideav_webp::parse_container;
 
-const LOSSY_1X1: &[u8] = include_bytes!("../../../docs/image/webp/fixtures/lossy-1x1/input.webp");
-const LOSSLESS_1X1: &[u8] =
-    include_bytes!("../../../docs/image/webp/fixtures/lossless-1x1/input.webp");
-const EXTENDED_WITH_EXIF: &[u8] =
-    include_bytes!("../../../docs/image/webp/fixtures/extended-with-exif/input.webp");
+const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
+const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
+const EXTENDED_WITH_EXIF: &[u8] = include_bytes!("data/extended-with-exif.webp");
 
 #[test]
 fn fixture_lossy_1x1_has_a_single_vp8_chunk() {
