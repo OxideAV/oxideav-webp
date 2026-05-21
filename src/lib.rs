@@ -1,16 +1,19 @@
 //! # oxideav-webp
 //!
-//! Pure-Rust WebP image codec — clean-room round-1 scaffold built
-//! against RFC 9649 (WebP Image Format).
+//! Pure-Rust WebP image codec — clean-room scaffold built against
+//! RFC 9649 (WebP Image Format).
 //!
-//! Round 1 lands only the **structural** RIFF/WEBP container walker
-//! ([`container::parse`]); the `VP8 ` / `VP8L` bitstreams and the
-//! extended-format `VP8X` field decoding remain stubs that return
-//! [`Error::NotImplemented`].
+//! Round 1 landed the **structural** RIFF/WEBP container walker
+//! ([`container::parse`]). Round 2 adds typed field decoding for the
+//! `VP8X` extended-format header ([`vp8x::Vp8xHeader::parse`] and the
+//! [`parse_vp8x_header`] convenience wrapper) — feature flags plus
+//! the §2.7.1 1-based canvas dimensions. `VP8 ` / `VP8L` / `ALPH`
+//! bitstream decode remains a stub returning [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 pub mod container;
+pub mod vp8x;
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;
@@ -22,6 +25,8 @@ pub enum Error {
     NotImplemented,
     /// The RIFF/WEBP container walker rejected the input.
     Container(container::ContainerError),
+    /// The §2.7.1 VP8X chunk parser rejected the input.
+    Vp8x(vp8x::Vp8xError),
 }
 
 impl core::fmt::Display for Error {
@@ -29,6 +34,7 @@ impl core::fmt::Display for Error {
         match self {
             Self::NotImplemented => f.write_str("oxideav-webp: pixel decode not implemented yet"),
             Self::Container(e) => write!(f, "oxideav-webp container: {e}"),
+            Self::Vp8x(e) => write!(f, "oxideav-webp vp8x: {e}"),
         }
     }
 }
@@ -41,11 +47,30 @@ impl From<container::ContainerError> for Error {
     }
 }
 
+impl From<vp8x::Vp8xError> for Error {
+    fn from(e: vp8x::Vp8xError) -> Self {
+        Self::Vp8x(e)
+    }
+}
+
 /// Walk a `RIFF/WEBP` container per RFC 9649 §2.3–§2.7 and return
 /// the structural chunk list. This is the round-1 surface: it does
 /// not decode any payload.
 pub fn parse_container(bytes: &[u8]) -> Result<container::WebpContainer, Error> {
     container::parse(bytes).map_err(Into::into)
+}
+
+/// Decode the §2.7.1 `VP8X` chunk payload to a typed
+/// [`vp8x::Vp8xHeader`].
+///
+/// The argument is the **payload** of a `VP8X` chunk — exactly the
+/// 10 bytes following the 8-byte chunk header. The recommended call
+/// pattern is to walk the container first, locate the chunk whose
+/// FourCC is [`container::fourcc::VP8X`], borrow its payload via
+/// [`container::WebpChunk::payload`], and hand that slice to this
+/// function.
+pub fn parse_vp8x_header(payload: &[u8]) -> Result<vp8x::Vp8xHeader, Error> {
+    vp8x::Vp8xHeader::parse(payload).map_err(Into::into)
 }
 
 /// Decode a WebP file to pixels.

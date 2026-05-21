@@ -6,6 +6,38 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 2 (2026-05-21).** Typed parser for the §2.7.1
+  `VP8X` chunk payload. New module `vp8x` exposes
+  `Vp8xHeader::parse(&[u8]) -> Result<Vp8xHeader, Vp8xError>` and a
+  top-level `parse_vp8x_header` convenience wrapper. `Vp8xHeader`
+  carries the §2.7.1 1-based canvas dimensions
+  (`canvas_width`, `canvas_height`) plus the five named feature
+  flags (`has_iccp` ↔ `I`, `has_alpha` ↔ `L`, `has_exif` ↔ `E`,
+  `has_xmp` ↔ `X`, `has_animation` ↔ `A`) and a derived
+  `has_unknown` summary that is true when any of the §2.7.1
+  reserved positions (the `Rsv` pair, the `R` bit, or the 24-bit
+  reserved field) is non-zero. The parser enforces only the §2.7.1
+  MUSTs that aren't "MUST be ignored": payload length is exactly
+  10 bytes and `canvas_width * canvas_height ≤ 2^32 - 1`.
+* 15 new unit tests + 1 new integration test cross-checking the
+  bit-position decode against the fixture corpus' `trace.txt`
+  output. Test count: **27** (was 11).
+
+### Changed
+
+* `Error` gained a `Vp8x(Vp8xError)` variant.
+
+### Notes
+
+Pixel decode (VP8 / VP8L / ALPH bitstreams) is still not
+implemented; `decode_webp` still returns `Error::NotImplemented`.
+Subsequent rounds will decode each bitstream layer against the
+RFC-9649-referenced specifications and the fixture corpus.
+
+## [Earlier — Unreleased entries, retained]
+
+### Added
+
 * **Clean-room round 1 (2026-05-20).** Structural RIFF/WEBP
   container walker per RFC 9649 §2.3–§2.7. New module `container`
   exposes `parse(&[u8]) -> Result<WebpContainer, ContainerError>`,
@@ -25,13 +57,6 @@ All notable changes to `oxideav-webp` are recorded here.
 * `Error` gained a `Container(ContainerError)` variant for walker
   errors; `NotImplemented` remains for the still-unimplemented
   pixel decode path.
-
-### Notes
-
-Pixel decode (VP8 / VP8L / ALPH / VP8X field parsing) is not yet
-implemented; `decode_webp` still returns `Error::NotImplemented`.
-Subsequent rounds will decode each layer against the
-RFC-9649-referenced specifications and the fixture corpus.
 
 * **Orphan rebuild (2026-05-20).** The crate was reset to a clean-room
   scaffold. The prior implementation contained module-level docstrings

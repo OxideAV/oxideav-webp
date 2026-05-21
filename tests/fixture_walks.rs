@@ -13,7 +13,7 @@
 //! explicitly out of scope for this test file.
 
 use oxideav_webp::container::fourcc;
-use oxideav_webp::parse_container;
+use oxideav_webp::{parse_container, parse_vp8x_header};
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
 const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
@@ -49,4 +49,27 @@ fn fixture_extended_with_exif_walks_vp8x_vp8_exif() {
     assert!(c.is_extended());
     assert!(c.first_chunk_with_fourcc(fourcc::VP8).is_some());
     assert!(c.first_chunk_with_fourcc(fourcc::EXIF).is_some());
+}
+
+#[test]
+fn fixture_extended_with_exif_vp8x_payload_decodes_to_128x128_exif_only() {
+    // Round-2 surface: walker → typed VP8X. Anchors the bit-position
+    // decode against a real libwebp-produced VP8X chunk. The fixture's
+    // own `trace.txt` reports the same flags / dimensions.
+    let c = parse_container(EXTENDED_WITH_EXIF).expect("extended-with-exif fixture parses");
+    let vp8x = c
+        .first_chunk_with_fourcc(fourcc::VP8X)
+        .expect("VP8X chunk present");
+    let h = parse_vp8x_header(vp8x.payload(EXTENDED_WITH_EXIF))
+        .expect("VP8X payload parses per §2.7.1");
+    assert_eq!(h.canvas_width, 128);
+    assert_eq!(h.canvas_height, 128);
+    assert!(h.has_exif);
+    assert!(!h.has_iccp);
+    assert!(!h.has_xmp);
+    assert!(!h.has_alpha);
+    assert!(!h.has_animation);
+    // Producer set every §2.7.1 reserved bit to 0 — has_unknown stays
+    // clear, matching the trace report of `flags=0x00000008`.
+    assert!(!h.has_unknown);
 }
