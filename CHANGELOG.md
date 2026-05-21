@@ -6,6 +6,46 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 3 (2026-05-21).** Typed parsers for the two
+  §2.7.1 metadata chunks that travel alongside `VP8X`:
+  * `alph::AlphHeader::parse(&[u8]) -> Result<AlphHeader, AlphError>`
+    decodes the §2.7.1.2 Figure 10 info byte (`Rsv|P|F|C`, 2 bits each,
+    MSB-first) into typed `AlphCompression` / `AlphFiltering` /
+    `AlphPreprocessing` enums plus a raw `reserved: u8` for
+    observability. The alpha bitstream itself is not decoded —
+    `AlphHeader::bitstream_offset()` reports the constant `1` so
+    callers can slice the remainder out of the chunk payload.
+  * `anim::AnimHeader::parse(&[u8]) -> Result<AnimHeader, AnimError>`
+    decodes the §2.7.1.1 Figure 8 6-byte payload: a 4-byte BGRA
+    `BackgroundColor` plus a little-endian u16 `loop_count`. A
+    `loops_forever()` helper surfaces the §2.7.1.1 `loop_count == 0`
+    sentinel.
+  * Top-level convenience wrappers `parse_alph_header` and
+    `parse_anim_header`.
+* 18 new unit tests + 2 new integration tests cross-checking the
+  bit-position and BGRA decodes against the
+  `docs/image/webp/fixtures/lossy-with-alpha-128x128/trace.txt`
+  (`header_byte=0x01`, `method=1 filter=0 pre_processing=0`) and
+  `docs/image/webp/fixtures/animated-with-alpha/trace.txt`
+  (`bgcolor=0xffffffff loop_count=0`) golden outputs. Test count:
+  **45** (was 27).
+
+### Changed
+
+* `Error` gained `Alph(AlphError)` and `Anim(AnimError)` variants.
+
+### Notes
+
+Pixel decode (VP8 / VP8L bitstreams) and the actual ALPH alpha
+bitstream are still not implemented; `decode_webp` still returns
+`Error::NotImplemented`. Subsequent rounds will decode each
+bitstream layer against the RFC-9649-referenced specifications and
+the fixture corpus.
+
+## [Earlier — Unreleased entries, retained]
+
+### Added
+
 * **Clean-room round 2 (2026-05-21).** Typed parser for the §2.7.1
   `VP8X` chunk payload. New module `vp8x` exposes
   `Vp8xHeader::parse(&[u8]) -> Result<Vp8xHeader, Vp8xError>` and a

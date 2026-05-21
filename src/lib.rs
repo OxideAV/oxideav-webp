@@ -4,14 +4,23 @@
 //! RFC 9649 (WebP Image Format).
 //!
 //! Round 1 landed the **structural** RIFF/WEBP container walker
-//! ([`container::parse`]). Round 2 adds typed field decoding for the
-//! `VP8X` extended-format header ([`vp8x::Vp8xHeader::parse`] and the
-//! [`parse_vp8x_header`] convenience wrapper) — feature flags plus
-//! the §2.7.1 1-based canvas dimensions. `VP8 ` / `VP8L` / `ALPH`
-//! bitstream decode remains a stub returning [`Error::NotImplemented`].
+//! ([`container::parse`]). Round 2 added typed field decoding for the
+//! `VP8X` extended-format header ([`vp8x::Vp8xHeader::parse`]). Round 3
+//! adds typed field decoding for the two §2.7.1.1 / §2.7.1.2 metadata
+//! chunks that travel alongside VP8X:
+//!
+//! * [`alph::AlphHeader::parse`] — the `ALPH` info byte
+//!   (`Rsv|P|F|C`).
+//! * [`anim::AnimHeader::parse`] — the `ANIM` 6-byte payload
+//!   (BGRA background colour + u16 loop count).
+//!
+//! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
+//! bitstream remain stubs returning [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
+pub mod alph;
+pub mod anim;
 pub mod container;
 pub mod vp8x;
 
@@ -27,6 +36,10 @@ pub enum Error {
     Container(container::ContainerError),
     /// The §2.7.1 VP8X chunk parser rejected the input.
     Vp8x(vp8x::Vp8xError),
+    /// The §2.7.1.2 ALPH info-byte parser rejected the input.
+    Alph(alph::AlphError),
+    /// The §2.7.1.1 ANIM payload parser rejected the input.
+    Anim(anim::AnimError),
 }
 
 impl core::fmt::Display for Error {
@@ -35,6 +48,8 @@ impl core::fmt::Display for Error {
             Self::NotImplemented => f.write_str("oxideav-webp: pixel decode not implemented yet"),
             Self::Container(e) => write!(f, "oxideav-webp container: {e}"),
             Self::Vp8x(e) => write!(f, "oxideav-webp vp8x: {e}"),
+            Self::Alph(e) => write!(f, "oxideav-webp alph: {e}"),
+            Self::Anim(e) => write!(f, "oxideav-webp anim: {e}"),
         }
     }
 }
@@ -50,6 +65,18 @@ impl From<container::ContainerError> for Error {
 impl From<vp8x::Vp8xError> for Error {
     fn from(e: vp8x::Vp8xError) -> Self {
         Self::Vp8x(e)
+    }
+}
+
+impl From<alph::AlphError> for Error {
+    fn from(e: alph::AlphError) -> Self {
+        Self::Alph(e)
+    }
+}
+
+impl From<anim::AnimError> for Error {
+    fn from(e: anim::AnimError) -> Self {
+        Self::Anim(e)
     }
 }
 
@@ -73,11 +100,33 @@ pub fn parse_vp8x_header(payload: &[u8]) -> Result<vp8x::Vp8xHeader, Error> {
     vp8x::Vp8xHeader::parse(payload).map_err(Into::into)
 }
 
+/// Decode the §2.7.1.2 `ALPH` chunk info byte to a typed
+/// [`alph::AlphHeader`].
+///
+/// The argument is the **payload** of an `ALPH` chunk — i.e. the
+/// slice returned by [`container::WebpChunk::payload`] for a chunk
+/// whose FourCC is [`container::fourcc::ALPH`]. Only the first byte
+/// is consumed by this layer; the rest of the payload is the alpha
+/// bitstream proper, which is not decoded here.
+pub fn parse_alph_header(payload: &[u8]) -> Result<alph::AlphHeader, Error> {
+    alph::AlphHeader::parse(payload).map_err(Into::into)
+}
+
+/// Decode the §2.7.1.1 `ANIM` chunk payload to a typed
+/// [`anim::AnimHeader`].
+///
+/// The argument is the 6-byte chunk payload — the BGRA background
+/// colour followed by the little-endian u16 loop count.
+pub fn parse_anim_header(payload: &[u8]) -> Result<anim::AnimHeader, Error> {
+    anim::AnimHeader::parse(payload).map_err(Into::into)
+}
+
 /// Decode a WebP file to pixels.
 ///
-/// Returns [`Error::NotImplemented`] — round 1 only ships the
-/// structural walker; pixel decode (`VP8 ` / `VP8L` / `ALPH`) is
-/// scheduled for a later round.
+/// Returns [`Error::NotImplemented`] — rounds 1 through 3 only ship
+/// the structural plus header-field parsers (`container`, `vp8x`,
+/// `alph`, `anim`). Pixel decode (`VP8 ` / `VP8L` plus the actual ALPH
+/// alpha bitstream) is scheduled for later rounds.
 pub fn decode_webp(_bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Err(Error::NotImplemented)
 }
