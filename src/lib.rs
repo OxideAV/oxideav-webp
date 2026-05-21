@@ -7,8 +7,11 @@
 //! ([`container::parse`]). Round 2 added typed field decoding for the
 //! `VP8X` extended-format header ([`vp8x::Vp8xHeader::parse`]). Round 3
 //! added typed field decoding for the §2.7.1.1 `ANIM` / §2.7.1.2 `ALPH`
-//! metadata chunks. Round 4 adds typed field decoding for the per-frame
-//! §2.7.1.1 `ANMF` header:
+//! metadata chunks. Round 4 added typed field decoding for the
+//! per-frame §2.7.1.1 `ANMF` header. Round 5 adds the **builder**
+//! side of the RIFF/WEBP container — the inverse of the walker — so
+//! external encoders can wrap a `VP8 ` / `VP8L` payload in a
+//! well-formed file:
 //!
 //! * [`alph::AlphHeader::parse`] — the `ALPH` info byte
 //!   (`Rsv|P|F|C`).
@@ -17,15 +20,25 @@
 //! * [`anmf::AnmfHeader::parse`] — the `ANMF` 16-byte per-frame
 //!   header (frame X / Y / width / height / duration plus
 //!   `Reserved|B|D` info byte).
+//! * [`build::build_chunk`] — generic §2.3 chunk writer (FourCC +
+//!   Size + payload + odd-size pad).
+//! * [`build::build_vp8x_chunk`] — §2.7.1 Figure 7 typed VP8X
+//!   payload writer.
+//! * [`build::build_webp_file`] — §2.4 file writer for simple
+//!   (`VP8 ` / `VP8L`) and extended (`VP8X` + `VP8 ` / `VP8L`)
+//!   layouts.
 //!
 //! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
-//! bitstream remain stubs returning [`Error::NotImplemented`].
+//! bitstream remain stubs returning [`Error::NotImplemented`]; the
+//! builders are deliberately framing-only so an external encoder can
+//! pre-compute the codec payload bytes.
 
 #![warn(missing_debug_implementations)]
 
 pub mod alph;
 pub mod anim;
 pub mod anmf;
+pub mod build;
 pub mod container;
 pub mod vp8x;
 
@@ -47,6 +60,8 @@ pub enum Error {
     Anim(anim::AnimError),
     /// The §2.7.1.1 ANMF per-frame header parser rejected the input.
     Anmf(anmf::AnmfError),
+    /// The §2.3 / §2.4 / §2.7.1 RIFF/WEBP builders rejected the input.
+    Build(build::BuildError),
 }
 
 impl core::fmt::Display for Error {
@@ -58,6 +73,7 @@ impl core::fmt::Display for Error {
             Self::Alph(e) => write!(f, "oxideav-webp alph: {e}"),
             Self::Anim(e) => write!(f, "oxideav-webp anim: {e}"),
             Self::Anmf(e) => write!(f, "oxideav-webp anmf: {e}"),
+            Self::Build(e) => write!(f, "oxideav-webp build: {e}"),
         }
     }
 }
@@ -91,6 +107,12 @@ impl From<anim::AnimError> for Error {
 impl From<anmf::AnmfError> for Error {
     fn from(e: anmf::AnmfError) -> Self {
         Self::Anmf(e)
+    }
+}
+
+impl From<build::BuildError> for Error {
+    fn from(e: build::BuildError) -> Self {
+        Self::Build(e)
     }
 }
 
@@ -145,6 +167,29 @@ pub fn parse_anim_header(payload: &[u8]) -> Result<anim::AnimHeader, Error> {
 /// sub-RIFF, which is not decoded here.
 pub fn parse_anmf_header(payload: &[u8]) -> Result<anmf::AnmfHeader, Error> {
     anmf::AnmfHeader::parse(payload).map_err(Into::into)
+}
+
+/// Assemble a `RIFF/WEBP` file around a single bitstream payload per
+/// RFC 9649 §2.4 + §2.5 / §2.6 / §2.7. Convenience wrapper over
+/// [`build::build_webp_file`] returning the crate-wide [`Error`].
+pub fn build_webp_file(
+    payload: &[u8],
+    image_kind: build::ImageKind,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Result<Vec<u8>, Error> {
+    build::build_webp_file(payload, image_kind, canvas_width, canvas_height).map_err(Into::into)
+}
+
+/// Build the 10-byte §2.7.1 `VP8X` chunk payload (flags + reserved +
+/// canvas dims). Convenience wrapper over [`build::build_vp8x_chunk`]
+/// returning the crate-wide [`Error`].
+pub fn build_vp8x_chunk(
+    canvas_width: u32,
+    canvas_height: u32,
+    flags: build::Vp8xFlags,
+) -> Result<Vec<u8>, Error> {
+    build::build_vp8x_chunk(canvas_width, canvas_height, flags).map_err(Into::into)
 }
 
 /// Decode a WebP file to pixels.

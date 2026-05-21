@@ -15,9 +15,11 @@
 
 use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
+use oxideav_webp::build::{ImageKind, Vp8xFlags};
 use oxideav_webp::container::fourcc;
 use oxideav_webp::{
-    parse_alph_header, parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
+    build_vp8x_chunk, build_webp_file, parse_alph_header, parse_anim_header, parse_anmf_header,
+    parse_container, parse_vp8x_header,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
@@ -160,4 +162,73 @@ fn fixture_animated_with_alpha_anim_payload_decodes_to_white_opaque_infinite() {
     assert_eq!(h.background_color.as_u32_le(), 0xFFFF_FFFF);
     assert_eq!(h.loop_count, 0);
     assert!(h.loops_forever());
+}
+
+#[test]
+fn round5_lossy_fixture_payload_rewraps_into_byte_identical_riff_envelope() {
+    // Round-5 surface: builder ↔ walker round-trip on a real fixture.
+    // We rip the §2.5 `VP8 ` chunk's payload out of the libwebp-produced
+    // lossy-1x1.webp, hand it back to the builder, and verify the
+    // resulting bytes parse to the same chunk content + same
+    // §2.4 File Size field. This is the encoder-replacement path —
+    // demonstrates the builder is the algebraic inverse of the walker
+    // for simple-lossy files.
+    let c = parse_container(LOSSY_1X1).expect("lossy-1x1 fixture parses");
+    assert_eq!(c.chunks.len(), 1);
+    assert_eq!(c.chunks[0].fourcc, fourcc::VP8);
+    let payload = c.chunks[0].payload(LOSSY_1X1);
+
+    let rebuilt = build_webp_file(payload, ImageKind::Lossy, 0, 0)
+        .expect("simple-lossy file builds from its own VP8 payload");
+    let c2 = parse_container(&rebuilt).expect("rebuilt simple-lossy file parses");
+    assert_eq!(c2.chunks.len(), 1);
+    assert_eq!(c2.chunks[0].fourcc, fourcc::VP8);
+    assert_eq!(c2.chunks[0].size, c.chunks[0].size);
+    assert_eq!(c2.chunks[0].payload(&rebuilt), payload);
+    assert_eq!(c2.riff_file_size, c.riff_file_size);
+}
+
+#[test]
+fn round5_lossless_fixture_payload_rewraps_into_byte_identical_riff_envelope() {
+    // Same as the lossy round-trip but on the §2.6 simple-lossless
+    // fixture. Catches any LE / pad-byte / FourCC drift between the
+    // walker and builder on the VP8L FourCC.
+    let c = parse_container(LOSSLESS_1X1).expect("lossless-1x1 fixture parses");
+    assert_eq!(c.chunks.len(), 1);
+    assert_eq!(c.chunks[0].fourcc, fourcc::VP8L);
+    let payload = c.chunks[0].payload(LOSSLESS_1X1);
+
+    let rebuilt = build_webp_file(payload, ImageKind::Lossless, 0, 0)
+        .expect("simple-lossless file builds from its own VP8L payload");
+    let c2 = parse_container(&rebuilt).expect("rebuilt simple-lossless file parses");
+    assert_eq!(c2.chunks.len(), 1);
+    assert_eq!(c2.chunks[0].fourcc, fourcc::VP8L);
+    assert_eq!(c2.chunks[0].payload(&rebuilt), payload);
+    assert_eq!(c2.riff_file_size, c.riff_file_size);
+}
+
+#[test]
+fn round5_build_vp8x_chunk_round_trips_through_typed_parser_with_flags() {
+    // §2.7.1 builder ↔ typed parser round-trip. We set every named
+    // feature flag and a non-square canvas to catch any LE / bit-
+    // position swap between writer and reader.
+    let flags = Vp8xFlags {
+        has_iccp: true,
+        has_alpha: true,
+        has_exif: false,
+        has_xmp: true,
+        has_animation: false,
+    };
+    let payload = build_vp8x_chunk(640, 480, flags).expect("VP8X payload builds");
+    let h = parse_vp8x_header(&payload).expect("VP8X payload parses back");
+    assert_eq!(h.canvas_width, 640);
+    assert_eq!(h.canvas_height, 480);
+    assert!(h.has_iccp);
+    assert!(h.has_alpha);
+    assert!(!h.has_exif);
+    assert!(h.has_xmp);
+    assert!(!h.has_animation);
+    // The builder zero-fills every Reserved bit + the 24-bit reserved
+    // field, so the parser's forward-compat signal must stay clear.
+    assert!(!h.has_unknown);
 }

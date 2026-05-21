@@ -2,7 +2,7 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-21 (clean-room round 4)
+## Status — 2026-05-22 (clean-room round 5)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -49,12 +49,31 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   per-frame `Frame Data` sub-RIFF is **not** decoded —
   `AnmfHeader::frame_data_offset()` returns the fixed `16` so
   callers can slice it out for the next layer.
+* **RIFF/WEBP builders (round 5):** RFC 9649 §2.3 / §2.4 / §2.7.1
+  *writer* counterpart of the walker. New module `build` exposes:
+  * [`build::build_chunk(fourcc, payload)`](src/build.rs) — generic
+    §2.3 chunk writer (FourCC + Size LE + payload + odd-size pad).
+  * [`build::build_vp8x_chunk(canvas_width, canvas_height, flags)`](src/build.rs) /
+    the [`build_vp8x_chunk`](src/lib.rs) wrapper — §2.7.1 Figure 7
+    10-byte payload writer (flags byte + zero-filled 24-bit reserved
+    + 24-bit LE `(w-1)` + 24-bit LE `(h-1)`).
+  * [`build::build_webp_file(payload, image_kind, w, h)`](src/build.rs) /
+    the [`build_webp_file`](src/lib.rs) wrapper — §2.4 file writer
+    for `ImageKind::{Lossy, Lossless, ExtendedLossy, ExtendedLossless}`.
+    `ImageKind::Lossy` / `Lossless` emit the simple §2.5 / §2.6 layout
+    (one `VP8 ` / `VP8L` chunk); the `Extended*` variants emit `VP8X`
+    + bitstream per §2.7's chunk-ordering rule. The §2.4 `File Size`
+    field is computed as `4 + body.len()` per the RFC.
+  * Canvas-dim validation matches the parser's MUSTs symmetrically
+    (zero / above 2^24 / product cap > 2^32 - 1).
+  * Standalone-friendly: every public function compiles cleanly
+    under `--no-default-features` (no `oxideav-core` dependency).
 * **Pixel decode (VP8 / VP8L / ALPH bitstream):** not implemented yet —
   [`decode_webp`](src/lib.rs) returns [`Error::NotImplemented`].
-* **Registry hook:** [`register`](src/lib.rs) is a no-op; round 4
+* **Registry hook:** [`register`](src/lib.rs) is a no-op; round 5
   still ships no decoder/encoder to the runtime context.
 
-## What round 4 lands
+## What round 5 lands
 
 | Item                          | Status                                              |
 | ----------------------------- | --------------------------------------------------- |
@@ -74,32 +93,43 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | §2.7.1.4 `ICCP`               | surfaced as opaque chunk                            |
 | §2.7.1.5 `EXIF` / `XMP `      | surfaced as opaque chunks                           |
 | §2.7.1.6 unknown chunks       | surfaced (no special handling required by §2.7.1.6) |
+| §2.3 `build_chunk` writer     | **new** — generic FourCC+Size+payload+odd-pad emit  |
+| §2.7.1 `build_vp8x_chunk`     | **new** — typed flag-byte + 24-bit LE × 2 emit      |
+| §2.4 `build_webp_file`        | **new** — simple + extended `RIFF/WEBP` envelope    |
 | VP8 / VP8L bitstream decode   | not yet — `Error::NotImplemented`                   |
+| VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **63** (56 unit + 7 integration against the
-`docs/image/webp/fixtures/` corpus).
+Test count: **83** (73 unit + 10 integration against the
+`docs/image/webp/fixtures/` corpus, including two builder ↔ walker
+round-trip tests that re-wrap the `lossy-1x1.webp` / `lossless-1x1.webp`
+fixtures' own `VP8 ` / `VP8L` payloads).
 
 ## Clean-room sources
 
-Rounds 1 through 4 were implemented entirely against:
+Rounds 1 through 5 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
-  also available as `rfc9649-webp.pdf`). Round 4 cites §2.7.1.1
-  Figure 9 (`ANMF`). Earlier rounds cited §2.4 / §2.3 (file +
-  chunk headers), §2.7.1 (`VP8X` Figure 7), §2.7.1.1 Figure 8
-  (`ANIM`), and §2.7.1.2 Figure 10 (`ALPH`).
+  also available as `rfc9649-webp.pdf`). Round 5 cites §2.3 (generic
+  RIFF chunk including the odd-size pad rule), §2.4 (`File Size`
+  field accounting), §2.5 / §2.6 (simple lossy/lossless layouts),
+  §2.7 (extended-format chunk ordering), and §2.7.1 Figure 7 (the
+  VP8X 10-byte payload layout) — the same sections the walker /
+  field parsers were built against in earlier rounds. Round 4 cites
+  §2.7.1.1 Figure 9 (`ANMF`). Earlier rounds cited §2.7.1 (`VP8X`
+  Figure 7), §2.7.1.1 Figure 8 (`ANIM`), and §2.7.1.2 Figure 10
+  (`ALPH`).
 * The 18-fixture corpus at `docs/image/webp/fixtures/` — consumed
-  as opaque byte streams. Round 4 additionally cross-checks the
-  ANMF u24 LE decode and the `Reserved|B|D` info-byte layout
-  against `animated-with-alpha/trace.txt` (`flags_byte=0x02
-  dispose=0 blend=1`, three identical 64×64 / 100 ms frames at
-  x=0 / y=0).
+  as opaque byte streams. Round 5 round-trips the `lossy-1x1.webp` /
+  `lossless-1x1.webp` fixtures' own `VP8 ` / `VP8L` payloads back
+  through the new builder to demonstrate the writer is the algebraic
+  inverse of the walker. Round 4 cross-checked the ANMF u24 LE
+  decode against `animated-with-alpha/trace.txt`.
 
 No external library source — libwebp, libvpx, image-rs, webp-rs,
 etc. — was consulted. `cwebp` / `dwebp` would be permissible as
-black-box validators; rounds 1 through 4 did not invoke them
-directly (round 4 reads only the `trace.txt` outputs already
-committed to `docs/`).
+black-box validators; rounds 1 through 5 did not invoke them
+directly (round 5 reads only the fixture bytes already committed
+to `docs/` / the in-crate `tests/data/`).
 
 ## License
 

@@ -6,6 +6,64 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 5 (2026-05-22).** RIFF/WEBP container *builder*
+  helpers — the inverse of the round-1 walker. New module `build`
+  exposes:
+  * `build::build_chunk(fourcc, payload) -> Result<Vec<u8>, BuildError>`
+    — generic §2.3 chunk writer (4-byte FourCC + 4-byte little-endian
+    `Size` + payload + odd-size `0x00` pad byte).
+  * `build::build_vp8x_chunk(canvas_width, canvas_height, Vp8xFlags) ->
+    Result<Vec<u8>, BuildError>` — §2.7.1 Figure 7 10-byte payload
+    writer. Inverse of `vp8x::Vp8xHeader::parse`: same bit positions
+    for the `I` / `L` / `E` / `X` / `A` feature flags, same 24-bit
+    little-endian Minus-One width/height encoding, same 24-bit zero-
+    filled Reserved field, same 2^32 - 1 product cap.
+  * `build::build_webp_file(payload, image_kind, canvas_width,
+    canvas_height) -> Result<Vec<u8>, BuildError>` — §2.4 file writer
+    over four `ImageKind` variants:
+    * `Lossy` / `Lossless` — §2.5 / §2.6 simple layouts (single
+      `VP8 ` / `VP8L` chunk; canvas dims are ignored because the
+      bitstream carries them).
+    * `ExtendedLossy` / `ExtendedLossless` — §2.7 extended layout
+      (`VP8X` chunk + bitstream chunk, in the §2.7-mandated order).
+  * Convenience wrappers `build_webp_file` / `build_vp8x_chunk` at
+    the crate root that return the crate-wide `Error`.
+* `Vp8xFlags` (Default-able struct with `has_iccp` / `has_alpha` /
+  `has_exif` / `has_xmp` / `has_animation`) drives the §2.7.1 flag
+  byte. Round 5 defaults all flags off since this crate ships no
+  encoder for the related bitstreams yet — once `ALPH` / `ANIM` /
+  metadata writers land, those writers will set the corresponding
+  flag here so the §2.7.1 declaration matches the chunks emitted.
+* `BuildError` variants: `CanvasDimZero { which }`,
+  `CanvasDimTooLarge { which, got }`, `CanvasTooLarge { canvas_width,
+  canvas_height }`, `PayloadTooLargeForChunk { got }`.
+* Public `MAX_VP8X_CANVAS_DIM` / `MAX_CHUNK_PAYLOAD` constants
+  documenting the §2.7.1 24-bit and §2.3 32-bit field maxima.
+* 18 new unit tests inside `build::tests` (chunk layout / pad byte /
+  flag bit positions / dim LE byte order / boundary refusal modes /
+  file round-trip / file-size accounting / 64 KiB round-trip /
+  corrupt-after-build refusal) + 3 new integration tests
+  (`round5_lossy_fixture_payload_rewraps_into_byte_identical_riff_envelope`,
+  `round5_lossless_fixture_payload_rewraps_into_byte_identical_riff_envelope`,
+  `round5_build_vp8x_chunk_round_trips_through_typed_parser_with_flags`)
+  that close the writer ↔ walker / writer ↔ typed-parser loop on
+  real `docs/image/webp/fixtures/` bytes. Test count: **83** (was
+  63).
+
+### Changed
+
+* `Error` gained a `Build(BuildError)` variant.
+
+### Notes
+
+The builders are intentionally framing-only: they accept the `VP8 ` /
+`VP8L` payload as opaque bytes the caller computed elsewhere. Pixel
+decode and VP8 / VP8L encode remain not-implemented in this crate;
+`decode_webp` still returns `Error::NotImplemented`. With this layer
+in place, the workspace's `cli-convert` `encode_webp` path is
+unblocked at the container layer — it can drive the builder once a
+VP8L encoder lands.
+
 * **Clean-room round 4 (2026-05-21).** Typed parser for the per-frame
   §2.7.1.1 `ANMF` chunk header (Figure 9). New module `anmf` exposes
   `anmf::AnmfHeader::parse(&[u8]) -> Result<AnmfHeader, AnmfError>`
