@@ -6,13 +6,17 @@
 //! Round 1 landed the **structural** RIFF/WEBP container walker
 //! ([`container::parse`]). Round 2 added typed field decoding for the
 //! `VP8X` extended-format header ([`vp8x::Vp8xHeader::parse`]). Round 3
-//! adds typed field decoding for the two §2.7.1.1 / §2.7.1.2 metadata
-//! chunks that travel alongside VP8X:
+//! added typed field decoding for the §2.7.1.1 `ANIM` / §2.7.1.2 `ALPH`
+//! metadata chunks. Round 4 adds typed field decoding for the per-frame
+//! §2.7.1.1 `ANMF` header:
 //!
 //! * [`alph::AlphHeader::parse`] — the `ALPH` info byte
 //!   (`Rsv|P|F|C`).
 //! * [`anim::AnimHeader::parse`] — the `ANIM` 6-byte payload
 //!   (BGRA background colour + u16 loop count).
+//! * [`anmf::AnmfHeader::parse`] — the `ANMF` 16-byte per-frame
+//!   header (frame X / Y / width / height / duration plus
+//!   `Reserved|B|D` info byte).
 //!
 //! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
 //! bitstream remain stubs returning [`Error::NotImplemented`].
@@ -21,6 +25,7 @@
 
 pub mod alph;
 pub mod anim;
+pub mod anmf;
 pub mod container;
 pub mod vp8x;
 
@@ -40,6 +45,8 @@ pub enum Error {
     Alph(alph::AlphError),
     /// The §2.7.1.1 ANIM payload parser rejected the input.
     Anim(anim::AnimError),
+    /// The §2.7.1.1 ANMF per-frame header parser rejected the input.
+    Anmf(anmf::AnmfError),
 }
 
 impl core::fmt::Display for Error {
@@ -50,6 +57,7 @@ impl core::fmt::Display for Error {
             Self::Vp8x(e) => write!(f, "oxideav-webp vp8x: {e}"),
             Self::Alph(e) => write!(f, "oxideav-webp alph: {e}"),
             Self::Anim(e) => write!(f, "oxideav-webp anim: {e}"),
+            Self::Anmf(e) => write!(f, "oxideav-webp anmf: {e}"),
         }
     }
 }
@@ -77,6 +85,12 @@ impl From<alph::AlphError> for Error {
 impl From<anim::AnimError> for Error {
     fn from(e: anim::AnimError) -> Self {
         Self::Anim(e)
+    }
+}
+
+impl From<anmf::AnmfError> for Error {
+    fn from(e: anmf::AnmfError) -> Self {
+        Self::Anmf(e)
     }
 }
 
@@ -121,12 +135,24 @@ pub fn parse_anim_header(payload: &[u8]) -> Result<anim::AnimHeader, Error> {
     anim::AnimHeader::parse(payload).map_err(Into::into)
 }
 
+/// Decode the §2.7.1.1 `ANMF` per-frame header to a typed
+/// [`anmf::AnmfHeader`].
+///
+/// The argument is the **payload** of an `ANMF` chunk — the slice
+/// returned by [`container::WebpChunk::payload`] for a chunk whose
+/// FourCC is [`container::fourcc::ANMF`]. Only the first 16 bytes
+/// are consumed; the remainder is the per-frame `Frame Data`
+/// sub-RIFF, which is not decoded here.
+pub fn parse_anmf_header(payload: &[u8]) -> Result<anmf::AnmfHeader, Error> {
+    anmf::AnmfHeader::parse(payload).map_err(Into::into)
+}
+
 /// Decode a WebP file to pixels.
 ///
-/// Returns [`Error::NotImplemented`] — rounds 1 through 3 only ship
+/// Returns [`Error::NotImplemented`] — rounds 1 through 4 only ship
 /// the structural plus header-field parsers (`container`, `vp8x`,
-/// `alph`, `anim`). Pixel decode (`VP8 ` / `VP8L` plus the actual ALPH
-/// alpha bitstream) is scheduled for later rounds.
+/// `alph`, `anim`, `anmf`). Pixel decode (`VP8 ` / `VP8L` plus the
+/// actual ALPH alpha bitstream) is scheduled for later rounds.
 pub fn decode_webp(_bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Err(Error::NotImplemented)
 }

@@ -1,8 +1,8 @@
 # oxideav-webp
 
-Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH).
+Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-21 (clean-room round 3)
+## Status — 2026-05-21 (clean-room round 4)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -36,12 +36,25 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH).
   `AnimHeader { background_color: BackgroundColor { blue, green, red,
   alpha }, loop_count }`. `loops_forever()` reports the §2.7.1.1
   "0 means infinite" sentinel.
+* **ANMF per-frame header parse (round 4):** RFC 9649 §2.7.1.1
+  Figure 9 typed decode of the 16-byte per-frame header.
+  [`anmf::AnmfHeader::parse`] / the
+  [`parse_anmf_header`](src/lib.rs) wrapper return
+  `AnmfHeader { x, y, width, height, duration_ms, blend:
+  BlendingMethod, dispose: DisposalMethod, reserved, info_byte }`.
+  Resolved-form fields: `x` / `y` carry the canvas-pixel
+  coordinates (already doubled per §2.7.1.1); `width` / `height`
+  carry the 1-based pixel counts. `BlendingMethod` is `AlphaBlend`
+  / `Overwrite`; `DisposalMethod` is `None` / `Background`. The
+  per-frame `Frame Data` sub-RIFF is **not** decoded —
+  `AnmfHeader::frame_data_offset()` returns the fixed `16` so
+  callers can slice it out for the next layer.
 * **Pixel decode (VP8 / VP8L / ALPH bitstream):** not implemented yet —
   [`decode_webp`](src/lib.rs) returns [`Error::NotImplemented`].
-* **Registry hook:** [`register`](src/lib.rs) is a no-op; round 3
+* **Registry hook:** [`register`](src/lib.rs) is a no-op; round 4
   still ships no decoder/encoder to the runtime context.
 
-## What round 3 lands
+## What round 4 lands
 
 | Item                          | Status                                              |
 | ----------------------------- | --------------------------------------------------- |
@@ -54,7 +67,8 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH).
 | §2.7.1 canvas dim decode      | done (24-bit LE × 2, 1-based)                       |
 | §2.7.1 canvas product cap     | done (rejects `w*h > 2^32 - 1`)                     |
 | §2.7.1.1 `ANIM` field parse   | done (BGRA u8×4 + u16 LE loop count)                |
-| §2.7.1.1 `ANMF` field parse   | not yet — surfaced as opaque chunk                  |
+| §2.7.1.1 `ANMF` field parse   | done (5×u24 LE + 6-bit Rsv + B + D info byte)       |
+| §2.7.1.1 `ANMF` Frame Data    | not yet — sub-RIFF bytes after 16-byte header opaque |
 | §2.7.1.2 `ALPH` info byte     | done (Rsv/P/F/C 2-bit decompose, typed enums)       |
 | §2.7.1.2 `ALPH` bitstream     | not yet — bytes after info byte are out of scope    |
 | §2.7.1.4 `ICCP`               | surfaced as opaque chunk                            |
@@ -62,26 +76,29 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH).
 | §2.7.1.6 unknown chunks       | surfaced (no special handling required by §2.7.1.6) |
 | VP8 / VP8L bitstream decode   | not yet — `Error::NotImplemented`                   |
 
-Test count: **45** (39 unit + 6 integration against the
+Test count: **63** (56 unit + 7 integration against the
 `docs/image/webp/fixtures/` corpus).
 
 ## Clean-room sources
 
-Rounds 1 through 3 were implemented entirely against:
+Rounds 1 through 4 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
-  also available as `rfc9649-webp.pdf`). Round 3 cites §2.7.1.1
-  Figure 8 (`ANIM`) + §2.7.1.2 Figure 10 (`ALPH`).
+  also available as `rfc9649-webp.pdf`). Round 4 cites §2.7.1.1
+  Figure 9 (`ANMF`). Earlier rounds cited §2.4 / §2.3 (file +
+  chunk headers), §2.7.1 (`VP8X` Figure 7), §2.7.1.1 Figure 8
+  (`ANIM`), and §2.7.1.2 Figure 10 (`ALPH`).
 * The 18-fixture corpus at `docs/image/webp/fixtures/` — consumed
-  as opaque byte streams. Round 3 additionally cross-checks the
-  ALPH bit-position decode and the ANIM BGRA / loop-count decode
-  against the fixtures' `trace.txt` files (libwebp's instrumented
-  decoder output, treated as a black-box golden record).
+  as opaque byte streams. Round 4 additionally cross-checks the
+  ANMF u24 LE decode and the `Reserved|B|D` info-byte layout
+  against `animated-with-alpha/trace.txt` (`flags_byte=0x02
+  dispose=0 blend=1`, three identical 64×64 / 100 ms frames at
+  x=0 / y=0).
 
 No external library source — libwebp, libvpx, image-rs, webp-rs,
 etc. — was consulted. `cwebp` / `dwebp` would be permissible as
-black-box validators; rounds 1 through 3 did not invoke them
-directly (round 3 reads only the `trace.txt` outputs already
+black-box validators; rounds 1 through 4 did not invoke them
+directly (round 4 reads only the `trace.txt` outputs already
 committed to `docs/`).
 
 ## License

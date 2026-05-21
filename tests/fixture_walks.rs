@@ -14,8 +14,11 @@
 //! this test file.
 
 use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
+use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::container::fourcc;
-use oxideav_webp::{parse_alph_header, parse_anim_header, parse_container, parse_vp8x_header};
+use oxideav_webp::{
+    parse_alph_header, parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
+};
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
 const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
@@ -98,6 +101,44 @@ fn fixture_lossy_with_alpha_alph_info_byte_decodes_to_lossless_no_filter_no_pre(
     // proper (out of scope for round 3).
     let bitstream = &alph.payload(LOSSY_WITH_ALPHA)[h.bitstream_offset()..];
     assert_eq!(bitstream.len(), (alph.size as usize) - 1);
+}
+
+#[test]
+fn fixture_animated_with_alpha_all_three_anmf_headers_decode_to_trace_values() {
+    // Round-4 surface: walker → typed ANMF. Cross-checks the 16-byte
+    // per-frame header decode against `animated-with-alpha/trace.txt`,
+    // which reports for every one of the three frames:
+    //   ANMF_FRAME x_offset=0 y_offset=0 width=64 height=64
+    //              duration=100 dispose=0 blend=1 flags_byte=0x02
+    let c = parse_container(ANIMATED_WITH_ALPHA).expect("animated-with-alpha fixture parses");
+    let anmfs: Vec<_> = c
+        .chunks
+        .iter()
+        .filter(|ch| ch.fourcc == fourcc::ANMF)
+        .collect();
+    assert_eq!(anmfs.len(), 3, "trace.txt reports three ANMF chunks");
+    for (i, anmf_chunk) in anmfs.iter().enumerate() {
+        let payload = anmf_chunk.payload(ANIMATED_WITH_ALPHA);
+        let h = parse_anmf_header(payload)
+            .unwrap_or_else(|e| panic!("ANMF #{i} payload parses per §2.7.1.1: {e:?}"));
+        assert_eq!(h.x, 0, "frame {i} x_offset");
+        assert_eq!(h.y, 0, "frame {i} y_offset");
+        assert_eq!(h.width, 64, "frame {i} width");
+        assert_eq!(h.height, 64, "frame {i} height");
+        assert_eq!(h.duration_ms, 100, "frame {i} duration");
+        assert_eq!(h.blend, BlendingMethod::Overwrite, "frame {i} blend");
+        assert_eq!(h.dispose, DisposalMethod::None, "frame {i} dispose");
+        assert_eq!(h.info_byte, 0x02, "frame {i} flags byte");
+        assert_eq!(h.reserved, 0, "frame {i} reserved");
+        // The Frame Data sub-RIFF starts immediately after the
+        // 16-byte header — `Chunk Size - 16` bytes long per §2.7.1.1.
+        let frame_data = &payload[h.frame_data_offset()..];
+        assert_eq!(
+            frame_data.len(),
+            (anmf_chunk.size as usize) - 16,
+            "frame {i} frame_data length matches §2.7.1.1 `Chunk Size - 16`"
+        );
+    }
 }
 
 #[test]

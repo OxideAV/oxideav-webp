@@ -6,6 +6,51 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 4 (2026-05-21).** Typed parser for the per-frame
+  §2.7.1.1 `ANMF` chunk header (Figure 9). New module `anmf` exposes
+  `anmf::AnmfHeader::parse(&[u8]) -> Result<AnmfHeader, AnmfError>`
+  and the top-level convenience wrapper `parse_anmf_header`. The
+  16-byte header decodes to:
+  * `x: u32` — `Frame X * 2` per §2.7.1.1 (24-bit little-endian
+    uint24 doubled).
+  * `y: u32` — `Frame Y * 2`.
+  * `width: u32` — `1 + Frame Width Minus One` (always ≥ 1).
+  * `height: u32` — `1 + Frame Height Minus One` (always ≥ 1).
+  * `duration_ms: u32` — literal Frame Duration in ms.
+  * `blend: BlendingMethod` — `AlphaBlend` / `Overwrite` (bit 1 of
+    the info byte).
+  * `dispose: DisposalMethod` — `None` / `Background` (bit 0 of the
+    info byte).
+  * `reserved: u8` + `info_byte: u8` — surfaced raw for trace
+    observability.
+  `AnmfHeader::HEADER_LEN` constant + `frame_data_offset()` helper
+  (always 16) lets callers slice the per-frame `Frame Data` sub-RIFF
+  out of the chunk payload. The header parser stays **structural** —
+  it does not descend into the per-frame `ALPH` / `VP8 ` / `VP8L`
+  sub-chunks.
+* 15 new unit tests + 1 new integration test cross-checking the
+  bit-position and uint24 decodes against the
+  `docs/image/webp/fixtures/animated-with-alpha/trace.txt`
+  (`flags_byte=0x02 dispose=0 blend=1`, three identical ANMF frames
+  at 64×64 / 100 ms / x=0 / y=0) golden output. Test count: **63**
+  (was 45).
+
+### Changed
+
+* `Error` gained an `Anmf(AnmfError)` variant.
+
+### Notes
+
+Pixel decode (VP8 / VP8L bitstreams) and the actual ALPH alpha
+bitstream are still not implemented; `decode_webp` still returns
+`Error::NotImplemented`. Round 5+ targets bitstream decode of the
+simplest VP8L paths against the lossless-1x1 / lossless-32x32-rgb
+fixtures.
+
+## [Earlier — Unreleased entries, retained]
+
+### Added
+
 * **Clean-room round 3 (2026-05-21).** Typed parsers for the two
   §2.7.1 metadata chunks that travel alongside `VP8X`:
   * `alph::AlphHeader::parse(&[u8]) -> Result<AlphHeader, AlphError>`
