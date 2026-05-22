@@ -8,10 +8,13 @@
 //! `VP8X` extended-format header ([`vp8x::Vp8xHeader::parse`]). Round 3
 //! added typed field decoding for the §2.7.1.1 `ANIM` / §2.7.1.2 `ALPH`
 //! metadata chunks. Round 4 added typed field decoding for the
-//! per-frame §2.7.1.1 `ANMF` header. Round 5 adds the **builder**
+//! per-frame §2.7.1.1 `ANMF` header. Round 5 added the **builder**
 //! side of the RIFF/WEBP container — the inverse of the walker — so
 //! external encoders can wrap a `VP8 ` / `VP8L` payload in a
-//! well-formed file:
+//! well-formed file. Round 6 adds a typed §2.5 `VP8 ` chunk handle
+//! ([`vp8_chunk::WebpLossyChunk`]) that lets container-layer callers
+//! route the VP8 payload to a downstream VP8 decoder **without**
+//! `oxideav-webp` taking a runtime dependency on `oxideav-vp8`.
 //!
 //! * [`alph::AlphHeader::parse`] — the `ALPH` info byte
 //!   (`Rsv|P|F|C`).
@@ -27,11 +30,18 @@
 //! * [`build::build_webp_file`] — §2.4 file writer for simple
 //!   (`VP8 ` / `VP8L`) and extended (`VP8X` + `VP8 ` / `VP8L`)
 //!   layouts.
+//! * [`vp8_chunk::WebpLossyChunk`] — typed §2.5 `VP8 ` chunk
+//!   handle. Peeks the RFC 6386 §9.1 keyframe header (width /
+//!   height / version / first_partition_size / scale fields) and
+//!   exposes the chunk payload via [`vp8_chunk::WebpLossyChunk::bitstream`]
+//!   for routing to an external VP8 decoder.
 //!
 //! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
 //! bitstream remain stubs returning [`Error::NotImplemented`]; the
 //! builders are deliberately framing-only so an external encoder can
-//! pre-compute the codec payload bytes.
+//! pre-compute the codec payload bytes. The round-6 lossy handle is
+//! likewise framing-only — it surfaces canvas dims and the routing
+//! slice but performs no VP8 decode.
 
 #![warn(missing_debug_implementations)]
 
@@ -40,6 +50,7 @@ pub mod anim;
 pub mod anmf;
 pub mod build;
 pub mod container;
+pub mod vp8_chunk;
 pub mod vp8x;
 
 #[cfg(feature = "registry")]
@@ -62,6 +73,8 @@ pub enum Error {
     Anmf(anmf::AnmfError),
     /// The §2.3 / §2.4 / §2.7.1 RIFF/WEBP builders rejected the input.
     Build(build::BuildError),
+    /// The §2.5 typed `VP8 ` chunk handle rejected the chunk payload.
+    Lossy(vp8_chunk::WebpLossyError),
 }
 
 impl core::fmt::Display for Error {
@@ -74,6 +87,7 @@ impl core::fmt::Display for Error {
             Self::Anim(e) => write!(f, "oxideav-webp anim: {e}"),
             Self::Anmf(e) => write!(f, "oxideav-webp anmf: {e}"),
             Self::Build(e) => write!(f, "oxideav-webp build: {e}"),
+            Self::Lossy(e) => write!(f, "oxideav-webp lossy: {e}"),
         }
     }
 }
@@ -113,6 +127,12 @@ impl From<anmf::AnmfError> for Error {
 impl From<build::BuildError> for Error {
     fn from(e: build::BuildError) -> Self {
         Self::Build(e)
+    }
+}
+
+impl From<vp8_chunk::WebpLossyError> for Error {
+    fn from(e: vp8_chunk::WebpLossyError) -> Self {
+        Self::Lossy(e)
     }
 }
 
@@ -192,12 +212,35 @@ pub fn build_vp8x_chunk(
     build::build_vp8x_chunk(canvas_width, canvas_height, flags).map_err(Into::into)
 }
 
+/// Walk a `RIFF/WEBP` buffer and, if it carries a §2.5 simple-lossy
+/// `VP8 ` chunk (or a §2.7 extended-lossy file with a `VP8 ` chunk
+/// alongside `VP8X`), return a typed [`vp8_chunk::WebpLossyChunk`]
+/// handle whose [`bitstream`](vp8_chunk::WebpLossyChunk::bitstream)
+/// slice can be routed to an external VP8 decoder.
+///
+/// Returns `Ok(None)` if the file is well-formed but carries no
+/// `VP8 ` chunk (e.g. a `VP8L`-only simple-lossless file).
+///
+/// The returned handle borrows out of `bytes`, so the slice must
+/// outlive the handle.
+///
+/// This is the round-6 routing API — `oxideav-webp` deliberately
+/// does **not** take a runtime dependency on `oxideav-vp8`; the
+/// caller picks which VP8 decoder consumes the borrowed payload.
+pub fn extract_lossy_chunk(bytes: &[u8]) -> Result<Option<vp8_chunk::WebpLossyChunk<'_>>, Error> {
+    let c = container::parse(bytes)?;
+    vp8_chunk::extract_lossy(bytes, &c).map_err(Into::into)
+}
+
 /// Decode a WebP file to pixels.
 ///
-/// Returns [`Error::NotImplemented`] — rounds 1 through 4 only ship
+/// Returns [`Error::NotImplemented`] — rounds 1 through 6 only ship
 /// the structural plus header-field parsers (`container`, `vp8x`,
-/// `alph`, `anim`, `anmf`). Pixel decode (`VP8 ` / `VP8L` plus the
-/// actual ALPH alpha bitstream) is scheduled for later rounds.
+/// `alph`, `anim`, `anmf`, `vp8_chunk`) plus the round-5 builder.
+/// Pixel decode (`VP8 ` / `VP8L` plus the actual ALPH alpha
+/// bitstream) is the responsibility of downstream decoder crates;
+/// callers use [`extract_lossy_chunk`] / the §2.6 walker hooks to
+/// route the bitstream bytes onward.
 pub fn decode_webp(_bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Err(Error::NotImplemented)
 }

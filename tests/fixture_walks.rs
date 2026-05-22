@@ -17,9 +17,10 @@ use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::build::{ImageKind, Vp8xFlags};
 use oxideav_webp::container::fourcc;
+use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
 use oxideav_webp::{
-    build_vp8x_chunk, build_webp_file, parse_alph_header, parse_anim_header, parse_anmf_header,
-    parse_container, parse_vp8x_header,
+    build_vp8x_chunk, build_webp_file, extract_lossy_chunk, parse_alph_header, parse_anim_header,
+    parse_anmf_header, parse_container, parse_vp8x_header,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
@@ -205,6 +206,125 @@ fn round5_lossless_fixture_payload_rewraps_into_byte_identical_riff_envelope() {
     assert_eq!(c2.chunks[0].fourcc, fourcc::VP8L);
     assert_eq!(c2.chunks[0].payload(&rebuilt), payload);
     assert_eq!(c2.riff_file_size, c.riff_file_size);
+}
+
+#[test]
+fn round6_lossy_1x1_fixture_extracts_to_typed_lossy_chunk_with_trace_dims() {
+    // Round-6 surface: walker → typed lossy chunk. The
+    // `lossy-1x1/trace.txt` golden output records the VP8 frame
+    // header as
+    //   VP8_FRAME_HEADER key_frame=1 profile=0 show=1
+    //                    partition_length=11 width=1 height=1
+    //                    xscale=0 yscale=0
+    // The typed handle must surface every one of these fields,
+    // and must also borrow the chunk payload verbatim so a
+    // downstream VP8 decoder gets the exact bytes the walker saw.
+    let handle = extract_lossy_chunk(LOSSY_1X1)
+        .expect("lossy-1x1 fixture parses + extracts")
+        .expect("lossy-1x1 fixture has a 'VP8 ' chunk");
+    assert_eq!(handle.width(), 1, "trace width=1");
+    assert_eq!(handle.height(), 1, "trace height=1");
+    assert_eq!(handle.version(), 0, "trace profile=0");
+    assert!(handle.show_frame(), "trace show=1");
+    assert_eq!(
+        handle.first_partition_size(),
+        11,
+        "trace partition_length=11"
+    );
+    assert_eq!(handle.horizontal_scale(), 0, "trace xscale=0");
+    assert_eq!(handle.vertical_scale(), 0, "trace yscale=0");
+
+    // Payload must include the §9.1 10-byte header at offset 0 plus
+    // the entropy-coded remainder (the trace's CHUNK size=40 for the
+    // VP8 chunk → 40 byte payload).
+    assert_eq!(
+        handle.bitstream().len(),
+        40,
+        "trace CHUNK fourcc=VP8 size=40"
+    );
+    assert!(handle.bitstream().len() >= VP8_KEYFRAME_HEADER_LEN);
+
+    // The walker's chunk payload must match the handle's bitstream —
+    // demonstrates the handle borrows out of the walker's slice
+    // without modifying it.
+    let c = parse_container(LOSSY_1X1).unwrap();
+    let chunk = c.first_chunk_with_fourcc(fourcc::VP8).unwrap();
+    assert_eq!(handle.bitstream(), chunk.payload(LOSSY_1X1));
+}
+
+#[test]
+fn round6_lossy_with_alpha_extended_fixture_extracts_to_128x128_keyframe() {
+    // Extended-format fixture: 'VP8X' + 'ALPH' + 'VP8 '. The §2.5
+    // / §9.1 dims still come from the 'VP8 ' chunk's keyframe
+    // header. The trace records width=128 height=128 partition=328.
+    let handle = extract_lossy_chunk(LOSSY_WITH_ALPHA)
+        .expect("lossy-with-alpha parses")
+        .expect("'VP8 ' chunk present alongside 'VP8X' / 'ALPH'");
+    assert_eq!(handle.width(), 128);
+    assert_eq!(handle.height(), 128);
+    assert_eq!(handle.first_partition_size(), 328);
+    assert!(handle.show_frame());
+    assert_eq!(handle.version(), 0);
+
+    // The §2.7.1 VP8X-declared canvas must agree with the §9.1
+    // keyframe-derived canvas — the typed handle does *not*
+    // enforce that policy (cross-validation is the caller's job),
+    // but the trace says they match for this fixture.
+    let c = parse_container(LOSSY_WITH_ALPHA).unwrap();
+    let vp8x = parse_vp8x_header(
+        c.first_chunk_with_fourcc(fourcc::VP8X)
+            .unwrap()
+            .payload(LOSSY_WITH_ALPHA),
+    )
+    .unwrap();
+    assert_eq!(vp8x.canvas_width, handle.width() as u32);
+    assert_eq!(vp8x.canvas_height, handle.height() as u32);
+}
+
+#[test]
+fn round6_lossless_fixture_extract_returns_none() {
+    // §2.6 simple-lossless file has no 'VP8 ' chunk, only 'VP8L'.
+    // `extract_lossy_chunk` must report that cleanly.
+    let res = extract_lossy_chunk(LOSSLESS_1X1).expect("lossless-1x1 parses");
+    assert!(res.is_none(), "lossless file carries no VP8 chunk");
+}
+
+#[test]
+fn round6_lossy_chunk_payload_survives_round_trip_through_builder() {
+    // Round-5 ↔ round-6 interplay: take the §2.5 'VP8 ' payload
+    // surfaced by `extract_lossy_chunk`, re-wrap it via the
+    // round-5 builder, and verify the re-extracted handle peeks
+    // the same RFC 6386 §9.1 fields. This locks down the "router
+    // ↔ container builder" contract for the encoder-replacement
+    // pipeline.
+    let original = extract_lossy_chunk(LOSSY_1X1).unwrap().unwrap();
+    let bitstream = original.bitstream();
+
+    let rebuilt = build_webp_file(bitstream, ImageKind::Lossy, 0, 0)
+        .expect("simple-lossy file builds from extracted VP8 payload");
+    let re_extracted = extract_lossy_chunk(&rebuilt)
+        .expect("rebuilt file parses")
+        .expect("rebuilt file carries a VP8 chunk");
+    assert_eq!(re_extracted.width(), original.width());
+    assert_eq!(re_extracted.height(), original.height());
+    assert_eq!(re_extracted.version(), original.version());
+    assert_eq!(
+        re_extracted.first_partition_size(),
+        original.first_partition_size()
+    );
+    assert_eq!(re_extracted.bitstream(), bitstream);
+}
+
+#[test]
+fn round6_lossy_chunk_from_chunk_works_on_walker_output() {
+    // Direct WebpLossyChunk::from_chunk path — bypasses the
+    // top-level extract_lossy_chunk helper to verify the
+    // chunk-level construction works too.
+    let c = parse_container(LOSSY_1X1).unwrap();
+    let vp8 = c.first_chunk_with_fourcc(fourcc::VP8).unwrap();
+    let handle = WebpLossyChunk::from_chunk(LOSSY_1X1, vp8).expect("VP8 chunk handle constructs");
+    assert_eq!(handle.width(), 1);
+    assert_eq!(handle.height(), 1);
 }
 
 #[test]

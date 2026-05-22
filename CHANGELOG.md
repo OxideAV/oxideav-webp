@@ -6,6 +6,68 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 6 (2026-05-22).** Typed §2.5 `VP8 ` chunk
+  routing handle. New module `vp8_chunk` exposes:
+  * `vp8_chunk::WebpLossyChunk` — a borrowed handle around a §2.5
+    `VP8 ` chunk payload. Peeks the 10-byte RFC 6386 §9.1 keyframe
+    header (3-byte frame tag carrying frame_type / version /
+    show_frame / 19-bit first_partition_size, 3-byte sync code
+    `0x9D 0x01 0x2A`, two 16-bit `(scale << 14) | dim` words) and
+    surfaces `width()` / `height()` / `version()` / `show_frame()`
+    / `first_partition_size()` / `horizontal_scale()` /
+    `vertical_scale()`. The chunk payload is exposed verbatim via
+    `bitstream()` so a downstream VP8 decoder can consume it.
+  * `vp8_chunk::WebpLossyChunk::from_chunk(buf, chunk)` /
+    `from_payload(slice)` constructors.
+  * `vp8_chunk::extract_lossy(buf, container)` — pulls the first
+    `VP8 ` chunk out of an already-walked container; returns
+    `Ok(None)` for `VP8L`-only files.
+  * `extract_lossy_chunk(bytes)` — top-level convenience wrapper
+    that walks the container and extracts in one call.
+  * Refusal modes: `NotVp8Chunk` / `PayloadTooShortForKeyframe` /
+    `NotAKeyframe` / `BadStartCode`. §2.5 / §9.1 together imply a
+    WebP `VP8 ` chunk MUST be a keyframe; `NotAKeyframe` enforces
+    this. Bad `0x9D 0x01 0x2A` sync bytes are surfaced raw so
+    callers can distinguish "wrong codec" from "corrupted payload".
+* The handle is deliberately a **routing** surface — `oxideav-webp`
+  takes no runtime dependency on `oxideav-vp8`. A caller routes the
+  borrowed `bitstream()` slice to whichever VP8 decoder it wants.
+* 9 new unit tests inside `vp8_chunk::tests` (minimal 1x1 / max
+  14-bit dims / short-payload refusal / interframe refusal / bad
+  start-code refusal / non-VP8 fourcc refusal / payload-bytes
+  round-trip via walker / extract returns None on lossless /
+  extract returns Some on lossy) + 5 new integration tests against
+  the fixture corpus:
+  * `round6_lossy_1x1_fixture_extracts_to_typed_lossy_chunk_with_trace_dims`
+    cross-checks every §9.1 field against `lossy-1x1/trace.txt`.
+  * `round6_lossy_with_alpha_extended_fixture_extracts_to_128x128_keyframe`
+    cross-checks the extended-format `VP8 ` chunk's §9.1 dims and
+    also asserts the §2.7.1 VP8X-declared canvas agrees with the
+    §9.1-derived canvas for this fixture.
+  * `round6_lossless_fixture_extract_returns_none` confirms
+    `extract_lossy_chunk` returns `Ok(None)` on a `VP8L`-only file.
+  * `round6_lossy_chunk_payload_survives_round_trip_through_builder`
+    routes the extracted payload back through the round-5 builder
+    and re-extracts, locking down the writer ↔ router contract.
+  * `round6_lossy_chunk_from_chunk_works_on_walker_output` exercises
+    the `from_chunk` constructor directly.
+  Test count: **97** (was 83).
+
+### Changed
+
+* `Error` gained a `Lossy(vp8_chunk::WebpLossyError)` variant.
+
+### Notes
+
+`decode_webp` still returns `Error::NotImplemented`; the round-6
+typed handle is a hand-off layer, not a pixel decoder. The routing
+contract is one-way: this crate emits a typed
+`WebpLossyChunk::bitstream()` slice, and the caller picks a VP8
+decoder (e.g. `oxideav-vp8`) to consume it. That keeps
+`oxideav-webp` standalone-friendly — every public function still
+compiles under `--no-default-features` with no `oxideav-core`
+dependency.
+
 * **Clean-room round 5 (2026-05-22).** RIFF/WEBP container *builder*
   helpers — the inverse of the round-1 walker. New module `build`
   exposes:
