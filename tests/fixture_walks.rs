@@ -18,13 +18,15 @@ use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::build::{ImageKind, Vp8xFlags};
 use oxideav_webp::container::fourcc;
 use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
+use oxideav_webp::vp8l_chunk::{WebpLosslessChunk, VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE};
 use oxideav_webp::{
-    build_vp8x_chunk, build_webp_file, extract_lossy_chunk, parse_alph_header, parse_anim_header,
-    parse_anmf_header, parse_container, parse_vp8x_header,
+    build_vp8x_chunk, build_webp_file, extract_lossless_chunk, extract_lossy_chunk,
+    parse_alph_header, parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
 const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
+const LOSSLESS_32X32_RGBA: &[u8] = include_bytes!("data/lossless-32x32-rgba.webp");
 const EXTENDED_WITH_EXIF: &[u8] = include_bytes!("data/extended-with-exif.webp");
 const LOSSY_WITH_ALPHA: &[u8] = include_bytes!("data/lossy-with-alpha-128x128.webp");
 const ANIMATED_WITH_ALPHA: &[u8] = include_bytes!("data/animated-with-alpha.webp");
@@ -325,6 +327,111 @@ fn round6_lossy_chunk_from_chunk_works_on_walker_output() {
     let handle = WebpLossyChunk::from_chunk(LOSSY_1X1, vp8).expect("VP8 chunk handle constructs");
     assert_eq!(handle.width(), 1);
     assert_eq!(handle.height(), 1);
+}
+
+#[test]
+fn round7_lossless_1x1_fixture_extracts_to_typed_lossless_chunk_with_trace_dims() {
+    // Round-7 surface: walker → typed lossless chunk. The
+    // `lossless-1x1/trace.txt` golden output records the VP8L
+    // image-header as
+    //   VP8L_HEADER magic=0x2f width=1 height=1 alpha_used=0 version=0
+    // The typed handle must surface every one of these fields,
+    // and must also borrow the chunk payload verbatim so a
+    // downstream VP8L decoder gets the exact bytes the walker saw.
+    let handle = extract_lossless_chunk(LOSSLESS_1X1)
+        .expect("lossless-1x1 fixture parses + extracts")
+        .expect("lossless-1x1 fixture has a 'VP8L' chunk");
+    assert_eq!(handle.width(), 1, "trace width=1");
+    assert_eq!(handle.height(), 1, "trace height=1");
+    assert!(!handle.alpha_is_used(), "trace alpha_used=0");
+    assert_eq!(handle.version(), 0, "trace version=0");
+
+    // Payload must include the §3.4 / §7.1 5-byte image-header at
+    // offset 0 plus the entropy-coded remainder (the trace's
+    // CHUNK size=17 for the VP8L chunk → 17 byte payload).
+    assert_eq!(handle.bitstream().len(), 17, "trace CHUNK size=17");
+    assert!(handle.bitstream().len() >= VP8L_IMAGE_HEADER_LEN);
+    assert_eq!(
+        handle.bitstream()[0],
+        VP8L_SIGNATURE,
+        "VP8L payload byte 0 must be 0x2F"
+    );
+
+    // The walker's chunk payload must match the handle's bitstream —
+    // demonstrates the handle borrows out of the walker's slice
+    // without modifying it.
+    let c = parse_container(LOSSLESS_1X1).unwrap();
+    let chunk = c
+        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8L)
+        .unwrap();
+    assert_eq!(handle.bitstream(), chunk.payload(LOSSLESS_1X1));
+}
+
+#[test]
+fn round7_lossless_32x32_rgba_fixture_extracts_with_alpha_used_bit_set() {
+    // `lossless-32x32-rgba/trace.txt` reports
+    //   VP8L_HEADER magic=0x2f width=32 height=32 alpha_used=1 version=0
+    // The fixture's RGBA source means the encoder set `alpha_is_used`
+    // — this is the only fixture in the small in-crate corpus that
+    // exercises the hint=1 path of the §3.4 / §7.1 bit decode.
+    let handle = extract_lossless_chunk(LOSSLESS_32X32_RGBA)
+        .expect("lossless-32x32-rgba fixture parses + extracts")
+        .expect("lossless-32x32-rgba fixture has a 'VP8L' chunk");
+    assert_eq!(handle.width(), 32, "trace width=32");
+    assert_eq!(handle.height(), 32, "trace height=32");
+    assert!(handle.alpha_is_used(), "trace alpha_used=1");
+    assert_eq!(handle.version(), 0, "trace version=0");
+
+    // Trace reports CHUNK size=121 — same length must hit
+    // bitstream().
+    assert_eq!(handle.bitstream().len(), 121, "trace CHUNK size=121");
+    assert_eq!(handle.bitstream()[0], VP8L_SIGNATURE);
+}
+
+#[test]
+fn round7_lossy_fixture_extract_lossless_returns_none() {
+    // §2.5 simple-lossy file has no 'VP8L' chunk, only 'VP8 '.
+    // `extract_lossless_chunk` must report that cleanly.
+    let res = extract_lossless_chunk(LOSSY_1X1).expect("lossy-1x1 parses");
+    assert!(res.is_none(), "lossy file carries no VP8L chunk");
+}
+
+#[test]
+fn round7_lossless_chunk_payload_survives_round_trip_through_builder() {
+    // Round-5 ↔ round-7 interplay: take the §2.6 'VP8L' payload
+    // surfaced by `extract_lossless_chunk`, re-wrap it via the
+    // round-5 builder, and verify the re-extracted handle peeks
+    // the same §3.4 / §7.1 fields. Locks down the "router ↔
+    // container builder" contract for the lossless path.
+    let original = extract_lossless_chunk(LOSSLESS_1X1).unwrap().unwrap();
+    let bitstream = original.bitstream();
+
+    let rebuilt = build_webp_file(bitstream, ImageKind::Lossless, 0, 0)
+        .expect("simple-lossless file builds from extracted VP8L payload");
+    let re_extracted = extract_lossless_chunk(&rebuilt)
+        .expect("rebuilt file parses")
+        .expect("rebuilt file carries a VP8L chunk");
+    assert_eq!(re_extracted.width(), original.width());
+    assert_eq!(re_extracted.height(), original.height());
+    assert_eq!(re_extracted.alpha_is_used(), original.alpha_is_used());
+    assert_eq!(re_extracted.version(), original.version());
+    assert_eq!(re_extracted.bitstream(), bitstream);
+}
+
+#[test]
+fn round7_lossless_chunk_from_chunk_works_on_walker_output() {
+    // Direct WebpLosslessChunk::from_chunk path — bypasses the
+    // top-level extract_lossless_chunk helper to verify the
+    // chunk-level construction works too.
+    let c = parse_container(LOSSLESS_1X1).unwrap();
+    let vp8l = c
+        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8L)
+        .unwrap();
+    let handle =
+        WebpLosslessChunk::from_chunk(LOSSLESS_1X1, vp8l).expect("VP8L chunk handle constructs");
+    assert_eq!(handle.width(), 1);
+    assert_eq!(handle.height(), 1);
+    assert!(!handle.alpha_is_used());
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-22 (clean-room round 6)
+## Status — 2026-05-22 (clean-room round 7)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -81,6 +81,21 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   `0x9D 0x01 0x2A` start codes per §9.1. **No** runtime dependency on
   `oxideav-vp8`: the typed chunk is a hand-off surface that lets a
   caller route the bitstream to whichever VP8 decoder it wants.
+* **Typed `VP8L` chunk handle (round 7):** RFC 9649 §2.6 routing
+  layer for the simple-lossless `VP8L` chunk. New module `vp8l_chunk`
+  exposes [`vp8l_chunk::WebpLosslessChunk`] +
+  [`extract_lossless_chunk`](src/lib.rs). The handle borrows the
+  chunk payload byte-for-byte and decodes the §3.4 / §7.1 5-byte
+  image-header (one-byte `0x2F` signature + LE bit-packed 14-bit
+  `width - 1` + 14-bit `height - 1` + `alpha_is_used` bit + 3-bit
+  `version`). Surfaces resolved 1-based `width`, `height` plus raw
+  `alpha_is_used`, `version` and exposes the routing slice via
+  `bitstream()`. Refuses short payloads and bad `0x2F` signatures;
+  surfaces non-zero `version` for downstream policy (§3.4 says the
+  *decoder* "should treat as an error" — out of scope for this
+  router). **No** runtime dependency on `oxideav-vp8l`: the typed
+  chunk is a hand-off surface that lets a caller route the
+  bitstream to whichever VP8L decoder it wants.
 * **Pixel decode (VP8 / VP8L / ALPH bitstream):** not implemented yet —
   [`decode_webp`](src/lib.rs) returns [`Error::NotImplemented`].
   Callers route the `VP8 ` payload via
@@ -88,7 +103,7 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
 
-## What round 6 lands
+## What round 7 lands
 
 | Item                          | Status                                              |
 | ----------------------------- | --------------------------------------------------- |
@@ -97,6 +112,7 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | §2.5 simple lossy             | structural pass — `VP8 ` chunk surfaced             |
 | §2.5 typed `VP8 ` handle      | **new** — RFC 6386 §9.1 keyframe peek + routing slice |
 | §2.6 simple lossless          | structural pass — `VP8L` chunk surfaced             |
+| §2.6 typed `VP8L` handle      | **new** — §3.4 / §7.1 image-header peek + routing slice |
 | §2.7 extended (VP8X et al.)   | structural pass — every documented FourCC surfaced  |
 | §2.7.1 VP8X flag-byte parse   | done (`I`/`L`/`E`/`X`/`A` + `Rsv`/`R` ignored)      |
 | §2.7.1 canvas dim decode      | done (24-bit LE × 2, 1-based)                       |
@@ -115,27 +131,44 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **97** (82 unit + 15 integration against the
-`docs/image/webp/fixtures/` corpus, including four new round-6
-integration tests that pull a typed `WebpLossyChunk` out of the
-real `lossy-1x1.webp` / `lossy-with-alpha-128x128.webp` fixtures
-and verify the §9.1 dims / partition / scale fields against the
-fixtures' `trace.txt` golden output, plus a `builder ↔ extractor`
-round-trip and a `from_chunk` direct construction test).
+Test count: **112** (92 unit + 20 integration against the
+`docs/image/webp/fixtures/` corpus). Round 7 adds 10 unit tests
+inside `vp8l_chunk::tests` (minimal 1×1, 16384×16384 max dims with
+alpha_is_used set, non-zero version surfacing, short-payload
+refusal, bad-signature refusal, trailing-image-stream borrow,
+non-VP8L FourCC refusal, walker round-trip, lossy-container
+returns None, simple-lossless returns Some) plus 5 integration
+tests that pull a typed `WebpLosslessChunk` out of the real
+`lossless-1x1.webp` and the newly-vendored
+`lossless-32x32-rgba.webp` fixtures and verify the §3.4 / §7.1
+dims / `alpha_is_used` / `version` fields against the fixtures'
+`trace.txt` golden output, plus a `builder ↔ extractor` round-trip
+and a `from_chunk` direct construction test.
 
 ## Clean-room sources
 
-Rounds 1 through 6 were implemented entirely against:
+Rounds 1 through 7 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
-  also available as `rfc9649-webp.pdf`). Round 6 cites §2.5 (the
-  simple-lossy file layout + its informative note that the VP8 frame
-  header carries the canvas dimensions). Earlier rounds cited §2.3
-  (generic RIFF chunk including the odd-size pad rule), §2.4
-  (`File Size` field accounting), §2.6 (simple-lossless layout),
-  §2.7 (extended-format chunk ordering), §2.7.1 Figure 7 (the VP8X
-  10-byte payload layout), §2.7.1.1 Figure 8 (`ANIM`), §2.7.1.1
-  Figure 9 (`ANMF`), and §2.7.1.2 Figure 10 (`ALPH`).
+  also available as `rfc9649-webp.pdf`). Round 7 cites §2.6 (the
+  simple-lossless file layout + its informative note that the VP8L
+  header carries the canvas dimensions). Round 6 cited §2.5 (the
+  simple-lossy file layout). Earlier rounds cited §2.3 (generic
+  RIFF chunk including the odd-size pad rule), §2.4 (`File Size`
+  field accounting), §2.7 (extended-format chunk ordering), §2.7.1
+  Figure 7 (the VP8X 10-byte payload layout), §2.7.1.1 Figure 8
+  (`ANIM`), §2.7.1.1 Figure 9 (`ANMF`), and §2.7.1.2 Figure 10
+  (`ALPH`).
+* **WebP Lossless Bitstream Specification** — `docs/image/webp/
+  google-webp-lossless-bitstream.html` (also reproduced in RFC 9649
+  §3). Round 7 cites §3.4 ("RIFF Header") for the on-wire layout
+  (one-byte `0x2F` signature; `width = ReadBits(14) + 1`;
+  `height = ReadBits(14) + 1`; `alpha_is_used = ReadBits(1)`;
+  `version_number = ReadBits(3)`) and §7.1 ("Basic Structure") for
+  the ABNF `image-header = %x2F image-size alpha-is-used version`
+  / `image-size = 14BIT 14BIT ; width - 1, height - 1`. The typed
+  `WebpLosslessChunk` handle decodes exactly these fields —
+  nothing past offset 5 of the VP8L payload is consulted.
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`). Round 6 cites §9.1
   ("Uncompressed Data Chunk") for the 3-byte frame tag layout
@@ -145,18 +178,20 @@ Rounds 1 through 6 were implemented entirely against:
   `WebpLossyChunk` handle decodes exactly these fields — nothing
   past offset 10 of the VP8 payload is consulted.
 * The 18-fixture corpus at `docs/image/webp/fixtures/` — consumed
-  as opaque byte streams. Round 6 cross-checks the `lossy-1x1`
-  trace's reported `width=1 height=1 partition_length=11 xscale=0
-  yscale=0` and the `lossy-with-alpha-128x128` trace's reported
-  `width=128 height=128 partition_length=328`. Round 5 round-trips
+  as opaque byte streams. Round 7 cross-checks the `lossless-1x1`
+  trace's reported `width=1 height=1 alpha_used=0 version=0` and
+  the newly-vendored `lossless-32x32-rgba` trace's reported
+  `width=32 height=32 alpha_used=1 version=0`. Round 6 cross-checked
+  the `lossy-1x1` and `lossy-with-alpha-128x128` `width` / `height`
+  / `partition_length` / `xscale` / `yscale`. Round 5 round-trips
   the `lossy-1x1.webp` / `lossless-1x1.webp` fixtures' own `VP8 ` /
   `VP8L` payloads back through the new builder; round 4 cross-checked
   the ANMF u24 LE decode against `animated-with-alpha/trace.txt`.
 
 No external library source — libwebp, libvpx, image-rs, webp-rs,
 etc. — was consulted. `cwebp` / `dwebp` would be permissible as
-black-box validators; rounds 1 through 6 did not invoke them
-directly (round 6 reads only the fixture bytes already committed
+black-box validators; rounds 1 through 7 did not invoke them
+directly (round 7 reads only the fixture bytes already committed
 to `docs/` / the in-crate `tests/data/`).
 
 ## License

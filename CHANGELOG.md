@@ -6,6 +6,69 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 7 (2026-05-22).** Typed §2.6 `VP8L` chunk
+  routing handle. New module `vp8l_chunk` exposes:
+  * `vp8l_chunk::WebpLosslessChunk` — a borrowed handle around a
+    §2.6 `VP8L` chunk payload. Decodes the 5-byte WebP-Lossless
+    §3.4 / §7.1 image-header (one-byte `0x2F` signature followed
+    by LE bit-packed 14-bit `width-1` + 14-bit `height-1` + 1-bit
+    `alpha_is_used` + 3-bit `version`) and surfaces resolved
+    1-based `width()` / `height()` plus raw `alpha_is_used()` /
+    `version()`. The chunk payload is exposed verbatim via
+    `bitstream()` so a downstream VP8L decoder can consume it.
+  * `vp8l_chunk::WebpLosslessChunk::from_chunk(buf, chunk)` /
+    `from_payload(slice)` constructors.
+  * `vp8l_chunk::extract_lossless(buf, container)` — pulls the
+    first `VP8L` chunk out of an already-walked container;
+    returns `Ok(None)` for `VP8 `-only files.
+  * `extract_lossless_chunk(bytes)` — top-level convenience wrapper
+    that walks the container and extracts in one call.
+  * `VP8L_SIGNATURE` / `VP8L_IMAGE_HEADER_LEN` public constants.
+  * Refusal modes: `NotVp8lChunk` / `PayloadTooShortForHeader` /
+    `BadSignature`. §3.4 says `version` MUST be `0`; the typed
+    handle surfaces it raw rather than refusing — the
+    version-mismatch policy belongs to the downstream decoder.
+* The handle is deliberately a **routing** surface — `oxideav-webp`
+  takes no runtime dependency on a VP8L decoder. A caller routes
+  the borrowed `bitstream()` slice to whichever lossless-WebP
+  decoder it wants.
+* 10 new unit tests inside `vp8l_chunk::tests` (minimal 1×1,
+  16384×16384 max dims with alpha hint set, non-zero version
+  surfacing, short-payload refusal, bad-signature refusal,
+  trailing-image-stream borrow, non-VP8L FourCC refusal, walker
+  round-trip, lossy-container returns None, simple-lossless
+  returns Some) plus a new `lossless-32x32-rgba.webp` fixture
+  in `tests/data/` (byte-for-byte copy of
+  `docs/image/webp/fixtures/lossless-32x32-rgba/input.webp`) +
+  5 new integration tests:
+  * `round7_lossless_1x1_fixture_extracts_to_typed_lossless_chunk_with_trace_dims`
+    cross-checks every §3.4 field against `lossless-1x1/trace.txt`.
+  * `round7_lossless_32x32_rgba_fixture_extracts_with_alpha_used_bit_set`
+    cross-checks the only `alpha_used=1` path in the in-crate
+    fixture corpus against `lossless-32x32-rgba/trace.txt`.
+  * `round7_lossy_fixture_extract_lossless_returns_none` confirms
+    `extract_lossless_chunk` returns `Ok(None)` on a `VP8 `-only file.
+  * `round7_lossless_chunk_payload_survives_round_trip_through_builder`
+    routes the extracted payload back through the round-5 builder
+    and re-extracts, locking down the writer ↔ router contract.
+  * `round7_lossless_chunk_from_chunk_works_on_walker_output`
+    exercises the `from_chunk` constructor directly.
+  Test count: **112** (was 97).
+
+### Changed
+
+* `Error` gained a `Lossless(vp8l_chunk::WebpLosslessError)` variant.
+
+### Notes
+
+`decode_webp` still returns `Error::NotImplemented`; the round-7
+typed handle is a hand-off layer, not a pixel decoder. The routing
+contract is one-way: this crate emits a typed
+`WebpLosslessChunk::bitstream()` slice, and the caller picks a
+VP8L decoder to consume it. That keeps `oxideav-webp`
+standalone-friendly — every public function still compiles under
+`--no-default-features` with no `oxideav-core` dependency.
+
 * **Clean-room round 6 (2026-05-22).** Typed §2.5 `VP8 ` chunk
   routing handle. New module `vp8_chunk` exposes:
   * `vp8_chunk::WebpLossyChunk` — a borrowed handle around a §2.5
