@@ -65,15 +65,29 @@
 //!   raw entropy-decoded ARGB stream, *before* any predictor /
 //!   color / subtract-green / color-indexing inverse pass. (Those
 //!   transforms operate on the buffer this loop produces.)
-//! * No §6.2.2 entropy-image / multi-group selection — this loop runs
-//!   a single [`PrefixCodeGroup`] over the whole image. The
-//!   multi-group path (one group per pixel block selected by an
-//!   entropy image) reuses the same per-symbol primitives but is a
-//!   future round.
 //! * No `oxideav-core` runtime dependency — this module compiles under
 //!   `--no-default-features`.
+//!
+//! ## §6.2.2 multi-group (entropy-image) path
+//!
+//! [`decode_argb`] is the full ARGB-role decode: it consumes the
+//! round-106 [`crate::meta_prefix::MetaPrefixHeader`] result and, when
+//! the meta-prefix bit selected multiple groups, decodes the §6.2.2
+//! *entropy image* (itself a §5 `entropy-coded-image` of size
+//! `DIV_ROUND_UP(width, 1<<prefix_bits)` ×
+//! `DIV_ROUND_UP(height, 1<<prefix_bits)`), derives
+//! `num_prefix_groups = max(entropy image) + 1`, reads that many
+//! [`PrefixCodeGroup`]s, and runs the per-pixel §6.2.3 loop selecting a
+//! group per block via
+//! `meta_index[(y >> prefix_bits) * block_width + (x >> prefix_bits)]`.
+//! The single-group case (meta-prefix bit zero, or a non-ARGB role)
+//! degrades to the same primitives with one group used everywhere.
+//! Per §6.2.2 the per-pixel meta-prefix code is the red+green channels
+//! of the entropy-image pixel: `(entropy_pixel >> 8) & 0xffff`.
 
-use crate::meta_prefix::PrefixCodeGroup;
+use crate::meta_prefix::{
+    ImageRole, MetaPrefixCodes, MetaPrefixError, MetaPrefixHeader, PrefixCodeGroup,
+};
 use crate::vp8l_prefix::PrefixError;
 use crate::vp8l_stream::{BitReader, BitReaderEof};
 
@@ -260,6 +274,29 @@ pub enum DecodeError {
         /// The total number of pixels in the image.
         total_pixels: usize,
     },
+    /// §5.2.3 / §6.2.2: reading the color-cache info, meta-prefix bit,
+    /// the entropy-image header, or one of the per-group prefix-code
+    /// groups failed.
+    MetaPrefix(MetaPrefixError),
+    /// §6.2.2: the entropy image's `prefix_image_width` /
+    /// `prefix_image_height` were zero (a degenerate header that yields
+    /// no blocks to select groups for).
+    EmptyEntropyImage {
+        /// The derived entropy-image width.
+        prefix_image_width: u32,
+        /// The derived entropy-image height.
+        prefix_image_height: u32,
+    },
+    /// §6.2.2: a pixel's block selected a meta-prefix code at or beyond
+    /// `num_prefix_groups` — i.e. an index larger than the maximum the
+    /// entropy image was supposed to contain. This can only arise from a
+    /// logic error in the caller, but is checked rather than panicking.
+    MetaPrefixIndexOutOfRange {
+        /// The selected meta-prefix code.
+        meta_prefix_code: usize,
+        /// The number of prefix-code groups that were read.
+        num_prefix_groups: usize,
+    },
 }
 
 impl From<BitReaderEof> for DecodeError {
@@ -273,6 +310,15 @@ impl From<PrefixError> for DecodeError {
         match e {
             PrefixError::Eof(eof) => Self::Eof(eof),
             other => Self::Prefix(other),
+        }
+    }
+}
+
+impl From<MetaPrefixError> for DecodeError {
+    fn from(e: MetaPrefixError) -> Self {
+        match e {
+            MetaPrefixError::Eof(eof) => Self::Eof(eof),
+            other => Self::MetaPrefix(other),
         }
     }
 }
@@ -304,6 +350,21 @@ impl core::fmt::Display for DecodeError {
             } => write!(
                 f,
                 "VP8L §5.2.2 image decode: backward reference length {length} at pixel {position} overruns the {total_pixels}-pixel image"
+            ),
+            Self::MetaPrefix(e) => write!(f, "VP8L §6.2.2 image decode meta-prefix: {e}"),
+            Self::EmptyEntropyImage {
+                prefix_image_width,
+                prefix_image_height,
+            } => write!(
+                f,
+                "VP8L §6.2.2 image decode: degenerate entropy image of size {prefix_image_width}x{prefix_image_height}"
+            ),
+            Self::MetaPrefixIndexOutOfRange {
+                meta_prefix_code,
+                num_prefix_groups,
+            } => write!(
+                f,
+                "VP8L §6.2.2 image decode: meta-prefix code {meta_prefix_code} out of range for {num_prefix_groups} prefix-code group(s)"
             ),
         }
     }
@@ -483,6 +544,99 @@ fn pack_argb(green: u8, red: u8, blue: u8, alpha: u8) -> u32 {
     ((alpha as u32) << 24) | ((red as u32) << 16) | ((green as u32) << 8) | (blue as u32)
 }
 
+/// Decode the single §6.2.3 symbol at the current position using
+/// `group`, appending the emitted pixel(s) to `pixels` and (when
+/// present) maintaining `color_cache` in stream order.
+///
+/// This is the per-symbol core shared by the single-group
+/// [`decode_image`] loop and the multi-group [`decode_argb`] loop. The
+/// only difference between the two callers is *which* group they pass
+/// for the symbol at the current pixel; the literal / LZ77 / color-cache
+/// dispatch below is identical (the spec switches the group per pixel in
+/// §6.2.2 but the §6.2.3 decode of each pixel is role-independent).
+///
+/// `width` is the image width (needed for the §5.2.2 distance map) and
+/// `total_pixels` is its pixel count (needed for the overrun check).
+/// `alphabet_size` and `cache_size` are derived once by the caller.
+#[allow(clippy::too_many_arguments)]
+fn decode_one_symbol(
+    reader: &mut BitReader<'_>,
+    group: &PrefixCodeGroup,
+    color_cache: &mut Option<ColorCache>,
+    pixels: &mut Vec<u32>,
+    width: u32,
+    total_pixels: usize,
+    alphabet_size: usize,
+    cache_size: usize,
+) -> Result<(), DecodeError> {
+    let s = group.green.read_symbol(reader)? as usize;
+    match GreenSymbol::classify(s, alphabet_size)? {
+        GreenSymbol::Literal { green } => {
+            // §5.2.1: green came from prefix #1 (already read as S);
+            // read red / blue / alpha from prefix #2 / #3 / #4.
+            let red = group.red.read_symbol(reader)? as u8;
+            let blue = group.blue.read_symbol(reader)? as u8;
+            let alpha = group.alpha.read_symbol(reader)? as u8;
+            let argb = pack_argb(green, red, blue, alpha);
+            pixels.push(argb);
+            if let Some(cache) = color_cache.as_mut() {
+                cache.insert(argb);
+            }
+        }
+        GreenSymbol::LengthPrefix { prefix_code } => {
+            // §5.2.2: length L from the length prefix code + extra.
+            let length = read_lz77_value(reader, prefix_code)? as usize;
+            // Distance: prefix code #5 → raw distance_code → map.
+            let dist_prefix = group.distance.read_symbol(reader)? as u32;
+            let distance_code = read_lz77_value(reader, dist_prefix)?;
+            let dist = distance_code_to_pixel_distance(distance_code, width);
+            let position = pixels.len();
+            if dist > position {
+                return Err(DecodeError::BackwardReferenceUnderflow {
+                    position,
+                    distance: dist,
+                });
+            }
+            if position + length > total_pixels {
+                return Err(DecodeError::BackwardReferenceOverflow {
+                    position,
+                    length,
+                    total_pixels,
+                });
+            }
+            // §5.2.2: copy L pixels from `position - dist`. The copy is
+            // byte-for-byte scan-line, and overlapping copies (dist <
+            // length) repeat the just-copied pixels, which is the
+            // standard LZ77 behaviour.
+            let src_start = position - dist;
+            for i in 0..length {
+                let argb = pixels[src_start + i];
+                pixels.push(argb);
+                if let Some(cache) = color_cache.as_mut() {
+                    cache.insert(argb);
+                }
+            }
+        }
+        GreenSymbol::ColorCache { index } => {
+            // §5.2.3: resolve the cache index to its ARGB.
+            let cache = color_cache
+                .as_mut()
+                .ok_or(DecodeError::ColorCacheIndexOutOfRange {
+                    index,
+                    cache_size: 0,
+                })?;
+            let argb = cache
+                .lookup(index)
+                .ok_or(DecodeError::ColorCacheIndexOutOfRange { index, cache_size })?;
+            pixels.push(argb);
+            // §5.2.3: every emitted pixel (even a cache hit) is
+            // re-inserted in stream order.
+            cache.insert(argb);
+        }
+    }
+    Ok(())
+}
+
 /// Decode one §5.2 entropy-coded ARGB image with a single
 /// [`PrefixCodeGroup`].
 ///
@@ -512,71 +666,294 @@ pub fn decode_image(
     let mut pixels: Vec<u32> = Vec::with_capacity(total_pixels);
 
     while pixels.len() < total_pixels {
-        let s = group.green.read_symbol(reader)? as usize;
-        match GreenSymbol::classify(s, alphabet_size)? {
-            GreenSymbol::Literal { green } => {
-                // §5.2.1: green came from prefix #1 (already read as S);
-                // read red / blue / alpha from prefix #2 / #3 / #4.
-                let red = group.red.read_symbol(reader)? as u8;
-                let blue = group.blue.read_symbol(reader)? as u8;
-                let alpha = group.alpha.read_symbol(reader)? as u8;
-                let argb = pack_argb(green, red, blue, alpha);
-                pixels.push(argb);
-                if let Some(cache) = color_cache.as_mut() {
-                    cache.insert(argb);
-                }
-            }
-            GreenSymbol::LengthPrefix { prefix_code } => {
-                // §5.2.2: length L from the length prefix code + extra.
-                let length = read_lz77_value(reader, prefix_code)? as usize;
-                // Distance: prefix code #5 → raw distance_code → map.
-                let dist_prefix = group.distance.read_symbol(reader)? as u32;
-                let distance_code = read_lz77_value(reader, dist_prefix)?;
-                let dist = distance_code_to_pixel_distance(distance_code, width);
-                let position = pixels.len();
-                if dist > position {
-                    return Err(DecodeError::BackwardReferenceUnderflow {
-                        position,
-                        distance: dist,
-                    });
-                }
-                if position + length > total_pixels {
-                    return Err(DecodeError::BackwardReferenceOverflow {
-                        position,
-                        length,
-                        total_pixels,
-                    });
-                }
-                // §5.2.2: copy L pixels from `position - dist`. The copy
-                // is byte-for-byte scan-line, and overlapping copies
-                // (dist < length) repeat the just-copied pixels, which
-                // is the standard LZ77 behaviour.
-                let src_start = position - dist;
-                for i in 0..length {
-                    let argb = pixels[src_start + i];
-                    pixels.push(argb);
-                    if let Some(cache) = color_cache.as_mut() {
-                        cache.insert(argb);
-                    }
-                }
-            }
-            GreenSymbol::ColorCache { index } => {
-                // §5.2.3: resolve the cache index to its ARGB.
-                let cache = color_cache
-                    .as_mut()
-                    .ok_or(DecodeError::ColorCacheIndexOutOfRange {
-                        index,
-                        cache_size: 0,
-                    })?;
-                let argb = cache
-                    .lookup(index)
-                    .ok_or(DecodeError::ColorCacheIndexOutOfRange { index, cache_size })?;
-                pixels.push(argb);
-                // §5.2.3: every emitted pixel (even a cache hit) is
-                // re-inserted in stream order.
-                cache.insert(argb);
-            }
+        decode_one_symbol(
+            reader,
+            group,
+            &mut color_cache,
+            &mut pixels,
+            width,
+            total_pixels,
+            alphabet_size,
+            cache_size,
+        )?;
+    }
+
+    Ok(DecodedImage {
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// §6.2.2 per-pixel meta-prefix index: the decoded entropy image folded
+/// into the one number each pixel block needs — its meta-prefix code,
+/// i.e. the index into the array of [`PrefixCodeGroup`]s.
+///
+/// The entropy image is a sub-resolution image of size
+/// `prefix_image_width × prefix_image_height` where each pixel covers a
+/// `(1 << prefix_bits) × (1 << prefix_bits)` block of the full ARGB
+/// image. Per §6.2.2 the meta-prefix code for a block is the red+green
+/// channels of the corresponding entropy-image pixel:
+/// `(entropy_pixel >> 8) & 0xffff`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaPrefixIndex {
+    /// §6.2.2 `prefix_bits` (`ReadBits(3) + 2`); a block is
+    /// `(1 << prefix_bits)` pixels wide and tall.
+    prefix_bits: u8,
+    /// `DIV_ROUND_UP(image_width, 1 << prefix_bits)`.
+    block_width: u32,
+    /// `DIV_ROUND_UP(image_height, 1 << prefix_bits)`.
+    block_height: u32,
+    /// `block_width * block_height` meta-prefix codes, scan-line order.
+    meta_codes: Vec<u16>,
+}
+
+impl MetaPrefixIndex {
+    /// §6.2.2 `prefix_bits`.
+    pub fn prefix_bits(&self) -> u8 {
+        self.prefix_bits
+    }
+
+    /// The entropy-image width in blocks (`prefix_image_width`).
+    pub fn block_width(&self) -> u32 {
+        self.block_width
+    }
+
+    /// The entropy-image height in blocks (`prefix_image_height`).
+    pub fn block_height(&self) -> u32 {
+        self.block_height
+    }
+
+    /// The per-block meta-prefix codes in scan-line order.
+    pub fn meta_codes(&self) -> &[u16] {
+        &self.meta_codes
+    }
+
+    /// §6.2.2 `num_prefix_groups = max(entropy image) + 1`. With no
+    /// blocks this is `0`; callers reject that as a degenerate header.
+    pub fn num_prefix_groups(&self) -> usize {
+        self.meta_codes
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m as usize + 1)
+            .unwrap_or(0)
+    }
+
+    /// §6.2.2 group selection for pixel `(x, y)`:
+    /// `meta_index[(y >> prefix_bits) * block_width + (x >> prefix_bits)]`.
+    pub fn meta_code_for(&self, x: u32, y: u32) -> u16 {
+        let bx = x >> self.prefix_bits;
+        let by = y >> self.prefix_bits;
+        let position = (by * self.block_width + bx) as usize;
+        self.meta_codes[position]
+    }
+}
+
+/// Decode the §6.2.2 *entropy image* into a [`MetaPrefixIndex`].
+///
+/// The entropy image is itself an `entropy-coded-image` (§7.3 ABNF):
+/// a §5.2.3 `color-cache-info` bit followed by a single prefix-code
+/// group and the §5.2 LZ77 / color-cache data. `reader` must be
+/// positioned at the start of that block — i.e. at the
+/// `entropy_image_bit_position` the round-106
+/// [`MetaPrefixHeader`] recorded for an
+/// [`MetaPrefixCodes::EntropyImagePending`] result. On return the
+/// reader sits at the start of the main ARGB image's prefix-code
+/// groups.
+///
+/// `prefix_bits`, `prefix_image_width`, and `prefix_image_height` are
+/// the dimensions the round-106 header already derived.
+pub fn decode_entropy_image(
+    reader: &mut BitReader<'_>,
+    prefix_bits: u8,
+    prefix_image_width: u32,
+    prefix_image_height: u32,
+) -> Result<MetaPrefixIndex, DecodeError> {
+    if prefix_image_width == 0 || prefix_image_height == 0 {
+        return Err(DecodeError::EmptyEntropyImage {
+            prefix_image_width,
+            prefix_image_height,
+        });
+    }
+
+    // The entropy image is an entropy-coded-image: color-cache-info +
+    // one prefix-code group, no §6.2.2 meta-prefix bit. The round-106
+    // reader handles exactly that for the `EntropyCoded` role.
+    let header = MetaPrefixHeader::read(
+        reader,
+        ImageRole::EntropyCoded,
+        prefix_image_width,
+        prefix_image_height,
+    )?;
+    let group = match &header.codes {
+        MetaPrefixCodes::Single { group } => group.as_ref(),
+        // EntropyImagePending is impossible for the EntropyCoded role
+        // (no meta-prefix bit is read), but guard rather than panic.
+        MetaPrefixCodes::EntropyImagePending { .. } => {
+            return Err(DecodeError::EmptyEntropyImage {
+                prefix_image_width,
+                prefix_image_height,
+            });
         }
+    };
+    let cache = header
+        .color_cache
+        .is_enabled()
+        .then(|| ColorCache::new(header.color_cache.code_bits));
+
+    let decoded = decode_image(
+        reader,
+        group,
+        cache,
+        prefix_image_width,
+        prefix_image_height,
+    )?;
+
+    // §6.2.2: meta_prefix_code = (entropy_pixel >> 8) & 0xffff — the
+    // red+green channels of each block's entropy-image pixel.
+    let meta_codes: Vec<u16> = decoded
+        .pixels()
+        .iter()
+        .map(|&argb| ((argb >> 8) & 0xffff) as u16)
+        .collect();
+
+    Ok(MetaPrefixIndex {
+        prefix_bits,
+        block_width: prefix_image_width,
+        block_height: prefix_image_height,
+        meta_codes,
+    })
+}
+
+/// Decode a full §5.1 ARGB-role image — the §6.2.2 multi-group path.
+///
+/// `reader` must be positioned at the start of the ARGB image's
+/// `spatially-coded-image`: the §5.2.3 `color-cache-info` bit, then the
+/// §6.2.2 meta-prefix bit. This function reads the round-106
+/// [`MetaPrefixHeader`] for the [`ImageRole::Argb`] role and dispatches:
+///
+/// * **single group** (`meta-prefix = %b0`): runs the §6.2.3 decode
+///   loop with the one group everywhere (identical to [`decode_image`]).
+/// * **multiple groups** (`meta-prefix = %b1`): decodes the §6.2.2
+///   entropy image via [`decode_entropy_image`], computes
+///   `num_prefix_groups = max(entropy image) + 1`, reads that many
+///   [`PrefixCodeGroup`]s, then runs the §6.2.3 loop selecting a group
+///   per pixel block via
+///   [`MetaPrefixIndex::meta_code_for`].
+///
+/// Returns a [`DecodedImage`] of `width * height` ARGB pixels in
+/// scan-line order, before any §4 inverse transform.
+pub fn decode_argb(
+    reader: &mut BitReader<'_>,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, DecodeError> {
+    let header = MetaPrefixHeader::read(reader, ImageRole::Argb, width, height)?;
+    let color_cache_size = header.color_cache.size();
+    let cache_code_bits = header.color_cache.code_bits;
+    let cache_enabled = header.color_cache.is_enabled();
+
+    match header.codes {
+        MetaPrefixCodes::Single { group } => {
+            let cache = cache_enabled.then(|| ColorCache::new(cache_code_bits));
+            decode_image(reader, &group, cache, width, height)
+        }
+        MetaPrefixCodes::EntropyImagePending {
+            prefix_bits,
+            image_width: prefix_image_width,
+            image_height: prefix_image_height,
+            ..
+        } => {
+            // The reader is already positioned at the entropy image
+            // start (just past the `prefix_bits` field).
+            let index =
+                decode_entropy_image(reader, prefix_bits, prefix_image_width, prefix_image_height)?;
+            let num_prefix_groups = index.num_prefix_groups();
+            if num_prefix_groups == 0 {
+                return Err(DecodeError::EmptyEntropyImage {
+                    prefix_image_width,
+                    prefix_image_height,
+                });
+            }
+
+            // §6.2.2: read num_prefix_groups prefix-code groups, each
+            // sized against the *main* ARGB color cache.
+            let mut groups: Vec<PrefixCodeGroup> = Vec::with_capacity(num_prefix_groups);
+            for _ in 0..num_prefix_groups {
+                groups.push(PrefixCodeGroup::read(reader, color_cache_size)?);
+            }
+
+            decode_argb_multi_group(
+                reader,
+                &groups,
+                &index,
+                cache_enabled,
+                cache_code_bits,
+                width,
+                height,
+            )
+        }
+    }
+}
+
+/// §6.2.2 / §6.2.3 multi-group decode loop: like [`decode_image`] but
+/// the group used for each pixel is selected by the entropy image.
+///
+/// `groups` holds the `num_prefix_groups` prefix-code groups, `index`
+/// the decoded entropy image. For each pixel `(x, y)` in scan-line
+/// order the meta-prefix code
+/// `index.meta_code_for(x, y)` indexes `groups`; that group decodes the
+/// pixel via the shared §6.2.3 [`decode_one_symbol`] core. A single
+/// color cache is maintained across the whole image in stream order
+/// (§5.2.3), independent of which group emitted the pixel.
+#[allow(clippy::too_many_arguments)]
+fn decode_argb_multi_group(
+    reader: &mut BitReader<'_>,
+    groups: &[PrefixCodeGroup],
+    index: &MetaPrefixIndex,
+    cache_enabled: bool,
+    cache_code_bits: u32,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, DecodeError> {
+    let cache_size = if cache_enabled {
+        1usize << cache_code_bits
+    } else {
+        0
+    };
+    let alphabet_size = PrefixCodeGroup::green_alphabet_size(cache_size);
+    let total_pixels = (width as usize) * (height as usize);
+    let mut color_cache = cache_enabled.then(|| ColorCache::new(cache_code_bits));
+    let mut pixels: Vec<u32> = Vec::with_capacity(total_pixels);
+
+    // The current pixel's (x, y) is derived from `pixels.len()` — the
+    // decode loop fills in scan-line order, and an LZ77 backref pushes
+    // multiple pixels at once but always lands the cursor back on the
+    // next undefined pixel. Group selection happens once per *symbol*,
+    // keyed by the position of the next pixel to emit (the spec selects
+    // the group for the pixel the decoder is about to decode).
+    while pixels.len() < total_pixels {
+        let position = pixels.len();
+        let x = (position % width as usize) as u32;
+        let y = (position / width as usize) as u32;
+        let meta_code = index.meta_code_for(x, y) as usize;
+        let group = groups
+            .get(meta_code)
+            .ok_or(DecodeError::MetaPrefixIndexOutOfRange {
+                meta_prefix_code: meta_code,
+                num_prefix_groups: groups.len(),
+            })?;
+        decode_one_symbol(
+            reader,
+            group,
+            &mut color_cache,
+            &mut pixels,
+            width,
+            total_pixels,
+            alphabet_size,
+            cache_size,
+        )?;
     }
 
     Ok(DecodedImage {
@@ -1089,6 +1466,228 @@ mod tests {
         match GreenSymbol::classify(280, alphabet) {
             Err(DecodeError::GreenSymbolOutOfRange { .. }) => {}
             other => panic!("expected GreenSymbolOutOfRange, got {other:?}"),
+        }
+    }
+
+    // ---- §6.2.2 entropy-image multi-group path ----
+
+    impl BitWriter {
+        /// Emit a §6.2 prefix-code group of five single-symbol simple
+        /// codes (GREEN / RED / BLUE / ALPHA / DIST), each carrying no
+        /// data bits in the §5.2 stream.
+        fn write_single_symbol_group(&mut self, g: u32, r: u32, b: u32, a: u32, d: u32) {
+            self.write_simple_single_symbol(g);
+            self.write_simple_single_symbol(r);
+            self.write_simple_single_symbol(b);
+            self.write_simple_single_symbol(a);
+            self.write_simple_single_symbol(d);
+        }
+    }
+
+    #[test]
+    fn meta_prefix_index_helpers_match_spec() {
+        // Build the index directly to exercise the §6.2.2 derivations.
+        let index = MetaPrefixIndex {
+            prefix_bits: 2, // block size 4
+            block_width: 2,
+            block_height: 1,
+            meta_codes: vec![0, 1],
+        };
+        // num_prefix_groups = max(0, 1) + 1 = 2.
+        assert_eq!(index.num_prefix_groups(), 2);
+        // §6.2.2 selection: position = (y>>2)*2 + (x>>2).
+        // Pixels 0..3 → block 0 → code 0; 4..7 → block 1 → code 1.
+        assert_eq!(index.meta_code_for(0, 0), 0);
+        assert_eq!(index.meta_code_for(3, 0), 0);
+        assert_eq!(index.meta_code_for(4, 0), 1);
+        assert_eq!(index.meta_code_for(7, 0), 1);
+    }
+
+    #[test]
+    fn meta_prefix_index_num_groups_uses_max_not_count() {
+        // A 2-block entropy image whose codes are {0, 5} → 6 groups
+        // (max + 1), not 2.
+        let index = MetaPrefixIndex {
+            prefix_bits: 2,
+            block_width: 2,
+            block_height: 1,
+            meta_codes: vec![0, 5],
+        };
+        assert_eq!(index.num_prefix_groups(), 6);
+    }
+
+    #[test]
+    fn decode_entropy_image_extracts_red_green_meta_codes() {
+        // A 2x1 entropy image. Pixel 0: green=0, red=0 → meta-code 0.
+        // Pixel 1: green=1, red=0 → meta-code 1. (meta = (red<<8)|green.)
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // entropy-image color-cache-info = disabled
+                            // GREEN code carries greens {0, 1}; RED/BLUE/ALPHA/DIST single 0.
+        w.write_simple_two_symbols(0, 1); // GREEN: 0 → bit 0, 1 → bit 1
+        w.write_simple_single_symbol(0); // RED  = 0
+        w.write_simple_single_symbol(0); // BLUE = 0
+        w.write_simple_single_symbol(0); // ALPHA= 0
+        w.write_simple_single_symbol(0); // DIST = 0
+        w.write_bits(0, 1); // entropy pixel 0 GREEN = 0
+        w.write_bits(1, 1); // entropy pixel 1 GREEN = 1
+        let data = w.into_bytes();
+        let mut r = BitReader::new(&data);
+        let index = decode_entropy_image(&mut r, 2, 2, 1).unwrap();
+        assert_eq!(index.prefix_bits(), 2);
+        assert_eq!(index.block_width(), 2);
+        assert_eq!(index.block_height(), 1);
+        assert_eq!(index.meta_codes(), &[0, 1]);
+        assert_eq!(index.num_prefix_groups(), 2);
+    }
+
+    #[test]
+    fn decode_entropy_image_high_meta_code_uses_red_channel() {
+        // A 1x1 entropy image with green=2, red=3 → meta = (3<<8)|2 = 770.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // color-cache disabled
+        w.write_simple_single_symbol(2); // GREEN = 2 (single leaf, no data bit)
+        w.write_simple_single_symbol(3); // RED   = 3
+        w.write_simple_single_symbol(0); // BLUE
+        w.write_simple_single_symbol(0); // ALPHA
+        w.write_simple_single_symbol(0); // DIST
+        let data = w.into_bytes();
+        let mut r = BitReader::new(&data);
+        let index = decode_entropy_image(&mut r, 2, 1, 1).unwrap();
+        assert_eq!(index.meta_codes(), &[(3u16 << 8) | 2]);
+        assert_eq!(index.num_prefix_groups(), 771);
+    }
+
+    #[test]
+    fn decode_argb_two_groups_select_per_block() {
+        // An 8x1 ARGB image, prefix_bits = 2 (block size 4) → 2 blocks.
+        // Block 0 (pixels 0..3) uses group 0 (green 100); block 1 (4..7)
+        // uses group 1 (green 200). Both groups single-symbol → main
+        // image data stream consumes no bits.
+        let mut w = BitWriter::new();
+        // --- spatially-coded-image header (ARGB role) ---
+        w.write_bits(0, 1); // main color-cache-info = disabled
+        w.write_bits(1, 1); // meta-prefix = 1 → multiple groups
+        w.write_bits(0, 3); // prefix_bits raw = 0 → 2 (block 4)
+                            // --- entropy image (2x1 entropy-coded-image) ---
+        w.write_bits(0, 1); // entropy color-cache-info = disabled
+        w.write_simple_two_symbols(0, 1); // GREEN {0,1}
+        w.write_simple_single_symbol(0); // RED
+        w.write_simple_single_symbol(0); // BLUE
+        w.write_simple_single_symbol(0); // ALPHA
+        w.write_simple_single_symbol(0); // DIST
+        w.write_bits(0, 1); // entropy pixel 0 GREEN = 0 → meta 0
+        w.write_bits(1, 1); // entropy pixel 1 GREEN = 1 → meta 1
+                            // --- num_prefix_groups = 2 prefix-code groups ---
+        w.write_single_symbol_group(100, 0x10, 0x20, 0x30, 0); // group 0
+        w.write_single_symbol_group(200, 0x40, 0x50, 0x60, 0); // group 1
+                                                               // --- main image data: 8 single-symbol literals, no bits ---
+        let data = w.into_bytes();
+        let mut r = BitReader::new(&data);
+        let img = decode_argb(&mut r, 8, 1).unwrap();
+        assert_eq!(img.width(), 8);
+        assert_eq!(img.height(), 1);
+        let g0 = pack_argb(100, 0x10, 0x20, 0x30);
+        let g1 = pack_argb(200, 0x40, 0x50, 0x60);
+        assert_eq!(
+            img.pixels(),
+            &[g0, g0, g0, g0, g1, g1, g1, g1],
+            "first 4 pixels use group 0, last 4 use group 1"
+        );
+    }
+
+    #[test]
+    fn decode_argb_single_group_meta_prefix_zero() {
+        // ARGB role, meta-prefix = 0 → one group everywhere. A 2x1 image
+        // with greens 7 and 8 via a two-symbol GREEN code.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // color-cache disabled
+        w.write_bits(0, 1); // meta-prefix = 0 → single group
+        w.write_simple_two_symbols(7, 8); // GREEN {7, 8}
+        w.write_simple_single_symbol(0xAA); // RED
+        w.write_simple_single_symbol(0xBB); // BLUE
+        w.write_simple_single_symbol(0xCC); // ALPHA
+        w.write_simple_single_symbol(0); // DIST
+        w.write_bits(0, 1); // pixel0 GREEN = 7
+        w.write_bits(1, 1); // pixel1 GREEN = 8
+        let data = w.into_bytes();
+        let mut r = BitReader::new(&data);
+        let img = decode_argb(&mut r, 2, 1).unwrap();
+        assert_eq!(
+            img.pixels(),
+            &[
+                pack_argb(7, 0xAA, 0xBB, 0xCC),
+                pack_argb(8, 0xAA, 0xBB, 0xCC)
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_argb_single_group_matches_decode_image() {
+        // The single-group decode_argb result must match a direct
+        // decode_image with the same group + stream tail.
+        let mut header = BitWriter::new();
+        header.write_bits(0, 1); // color-cache disabled
+        header.write_bits(0, 1); // meta-prefix = 0
+        header.write_single_symbol_group(0x42, 0x10, 0x20, 0x30, 0);
+        let data = header.into_bytes();
+        let mut r = BitReader::new(&data);
+        let img = decode_argb(&mut r, 1, 1).unwrap();
+        assert_eq!(img.pixels(), &[pack_argb(0x42, 0x10, 0x20, 0x30)]);
+    }
+
+    #[test]
+    fn decode_argb_multi_group_with_color_cache_round_2x2() {
+        // A 8x1 ARGB image with a color cache enabled. Two groups; group
+        // 0 emits literal green=50, group 1 emits literal green=60. The
+        // cache is maintained across blocks in stream order; this checks
+        // the multi-group loop threads a single cache through both
+        // groups without panicking and yields the expected literals.
+        let cache_bits = 4u32; // size 16
+        let cache_size = 1usize << cache_bits;
+        let mut w = BitWriter::new();
+        w.write_bits(1, 1); // main color-cache-info = enabled
+        w.write_bits(cache_bits, 4); // code_bits = 4
+        w.write_bits(1, 1); // meta-prefix = 1 → multi
+        w.write_bits(0, 3); // prefix_bits → 2 (block 4)
+                            // entropy image 2x1, codes {0, 1}, no cache.
+        w.write_bits(0, 1);
+        w.write_simple_two_symbols(0, 1);
+        w.write_simple_single_symbol(0);
+        w.write_simple_single_symbol(0);
+        w.write_simple_single_symbol(0);
+        w.write_simple_single_symbol(0);
+        w.write_bits(0, 1); // entropy pixel 0 → meta 0
+        w.write_bits(1, 1); // entropy pixel 1 → meta 1
+                            // 2 prefix-code groups, sized against the main cache.
+        w.write_single_symbol_group(50, 0x11, 0x22, 0x33, 0);
+        w.write_single_symbol_group(60, 0x44, 0x55, 0x66, 0);
+        let data = w.into_bytes();
+        let mut r = BitReader::new(&data);
+        let img = decode_argb(&mut r, 8, 1).unwrap();
+        let g0 = pack_argb(50, 0x11, 0x22, 0x33);
+        let g1 = pack_argb(60, 0x44, 0x55, 0x66);
+        assert_eq!(img.pixels(), &[g0, g0, g0, g0, g1, g1, g1, g1]);
+        // Sanity: cache was sized for the alphabet (so the group GREEN
+        // reads used the extended alphabet without overruns).
+        assert_eq!(
+            PrefixCodeGroup::green_alphabet_size(cache_size),
+            256 + 24 + cache_size
+        );
+    }
+
+    #[test]
+    fn decode_entropy_image_zero_dim_is_refused() {
+        let data = [0u8; 4];
+        let mut r = BitReader::new(&data);
+        match decode_entropy_image(&mut r, 2, 0, 1) {
+            Err(DecodeError::EmptyEntropyImage {
+                prefix_image_width,
+                prefix_image_height,
+            }) => {
+                assert_eq!(prefix_image_width, 0);
+                assert_eq!(prefix_image_height, 1);
+            }
+            other => panic!("expected EmptyEntropyImage, got {other:?}"),
         }
     }
 }

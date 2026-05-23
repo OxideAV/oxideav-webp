@@ -20,7 +20,9 @@ use oxideav_webp::container::fourcc;
 use oxideav_webp::meta_prefix::{ImageRole, MetaPrefixCodes, MetaPrefixHeader};
 use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
 use oxideav_webp::vp8l_chunk::{WebpLosslessChunk, VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE};
-use oxideav_webp::vp8l_decode::{decode_image, DecodeError};
+use oxideav_webp::vp8l_decode::{
+    decode_argb, decode_entropy_image, decode_image, DecodeError, MetaPrefixIndex,
+};
 use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
 use oxideav_webp::{
@@ -805,4 +807,137 @@ fn round107_decode_error_surfaces_through_crate_error() {
     };
     let wrapped: oxideav_webp::Error = e.into();
     assert!(matches!(wrapped, oxideav_webp::Error::Vp8lDecode(_)));
+}
+
+/// LSB-first bit writer for the round-108 synthetic-stream tests.
+struct R108BitWriter {
+    bytes: Vec<u8>,
+    bit_pos: usize,
+}
+impl R108BitWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            bit_pos: 0,
+        }
+    }
+    fn write_bits(&mut self, mut value: u32, n: usize) {
+        for _ in 0..n {
+            let byte_idx = self.bit_pos >> 3;
+            if byte_idx >= self.bytes.len() {
+                self.bytes.push(0);
+            }
+            let bit = (value & 1) as u8;
+            self.bytes[byte_idx] |= bit << (self.bit_pos & 7);
+            self.bit_pos += 1;
+            value >>= 1;
+        }
+    }
+    /// §6.2.1 simple-code single-symbol code (length-1 leaf, 8-bit form).
+    fn simple_single(&mut self, sym: u32) {
+        self.write_bits(1, 1); // simple flag
+        self.write_bits(0, 1); // num_symbols - 1 = 0
+        self.write_bits(1, 1); // is_first_8bits = 1
+        self.write_bits(sym, 8);
+    }
+    /// §6.2.1 simple-code two-symbol code, both length 1.
+    fn simple_two(&mut self, a: u32, b: u32) {
+        self.write_bits(1, 1);
+        self.write_bits(1, 1); // num_symbols - 1 = 1
+        self.write_bits(1, 1);
+        self.write_bits(a, 8);
+        self.write_bits(b, 8);
+    }
+    fn group_single(&mut self, g: u32, r: u32, b: u32, a: u32, d: u32) {
+        self.simple_single(g);
+        self.simple_single(r);
+        self.simple_single(b);
+        self.simple_single(a);
+        self.simple_single(d);
+    }
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+#[test]
+fn round108_decode_argb_multi_group_through_public_api() {
+    // The §6.2.2 multi-group ARGB decode reached through the public
+    // `decode_argb` entry point. An 8×1 ARGB image, prefix_bits=2 (block
+    // size 4) → 2 horizontal blocks. The entropy image (2×1) selects
+    // group 0 for block 0 (pixels 0..3) and group 1 for block 1
+    // (pixels 4..7). Group 0 emits green=111; group 1 emits green=222.
+    let mut w = R108BitWriter::new();
+    // spatially-coded-image header (ARGB role)
+    w.write_bits(0, 1); // main color-cache-info = disabled
+    w.write_bits(1, 1); // meta-prefix = 1 → multi-group
+    w.write_bits(0, 3); // prefix_bits raw = 0 → 2 (block 4)
+                        // entropy image: 2×1 entropy-coded-image
+    w.write_bits(0, 1); // entropy color-cache-info = disabled
+    w.simple_two(0, 1); // GREEN {0, 1}
+    w.simple_single(0); // RED
+    w.simple_single(0); // BLUE
+    w.simple_single(0); // ALPHA
+    w.simple_single(0); // DIST
+    w.write_bits(0, 1); // entropy pixel 0 GREEN = 0 → meta-code 0
+    w.write_bits(1, 1); // entropy pixel 1 GREEN = 1 → meta-code 1
+                        // 2 prefix-code groups
+    w.group_single(111, 0x10, 0x20, 0x30, 0);
+    w.group_single(222, 0x40, 0x50, 0x60, 0);
+    // main image data: 8 single-symbol literals → no bits.
+    let data = w.into_bytes();
+
+    let mut r = BitReader::new(&data);
+    let img = decode_argb(&mut r, 8, 1).expect("multi-group ARGB decodes");
+    assert_eq!(img.width(), 8);
+    assert_eq!(img.height(), 1);
+    let pixels = img.pixels();
+    // First block: group 0; second block: group 1.
+    for &p in &pixels[0..4] {
+        assert_eq!(p & 0x0000_ff00, 111u32 << 8, "block 0 green should be 111");
+    }
+    for &p in &pixels[4..8] {
+        assert_eq!(p & 0x0000_ff00, 222u32 << 8, "block 1 green should be 222");
+    }
+}
+
+#[test]
+fn round108_decode_argb_single_group_through_public_api() {
+    // The single-group path of the same public `decode_argb`: meta-prefix
+    // bit 0 → one group everywhere. A 3×1 image whose single-leaf GREEN
+    // (no data bits) makes all three pixels the same literal.
+    let mut w = R108BitWriter::new();
+    w.write_bits(0, 1); // color-cache disabled
+    w.write_bits(0, 1); // meta-prefix = 0 → single group
+    w.group_single(0x33, 0x21, 0x22, 0x23, 0); // GREEN=0x33 single-leaf
+    let data = w.into_bytes();
+    let mut r = BitReader::new(&data);
+    let img = decode_argb(&mut r, 3, 1).expect("single-group ARGB decodes");
+    // All three pixels are the same literal:
+    // (alpha=0x23, red=0x21, green=0x33, blue=0x22).
+    let expected = (0x23u32 << 24) | (0x21u32 << 16) | (0x33u32 << 8) | 0x22u32;
+    assert_eq!(img.pixels(), &[expected, expected, expected]);
+}
+
+#[test]
+fn round108_decode_entropy_image_public_api_and_num_groups() {
+    // `decode_entropy_image` is public: decode a 2×1 entropy image and
+    // confirm the §6.2.2 meta-code extraction + num_prefix_groups.
+    let mut w = R108BitWriter::new();
+    w.write_bits(0, 1); // color-cache disabled
+    w.simple_two(0, 4); // GREEN {0, 4}
+    w.simple_single(0); // RED
+    w.simple_single(0); // BLUE
+    w.simple_single(0); // ALPHA
+    w.simple_single(0); // DIST
+    w.write_bits(0, 1); // pixel 0 GREEN = 0 → meta 0
+    w.write_bits(1, 1); // pixel 1 GREEN = 4 → meta 4
+    let data = w.into_bytes();
+    let mut r = BitReader::new(&data);
+    let index: MetaPrefixIndex = decode_entropy_image(&mut r, 2, 2, 1).unwrap();
+    assert_eq!(index.meta_codes(), &[0, 4]);
+    // num_prefix_groups = max(0,4) + 1 = 5 (max-based, not block count).
+    assert_eq!(index.num_prefix_groups(), 5);
+    assert_eq!(index.meta_code_for(0, 0), 0);
+    assert_eq!(index.meta_code_for(4, 0), 4);
 }

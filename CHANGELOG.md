@@ -6,6 +6,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 108 (2026-05-24).** VP8L §6.2.2 entropy-image
+  multi-group ARGB decode — the piece that turns the round-106
+  meta-prefix dispatch and the round-107 single-group §5.2 loop into a
+  full multi-group ARGB decode. New `vp8l_decode` surface:
+  * `vp8l_decode::decode_argb(reader, width, height)` — the full
+    ARGB-role decode. Reads the round-106 `MetaPrefixHeader` for the
+    `Argb` role and dispatches: `meta-prefix = %b0` runs the
+    single-group `decode_image` path; `meta-prefix = %b1` decodes the
+    §6.2.2 entropy image, derives `num_prefix_groups = max(entropy
+    image) + 1`, reads that many `PrefixCodeGroup`s, and runs the
+    §6.2.3 loop selecting a group per pixel block.
+  * `vp8l_decode::decode_entropy_image(reader, prefix_bits,
+    prefix_image_width, prefix_image_height)` — decodes the §6.2.2
+    entropy image (itself a §5 `entropy-coded-image`) into a
+    `MetaPrefixIndex`. Each block's meta-prefix code is the red+green
+    channels of its entropy-image pixel: `(argb >> 8) & 0xffff`.
+  * `vp8l_decode::MetaPrefixIndex` — the per-block meta-prefix codes
+    plus `prefix_bits` / `block_width` / `block_height`. Exposes
+    `num_prefix_groups()` (max-based, not block count) and
+    `meta_code_for(x, y)` (`meta[(y >> prefix_bits) * block_width +
+    (x >> prefix_bits)]`).
+  * New `DecodeError` variants `MetaPrefix` / `EmptyEntropyImage` /
+    `MetaPrefixIndexOutOfRange`, plus a `From<MetaPrefixError>` impl.
+* 9 new unit tests in `vp8l_decode::tests` (meta-index helpers and
+  max-based `num_prefix_groups`; entropy-image red+green meta-code
+  extraction incl. the high-code red-channel path; two-group per-block
+  selection; single-group `decode_argb`; single-group parity with
+  `decode_image`; multi-group with a shared color cache; zero-dim
+  entropy-image refusal) and 3 integration tests in `fixture_walks`
+  (public `decode_argb` multi-group + single-group, public
+  `decode_entropy_image` with max-based group count).
 * **Clean-room round 107 (2026-05-24).** VP8L §5.2 LZ77
   backward-reference + §5.2.3 color-cache per-pixel ARGB decode loop —
   the §6.2.3 decoder that consumes symbols from a round-106

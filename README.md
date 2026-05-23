@@ -2,7 +2,7 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 107)
+## Status — 2026-05-24 (clean-room round 108)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -151,6 +151,30 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   layer is §5.2 LZ77 backward-reference + §5.2.3 color-cache *symbol*
   decode — the per-pixel decoder that consumes symbols from a
   `PrefixCodeGroup`.
+* **VP8L §6.2.2 entropy-image multi-group ARGB decode (round 108):**
+  [`vp8l_decode::decode_argb`] is the full ARGB-role decode. It reads
+  the round-106 [`meta_prefix::MetaPrefixHeader`] for the `Argb` role
+  and, when the §6.2.2 meta-prefix bit is set, decodes the *entropy
+  image* — itself a §5 `entropy-coded-image` of size
+  `DIV_ROUND_UP(width, 1<<prefix_bits)` ×
+  `DIV_ROUND_UP(height, 1<<prefix_bits)` — via
+  [`vp8l_decode::decode_entropy_image`] into a
+  [`vp8l_decode::MetaPrefixIndex`]. Per §6.2.2 each block's meta-prefix
+  code is the red+green channels of its entropy-image pixel
+  (`(argb >> 8) & 0xffff`); `num_prefix_groups = max(entropy image) + 1`
+  (the *maximum* code plus one, not the block count). The decoder reads
+  that many [`meta_prefix::PrefixCodeGroup`]s, then runs the §6.2.3
+  per-pixel loop selecting a group per block via
+  `meta_index[(y >> prefix_bits) * block_width + (x >> prefix_bits)]`.
+  A single §5.2.3 color cache is threaded across all groups in stream
+  order. The single-group case (meta-prefix bit zero) degrades to the
+  round-107 [`vp8l_decode::decode_image`] path. The §6.2.3 per-pixel
+  core is now a shared helper used by both the single- and multi-group
+  loops, so the literal / LZ77 / color-cache dispatch is identical in
+  both. Standalone-friendly (compiles under `--no-default-features`).
+  This completes the §5 / §6 lossless entropy stage; the remaining
+  lossless work is the §4 inverse-transform passes that consume this
+  decode's ARGB buffer.
 * **VP8L §5.2 per-pixel ARGB decode loop (round 107):** new module
   `vp8l_decode`. [`vp8l_decode::decode_image`] runs the §6.2.3
   per-pixel decode loop over a single
@@ -222,6 +246,20 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   next.
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
+
+## What round 108 lands
+
+| Item                                              | Status                                                |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| §6.2.2 entropy-image decode → meta-index          | **new** — `decode_entropy_image` → `MetaPrefixIndex`  |
+| §6.2.2 meta-prefix code = `(argb >> 8) & 0xffff`  | **new** — red+green channels per block                |
+| §6.2.2 `num_prefix_groups = max(entropy)+1`       | **new** — `MetaPrefixIndex::num_prefix_groups`        |
+| §6.2.2 read `num_prefix_groups` prefix groups     | **new** — `decode_argb` group-array read              |
+| §6.2.2 per-pixel group selection                  | **new** — `MetaPrefixIndex::meta_code_for`            |
+| §6.2.2 full multi-group ARGB decode               | **new** — `decode_argb` (`EntropyImagePending` arm)   |
+| §6.2.2 single-group ARGB decode (`%b0`)           | **new** — `decode_argb` (`Single` arm) → `decode_image` |
+| Shared §6.2.3 per-pixel core (single + multi)     | **new** — `decode_one_symbol`                         |
+| Degenerate / out-of-range meta-index refusal      | **new** — `EmptyEntropyImage` / `MetaPrefixIndexOutOfRange` |
 
 ## What round 107 lands
 
@@ -307,8 +345,16 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **195** (166 unit + 29 integration against the
-`docs/image/webp/fixtures/` corpus). Round 107 adds 24 unit tests
+Test count: **207** (175 unit + 32 integration against the
+`docs/image/webp/fixtures/` corpus). Round 108 adds 9 unit tests
+inside `vp8l_decode::tests` (`MetaPrefixIndex` selection + max-based
+`num_prefix_groups`; entropy-image red+green meta-code extraction
+including the high-code red-channel path; two-group per-block decode;
+single-group `decode_argb`; single-group parity with `decode_image`;
+multi-group with a shared color cache; zero-dim entropy-image refusal)
+plus 3 integration tests in `fixture_walks` (public `decode_argb`
+multi-group + single-group, public `decode_entropy_image` with the
+max-based group count). Round 107 adds 24 unit tests
 inside `vp8l_decode::tests` (§5.2.2 LZ77 value transform across prefix
 codes 0–6 and the length-4096 boundary at prefix 23; distance map
 length / first-entry spec examples / above-120 offset / negative-offset

@@ -67,6 +67,19 @@
 //!   scan-line order (before any §4 inverse transform). Includes the
 //!   §5.2.2 prefix→value transform, the 120-element distance map, and
 //!   the §5.2.3 `0x1e35a7bd` color cache.
+//! * [`vp8l_decode::decode_argb`] — the §6.2.2 multi-group ARGB decode
+//!   (round 108). Reads the round-106 [`meta_prefix::MetaPrefixHeader`]
+//!   for the ARGB role and, when the meta-prefix bit selects multiple
+//!   groups, decodes the §6.2.2 *entropy image*
+//!   ([`vp8l_decode::decode_entropy_image`] →
+//!   [`vp8l_decode::MetaPrefixIndex`]), derives
+//!   `num_prefix_groups = max(entropy image) + 1`, reads that many
+//!   prefix-code groups, and runs the §6.2.3 loop selecting a group per
+//!   pixel block via
+//!   `meta_index[(y >> prefix_bits) * block_width + (x >> prefix_bits)]`.
+//!   Single-group images degrade to the round-107 path. Per §6.2.2 each
+//!   block's meta-prefix code is the red+green channels of its
+//!   entropy-image pixel (`(argb >> 8) & 0xffff`).
 //!
 //! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
 //! bitstream remain stubs returning [`Error::NotImplemented`]; the
