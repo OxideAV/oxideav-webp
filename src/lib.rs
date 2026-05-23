@@ -41,6 +41,15 @@
 //!   `alpha_is_used` bit + 3-bit `version`) and exposes the chunk
 //!   payload via [`vp8l_chunk::WebpLosslessChunk::bitstream`] for
 //!   routing to an external VP8L decoder.
+//! * [`vp8l_stream::TransformList`] — the §4 transform-presence loop
+//!   (round 99): each present transform's leading fixed fields, stopping
+//!   at the first §5 entropy-coded body.
+//! * [`vp8l_prefix::PrefixCode`] — the §6.2.1 prefix-code reader
+//!   (round 104): reads a single canonical prefix code's lengths off
+//!   the wire (simple or normal code length code) and decodes symbols
+//!   one at a time. This is the first piece of the §5 / §6 entropy
+//!   machinery the §4 transform bodies and the main image stream both
+//!   consume.
 //!
 //! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
 //! bitstream remain stubs returning [`Error::NotImplemented`]; the
@@ -59,6 +68,7 @@ pub mod build;
 pub mod container;
 pub mod vp8_chunk;
 pub mod vp8l_chunk;
+pub mod vp8l_prefix;
 pub mod vp8l_stream;
 pub mod vp8x;
 
@@ -88,6 +98,8 @@ pub enum Error {
     Lossless(vp8l_chunk::WebpLosslessError),
     /// The §4 VP8L transform-list reader rejected the bitstream.
     Vp8lTransform(vp8l_stream::TransformListError),
+    /// The §6.2.1 VP8L prefix-code reader rejected the bitstream.
+    Vp8lPrefix(vp8l_prefix::PrefixError),
 }
 
 impl core::fmt::Display for Error {
@@ -103,6 +115,7 @@ impl core::fmt::Display for Error {
             Self::Lossy(e) => write!(f, "oxideav-webp lossy: {e}"),
             Self::Lossless(e) => write!(f, "oxideav-webp lossless: {e}"),
             Self::Vp8lTransform(e) => write!(f, "oxideav-webp vp8l-transform: {e}"),
+            Self::Vp8lPrefix(e) => write!(f, "oxideav-webp vp8l-prefix: {e}"),
         }
     }
 }
@@ -160,6 +173,12 @@ impl From<vp8l_chunk::WebpLosslessError> for Error {
 impl From<vp8l_stream::TransformListError> for Error {
     fn from(e: vp8l_stream::TransformListError) -> Self {
         Self::Vp8lTransform(e)
+    }
+}
+
+impl From<vp8l_prefix::PrefixError> for Error {
+    fn from(e: vp8l_prefix::PrefixError) -> Self {
+        Self::Vp8lPrefix(e)
     }
 }
 

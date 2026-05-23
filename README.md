@@ -2,7 +2,7 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 99)
+## Status — 2026-05-24 (clean-room round 104)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -116,15 +116,57 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   continue. Top-level [`read_vp8l_transform_list`](src/lib.rs) walks
   the container, extracts the `VP8L` chunk, and returns the parsed
   list. Standalone-friendly (compiles under `--no-default-features`).
+* **VP8L §6.2.1 prefix-code reader + canonical decoder (round 104):**
+  new module `vp8l_prefix`. [`vp8l_prefix::PrefixCode`] is a built
+  canonical prefix code over an alphabet of a given size.
+  [`PrefixCode::read`](src/vp8l_prefix.rs) reads one code's lengths off
+  the wire — dispatching on the §6.2.1 leading 1-bit flag between the
+  "Simple Code Length Code" (1–2 symbols, each length 1) and the
+  "Normal Code Length Code" (the 19-symbol code-length-code read in
+  `kCodeLengthCodeOrder`, the `max_symbol` gate, and the literal
+  `[0..15]` / repeat-`16` / zero-run-`17`/`18` expansion) — and builds
+  the decoder; [`PrefixCode::from_code_lengths`](src/vp8l_prefix.rs)
+  builds straight from a per-symbol length table.
+  [`PrefixCode::read_symbol`](src/vp8l_prefix.rs) decodes one symbol at
+  a time, MSB-first within a code, matching the canonical
+  `(length, value)` assignment the spec's `[Huffman]` reference fixes.
+  The §6.2.1 single-leaf-node tree (one symbol at length 1, reading
+  consumes no bits) is handled, and the completeness rule
+  (`sum 2^-len == 1`) is enforced with integer Kraft arithmetic —
+  over-/under-subscribed codes are refused. A new
+  [`vp8l_stream::BitReader::seek_to_bit`](src/vp8l_stream.rs) lets a
+  caller resume reading at a recorded boundary (e.g.
+  [`TransformList::body_bit_position`]). Standalone-friendly (compiles
+  under `--no-default-features`). The §6.2.1 reader is the foundation
+  every §5 / §6 consumer needs; §6.2.2 (meta prefix codes / entropy
+  image) and §5.2 (the LZ77 + color-cache pixel stream) are next.
 * **Pixel decode (VP8 / VP8L / ALPH bitstream):** not implemented yet —
   [`decode_webp`](src/lib.rs) returns [`Error::NotImplemented`].
   Callers route the `VP8 ` payload via
   [`extract_lossy_chunk`](src/lib.rs) to an external VP8 decoder.
-  The round-99 §4 transform list is the first step of the lossless
-  pixel path; the §5 entropy decode (prefix codes / Huffman code
-  groups / LZ77 / color cache) is the next section.
+  Round 99 landed the §4 transform list (first step of the lossless
+  pixel path); round 104 lands the §6.2.1 canonical-prefix-code
+  reader (the entropy primitive every §5 / §6 consumer needs).
+  §6.2.2 meta prefix codes and §5.2 LZ77 + color-cache decode are
+  next.
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
+
+## What round 104 lands
+
+| Item                                  | Status                                                |
+| ------------------------------------- | ----------------------------------------------------- |
+| §6.2.1 prefix-code dispatch (1-bit)   | **new** — simple/normal flag (`vp8l_prefix`)          |
+| §6.2.1 Simple Code Length Code        | **new** — 1–2 symbols at length 1 (1-bit or 8-bit)    |
+| §6.2.1 Normal Code Length Code        | **new** — 19-sym CLC in `kCodeLengthCodeOrder`        |
+| §6.2.1 `max_symbol` gate              | **new** — alphabet default + 2 + ReadBits(length_nbits) |
+| §6.2.1 literal lengths `[0..15]`      | **new** — direct length emit                          |
+| §6.2.1 repeat code `16`               | **new** — `3 + ReadBits(2)` previous-non-zero replay  |
+| §6.2.1 zero-run codes `17` / `18`     | **new** — `3 + ReadBits(3)` / `11 + ReadBits(7)`      |
+| §6.2.1 canonical decoder              | **new** — `(length, value)` order, MSB-first reads    |
+| §6.2.1 single-leaf-node exception     | **new** — reading consumes no bits                    |
+| §6.2.1 completeness (Kraft = 1)       | **new** — integer arithmetic; over/under refused      |
+| `BitReader::seek_to_bit`              | **new** — resume at recorded body boundaries          |
 
 ## What round 99 lands
 
@@ -136,7 +178,7 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | §4.3 subtract-green           | **new** — bodyless, loop continues past it          |
 | §4.4 color-indexing fields    | **new** — `color_table_size` + `width_bits`         |
 | §4 "used only once" rule      | **new** — `DuplicateTransform` refusal              |
-| §4 transform §5 body          | not yet — reader stops + reports `body_bit_position` |
+| §4 transform §5 body          | **r104 reader** consumes the §6.2.1 prefix-code start |
 | §2.4 WebP file header check   | done (`RIFF` + `File Size` + `WEBP`)                |
 | §2.3 chunk walker             | done (FourCC, Size, payload range, odd-size pad)    |
 | §2.5 simple lossy             | structural pass — `VP8 ` chunk surfaced             |
@@ -161,24 +203,28 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **133** (110 unit + 23 integration against the
-`docs/image/webp/fixtures/` corpus). Round 99 adds 18 unit tests
-inside `vp8l_stream::tests` (LSB-first single/multi-bit reads,
-byte-boundary-crossing read, full-u32 read, 0-bit no-op, EOF
-position/demand reporting, image-header seek, `TransformType`
-mapping, `width_bits` thresholds, empty list, subtract-green-only
-list, predictor/color/color-indexing stop-at-body, the
-subtract-green→predictor fixture shape, duplicate-transform
-refusal, truncated-list EOF, transform type/body helpers) plus 3
-integration tests that read the §4 transform list out of the real
-`lossless-1x1.webp` (`ColorIndexing num_colors=1 width_bits=3`) and
-`lossless-32x32-rgba.webp` (`SubtractGreen` then `Predictor
-size_bits=9`, halting at bit 49) fixtures against their `trace.txt`
-golden output, plus a `None`-for-lossy check.
+Test count: **151** (127 unit + 24 integration against the
+`docs/image/webp/fixtures/` corpus). Round 104 adds 16 unit tests
+inside `vp8l_prefix::tests` (single-leaf no-bit read, two-symbol
+canonical assignment, the classic `[1,2,3,3]` canonical example
+decoded in value order, over-subscribed / incomplete / empty /
+length-too-large refusals, simple 1-bit / 8-bit / two-symbol codes,
+simple symbol-out-of-range refusal, normal CLC with direct lengths,
+normal zero-run `18`, normal repeat `16`, normal max_symbol-too-large
+refusal, truncated-code EOF) + 1 new
+`vp8l_stream::tests::seek_to_bit_repositions_and_clamps` + 1
+integration test
+(`round104_lossless_1x1_color_table_prefix_group_matches_fixture_bytes`)
+that resumes at the COLOR_INDEXING §5 body of `lossless-1x1.webp`,
+reads the §5 color-cache info bit (0, matching the fixture trace's
+`color_cache_bits=0`) and the full 5-code prefix group, and asserts
+the single symbols GREEN=60 / RED=180 / BLUE=90 / ALPHA=255 / DIST=0
+(the single ARGB palette color 255,180,60,90) decoded purely from
+the fixture's own VP8L payload bytes.
 
 ## Clean-room sources
 
-Rounds 1 through 99 were implemented entirely against:
+Rounds 1 through 104 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
   also available as `rfc9649-webp.pdf`). Round 7 cites §2.6 (the
@@ -209,7 +255,26 @@ Rounds 1 through 99 were implemented entirely against:
   data), and §4.4 for `color_table_size = ReadBits(8) + 1` plus the
   `width_bits` pixel-bundling threshold table. The §4 transform
   *data* (sub-resolution images / color table, all §5-encoded) is
-  not decoded — the reader stops at that boundary.
+  not decoded — the reader stops at that boundary. Round 104 cites
+  §6.1 ("Most of the data is coded using a canonical prefix code"),
+  §6.2.1 ("Decoding and Building the Prefix Codes") for the leading
+  1-bit simple/normal flag dispatch, "Simple Code Length Code" for
+  the `num_symbols = ReadBits(1) + 1` and
+  `symbol0 = ReadBits(1 + 7*is_first_8bits)` layout, "Normal Code
+  Length Code" for the `num_code_lengths = 4 + ReadBits(4)`,
+  `kCodeLengthCodes = 19`, `kCodeLengthCodeOrder`, the
+  `max_symbol = alphabet_size | 2 + ReadBits(length_nbits)` gate,
+  the literal `[0..15]` code-length emission, the repeat `16`
+  (`3 + ReadBits(2)`), the zero-run `17` (`3 + ReadBits(3)`) and
+  `18` (`11 + ReadBits(7)`), and the single-leaf-node tree
+  exception. The canonical-prefix-code construction itself is the
+  `[Huffman]`-referenced canonical assignment fixed across the
+  family of canonical-prefix-code formats (codes assigned in
+  `(length, value)` order, read MSB-first within a code) and is
+  implemented from first principles via integer Kraft completeness
+  checking. The §6.2.2 meta-prefix-code section, §3.7 color cache,
+  and §5.2 LZ77 backward-reference layers all consume `PrefixCode`
+  symbols but are *not* implemented here.
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`). Round 6 cites §9.1
   ("Uncompressed Data Chunk") for the 3-byte frame tag layout
@@ -219,8 +284,15 @@ Rounds 1 through 99 were implemented entirely against:
   `WebpLossyChunk` handle decodes exactly these fields — nothing
   past offset 10 of the VP8 payload is consulted.
 * The 18-fixture corpus at `docs/image/webp/fixtures/` — consumed
-  as opaque byte streams. Round 99 cross-checks the §4 transform
-  list decoded from `lossless-1x1` against its trace's
+  as opaque byte streams. Round 104 walks `lossless-1x1.webp`'s
+  VP8L payload directly to derive a golden anchor — color-cache
+  bit = 0, then a 5-code prefix group each carrying a single
+  symbol (GREEN=60 / RED=180 / BLUE=90 / ALPHA=255 / DIST=0,
+  i.e. ARGB = 255,180,60,90, the single palette color of this 1×1
+  image). The fixture trace's `VP8L_COLOR_CACHE color_cache_bits=0`
+  / `VP8L_HUFFMAN_GROUP num_htree_groups=1` lines confirm the
+  derivation. Round 99 cross-checks the §4 transform list decoded
+  from `lossless-1x1` against its trace's
   `VP8L_TRANSFORM type=3 COLOR_INDEXING` / `num_colors=1
   packed_bits=3`, and from `lossless-32x32-rgba` against its
   trace's `type=2 SUBTRACT_GREEN` then `type=0 PREDICTOR bits=9`

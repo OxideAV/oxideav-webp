@@ -133,6 +133,17 @@ impl<'a> BitReader<'a> {
         self.bit_pos
     }
 
+    /// Reposition the bit cursor to an absolute bit offset from the
+    /// start of the slice.
+    ///
+    /// Used to resume reading at a boundary recorded earlier — e.g.
+    /// [`TransformList::body_bit_position`], where the §5 entropy-coded
+    /// body of a transform (or the main image stream) begins. The offset
+    /// is clamped to the end of the slice.
+    pub fn seek_to_bit(&mut self, bit_pos: usize) {
+        self.bit_pos = bit_pos.min(self.data.len() * 8);
+    }
+
     /// Bits remaining from the cursor to the end of the slice.
     pub fn bits_remaining(&self) -> usize {
         self.data.len() * 8 - self.bit_pos
@@ -491,6 +502,20 @@ mod tests {
         }
         // Position must not advance on a failed read.
         assert_eq!(r.bit_position(), 4);
+    }
+
+    #[test]
+    fn seek_to_bit_repositions_and_clamps() {
+        let data = [0x00u8, 0xFF];
+        let mut r = BitReader::new(&data);
+        r.seek_to_bit(8);
+        assert_eq!(r.bit_position(), 8);
+        // The byte at offset 8..16 is 0xFF.
+        assert_eq!(r.read_bits(8).unwrap(), 0xFF);
+        // Seeking past the end clamps to the slice length.
+        r.seek_to_bit(1000);
+        assert_eq!(r.bit_position(), 16);
+        assert_eq!(r.bits_remaining(), 0);
     }
 
     #[test]

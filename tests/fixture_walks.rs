@@ -19,7 +19,8 @@ use oxideav_webp::build::{ImageKind, Vp8xFlags};
 use oxideav_webp::container::fourcc;
 use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
 use oxideav_webp::vp8l_chunk::{WebpLosslessChunk, VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE};
-use oxideav_webp::vp8l_stream::{Transform, TransformType};
+use oxideav_webp::vp8l_prefix::PrefixCode;
+use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
 use oxideav_webp::{
     build_vp8x_chunk, build_webp_file, extract_lossless_chunk, extract_lossy_chunk,
     parse_alph_header, parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
@@ -520,4 +521,79 @@ fn round99_transform_list_returns_none_for_lossy_fixture() {
     // A simple-lossy file has no VP8L chunk, so the transform-list
     // reader returns Ok(None).
     assert!(read_vp8l_transform_list(LOSSY_1X1).unwrap().is_none());
+}
+
+#[test]
+fn round104_lossless_1x1_color_table_prefix_group_matches_fixture_bytes() {
+    // The round-99 §4 reader stops at the COLOR_INDEXING transform's §5
+    // body. The body is the color-table image — itself a §5
+    // entropy-coded stream that begins with the §5 color-cache info bit
+    // and then a §6.2 prefix-code group (5 canonical prefix codes).
+    //
+    // This test resumes at the recorded body bit position and decodes
+    // that prefix-code group with the round-104 §6.2.1 reader. The
+    // golden values are derived purely from the fixture's VP8L payload
+    // bytes (docs/image/webp/fixtures/lossless-1x1/input.webp) walked by
+    // hand against the §2 bit-reader + §6.2.1 pseudocode:
+    //   * color-cache use bit = 0 (matches trace VP8L_COLOR_CACHE
+    //     color_cache_bits=0),
+    //   * GREEN  = simple code, single symbol 60,
+    //   * RED    = simple code, single symbol 180,
+    //   * BLUE   = simple code, single symbol 90,
+    //   * ALPHA  = simple code, single symbol 255,
+    //   * DIST   = simple code, single symbol 0.
+    // (ARGB = 255,180,60,90 — the single palette color of this 1×1 image.)
+    let handle = extract_lossless_chunk(LOSSLESS_1X1)
+        .expect("lossless-1x1 parses")
+        .expect("lossless-1x1 has a VP8L chunk");
+    let payload = handle.bitstream();
+
+    // Read the §4 transform list to find where the COLOR_INDEXING §5
+    // body begins.
+    let mut reader = BitReader::new_after_image_header(payload);
+    let list = TransformList::read(&mut reader).expect("transform list reads");
+    assert!(list.stopped_at_entropy_body());
+    assert!(matches!(
+        list.transforms()[0],
+        Transform::ColorIndexing { .. }
+    ));
+
+    // Resume at the body: the color-table image stream.
+    reader.seek_to_bit(list.body_bit_position());
+
+    // §5 color-cache info bit (and, here, no cache size since the bit is
+    // 0). The color table is not in the ARGB role, so there is no
+    // meta-Huffman bit — a single prefix-code group follows directly.
+    let use_color_cache = reader.read_bit().expect("color-cache bit");
+    assert!(!use_color_cache, "trace color_cache_bits=0");
+    let cache_size = 0usize;
+
+    // Prefix-code group: GREEN+length+cache, RED, BLUE, ALPHA, DIST.
+    let green_alphabet = 256 + 24 + cache_size;
+    let green = PrefixCode::read(&mut reader, green_alphabet).expect("GREEN code");
+    assert_eq!(green.single_symbol(), Some(60), "GREEN single symbol");
+
+    let red = PrefixCode::read(&mut reader, 256).expect("RED code");
+    assert_eq!(red.single_symbol(), Some(180), "RED single symbol");
+
+    let blue = PrefixCode::read(&mut reader, 256).expect("BLUE code");
+    assert_eq!(blue.single_symbol(), Some(90), "BLUE single symbol");
+
+    let alpha = PrefixCode::read(&mut reader, 256).expect("ALPHA code");
+    assert_eq!(alpha.single_symbol(), Some(255), "ALPHA single symbol");
+
+    let dist = PrefixCode::read(&mut reader, 40).expect("DIST code");
+    assert_eq!(dist.single_symbol(), Some(0), "DIST single symbol");
+
+    // Each single-symbol code consumes no bits when its symbol is read.
+    let before = reader.bit_position();
+    assert_eq!(green.read_symbol(&mut reader).unwrap(), 60);
+    assert_eq!(red.read_symbol(&mut reader).unwrap(), 180);
+    assert_eq!(blue.read_symbol(&mut reader).unwrap(), 90);
+    assert_eq!(alpha.read_symbol(&mut reader).unwrap(), 255);
+    assert_eq!(
+        reader.bit_position(),
+        before,
+        "single-leaf reads consume 0 bits"
+    );
 }

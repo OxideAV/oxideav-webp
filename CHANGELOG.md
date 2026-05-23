@@ -6,6 +6,65 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 104 (2026-05-24).** VP8L §6.2.1 prefix-code
+  reader + canonical decoder — the first piece of the §5 / §6 entropy
+  machinery that sits on top of the round-99 §4 transform list. New
+  module `vp8l_prefix` exposes:
+  * `vp8l_prefix::PrefixCode` — a built canonical prefix code over an
+    alphabet. `PrefixCode::read(reader, alphabet_size)` reads one
+    code's lengths off the wire (dispatching on the §6.2.1 leading
+    simple/normal flag) and builds the decoder;
+    `PrefixCode::from_code_lengths(lengths)` builds straight from a
+    per-symbol length table; `read_symbol(reader)` decodes one symbol
+    at a time (MSB-first within a code, matching the canonical
+    `(length, value)` assignment). The §6.2.1 single-leaf-node tree is
+    handled (one symbol at length 1, reading consumes no bits) and the
+    completeness rule (`sum 2^-len == 1`) is enforced via integer
+    Kraft arithmetic — over-/under-subscribed codes are refused.
+  * `vp8l_prefix::read_code_lengths(reader, alphabet_size)` — the
+    §6.2.1 "Simple Code Length Code" (flag 1: 1–2 symbols at length 1)
+    and "Normal Code Length Code" (flag 0: the 19-symbol
+    code-length-code read in `kCodeLengthCodeOrder`, the `max_symbol`
+    gate, and the literal `[0..15]` / repeat-`16` / zero-run-`17`/`18`
+    expansion).
+  * `vp8l_prefix::PrefixError` + public `NUM_CODE_LENGTH_CODES` /
+    `CODE_LENGTH_CODE_ORDER` / `MAX_CODE_LENGTH` constants.
+  * `vp8l_stream::BitReader::seek_to_bit(bit_pos)` — repositions the
+    cursor to an absolute bit offset (clamped to the slice end) so a
+    caller can resume reading at a recorded boundary, e.g.
+    `TransformList::body_bit_position()`.
+* 16 new unit tests in `vp8l_prefix::tests` (single-leaf no-bit read,
+  two-symbol canonical assignment, the classic `[1,2,3,3]` canonical
+  example decoded in value order, over-subscribed / incomplete / empty
+  / length-too-large refusals, simple 1-bit / 8-bit / two-symbol
+  codes, simple symbol-out-of-range refusal, normal CLC with direct
+  lengths, normal zero-run `18`, normal repeat `16`, normal
+  max_symbol-too-large refusal, truncated-code EOF) + 1
+  `vp8l_stream::tests::seek_to_bit_repositions_and_clamps` + 1
+  integration test:
+  * `round104_lossless_1x1_color_table_prefix_group_matches_fixture_bytes`
+    resumes at the COLOR_INDEXING §5 body of `lossless-1x1.webp`,
+    reads the §5 color-cache info bit (0, matching the fixture trace's
+    `color_cache_bits=0`) and the full 5-code prefix group, and
+    asserts the single symbols GREEN=60 / RED=180 / BLUE=90 /
+    ALPHA=255 / DIST=0 (the single ARGB palette color 255,180,60,90)
+    decoded purely from the fixture's own VP8L payload bytes.
+  Test count: **151** (was 133).
+* The reader is **standalone-friendly** — `vp8l_prefix` compiles
+  under `--no-default-features` with no `oxideav-core` dependency.
+
+### Changed
+
+* `Error` gained a `Vp8lPrefix(vp8l_prefix::PrefixError)` variant.
+
+### Notes
+
+`decode_webp` still returns `Error::NotImplemented`. Round 104 builds
+the canonical-prefix-code primitive every §5 / §6 consumer needs.
+The next sections are §6.2.2 (meta prefix codes / entropy image —
+which *prefix-code group* applies to a pixel block) and §5.2 (the
+LZ77 + color-cache pixel stream that reads symbols from a group).
+
 * **Clean-room round 99 (2026-05-24).** VP8L bit-reader + §4
   transform-list reader. New module `vp8l_stream` exposes:
   * `vp8l_stream::BitReader` — the WebP-Lossless §2 `ReadBits(n)`
