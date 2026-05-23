@@ -19,9 +19,11 @@ use oxideav_webp::build::{ImageKind, Vp8xFlags};
 use oxideav_webp::container::fourcc;
 use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
 use oxideav_webp::vp8l_chunk::{WebpLosslessChunk, VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE};
+use oxideav_webp::vp8l_stream::{Transform, TransformType};
 use oxideav_webp::{
     build_vp8x_chunk, build_webp_file, extract_lossless_chunk, extract_lossy_chunk,
     parse_alph_header, parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
+    read_vp8l_transform_list,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
@@ -458,4 +460,64 @@ fn round5_build_vp8x_chunk_round_trips_through_typed_parser_with_flags() {
     // The builder zero-fills every Reserved bit + the 24-bit reserved
     // field, so the parser's forward-compat signal must stay clear.
     assert!(!h.has_unknown);
+}
+
+#[test]
+fn round99_lossless_1x1_transform_list_is_color_indexing_from_fixture() {
+    // docs/image/webp/fixtures/lossless-1x1/trace.txt records:
+    //   VP8L_TRANSFORM order=0 type=3 name=COLOR_INDEXING
+    //   VP8L_TRANSFORM_PARAM type=3 num_colors=1 packed_bits=3
+    // The §4 reader stops at the color-indexing transform's §5 body.
+    let list = read_vp8l_transform_list(LOSSLESS_1X1)
+        .expect("transform list reads")
+        .expect("VP8L chunk present");
+    assert_eq!(list.transforms().len(), 1);
+    match list.transforms()[0] {
+        Transform::ColorIndexing {
+            color_table_size,
+            width_bits,
+        } => {
+            assert_eq!(color_table_size, 1, "trace num_colors=1");
+            assert_eq!(width_bits, 3, "trace packed_bits=3");
+        }
+        other => panic!("expected ColorIndexing, got {other:?}"),
+    }
+    assert_eq!(
+        list.transforms()[0].transform_type(),
+        TransformType::ColorIndexing
+    );
+    // Color-indexing carries a §5 color table — the reader halts there.
+    assert!(list.stopped_at_entropy_body());
+}
+
+#[test]
+fn round99_lossless_32x32_rgba_transform_list_matches_fixture_prefix() {
+    // docs/image/webp/fixtures/lossless-32x32-rgba/trace.txt records:
+    //   order=0 type=2 SUBTRACT_GREEN
+    //   order=1 type=0 PREDICTOR  (TRANSFORM_PARAM bits=9)
+    //   order=2 type=1 CROSS_COLOR
+    // The §4 reader can advance past SUBTRACT_GREEN (no body) but
+    // stops at PREDICTOR (§5 sub-resolution image), so it surfaces the
+    // first two transforms only.
+    let list = read_vp8l_transform_list(LOSSLESS_32X32_RGBA)
+        .expect("transform list reads")
+        .expect("VP8L chunk present");
+    assert_eq!(list.transforms().len(), 2);
+    assert_eq!(list.transforms()[0], Transform::SubtractGreen);
+    match list.transforms()[1] {
+        Transform::Predictor { size_bits } => assert_eq!(size_bits, 9, "trace bits=9"),
+        other => panic!("expected Predictor, got {other:?}"),
+    }
+    assert!(list.stopped_at_entropy_body());
+    // SUBTRACT_GREEN = 3 bits (present + 2-bit type), PREDICTOR =
+    // present + 2-bit type + 3-bit size_bits = 6 bits; image-header is
+    // 40 bits. So the §5 body begins at bit 40 + 3 + 6 = 49.
+    assert_eq!(list.body_bit_position(), 49);
+}
+
+#[test]
+fn round99_transform_list_returns_none_for_lossy_fixture() {
+    // A simple-lossy file has no VP8L chunk, so the transform-list
+    // reader returns Ok(None).
+    assert!(read_vp8l_transform_list(LOSSY_1X1).unwrap().is_none());
 }

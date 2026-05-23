@@ -59,6 +59,7 @@ pub mod build;
 pub mod container;
 pub mod vp8_chunk;
 pub mod vp8l_chunk;
+pub mod vp8l_stream;
 pub mod vp8x;
 
 #[cfg(feature = "registry")]
@@ -85,6 +86,8 @@ pub enum Error {
     Lossy(vp8_chunk::WebpLossyError),
     /// The §2.6 typed `VP8L` chunk handle rejected the chunk payload.
     Lossless(vp8l_chunk::WebpLosslessError),
+    /// The §4 VP8L transform-list reader rejected the bitstream.
+    Vp8lTransform(vp8l_stream::TransformListError),
 }
 
 impl core::fmt::Display for Error {
@@ -99,6 +102,7 @@ impl core::fmt::Display for Error {
             Self::Build(e) => write!(f, "oxideav-webp build: {e}"),
             Self::Lossy(e) => write!(f, "oxideav-webp lossy: {e}"),
             Self::Lossless(e) => write!(f, "oxideav-webp lossless: {e}"),
+            Self::Vp8lTransform(e) => write!(f, "oxideav-webp vp8l-transform: {e}"),
         }
     }
 }
@@ -150,6 +154,12 @@ impl From<vp8_chunk::WebpLossyError> for Error {
 impl From<vp8l_chunk::WebpLosslessError> for Error {
     fn from(e: vp8l_chunk::WebpLosslessError) -> Self {
         Self::Lossless(e)
+    }
+}
+
+impl From<vp8l_stream::TransformListError> for Error {
+    fn from(e: vp8l_stream::TransformListError) -> Self {
+        Self::Vp8lTransform(e)
     }
 }
 
@@ -270,6 +280,31 @@ pub fn extract_lossless_chunk(
 ) -> Result<Option<vp8l_chunk::WebpLosslessChunk<'_>>, Error> {
     let c = container::parse(bytes)?;
     vp8l_chunk::extract_lossless(bytes, &c).map_err(Into::into)
+}
+
+/// Walk a `RIFF/WEBP` buffer, extract its §2.6 / §3.4 `VP8L` chunk,
+/// and read the §4 transform-presence list that follows the 5-byte
+/// VP8L image-header.
+///
+/// Returns `Ok(None)` if the file carries no `VP8L` chunk. Otherwise
+/// returns the parsed [`vp8l_stream::TransformList`] — the transforms
+/// in read order plus the bit position where the §5 entropy-coded
+/// image data (or the first transform's §5 body) begins.
+///
+/// This is the round-99 surface: it reads each transform's leading
+/// fixed-size fields (predictor / color `size_bits`, color-indexing
+/// `color_table_size`) but does **not** decode the §5 entropy-coded
+/// transform bodies or image data — those are returned-to boundaries
+/// for the next layer.
+pub fn read_vp8l_transform_list(bytes: &[u8]) -> Result<Option<vp8l_stream::TransformList>, Error> {
+    let c = container::parse(bytes)?;
+    let chunk = match vp8l_chunk::extract_lossless(bytes, &c)? {
+        Some(chunk) => chunk,
+        None => return Ok(None),
+    };
+    let mut reader = vp8l_stream::BitReader::new_after_image_header(chunk.bitstream());
+    let list = vp8l_stream::TransformList::read(&mut reader)?;
+    Ok(Some(list))
 }
 
 /// Decode a WebP file to pixels.

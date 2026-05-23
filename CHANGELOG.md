@@ -6,6 +6,69 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 99 (2026-05-24).** VP8L bit-reader + §4
+  transform-list reader. New module `vp8l_stream` exposes:
+  * `vp8l_stream::BitReader` — the WebP-Lossless §2 `ReadBits(n)`
+    primitive. Bytes are consumed in stream order, bits of each byte
+    least-significant-bit-first, and a multi-bit read returns a `u32`
+    whose bit 0 is the first bit read off the wire (matching the
+    spec's `b = ReadBits(2)` ≡ `b = ReadBits(1); b |= ReadBits(1) <<
+    1` rule). `read_bits(n)` / `read_bit()` /
+    `new_after_image_header(payload)` (seeks past the 5-byte §3.4
+    image-header) / `bit_position()` / `bits_remaining()`. EOF is a
+    typed `BitReaderEof { bit_pos, wanted, available }` that does not
+    advance the cursor.
+  * `vp8l_stream::TransformList::read(reader)` — the §4
+    `while (ReadBits(1))` transform-presence loop. For each present
+    transform it decodes the leading fixed `ReadBits` fields:
+    `Predictor` / `Color` `size_bits = ReadBits(3) + 2` (§4.1 / §4.2),
+    `SubtractGreen` (no data, §4.3), and `ColorIndexing`
+    `color_table_size = ReadBits(8) + 1` plus the derived
+    pixel-bundling `width_bits` (§4.4). §4's "each transform used
+    only once" rule is enforced (`DuplicateTransform`). The reader
+    **stops** at the first transform carrying a §5 entropy-coded body
+    (sub-resolution image / color table) it cannot yet decode and
+    records `body_bit_position()` + `stopped_at_entropy_body()` so the
+    next-round §5 reader resumes there; `SubtractGreen` (bodyless)
+    lets the loop continue.
+  * `vp8l_stream::Transform` / `TransformType` enums +
+    `Transform::transform_type()` / `has_entropy_body()` helpers.
+  * `read_vp8l_transform_list(bytes)` — top-level convenience: walks
+    the container, extracts the `VP8L` chunk, reads its §4 transform
+    list; returns `Ok(None)` for `VP8 `-only files.
+* 18 new unit tests in `vp8l_stream::tests` (LSB-first
+  single/multi-bit reads, byte-boundary read, full-u32 read, 0-bit
+  no-op, EOF position/demand reporting, image-header seek,
+  `TransformType` mapping, `width_bits` thresholds, empty list,
+  subtract-green-only list, predictor/color/color-indexing
+  stop-at-body, subtract-green→predictor fixture shape,
+  duplicate-transform refusal, truncated-list EOF, transform helpers)
+  plus 3 integration tests:
+  * `round99_lossless_1x1_transform_list_is_color_indexing_from_fixture`
+    cross-checks the §4 list decoded from `lossless-1x1.webp` against
+    its `trace.txt` (`COLOR_INDEXING num_colors=1 packed_bits=3`).
+  * `round99_lossless_32x32_rgba_transform_list_matches_fixture_prefix`
+    cross-checks the `SUBTRACT_GREEN` → `PREDICTOR size_bits=9`
+    prefix and the bit-49 stop boundary against the fixture trace.
+  * `round99_transform_list_returns_none_for_lossy_fixture`.
+  Test count: **133** (was 112).
+* The reader is **standalone-friendly** — `vp8l_stream` and
+  `read_vp8l_transform_list` compile under `--no-default-features`
+  with no `oxideav-core` dependency.
+
+### Changed
+
+* `Error` gained a `Vp8lTransform(vp8l_stream::TransformListError)`
+  variant.
+
+### Notes
+
+`decode_webp` still returns `Error::NotImplemented`. Round 99 is the
+first step of the lossless pixel path: it reads the §2 bit-reader
+foundation and the §4 transform list, stopping at the §5 entropy
+boundary. The §5 entropy decode (prefix codes / Huffman code groups
+/ LZ77 / color cache) is the next section.
+
 * **Clean-room round 7 (2026-05-22).** Typed §2.6 `VP8L` chunk
   routing handle. New module `vp8l_chunk` exposes:
   * `vp8l_chunk::WebpLosslessChunk` — a borrowed handle around a

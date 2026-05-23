@@ -2,7 +2,7 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-22 (clean-room round 7)
+## Status — 2026-05-24 (clean-room round 99)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -96,17 +96,47 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   router). **No** runtime dependency on `oxideav-vp8l`: the typed
   chunk is a hand-off surface that lets a caller route the
   bitstream to whichever VP8L decoder it wants.
+* **VP8L bit-reader + §4 transform-list reader (round 99):** new
+  module `vp8l_stream`. [`vp8l_stream::BitReader`] implements the
+  WebP-Lossless §2 `ReadBits(n)` primitive — bytes in stream order,
+  bits least-significant-bit-first, the first bit read becoming bit 0
+  of the returned integer. [`vp8l_stream::TransformList::read`] walks
+  the §4 `while (ReadBits(1))` transform-presence loop and decodes
+  each present transform's leading fixed-size fields: the §4.1 / §4.2
+  `size_bits = ReadBits(3) + 2` block-size for `Predictor` / `Color`,
+  nothing for `SubtractGreen` (§4.3), and the §4.4
+  `color_table_size = ReadBits(8) + 1` plus the derived pixel-bundling
+  `width_bits` for `ColorIndexing`. §4's "each transform used only
+  once" rule is enforced (`DuplicateTransform`). The reader **stops**
+  at the first transform that carries a §5 entropy-coded body (a
+  sub-resolution image or color table it cannot yet decode) and
+  records the bit offset via
+  [`TransformList::body_bit_position`] so the next-round §5 reader
+  resumes exactly there; `SubtractGreen` (bodyless) lets the loop
+  continue. Top-level [`read_vp8l_transform_list`](src/lib.rs) walks
+  the container, extracts the `VP8L` chunk, and returns the parsed
+  list. Standalone-friendly (compiles under `--no-default-features`).
 * **Pixel decode (VP8 / VP8L / ALPH bitstream):** not implemented yet —
   [`decode_webp`](src/lib.rs) returns [`Error::NotImplemented`].
   Callers route the `VP8 ` payload via
   [`extract_lossy_chunk`](src/lib.rs) to an external VP8 decoder.
+  The round-99 §4 transform list is the first step of the lossless
+  pixel path; the §5 entropy decode (prefix codes / Huffman code
+  groups / LZ77 / color cache) is the next section.
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
 
-## What round 7 lands
+## What round 99 lands
 
 | Item                          | Status                                              |
 | ----------------------------- | --------------------------------------------------- |
+| §2 VP8L `ReadBits(n)` reader  | **new** — LSB-first bit reader (`vp8l_stream`)      |
+| §4 transform-presence loop    | **new** — `while (ReadBits(1))` + 2-bit type        |
+| §4.1/§4.2 predictor/color `size_bits` | **new** — `ReadBits(3) + 2` leading field   |
+| §4.3 subtract-green           | **new** — bodyless, loop continues past it          |
+| §4.4 color-indexing fields    | **new** — `color_table_size` + `width_bits`         |
+| §4 "used only once" rule      | **new** — `DuplicateTransform` refusal              |
+| §4 transform §5 body          | not yet — reader stops + reports `body_bit_position` |
 | §2.4 WebP file header check   | done (`RIFF` + `File Size` + `WEBP`)                |
 | §2.3 chunk walker             | done (FourCC, Size, payload range, odd-size pad)    |
 | §2.5 simple lossy             | structural pass — `VP8 ` chunk surfaced             |
@@ -131,23 +161,24 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **112** (92 unit + 20 integration against the
-`docs/image/webp/fixtures/` corpus). Round 7 adds 10 unit tests
-inside `vp8l_chunk::tests` (minimal 1×1, 16384×16384 max dims with
-alpha_is_used set, non-zero version surfacing, short-payload
-refusal, bad-signature refusal, trailing-image-stream borrow,
-non-VP8L FourCC refusal, walker round-trip, lossy-container
-returns None, simple-lossless returns Some) plus 5 integration
-tests that pull a typed `WebpLosslessChunk` out of the real
-`lossless-1x1.webp` and the newly-vendored
-`lossless-32x32-rgba.webp` fixtures and verify the §3.4 / §7.1
-dims / `alpha_is_used` / `version` fields against the fixtures'
-`trace.txt` golden output, plus a `builder ↔ extractor` round-trip
-and a `from_chunk` direct construction test.
+Test count: **133** (110 unit + 23 integration against the
+`docs/image/webp/fixtures/` corpus). Round 99 adds 18 unit tests
+inside `vp8l_stream::tests` (LSB-first single/multi-bit reads,
+byte-boundary-crossing read, full-u32 read, 0-bit no-op, EOF
+position/demand reporting, image-header seek, `TransformType`
+mapping, `width_bits` thresholds, empty list, subtract-green-only
+list, predictor/color/color-indexing stop-at-body, the
+subtract-green→predictor fixture shape, duplicate-transform
+refusal, truncated-list EOF, transform type/body helpers) plus 3
+integration tests that read the §4 transform list out of the real
+`lossless-1x1.webp` (`ColorIndexing num_colors=1 width_bits=3`) and
+`lossless-32x32-rgba.webp` (`SubtractGreen` then `Predictor
+size_bits=9`, halting at bit 49) fixtures against their `trace.txt`
+golden output, plus a `None`-for-lossy check.
 
 ## Clean-room sources
 
-Rounds 1 through 7 were implemented entirely against:
+Rounds 1 through 99 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
   also available as `rfc9649-webp.pdf`). Round 7 cites §2.6 (the
@@ -168,7 +199,17 @@ Rounds 1 through 7 were implemented entirely against:
   the ABNF `image-header = %x2F image-size alpha-is-used version`
   / `image-size = 14BIT 14BIT ; width - 1, height - 1`. The typed
   `WebpLosslessChunk` handle decodes exactly these fields —
-  nothing past offset 5 of the VP8L payload is consulted.
+  nothing past offset 5 of the VP8L payload is consulted. Round 99
+  cites §2 ("Bit Reading") for the `ReadBits(n)`
+  least-significant-bit-first contract (the `b = ReadBits(2)` ≡
+  `b = ReadBits(1); b |= ReadBits(1) << 1` example), §4
+  ("Transforms") for the `while (ReadBits(1))` transform-presence
+  loop and the `TransformType` 2-bit enum, §4.1 / §4.2 for
+  `size_bits = ReadBits(3) + 2`, §4.3 (subtract-green carries no
+  data), and §4.4 for `color_table_size = ReadBits(8) + 1` plus the
+  `width_bits` pixel-bundling threshold table. The §4 transform
+  *data* (sub-resolution images / color table, all §5-encoded) is
+  not decoded — the reader stops at that boundary.
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`). Round 6 cites §9.1
   ("Uncompressed Data Chunk") for the 3-byte frame tag layout
@@ -178,7 +219,13 @@ Rounds 1 through 7 were implemented entirely against:
   `WebpLossyChunk` handle decodes exactly these fields — nothing
   past offset 10 of the VP8 payload is consulted.
 * The 18-fixture corpus at `docs/image/webp/fixtures/` — consumed
-  as opaque byte streams. Round 7 cross-checks the `lossless-1x1`
+  as opaque byte streams. Round 99 cross-checks the §4 transform
+  list decoded from `lossless-1x1` against its trace's
+  `VP8L_TRANSFORM type=3 COLOR_INDEXING` / `num_colors=1
+  packed_bits=3`, and from `lossless-32x32-rgba` against its
+  trace's `type=2 SUBTRACT_GREEN` then `type=0 PREDICTOR bits=9`
+  prefix (the reader halts at the predictor's §5 body).
+  Round 7 cross-checks the `lossless-1x1`
   trace's reported `width=1 height=1 alpha_used=0 version=0` and
   the newly-vendored `lossless-32x32-rgba` trace's reported
   `width=32 height=32 alpha_used=1 version=0`. Round 6 cross-checked
@@ -190,8 +237,8 @@ Rounds 1 through 7 were implemented entirely against:
 
 No external library source — libwebp, libvpx, image-rs, webp-rs,
 etc. — was consulted. `cwebp` / `dwebp` would be permissible as
-black-box validators; rounds 1 through 7 did not invoke them
-directly (round 7 reads only the fixture bytes already committed
+black-box validators; rounds 1 through 99 did not invoke them
+directly (round 99 reads only the fixture bytes already committed
 to `docs/` / the in-crate `tests/data/`).
 
 ## License
