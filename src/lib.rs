@@ -59,6 +59,14 @@
 //!   bit position at which the §5.2-encoded entropy image starts (for
 //!   the next round to resume from once §5.2 LZ77 + color-cache decode
 //!   lands).
+//! * [`vp8l_decode::decode_image`] — the §5.2 LZ77 backward-reference +
+//!   §5.2.3 color-cache per-pixel ARGB decode loop (round 107). Runs
+//!   the §6.2.3 GREEN symbol dispatch (literal / LZ77 length+distance /
+//!   color-cache code) over a single [`meta_prefix::PrefixCodeGroup`]
+//!   and produces a [`vp8l_decode::DecodedImage`] of ARGB pixels in
+//!   scan-line order (before any §4 inverse transform). Includes the
+//!   §5.2.2 prefix→value transform, the 120-element distance map, and
+//!   the §5.2.3 `0x1e35a7bd` color cache.
 //!
 //! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
 //! bitstream remain stubs returning [`Error::NotImplemented`]; the
@@ -78,6 +86,7 @@ pub mod container;
 pub mod meta_prefix;
 pub mod vp8_chunk;
 pub mod vp8l_chunk;
+pub mod vp8l_decode;
 pub mod vp8l_prefix;
 pub mod vp8l_stream;
 pub mod vp8x;
@@ -113,6 +122,8 @@ pub enum Error {
     /// The §5.2.3 / §6.2.2 VP8L meta-prefix header reader rejected the
     /// bitstream.
     Vp8lMetaPrefix(meta_prefix::MetaPrefixError),
+    /// The §5.2 VP8L per-pixel ARGB decode loop rejected the bitstream.
+    Vp8lDecode(vp8l_decode::DecodeError),
 }
 
 impl core::fmt::Display for Error {
@@ -130,6 +141,7 @@ impl core::fmt::Display for Error {
             Self::Vp8lTransform(e) => write!(f, "oxideav-webp vp8l-transform: {e}"),
             Self::Vp8lPrefix(e) => write!(f, "oxideav-webp vp8l-prefix: {e}"),
             Self::Vp8lMetaPrefix(e) => write!(f, "oxideav-webp vp8l-meta-prefix: {e}"),
+            Self::Vp8lDecode(e) => write!(f, "oxideav-webp vp8l-decode: {e}"),
         }
     }
 }
@@ -199,6 +211,12 @@ impl From<vp8l_prefix::PrefixError> for Error {
 impl From<meta_prefix::MetaPrefixError> for Error {
     fn from(e: meta_prefix::MetaPrefixError) -> Self {
         Self::Vp8lMetaPrefix(e)
+    }
+}
+
+impl From<vp8l_decode::DecodeError> for Error {
+    fn from(e: vp8l_decode::DecodeError) -> Self {
+        Self::Vp8lDecode(e)
     }
 }
 

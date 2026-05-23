@@ -2,7 +2,7 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 106)
+## Status — 2026-05-24 (clean-room round 107)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -151,6 +151,34 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   layer is §5.2 LZ77 backward-reference + §5.2.3 color-cache *symbol*
   decode — the per-pixel decoder that consumes symbols from a
   `PrefixCodeGroup`.
+* **VP8L §5.2 per-pixel ARGB decode loop (round 107):** new module
+  `vp8l_decode`. [`vp8l_decode::decode_image`] runs the §6.2.3
+  per-pixel decode loop over a single
+  [`meta_prefix::PrefixCodeGroup`], producing a [`vp8l_decode::DecodedImage`]
+  of `width * height` ARGB pixels in scan-line order (before any §4
+  inverse transform). The GREEN symbol `S` from prefix code #1 is
+  dispatched by range: `S < 256` is a §5.2.1 literal (green=`S`; red /
+  blue / alpha from prefix codes #2 / #3 / #4); `256 <= S < 280` is a
+  §5.2.2 LZ77 length prefix code; `S >= 280` is a §5.2.3 color-cache
+  code (`S - 280` indexes the cache). [`vp8l_decode::read_lz77_value`]
+  implements the §5.2.2 prefix → value transform shared by length and
+  distance (`prefix < 4 → prefix + 1`, else `offset + ReadBits(extra)
+  + 1`). [`vp8l_decode::DISTANCE_MAP`] is the 120-entry §5.2.2
+  neighbor-offset table and
+  [`vp8l_decode::distance_code_to_pixel_distance`] maps a raw distance
+  code to a scan-line distance (`dist = xi + yi*width`, clamped to 1;
+  codes `> 120` are `code - 120`). [`vp8l_decode::ColorCache`]
+  implements the §5.2.3 cache: zero-initialized, hashed by
+  `(0x1e35a7bd * argb) >> (32 - code_bits)`, with every emitted pixel
+  re-inserted in stream order. Backward references that underflow the
+  decoded prefix or overrun the image are refused; overlapping copies
+  (dist < length) repeat the just-copied pixels per standard LZ77.
+  [`vp8l_decode::GreenSymbol::classify`] is the §6.2.3 range dispatch,
+  unit-testable in isolation. Standalone-friendly (compiles under
+  `--no-default-features`). This closes the §5.2 single-group decode
+  path; the remaining lossless work is the §6.2.2 entropy-image
+  *multi-group* path (one `PrefixCodeGroup` per pixel block) plus the
+  §4 inverse-transform passes that consume this loop's ARGB buffer.
 * **VP8L §6.2.1 prefix-code reader + canonical decoder (round 104):**
   new module `vp8l_prefix`. [`vp8l_prefix::PrefixCode`] is a built
   canonical prefix code over an alphabet of a given size.
@@ -182,13 +210,35 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   Round 99 landed the §4 transform list (first step of the lossless
   pixel path); round 104 landed the §6.2.1 canonical-prefix-code
   reader (the entropy primitive every §5 / §6 consumer needs);
-  round 106 lands the §5.2.3 + §6.2.2 + §6.2 preamble that
+  round 106 landed the §5.2.3 + §6.2.2 + §6.2 preamble that
   assembles five-code prefix-code groups and resolves the
-  ARGB-role meta-prefix dispatch. §5.2 LZ77 + color-cache *symbol*
-  decode (and the entropy-image §5.2 decode that feeds the
-  multi-group path) is next.
+  ARGB-role meta-prefix dispatch; round 107 lands the §5.2 per-pixel
+  ARGB decode loop (`vp8l_decode::decode_image`) — §6.2.3 GREEN
+  dispatch, §5.2.2 LZ77 length/distance + the 120-element distance
+  map, and the §5.2.3 color cache — which turns a single
+  `PrefixCodeGroup` plus the §5.2 data into a decoded ARGB pixel
+  buffer. The §6.2.2 entropy-image *multi-group* path and the §4
+  inverse-transform passes (which consume this loop's output) are
+  next.
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
+
+## What round 107 lands
+
+| Item                                              | Status                                                |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| §6.2.3 GREEN symbol dispatch (`S<256` literal)    | **new** — `GreenSymbol::classify` (`vp8l_decode`)     |
+| §5.2.1 literal R/B/A from prefix #2/#3/#4         | **new** — `decode_image` literal arm                  |
+| §6.2.3 length codes `256..280`                    | **new** — `GreenSymbol::LengthPrefix`                 |
+| §6.2.3 color-cache codes `>= 280`                 | **new** — `GreenSymbol::ColorCache`                   |
+| §5.2.2 LZ77 prefix → value transform              | **new** — `read_lz77_value` (length + distance)       |
+| §5.2.2 120-element distance map                   | **new** — `DISTANCE_MAP` + `distance_code_to_pixel_distance` |
+| §5.2.2 distance code `> 120` (offset by 120)      | **new** — scan-line distance path                     |
+| §5.2.2 backward copy + LZ77 self-overlap          | **new** — `decode_image` length arm                   |
+| §5.2.3 color cache (`0x1e35a7bd` hash)            | **new** — `ColorCache::{new,hash,insert,lookup}`      |
+| §5.2.3 insert-every-pixel in stream order         | **new** — literal / copy / cache-hit all re-insert    |
+| §5.2 single-group ARGB decode → pixel buffer      | **new** — `decode_image` → `DecodedImage`             |
+| Underflow / overflow backward-ref refusal         | **new** — `BackwardReference{Underflow,Overflow}`     |
 
 ## What round 106 lands
 
@@ -257,8 +307,28 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **169** (142 unit + 27 integration against the
-`docs/image/webp/fixtures/` corpus). Round 106 adds 15 unit tests
+Test count: **195** (166 unit + 29 integration against the
+`docs/image/webp/fixtures/` corpus). Round 107 adds 24 unit tests
+inside `vp8l_decode::tests` (§5.2.2 LZ77 value transform across prefix
+codes 0–6 and the length-4096 boundary at prefix 23; distance map
+length / first-entry spec examples / above-120 offset / negative-offset
+clamp; §6.2.3 GREEN symbol literal / length / color-cache range
+classification + out-of-range refusal; §5.2.3 color-cache hash formula
+/ insert-lookup round-trip / zero-initialization; full decode loop for
+a literal-only 2×1 image, a single literal pixel, a length/distance
+back-reference with LZ77 self-overlap, a color-cache hit, plus the
+backward-reference-underflow and no-cache-cache-code refusals) plus 2
+integration tests:
+* `round107_lossless_1x1_color_table_decodes_end_to_end_to_palette_pixel`
+  drives the full pipeline — container walk → §4 transform list →
+  resume at the COLOR_INDEXING §5 body → §5.2.3 + §6.2 meta-prefix
+  header → `decode_image` — over `lossless-1x1.webp`'s 1×1 color-table
+  image, producing the single palette pixel ARGB `0xFFB43C5A`
+  (255,180,60,90) straight from the fixture's own VP8L payload bytes.
+* `round107_decode_error_surfaces_through_crate_error` locks the
+  `DecodeError → oxideav_webp::Error::Vp8lDecode` `From` wiring.
+
+Round 106 adds 15 unit tests
 inside `meta_prefix::tests` (color-cache info disabled / enabled at
 `code_bits` 1 / 11 / 0-refused / 12-refused, GREEN alphabet size
 formula across cache sizes, group read order matches §6.2,
@@ -301,7 +371,7 @@ the fixture's own VP8L payload bytes.
 
 ## Clean-room sources
 
-Rounds 1 through 106 were implemented entirely against:
+Rounds 1 through 107 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
   also available as `rfc9649-webp.pdf`). Round 7 cites §2.6 (the
@@ -367,11 +437,31 @@ Rounds 1 through 106 were implemented entirely against:
   `entropy-coded-image = color-cache-info data` ABNF split that
   determines whether the meta-prefix bit is present. The entropy
   *image* itself is a §5.2-encoded `entropy-coded-image` (LZ77 +
-  color-cache + per-pixel prefix-coded symbols) which this round
-  does not decode — the reader records the entropy-image start bit
+  color-cache + per-pixel prefix-coded symbols) which round 106 does
+  not decode — the reader records the entropy-image start bit
   for the next layer, mirroring how round 99 stopped at the first
-  §5 transform body. §5.2 LZ77 backward-references and the
-  §5.2.3 color-cache *symbol-lookup* path are still future work.
+  §5 transform body. Round 107 cites §5.2 ("Encoding of Image Data")
+  for the three per-pixel methods (prefix-coded literal / LZ77
+  backward reference / color-cache code), §5.2.1 ("Prefix-Coded
+  Literals") for the green / red / blue / alpha channel order,
+  §5.2.2 ("LZ77 Backward Reference") for the prefix-code + extra-bits
+  value transform (`if (prefix_code < 4) return prefix_code + 1;
+  extra_bits = (prefix_code - 2) >> 1; offset = (2 + (prefix_code &
+  1)) << extra_bits; return offset + ReadBits(extra_bits) + 1`), the
+  note that the maximum backward-reference length is 4096 (the first
+  24 length prefix codes), and the "Distance Mapping" 120-entry
+  distance map plus the `(xi, yi) = distance_map[distance_code - 1];
+  dist = xi + yi * image_width; if (dist < 1) dist = 1` conversion
+  (with codes `> 120` denoting the scan-line distance offset by 120),
+  §5.2.3 ("Color Cache Coding") for the `(0x1e35a7bd * color) >> (32
+  - color_cache_code_bits)` hash, the zero-initialization, and the
+  "insert every pixel ... in the order they appear in the stream"
+  rule, and §6.2.3 ("Decoding Entropy-Coded Image Data") for the
+  GREEN symbol `S` range dispatch (`S < 256` literal, `256 <= S <
+  256 + 24` length prefix code, `S >= 256 + 24` color-cache index).
+  The §6.2.2 entropy-image *multi-group* path and the §4
+  inverse-transform passes that consume the decoded ARGB buffer are
+  still future work.
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`). Round 6 cites §9.1
   ("Uncompressed Data Chunk") for the 3-byte frame tag layout

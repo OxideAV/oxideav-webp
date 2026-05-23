@@ -20,6 +20,7 @@ use oxideav_webp::container::fourcc;
 use oxideav_webp::meta_prefix::{ImageRole, MetaPrefixCodes, MetaPrefixHeader};
 use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
 use oxideav_webp::vp8l_chunk::{WebpLosslessChunk, VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE};
+use oxideav_webp::vp8l_decode::{decode_image, DecodeError};
 use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
 use oxideav_webp::{
@@ -743,4 +744,65 @@ fn round106_meta_prefix_argb_multi_group_records_entropy_image_boundary() {
         }
         other => panic!("expected EntropyImagePending, got {other:?}"),
     }
+}
+
+#[test]
+fn round107_lossless_1x1_color_table_decodes_end_to_end_to_palette_pixel() {
+    // End-to-end §5.2 decode of a real fixture's color-table image.
+    //
+    // The round-99 §4 reader stops at the COLOR_INDEXING transform's
+    // §5 body — the color-table image, an `entropy-coded-image` of
+    // width `color_table_size` and height 1. For `lossless-1x1.webp`,
+    // `color_table_size = 1`, so this is a 1×1 entropy-coded image
+    // holding a single palette color.
+    //
+    // This drives the full pipeline end-to-end:
+    //   walk container → §4 transform list → resume at body →
+    //   §5.2.3 + §6.2 meta-prefix header → §5.2 per-pixel decode loop.
+    // The round-104/106 by-hand decode established the single palette
+    // color (ARGB = 255,180,60,90). Here `decode_image` produces it
+    // straight from the fixture's own VP8L payload bytes.
+    let handle = extract_lossless_chunk(LOSSLESS_1X1)
+        .expect("lossless-1x1 parses")
+        .expect("lossless-1x1 has a VP8L chunk");
+    let payload = handle.bitstream();
+
+    let mut reader = BitReader::new_after_image_header(payload);
+    let list = TransformList::read(&mut reader).expect("transform list reads");
+    assert!(list.stopped_at_entropy_body());
+    let color_table_w = match list.transforms()[0] {
+        Transform::ColorIndexing {
+            color_table_size, ..
+        } => color_table_size as u32,
+        other => panic!("expected ColorIndexing, got {other:?}"),
+    };
+    assert_eq!(color_table_w, 1, "lossless-1x1 has a single palette color");
+
+    reader.seek_to_bit(list.body_bit_position());
+    let header = MetaPrefixHeader::read(&mut reader, ImageRole::EntropyCoded, color_table_w, 1)
+        .expect("meta-prefix header reads");
+    // Trace: color_cache_bits=0 → no cache for this image.
+    assert!(!header.color_cache.is_enabled());
+    let group = header.codes.group().expect("EntropyCoded → single group");
+
+    // Run the §5.2 per-pixel decode loop over the 1×1 color-table image.
+    let img = decode_image(&mut reader, group, None, color_table_w, 1)
+        .expect("color-table image decodes");
+    assert_eq!(img.width(), 1);
+    assert_eq!(img.height(), 1);
+    // ARGB = (alpha=255, red=180, green=60, blue=90) → 0xFFB43C5A.
+    assert_eq!(img.pixels(), &[0xFFB4_3C5Au32]);
+}
+
+#[test]
+fn round107_decode_error_surfaces_through_crate_error() {
+    // The §5.2 decode loop's `DecodeError` converts into the crate-wide
+    // `oxideav_webp::Error` via `From`, so a higher-level decode entry
+    // point can propagate it with `?`. This locks the wiring in lib.rs.
+    let e = DecodeError::GreenSymbolOutOfRange {
+        symbol: 280,
+        alphabet_size: 280,
+    };
+    let wrapped: oxideav_webp::Error = e.into();
+    assert!(matches!(wrapped, oxideav_webp::Error::Vp8lDecode(_)));
 }

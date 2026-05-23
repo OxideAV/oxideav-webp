@@ -6,6 +6,69 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 107 (2026-05-24).** VP8L §5.2 LZ77
+  backward-reference + §5.2.3 color-cache per-pixel ARGB decode loop —
+  the §6.2.3 decoder that consumes symbols from a round-106
+  `PrefixCodeGroup` and produces a decoded ARGB pixel buffer. New
+  module `vp8l_decode` exposes:
+  * `vp8l_decode::decode_image(reader, group, color_cache, width,
+    height)` — the §6.2.3 per-pixel decode loop. Reads GREEN symbol
+    `S` from prefix code #1 and dispatches by range (§5.2.1 literal /
+    §5.2.2 LZ77 backward reference / §5.2.3 color-cache code) until
+    `width * height` ARGB pixels are emitted. Returns a
+    `vp8l_decode::DecodedImage` (scan-line ARGB, pre-inverse-transform).
+  * `vp8l_decode::read_lz77_value(reader, prefix_code)` — the §5.2.2
+    prefix-code → value transform shared by length and distance
+    (`prefix < 4 → prefix + 1`, else `offset + ReadBits(extra) + 1`).
+  * `vp8l_decode::DISTANCE_MAP` (the 120-element §5.2.2 neighbor-offset
+    table) + `distance_code_to_pixel_distance(code, width)` (the
+    `dist = xi + yi*width`, clamp-to-1, `> 120 → code - 120` mapping).
+  * `vp8l_decode::ColorCache` — the §5.2.3 cache: zero-initialized,
+    hashed by `(0x1e35a7bd * argb) >> (32 - code_bits)`; `new` /
+    `hash` / `insert` / `lookup` / `size`. Every emitted pixel is
+    re-inserted in stream order.
+  * `vp8l_decode::GreenSymbol::classify(symbol, alphabet_size)` — the
+    §6.2.3 GREEN range dispatch (`Literal` / `LengthPrefix` /
+    `ColorCache`), unit-testable in isolation.
+  * `vp8l_decode::DecodeError` plus public constants
+    `NUM_DISTANCE_MAP_CODES` / `NUM_LENGTH_PREFIX_CODES` /
+    `COLOR_CACHE_HASH_MULTIPLIER`.
+* 24 new unit tests in `vp8l_decode::tests` (§5.2.2 LZ77 value
+  transform across prefix codes 0–6 + the length-4096 boundary at
+  prefix 23; distance-map length / spec-example first entries /
+  above-120 offset / negative-offset clamp; §6.2.3 GREEN literal /
+  length / color-cache classification + out-of-range refusal; §5.2.3
+  color-cache hash formula / insert-lookup round-trip /
+  zero-initialization; full decode loop for a literal-only 2×1 image,
+  a single literal pixel, a length/distance back-reference with LZ77
+  self-overlap, a color-cache hit, plus backward-reference-underflow
+  and no-cache refusals) plus 2 integration tests:
+  * `round107_lossless_1x1_color_table_decodes_end_to_end_to_palette_pixel`
+    drives container walk → §4 transform list → resume at the
+    COLOR_INDEXING §5 body → §5.2.3 + §6.2 meta-prefix header →
+    `decode_image` over `lossless-1x1.webp`'s 1×1 color-table image,
+    producing the single palette pixel ARGB `0xFFB43C5A`
+    (255,180,60,90) straight from the fixture's own VP8L payload bytes.
+  * `round107_decode_error_surfaces_through_crate_error` locks the
+    `DecodeError → oxideav_webp::Error::Vp8lDecode` `From` wiring.
+  Test count: **195** (was 169).
+* The decoder is **standalone-friendly** — `vp8l_decode` compiles
+  under `--no-default-features` with no `oxideav-core` dependency.
+
+### Changed
+
+* `Error` gained a `Vp8lDecode(vp8l_decode::DecodeError)` variant.
+
+### Notes
+
+`decode_webp` still returns `Error::NotImplemented`. Round 107 closes
+the §5.2 single-group ARGB decode path: a single `PrefixCodeGroup`
+plus the §5.2 data now decodes to a full ARGB pixel buffer. The
+remaining lossless work is the §6.2.2 entropy-image *multi-group*
+path (one group per pixel block, selected by an entropy image) and
+the §4 inverse-transform passes (predictor / color / subtract-green /
+color-indexing) that operate on the buffer this loop produces.
+
 * **Clean-room round 106 (2026-05-24).** VP8L §5.2.3 color-cache info
   + §6.2.2 meta-prefix dispatch + §6.2 5-prefix-code-group reader —
   the preamble every §5 image-data block opens with, sitting on top of
