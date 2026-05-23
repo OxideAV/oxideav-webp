@@ -17,6 +17,7 @@ use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::build::{ImageKind, Vp8xFlags};
 use oxideav_webp::container::fourcc;
+use oxideav_webp::meta_prefix::{ImageRole, MetaPrefixCodes, MetaPrefixHeader};
 use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
 use oxideav_webp::vp8l_chunk::{WebpLosslessChunk, VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE};
 use oxideav_webp::vp8l_prefix::PrefixCode;
@@ -596,4 +597,150 @@ fn round104_lossless_1x1_color_table_prefix_group_matches_fixture_bytes() {
         before,
         "single-leaf reads consume 0 bits"
     );
+}
+
+#[test]
+fn round106_lossless_1x1_color_table_meta_prefix_header_reads_single_group() {
+    // Round-106 surface: the §5.2.3 color-cache info + §6.2.2 meta-prefix
+    // + §6.2 5-prefix-code-group reader, exercised against the same
+    // fixture round 104 used. The COLOR_INDEXING transform's color-table
+    // image is an `entropy-coded-image` (§7.3 ABNF) — *not* the ARGB
+    // role — so the §6.2.2 meta-prefix bit is NOT present; the reader
+    // drops straight from the color-cache-info bit into the single
+    // prefix-code group. Trace says `color_cache_bits=0` /
+    // `num_htree_groups=1`.
+    let handle = extract_lossless_chunk(LOSSLESS_1X1)
+        .expect("lossless-1x1 parses")
+        .expect("lossless-1x1 has a VP8L chunk");
+    let payload = handle.bitstream();
+
+    let mut reader = BitReader::new_after_image_header(payload);
+    let list = TransformList::read(&mut reader).expect("transform list reads");
+    assert!(list.stopped_at_entropy_body());
+    let (color_table_w, color_table_h) = match list.transforms()[0] {
+        Transform::ColorIndexing {
+            color_table_size, ..
+        } => (color_table_size as u32, 1u32),
+        other => panic!("expected ColorIndexing, got {other:?}"),
+    };
+    reader.seek_to_bit(list.body_bit_position());
+
+    // Read the §5.2.3 + §6.2 preamble for the color-table image as an
+    // EntropyCoded role.
+    let header = MetaPrefixHeader::read(
+        &mut reader,
+        ImageRole::EntropyCoded,
+        color_table_w,
+        color_table_h,
+    )
+    .expect("meta-prefix header reads");
+    assert!(!header.color_cache.is_enabled());
+    assert_eq!(header.color_cache.size(), 0);
+    let group = header
+        .codes
+        .group()
+        .expect("EntropyCoded → single group always");
+    // ARGB palette = (255, 180, 60, 90) per round-104 derivation.
+    assert_eq!(group.green.single_symbol(), Some(60));
+    assert_eq!(group.red.single_symbol(), Some(180));
+    assert_eq!(group.blue.single_symbol(), Some(90));
+    assert_eq!(group.alpha.single_symbol(), Some(255));
+    assert_eq!(group.distance.single_symbol(), Some(0));
+}
+
+#[test]
+fn round106_meta_prefix_argb_single_group_synthetic_matches_trace_shape() {
+    // Mirror the fixture-trace shape `VP8L_COLOR_CACHE color_cache_bits=0`
+    // / `VP8L_HUFFMAN_GROUP meta_huffman=0 num_htree_groups=1` for an
+    // ARGB-role read with no cache and no meta-Huffman split. The §6.2.2
+    // dispatch bit IS read in this role; we set it to 0 and follow with
+    // five simple single-symbol prefix codes.
+    //
+    // Synthetic byte stream (LSB-first per §2):
+    //   bit 0: color-cache-info = 0      (cache disabled)
+    //   bit 1: meta-prefix      = 0      (single group)
+    //   then 5 × simple-code single-symbol codes (each 11 bits each:
+    //     1 flag + 1 num + 1 is_first_8bits + 8 sym).
+    fn write_bits(bytes: &mut Vec<u8>, bit_pos: &mut usize, mut value: u32, n: usize) {
+        for _ in 0..n {
+            let byte_idx = *bit_pos >> 3;
+            if byte_idx >= bytes.len() {
+                bytes.push(0);
+            }
+            let bit = (value & 1) as u8;
+            bytes[byte_idx] |= bit << (*bit_pos & 7);
+            *bit_pos += 1;
+            value >>= 1;
+        }
+    }
+    fn write_simple(bytes: &mut Vec<u8>, bit_pos: &mut usize, sym: u32) {
+        write_bits(bytes, bit_pos, 1, 1); // simple
+        write_bits(bytes, bit_pos, 0, 1); // num_symbols-1 = 0
+        write_bits(bytes, bit_pos, 1, 1); // is_first_8bits = 1
+        write_bits(bytes, bit_pos, sym, 8); // sym in 8 bits
+    }
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut bit_pos: usize = 0;
+    write_bits(&mut bytes, &mut bit_pos, 0, 1); // color-cache-info=0
+    write_bits(&mut bytes, &mut bit_pos, 0, 1); // meta-prefix=0
+    for sym in [128u32, 64, 32, 255, 1] {
+        write_simple(&mut bytes, &mut bit_pos, sym);
+    }
+    let mut reader = BitReader::new(&bytes);
+    let header = MetaPrefixHeader::read(&mut reader, ImageRole::Argb, 32, 32).unwrap();
+    assert!(!header.color_cache.is_enabled());
+    let group = header.codes.group().expect("single group");
+    assert_eq!(group.green.single_symbol(), Some(128));
+    assert_eq!(group.red.single_symbol(), Some(64));
+    assert_eq!(group.blue.single_symbol(), Some(32));
+    assert_eq!(group.alpha.single_symbol(), Some(255));
+    assert_eq!(group.distance.single_symbol(), Some(1));
+}
+
+#[test]
+fn round106_meta_prefix_argb_multi_group_records_entropy_image_boundary() {
+    // ARGB role, color-cache disabled, meta-prefix=1 with prefix_bits=4
+    // (so block_size = 16). For a 128×128 ARGB image, ceil(128/16) = 8
+    // → 8×8 entropy image. The reader records the boundary and STOPS
+    // (the entropy image itself is a §5.2-encoded entropy-coded-image
+    // that this round doesn't decode).
+    fn write_bits(bytes: &mut Vec<u8>, bit_pos: &mut usize, mut value: u32, n: usize) {
+        for _ in 0..n {
+            let byte_idx = *bit_pos >> 3;
+            if byte_idx >= bytes.len() {
+                bytes.push(0);
+            }
+            let bit = (value & 1) as u8;
+            bytes[byte_idx] |= bit << (*bit_pos & 7);
+            *bit_pos += 1;
+            value >>= 1;
+        }
+    }
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut bit_pos: usize = 0;
+    write_bits(&mut bytes, &mut bit_pos, 0, 1); // color-cache=0
+    write_bits(&mut bytes, &mut bit_pos, 1, 1); // meta-prefix=1
+    write_bits(&mut bytes, &mut bit_pos, 2, 3); // prefix_bits raw=2 → 4
+                                                // pad another byte so the bit reader has slack past the boundary.
+    bytes.push(0);
+
+    let mut reader = BitReader::new(&bytes);
+    let header = MetaPrefixHeader::read(&mut reader, ImageRole::Argb, 128, 128).unwrap();
+    match header.codes {
+        MetaPrefixCodes::EntropyImagePending {
+            prefix_bits,
+            image_width,
+            image_height,
+            entropy_image_bit_position,
+        } => {
+            assert_eq!(prefix_bits, 4);
+            assert_eq!(image_width, 8);
+            assert_eq!(image_height, 8);
+            // 1 + 1 + 3 = 5 bits consumed
+            assert_eq!(entropy_image_bit_position, 5);
+        }
+        other => panic!("expected EntropyImagePending, got {other:?}"),
+    }
 }

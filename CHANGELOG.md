@@ -6,6 +6,81 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 106 (2026-05-24).** VP8L §5.2.3 color-cache info
+  + §6.2.2 meta-prefix dispatch + §6.2 5-prefix-code-group reader —
+  the preamble every §5 image-data block opens with, sitting on top of
+  the round-104 single-prefix-code reader. New module `meta_prefix`
+  exposes:
+  * `meta_prefix::ColorCacheInfo` — the §5.2.3 `color-cache-info`
+    field. `ColorCacheInfo::read(reader)` dispatches on the leading
+    1-bit flag, reads the 4-bit `color_cache_code_bits` when set,
+    validates the §5.2.3 `[1..11]` range MUST, and surfaces
+    `is_enabled()` / `size()` (`1 << code_bits`).
+  * `meta_prefix::PrefixCodeGroup` — the five-prefix-code group the
+    §6.2 / §6.2.3 / §5.2 decode paths consume (GREEN+length+cache /
+    RED / BLUE / ALPHA / DIST). `PrefixCodeGroup::read(reader,
+    color_cache_size)` reads them in §6.2 bitstream order, sizing the
+    GREEN alphabet at `256 + 24 + color_cache_size` per §6.2.3.
+  * `meta_prefix::ImageRole` — the §5.1 image-data role tag (`Argb`
+    vs. `EntropyCoded`). Per §6.2.2 + §7.3 ABNF, the §6.2.2
+    meta-prefix dispatch bit is present ONLY for the ARGB role.
+  * `meta_prefix::MetaPrefixHeader::read(reader, role, image_w,
+    image_h)` — the combined §5.2.3 + §6.2.2 + §6.2 preamble reader.
+    Returns either `MetaPrefixCodes::Single { group }` (single
+    prefix-code group, single Huffman group case + every non-ARGB
+    role) or `MetaPrefixCodes::EntropyImagePending { prefix_bits,
+    image_width, image_height, entropy_image_bit_position }` (ARGB
+    role + multi-group case; the entropy image is itself a
+    §5.2-encoded `entropy-coded-image` that requires the next layer's
+    LZ77 + color-cache decoder, so the reader records the boundary
+    and stops — mirroring how round 99 stopped at the first §5
+    transform body and round 104 resumed there).
+  * `meta_prefix::MetaPrefixError` plus public constants
+    `COLOR_CACHE_BITS_MIN` / `COLOR_CACHE_BITS_MAX` /
+    `PREFIX_BITS_MIN` / `PREFIX_BITS_MAX`.
+* 15 new unit tests in `meta_prefix::tests` (color-cache info
+  disabled / enabled at `code_bits` 1 / 11 / 0-refused / 12-refused,
+  GREEN alphabet size formula, group read order matches §6.2,
+  EntropyCoded role skips meta-prefix bit, ARGB single-group read,
+  ARGB multi-group entropy-image boundary + bit position, ARGB
+  `DIV_ROUND_UP` rounding, ARGB max `prefix_bits=9`, ARGB
+  color-cache propagation into GREEN alphabet, truncated
+  `ColorCacheInfo` EOF, truncated `MetaPrefixHeader` EOF) plus 3
+  integration tests:
+  * `round106_lossless_1x1_color_table_meta_prefix_header_reads_single_group`
+    reads the COLOR_INDEXING transform's color-table image with the
+    `EntropyCoded` role and asserts the surfaced group matches r104's
+    by-hand decode (GREEN=60 / RED=180 / BLUE=90 / ALPHA=255 /
+    DIST=0).
+  * `round106_meta_prefix_argb_single_group_synthetic_matches_trace_shape`
+    exercises the ARGB-role single-group shape (`color_cache_bits=0`,
+    `meta_huffman=0`, `num_htree_groups=1`) every fixture trace
+    reports when no entropy image is in play.
+  * `round106_meta_prefix_argb_multi_group_records_entropy_image_boundary`
+    exercises the ARGB-role multi-group shape (`prefix_bits=4` over a
+    128×128 image), asserts 8×8 entropy-image dimensions and the
+    recorded entropy-image bit position.
+  Test count: **169** (was 151).
+* The reader is **standalone-friendly** — `meta_prefix` compiles
+  under `--no-default-features` with no `oxideav-core` dependency.
+
+### Changed
+
+* `Error` gained a `Vp8lMetaPrefix(meta_prefix::MetaPrefixError)`
+  variant.
+
+### Notes
+
+`decode_webp` still returns `Error::NotImplemented`. Round 106 lands
+the §5.2.3 + §6.2.2 + §6.2 preamble every §5 image-data block opens
+with. The remaining lossless-pixel-path work is §5.2 LZ77
+backward-reference decode + §5.2.3 color-cache *symbol-lookup*
+decode (the per-pixel decoder that pulls symbols from a
+`PrefixCodeGroup`) — that pair will close out the ARGB-role single-
+and entropy-coded-image-role paths in one round, with the
+entropy-image §5.2 decode (which feeds the ARGB multi-group path)
+following thereafter.
+
 * **Clean-room round 104 (2026-05-24).** VP8L §6.2.1 prefix-code
   reader + canonical decoder — the first piece of the §5 / §6 entropy
   machinery that sits on top of the round-99 §4 transform list. New

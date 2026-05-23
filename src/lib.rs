@@ -50,6 +50,15 @@
 //!   one at a time. This is the first piece of the §5 / §6 entropy
 //!   machinery the §4 transform bodies and the main image stream both
 //!   consume.
+//! * [`meta_prefix::MetaPrefixHeader`] — the §5.2.3 color-cache info,
+//!   §6.2.2 meta-prefix dispatch, and §6.2 5-prefix-code-group reader
+//!   (round 106). Surfaces either a fully-built single
+//!   [`meta_prefix::PrefixCodeGroup`] (the common case: single
+//!   meta-Huffman group, or any non-ARGB role) or, when an ARGB image
+//!   selects an entropy image, the entropy-image dimensions plus the
+//!   bit position at which the §5.2-encoded entropy image starts (for
+//!   the next round to resume from once §5.2 LZ77 + color-cache decode
+//!   lands).
 //!
 //! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
 //! bitstream remain stubs returning [`Error::NotImplemented`]; the
@@ -66,6 +75,7 @@ pub mod anim;
 pub mod anmf;
 pub mod build;
 pub mod container;
+pub mod meta_prefix;
 pub mod vp8_chunk;
 pub mod vp8l_chunk;
 pub mod vp8l_prefix;
@@ -100,6 +110,9 @@ pub enum Error {
     Vp8lTransform(vp8l_stream::TransformListError),
     /// The §6.2.1 VP8L prefix-code reader rejected the bitstream.
     Vp8lPrefix(vp8l_prefix::PrefixError),
+    /// The §5.2.3 / §6.2.2 VP8L meta-prefix header reader rejected the
+    /// bitstream.
+    Vp8lMetaPrefix(meta_prefix::MetaPrefixError),
 }
 
 impl core::fmt::Display for Error {
@@ -116,6 +129,7 @@ impl core::fmt::Display for Error {
             Self::Lossless(e) => write!(f, "oxideav-webp lossless: {e}"),
             Self::Vp8lTransform(e) => write!(f, "oxideav-webp vp8l-transform: {e}"),
             Self::Vp8lPrefix(e) => write!(f, "oxideav-webp vp8l-prefix: {e}"),
+            Self::Vp8lMetaPrefix(e) => write!(f, "oxideav-webp vp8l-meta-prefix: {e}"),
         }
     }
 }
@@ -179,6 +193,12 @@ impl From<vp8l_stream::TransformListError> for Error {
 impl From<vp8l_prefix::PrefixError> for Error {
     fn from(e: vp8l_prefix::PrefixError) -> Self {
         Self::Vp8lPrefix(e)
+    }
+}
+
+impl From<meta_prefix::MetaPrefixError> for Error {
+    fn from(e: meta_prefix::MetaPrefixError) -> Self {
+        Self::Vp8lMetaPrefix(e)
     }
 }
 

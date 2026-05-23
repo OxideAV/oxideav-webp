@@ -2,7 +2,7 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 104)
+## Status — 2026-05-24 (clean-room round 106)
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -116,6 +116,41 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   continue. Top-level [`read_vp8l_transform_list`](src/lib.rs) walks
   the container, extracts the `VP8L` chunk, and returns the parsed
   list. Standalone-friendly (compiles under `--no-default-features`).
+* **VP8L §5.2.3 color-cache info + §6.2.2 meta-prefix + §6.2 prefix-code
+  group reader (round 106):** new module `meta_prefix`.
+  [`meta_prefix::PrefixCodeGroup`] bundles the five §6.2 prefix codes
+  (GREEN+length+color-cache / RED / BLUE / ALPHA / DIST) the §5.2.1 /
+  §5.2.2 / §5.2.3 decode paths consume, and
+  [`PrefixCodeGroup::read`](src/meta_prefix.rs) reads them in §6.2
+  bitstream order via the round-104 [`vp8l_prefix::PrefixCode`].
+  [`meta_prefix::ColorCacheInfo`] reads the §5.2.3 `color-cache-info`
+  field (the leading 1-bit dispatch plus the optional 4-bit
+  `color_cache_code_bits`), validates the §5.2.3 `[1..11]` range, and
+  surfaces `is_enabled()` / `size()` (`1 << code_bits`).
+  [`meta_prefix::MetaPrefixHeader::read`](src/meta_prefix.rs) is the
+  combined preamble reader for one §5 image-data block: given the
+  [`meta_prefix::ImageRole`] (`Argb` carries the §6.2.2 meta-prefix
+  bit, `EntropyCoded` does not — matching §5.1 + §7.3 ABNF), it
+  consumes the color-cache info, then dispatches:
+  * `meta-prefix = %b0` (or non-ARGB role): immediately reads the
+    single 5-code [`PrefixCodeGroup`] and returns
+    [`meta_prefix::MetaPrefixCodes::Single`].
+  * `meta-prefix = %b1 entropy-image` (ARGB only): reads the §6.2.2
+    `prefix_bits = ReadBits(3) + 2` field (range `[2..9]`), derives
+    entropy-image `DIV_ROUND_UP(image_dim, 1 << prefix_bits)`
+    dimensions, records the bit position of the entropy-image start,
+    and returns [`meta_prefix::MetaPrefixCodes::EntropyImagePending`].
+    The entropy image itself is a §5.2-encoded
+    `entropy-coded-image` whose decode lives in the next layer; this
+    reader records the boundary for that layer to resume from (same
+    pattern round 99 used to stop at the first §5 transform body and
+    round 104 used to resume at it).
+  Boxes the `PrefixCodeGroup` inside the `Single` variant to keep the
+  enum compact (per `clippy::large_enum_variant`). Standalone-friendly
+  (compiles under `--no-default-features`). The next remaining lossless
+  layer is §5.2 LZ77 backward-reference + §5.2.3 color-cache *symbol*
+  decode — the per-pixel decoder that consumes symbols from a
+  `PrefixCodeGroup`.
 * **VP8L §6.2.1 prefix-code reader + canonical decoder (round 104):**
   new module `vp8l_prefix`. [`vp8l_prefix::PrefixCode`] is a built
   canonical prefix code over an alphabet of a given size.
@@ -145,12 +180,31 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   Callers route the `VP8 ` payload via
   [`extract_lossy_chunk`](src/lib.rs) to an external VP8 decoder.
   Round 99 landed the §4 transform list (first step of the lossless
-  pixel path); round 104 lands the §6.2.1 canonical-prefix-code
-  reader (the entropy primitive every §5 / §6 consumer needs).
-  §6.2.2 meta prefix codes and §5.2 LZ77 + color-cache decode are
-  next.
+  pixel path); round 104 landed the §6.2.1 canonical-prefix-code
+  reader (the entropy primitive every §5 / §6 consumer needs);
+  round 106 lands the §5.2.3 + §6.2.2 + §6.2 preamble that
+  assembles five-code prefix-code groups and resolves the
+  ARGB-role meta-prefix dispatch. §5.2 LZ77 + color-cache *symbol*
+  decode (and the entropy-image §5.2 decode that feeds the
+  multi-group path) is next.
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
+
+## What round 106 lands
+
+| Item                                          | Status                                                |
+| --------------------------------------------- | ----------------------------------------------------- |
+| §5.2.3 color-cache info (`%b0` / `%b1 4BIT`)  | **new** — `ColorCacheInfo::read` (`meta_prefix`)      |
+| §5.2.3 `color_cache_code_bits` `[1..11]` gate | **new** — `InvalidColorCacheCodeBits` refusal         |
+| §6.2 5-prefix-code-group reader               | **new** — `PrefixCodeGroup::read` in §6.2 order       |
+| §6.2.3 GREEN alphabet `256 + 24 + cache_size` | **new** — `green_alphabet_size(cache_size)`           |
+| §6.2.2 ARGB-role meta-prefix bit              | **new** — read iff `role == Argb`                     |
+| §6.2.2 entropy-coded-image role drops bit     | **new** — drops straight to single group              |
+| §6.2.2 single-group dispatch (`%b0`)          | **new** — `MetaPrefixCodes::Single`                   |
+| §6.2.2 multi-group dispatch (`%b1`)           | **new** — `MetaPrefixCodes::EntropyImagePending`      |
+| §6.2.2 `prefix_bits = ReadBits(3) + 2`        | **new** — range `[2..9]`                              |
+| §6.2.2 `DIV_ROUND_UP` entropy-image dims      | **new** — `n.div_ceil(1 << prefix_bits)`              |
+| Entropy-image §5.2 boundary recording         | **new** — `entropy_image_bit_position` for next round |
 
 ## What round 104 lands
 
@@ -203,15 +257,38 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **151** (127 unit + 24 integration against the
-`docs/image/webp/fixtures/` corpus). Round 104 adds 16 unit tests
-inside `vp8l_prefix::tests` (single-leaf no-bit read, two-symbol
-canonical assignment, the classic `[1,2,3,3]` canonical example
-decoded in value order, over-subscribed / incomplete / empty /
-length-too-large refusals, simple 1-bit / 8-bit / two-symbol codes,
-simple symbol-out-of-range refusal, normal CLC with direct lengths,
-normal zero-run `18`, normal repeat `16`, normal max_symbol-too-large
-refusal, truncated-code EOF) + 1 new
+Test count: **169** (142 unit + 27 integration against the
+`docs/image/webp/fixtures/` corpus). Round 106 adds 15 unit tests
+inside `meta_prefix::tests` (color-cache info disabled / enabled at
+`code_bits` 1 / 11 / 0-refused / 12-refused, GREEN alphabet size
+formula across cache sizes, group read order matches §6.2,
+EntropyCoded role skips meta-prefix bit, ARGB-role single-group
+read, ARGB-role multi-group entropy-image boundary + bit position,
+ARGB-role `DIV_ROUND_UP` rounding, ARGB-role max `prefix_bits=9`,
+ARGB-role color-cache propagates into GREEN alphabet size,
+truncated `ColorCacheInfo` EOF, truncated `MetaPrefixHeader` EOF)
+plus 3 integration tests:
+* `round106_lossless_1x1_color_table_meta_prefix_header_reads_single_group`
+  reads the COLOR_INDEXING transform's color-table image (an
+  `entropy-coded-image` role) and asserts the meta-prefix header
+  surfaces the same 5-code group r104 cracked open by hand —
+  GREEN=60 / RED=180 / BLUE=90 / ALPHA=255 / DIST=0.
+* `round106_meta_prefix_argb_single_group_synthetic_matches_trace_shape`
+  exercises the ARGB-role single-group path (`color_cache_bits=0`,
+  `meta_huffman=0`, `num_htree_groups=1`) — the shape every
+  fixture trace shows when no entropy image is in play.
+* `round106_meta_prefix_argb_multi_group_records_entropy_image_boundary`
+  exercises the ARGB-role multi-group path (`prefix_bits=4` over a
+  128×128 image), asserts the 8×8 entropy-image dimensions and the
+  recorded entropy-image bit position.
+
+Round 104 added 16 unit tests inside `vp8l_prefix::tests` (single-leaf
+no-bit read, two-symbol canonical assignment, the classic `[1,2,3,3]`
+canonical example decoded in value order, over-subscribed / incomplete
+/ empty / length-too-large refusals, simple 1-bit / 8-bit / two-symbol
+codes, simple symbol-out-of-range refusal, normal CLC with direct
+lengths, normal zero-run `18`, normal repeat `16`, normal
+max_symbol-too-large refusal, truncated-code EOF) + 1
 `vp8l_stream::tests::seek_to_bit_repositions_and_clamps` + 1
 integration test
 (`round104_lossless_1x1_color_table_prefix_group_matches_fixture_bytes`)
@@ -224,7 +301,7 @@ the fixture's own VP8L payload bytes.
 
 ## Clean-room sources
 
-Rounds 1 through 104 were implemented entirely against:
+Rounds 1 through 106 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
   also available as `rfc9649-webp.pdf`). Round 7 cites §2.6 (the
@@ -272,9 +349,29 @@ Rounds 1 through 104 were implemented entirely against:
   family of canonical-prefix-code formats (codes assigned in
   `(length, value)` order, read MSB-first within a code) and is
   implemented from first principles via integer Kraft completeness
-  checking. The §6.2.2 meta-prefix-code section, §3.7 color cache,
-  and §5.2 LZ77 backward-reference layers all consume `PrefixCode`
-  symbols but are *not* implemented here.
+  checking. Round 106 cites §5.1 ("Roles of Image Data") for the
+  five-roles taxonomy (ARGB / entropy / predictor / color-transform
+  / color-indexing image), §5.2.3 ("Color Cache Coding") for the
+  `color-cache-info` 1-bit dispatch + `color_cache_code_bits =
+  ReadBits(4)` + `color_cache_size = 1 << code_bits` + the
+  `[1..11]` range MUST, §6.2 ("Details") for the per-pixel
+  five-prefix-code group definition (GREEN+length+cache / RED /
+  BLUE / ALPHA / DIST), §6.2.2 ("Decoding of Meta Prefix Codes")
+  for the ARGB-role-only 1-bit dispatch, the "Entropy Image"
+  `prefix_bits = ReadBits(3) + 2` + `prefix_image_width =
+  DIV_ROUND_UP(image_width, 1 << prefix_bits)` + same for height,
+  and §6.2.3 ("Decoding Entropy-Coded Image Data") for the
+  `256 + 24 + color_cache_size` GREEN alphabet size; §7.3
+  ("Structure of the Image Data") for the
+  `spatially-coded-image = color-cache-info meta-prefix data` /
+  `entropy-coded-image = color-cache-info data` ABNF split that
+  determines whether the meta-prefix bit is present. The entropy
+  *image* itself is a §5.2-encoded `entropy-coded-image` (LZ77 +
+  color-cache + per-pixel prefix-coded symbols) which this round
+  does not decode — the reader records the entropy-image start bit
+  for the next layer, mirroring how round 99 stopped at the first
+  §5 transform body. §5.2 LZ77 backward-references and the
+  §5.2.3 color-cache *symbol-lookup* path are still future work.
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`). Round 6 cites §9.1
   ("Uncompressed Data Chunk") for the 3-byte frame tag layout
