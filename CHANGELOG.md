@@ -6,6 +6,45 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 117 (2026-05-24).** Re-exposed the
+  **published-0.1.5 lossless-encode public names** on top of the round-115
+  in-crate VP8L encoder (see `API-COMPAT.md`). All available standalone
+  (no `oxideav-core` dep):
+  * `encode_vp8l_argb(argb, width, height) -> Result<Vec<u8>, WebpError>`
+    — a **bare** §2.6 / §3.4 `VP8L` bitstream (image-header + image
+    stream), **no** RIFF wrapper. `argb` is `width * height` packed ARGB
+    (`(a<<24)|(r<<16)|(g<<8)|b`); the §3.4 `alpha_is_used` header bit is
+    auto-detected.
+  * `encode_vp8l_argb_with(argb, width, height, has_alpha)` — the fixed
+    (non-RDO) form: `has_alpha` sets the header bit explicitly.
+  * `encode_vp8l_argb_with_metadata(w, h, &argb, has_alpha, &meta) ->
+    Result<Vec<u8>, WebpError>` — a complete `.webp`. Emits the simple
+    `VP8L` layout when opaque and metadata-free, else auto-promotes to the
+    §2.7 extended `VP8X` layout (`VP8X` + [`ICCP`] + `VP8L` + [`EXIF`] +
+    [`XMP `], chunks in §2.7 order, flag octet declaring exactly the
+    present features). Round-trips through `decode_webp`; embedded metadata
+    reads back via `extract_metadata`.
+  * `WebpMetadata<'a> { icc/exif/xmp: Option<&'a [u8]> }` (borrowed encode
+    input, `::default()` = embed nothing) and
+    `WebpMetadataOwned { icc/exif/xmp: Option<Vec<u8>> }` (owned,
+    registry-side; `as_borrowed()` + `From<WebpMetadataOwned> for
+    WebpFileMetadata`).
+  * `pub const CODEC_ID_VP8L = "webp_vp8l"`.
+* **Registry `webp_vp8l` encoder (dual-API).** `register` now also
+  installs a VP8L encoder codec under `CODEC_ID_VP8L` (alongside a decoder
+  for symmetry). It accepts `Rgba` / `Rgb24` input (the `Rgb24` path
+  streams as fully opaque, no 3→4 expansion) and emits a `.webp` per
+  frame. Direct factories `registry::make_encoder(&params)`,
+  `registry::make_encoder_with_metadata(&params, WebpMetadataOwned)`, and
+  the `VideoFrame`-flavoured `registry::encode_vp8l_frame(...)` keep the
+  registry path + direct factory dual-API convention.
+* **New tests.** `tests/published_encode_api.rs` (standalone, runs under
+  `--no-default-features`): bare-bitstream shape, simple/extended layout
+  selection, metadata embed + read-back, forced-alpha round trip,
+  dimension-mismatch rejection. Plus in-crate unit tests for the bare
+  encode helpers (`vp8l_encode`) and the registry encoder
+  (round-trip RGBA, Rgb24-as-opaque, VP8X-on-metadata, NeedMore/Eof).
+
 * **Clean-room round 116 (2026-05-24).** First step of restoring the
   **published-0.1.5 public decode API shape** so downstream consumers
   compile again (see `API-COMPAT.md`). New published-shape decode types

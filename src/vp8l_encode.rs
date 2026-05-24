@@ -691,17 +691,90 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
         pixels.push((a << 24) | (r << 16) | (g << 8) | b);
     }
 
-    let stream = encode_argb_literals(&pixels);
-
-    // §3.4 image-header + image-stream = full VP8L chunk payload.
-    let header = build_image_header(width, height, alpha_is_used);
-    let mut payload = Vec::with_capacity(header.len() + stream.len());
-    payload.extend_from_slice(&header);
-    payload.extend_from_slice(&stream);
+    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used);
 
     // §2.4 / §2.6 RIFF/WEBP framing around the VP8L payload.
     let file = build::build_webp_file(&payload, ImageKind::Lossless, width, height)?;
     Ok(file)
+}
+
+/// Validate `width`/`height` against the §3.4 14-bit field range and check
+/// that an ARGB pixel slice carries exactly `width * height` pixels.
+///
+/// Shared by the bare-bitstream [`encode_vp8l_argb`] / [`encode_vp8l_argb_with`]
+/// entry points. Returns the §3.7.2.1.1 "pixel buffer is N, expected M"
+/// mismatch error using `pixels.len() * 4` so the byte counts match the
+/// RGBA-flavoured [`encode_webp_lossless`] error.
+fn validate_argb(pixels: &[u32], width: u32, height: u32) -> Result<(), EncodeError> {
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::InvalidDimensions { width, height });
+    }
+    let expected = (width as usize) * (height as usize);
+    if pixels.len() != expected {
+        return Err(EncodeError::PixelBufferMismatch {
+            got: pixels.len() * 4,
+            expected: expected * 4,
+        });
+    }
+    Ok(())
+}
+
+/// Assemble the bare §2.6 / §3.4 `VP8L` chunk **payload** for an ARGB image:
+/// the 5-byte §3.4 image-header followed by the §3.8.3 image stream.
+///
+/// `pixels` is `width * height` ARGB values in scan-line order, each
+/// `(alpha << 24) | (red << 16) | (green << 8) | blue`. `alpha_is_used`
+/// becomes the §3.4 `alpha_is_used` header bit. This is the inner payload a
+/// `VP8L` chunk wraps — *not* a RIFF/WEBP file. Callers wanting the framed
+/// file use [`encode_webp_lossless`] / [`encode_vp8l_argb_with_metadata`].
+fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: bool) -> Vec<u8> {
+    let stream = encode_argb_literals(pixels);
+    let header = build_image_header(width, height, alpha_is_used);
+    let mut payload = Vec::with_capacity(header.len() + stream.len());
+    payload.extend_from_slice(&header);
+    payload.extend_from_slice(&stream);
+    payload
+}
+
+/// Encode an ARGB image to a **bare** §2.6 / §3.4 `VP8L` bitstream — the
+/// chunk payload (image-header + image stream), with **no** RIFF/WEBP
+/// wrapper.
+///
+/// `pixels` is `width * height` ARGB values in scan-line order, each
+/// `(alpha << 24) | (red << 16) | (green << 8) | blue`. The `alpha_is_used`
+/// §3.4 header bit is auto-detected: it is set iff any pixel's alpha byte is
+/// not `0xff`. Use [`encode_vp8l_argb_with`] to force the bit explicitly.
+///
+/// The output is the exact byte sequence
+/// [`crate::vp8l_chunk::WebpLosslessChunk::bitstream`] returns for a framed
+/// file — i.e. wrapping it in `build_chunk(fourcc::VP8L, ..)` (or
+/// [`build::build_webp_file`] with [`ImageKind::Lossless`]) yields a complete
+/// `.webp`. Encoding path matches [`encode_webp_lossless`]: no §3.8.2
+/// transform, no §3.8.3 color cache, single meta-prefix code, literal-only.
+pub fn encode_vp8l_argb(pixels: &[u32], width: u32, height: u32) -> Result<Vec<u8>, EncodeError> {
+    let alpha_is_used = pixels.iter().any(|&p| (p >> 24) & 0xff != 0xff);
+    encode_vp8l_argb_with(pixels, width, height, alpha_is_used)
+}
+
+/// Encode an ARGB image to a bare §2.6 / §3.4 `VP8L` bitstream with the
+/// §3.4 `alpha_is_used` header bit set **explicitly** by the caller.
+///
+/// Identical to [`encode_vp8l_argb`] but with a fixed (non-auto-detected)
+/// `alpha_is_used`. A caller that already knows whether the image carries
+/// alpha — e.g. one decoding the §2.7.1 `VP8X` `L` flag — avoids the
+/// per-pixel scan. Setting `alpha_is_used = true` on a fully-opaque image is
+/// permitted (a decoder reconstructs the same opaque pixels); setting it
+/// `false` on an image with non-opaque pixels still round-trips because the
+/// alpha values are carried in the §3.7.3 ARGB literals regardless of the
+/// header bit.
+pub fn encode_vp8l_argb_with(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_argb(pixels, width, height)?;
+    Ok(encode_vp8l_payload(pixels, width, height, alpha_is_used))
 }
 
 #[cfg(test)]
@@ -914,6 +987,92 @@ mod tests {
                 assert_eq!(height, 0);
             }
             other => panic!("expected InvalidDimensions, got {other:?}"),
+        }
+    }
+
+    // ---- bare VP8L bitstream (encode_vp8l_argb / _with) ----
+
+    /// The bare bitstream wrapped in §2.6 framing equals the file
+    /// [`encode_webp_lossless`] produces for the same pixels.
+    #[test]
+    fn bare_bitstream_wrapped_equals_framed_file() {
+        // 3x2 ARGB image with a spread of colors and one non-opaque pixel.
+        let pixels: [u32; 6] = [
+            0xff10_2030,
+            0xff40_5060,
+            0x8070_8090,
+            0xffa0_b0c0,
+            0xffd0_e0f0,
+            0xff00_1122,
+        ];
+        let bare = encode_vp8l_argb(&pixels, 3, 2).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, 3, 2).unwrap();
+
+        // Re-derive the same file via the RGBA entry point.
+        let mut rgba = Vec::new();
+        for &p in &pixels {
+            rgba.push((p >> 16) as u8);
+            rgba.push((p >> 8) as u8);
+            rgba.push(p as u8);
+            rgba.push((p >> 24) as u8);
+        }
+        let via_rgba = encode_webp_lossless(&rgba, 3, 2).unwrap();
+        assert_eq!(framed, via_rgba);
+    }
+
+    /// A bare bitstream has no `RIFF` header — it begins with the §3.4
+    /// `0x2F` VP8L signature byte.
+    #[test]
+    fn bare_bitstream_has_no_riff_wrapper() {
+        let pixels = [0xff12_3456u32];
+        let bare = encode_vp8l_argb(&pixels, 1, 1).unwrap();
+        assert_ne!(&bare[0..4], b"RIFF");
+        assert_eq!(bare[0], crate::vp8l_chunk::VP8L_SIGNATURE);
+    }
+
+    /// `encode_vp8l_argb` auto-detects the §3.4 `alpha_is_used` bit.
+    #[test]
+    fn bare_bitstream_auto_detects_alpha() {
+        let opaque = [0xff11_2233u32, 0xff44_5566];
+        let bare = encode_vp8l_argb(&opaque, 2, 1).unwrap();
+        let h = crate::vp8l_chunk::WebpLosslessChunk::from_payload(&bare).unwrap();
+        assert!(!h.alpha_is_used());
+
+        let translucent = [0x8011_2233u32, 0xff44_5566];
+        let bare = encode_vp8l_argb(&translucent, 2, 1).unwrap();
+        let h = crate::vp8l_chunk::WebpLosslessChunk::from_payload(&bare).unwrap();
+        assert!(h.alpha_is_used());
+    }
+
+    /// `encode_vp8l_argb_with` forces the header bit regardless of pixels.
+    #[test]
+    fn bare_bitstream_with_forces_alpha_bit() {
+        let opaque = [0xff11_2233u32];
+        let bare = encode_vp8l_argb_with(&opaque, 1, 1, true).unwrap();
+        let h = crate::vp8l_chunk::WebpLosslessChunk::from_payload(&bare).unwrap();
+        assert!(h.alpha_is_used());
+    }
+
+    /// The bare bitstream round-trips back to the exact pixels through the
+    /// full decode chain once framed.
+    #[test]
+    fn bare_bitstream_round_trips() {
+        let pixels: [u32; 4] = [0x80aa_bbcc, 0xff00_1122, 0xc033_4455, 0xff66_7788];
+        let bare = encode_vp8l_argb(&pixels, 2, 2).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, 2, 2).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), &pixels);
+    }
+
+    #[test]
+    fn bare_bitstream_rejects_dimension_mismatch() {
+        let pixels = [0xff00_0000u32]; // 1 pixel
+        match encode_vp8l_argb(&pixels, 2, 2) {
+            Err(EncodeError::PixelBufferMismatch { got, expected }) => {
+                assert_eq!(got, 4);
+                assert_eq!(expected, 16);
+            }
+            other => panic!("expected PixelBufferMismatch, got {other:?}"),
         }
     }
 }

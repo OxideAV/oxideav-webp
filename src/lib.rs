@@ -662,6 +662,74 @@ pub struct WebpFileMetadata {
     pub xmp: Option<Vec<u8>>,
 }
 
+/// Borrowed file-level metadata for the encode side — the §2.7.1.4 `ICCP`,
+/// §2.7.1.5 `EXIF`, and §2.7.1.5 `XMP ` payloads to embed, each `None` to
+/// omit the corresponding chunk.
+///
+/// This is the borrowed form: the slices are not copied until the encoder
+/// frames them. The owned counterpart is [`WebpMetadataOwned`]. The default
+/// is all-`None` — embed no metadata — so a `VP8L` encode with
+/// `WebpMetadata::default()` emits the simple (non-`VP8X`) layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebpMetadata<'a> {
+    /// §2.7.1.4 `ICCP` ICC color-profile payload to embed, if any.
+    pub icc: Option<&'a [u8]>,
+    /// §2.7.1.5 `EXIF` Exif payload to embed, if any.
+    pub exif: Option<&'a [u8]>,
+    /// §2.7.1.5 `XMP ` XMP payload to embed, if any.
+    pub xmp: Option<&'a [u8]>,
+}
+
+impl<'a> WebpMetadata<'a> {
+    /// True if every field is `None` — encoding can stay on the simple
+    /// (non-`VP8X`) layout when no alpha is present either.
+    pub fn is_empty(&self) -> bool {
+        self.icc.is_none() && self.exif.is_none() && self.xmp.is_none()
+    }
+}
+
+/// Owned file-level metadata — the registry-side counterpart of the borrowed
+/// [`WebpMetadata`].
+///
+/// Carries owned `Vec<u8>` payloads so it can be stored on an encoder /
+/// codec-parameters struct without borrowing the caller's buffers. Convert
+/// to the borrowed form for an encode call with [`Self::as_borrowed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebpMetadataOwned {
+    /// §2.7.1.4 `ICCP` ICC color-profile payload to embed, if any.
+    pub icc: Option<Vec<u8>>,
+    /// §2.7.1.5 `EXIF` Exif payload to embed, if any.
+    pub exif: Option<Vec<u8>>,
+    /// §2.7.1.5 `XMP ` XMP payload to embed, if any.
+    pub xmp: Option<Vec<u8>>,
+}
+
+impl WebpMetadataOwned {
+    /// Borrow this owned metadata as a [`WebpMetadata`] for an encode call.
+    pub fn as_borrowed(&self) -> WebpMetadata<'_> {
+        WebpMetadata {
+            icc: self.icc.as_deref(),
+            exif: self.exif.as_deref(),
+            xmp: self.xmp.as_deref(),
+        }
+    }
+
+    /// True if every field is `None`.
+    pub fn is_empty(&self) -> bool {
+        self.icc.is_none() && self.exif.is_none() && self.xmp.is_none()
+    }
+}
+
+impl From<WebpMetadataOwned> for WebpFileMetadata {
+    fn from(m: WebpMetadataOwned) -> Self {
+        WebpFileMetadata {
+            icc: m.icc,
+            exif: m.exif,
+            xmp: m.xmp,
+        }
+    }
+}
+
 /// The published-API error type for the flat [`decode_webp`] /
 /// [`extract_metadata`] decode paths.
 ///
@@ -802,6 +870,137 @@ fn metadata_from_container(bytes: &[u8], c: &container::WebpContainer) -> WebpFi
 pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
     vp8l_encode::encode_webp_lossless(rgba, width, height).map_err(Into::into)
 }
+
+// ─────────────────────── Published-shape VP8L encode API ───────────────────────
+//
+// The published-0.1.5 lossless-encode public names, mapped onto the
+// round-115 in-crate VP8L encoder. `encode_vp8l_argb` / `_with` produce a
+// **bare** VP8L bitstream (no RIFF wrapper); `encode_vp8l_argb_with_metadata`
+// produces a complete `.webp`, auto-promoting to the §2.7 `VP8X` layout when
+// alpha or any metadata field is set. See `API-COMPAT.md`.
+
+/// Encode an ARGB image to a **bare** §2.6 / §3.4 `VP8L` bitstream — the
+/// chunk payload (image-header + image stream), with **no** RIFF/WEBP
+/// wrapper.
+///
+/// `argb` is `width * height` packed ARGB values in scan-line order, each
+/// `(alpha << 24) | (red << 16) | (green << 8) | blue` — the same layout
+/// [`vp8l_decode::DecodedImage::pixels`] produces. The §3.4 `alpha_is_used`
+/// header bit is auto-detected (set iff any pixel's alpha is not `0xff`);
+/// use [`encode_vp8l_argb_with`] to set it explicitly.
+///
+/// Wrapping the returned bytes in `build::build_webp_file(.., ImageKind::Lossless, ..)`
+/// (or `build::build_chunk(fourcc::VP8L, ..)`) yields a complete `.webp` that
+/// decodes back to the input pixels exactly via [`decode_webp`].
+pub fn encode_vp8l_argb(argb: &[u32], width: u32, height: u32) -> Result<Vec<u8>, WebpError> {
+    vp8l_encode::encode_vp8l_argb(argb, width, height)
+        .map_err(Error::from)
+        .map_err(WebpError::from)
+}
+
+/// Encode an ARGB image to a bare §2.6 / §3.4 `VP8L` bitstream with the
+/// §3.4 `alpha_is_used` header bit set **explicitly** by the caller.
+///
+/// The fixed (non-RDO) form of [`encode_vp8l_argb`]: `has_alpha` becomes the
+/// header bit verbatim instead of being scanned from the pixels. The alpha
+/// values are carried in the §3.7.3 ARGB literals regardless of the bit, so
+/// the round trip is exact either way.
+pub fn encode_vp8l_argb_with(
+    argb: &[u32],
+    width: u32,
+    height: u32,
+    has_alpha: bool,
+) -> Result<Vec<u8>, WebpError> {
+    vp8l_encode::encode_vp8l_argb_with(argb, width, height, has_alpha)
+        .map_err(Error::from)
+        .map_err(WebpError::from)
+}
+
+/// Encode an ARGB image to a complete `.webp` file carrying a §2.6 `VP8L`
+/// lossless bitstream, embedding any supplied file-level metadata.
+///
+/// `argb` is `width * height` packed ARGB values in scan-line order. The
+/// output layout is chosen automatically:
+///
+/// * **Simple `VP8L`** (`RIFF`/`WEBP` + `VP8L`) when `has_alpha` is `false`
+///   **and** `meta` is empty — the smallest spec-conformant still image.
+/// * **Extended `VP8X`** (`RIFF`/`WEBP` + `VP8X` + `ICCP` + `VP8L` +
+///   `EXIF` + `XMP `) when `has_alpha` is `true` **or** any metadata
+///   field is set. The §2.7.1 `VP8X` flag octet declares exactly the
+///   features present (`L`/`I`/`E`/`X`), and the metadata chunks are emitted
+///   in the §2.7 order (`ICCP` before the image, `EXIF`/`XMP ` after).
+///
+/// The bitstream's own §3.4 `alpha_is_used` header bit is set from
+/// `has_alpha`. Decoding the result through [`decode_webp`] reproduces the
+/// input pixels exactly; [`extract_metadata`] reads back the embedded
+/// ICC / Exif / XMP payloads.
+pub fn encode_vp8l_argb_with_metadata(
+    width: u32,
+    height: u32,
+    argb: &[u32],
+    has_alpha: bool,
+    meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>, WebpError> {
+    // Bare VP8L bitstream (image-header + image stream).
+    let payload = encode_vp8l_argb_with(argb, width, height, has_alpha)?;
+
+    // Simple layout when there is nothing to declare in a VP8X.
+    if !has_alpha && meta.is_empty() {
+        return build::build_webp_file(&payload, build::ImageKind::Lossless, width, height)
+            .map_err(Error::from)
+            .map_err(WebpError::from);
+    }
+
+    // Extended layout: VP8X header declaring exactly the present features,
+    // then ICCP, the VP8L image, EXIF, XMP — the §2.7 order.
+    let flags = build::Vp8xFlags {
+        has_iccp: meta.icc.is_some(),
+        has_alpha,
+        has_exif: meta.exif.is_some(),
+        has_xmp: meta.xmp.is_some(),
+        has_animation: false,
+    };
+    let vp8x_payload = build::build_vp8x_chunk(width, height, flags)
+        .map_err(Error::from)
+        .map_err(WebpError::from)?;
+
+    let mut body = Vec::new();
+    let mut push_chunk = |fourcc, payload: &[u8]| -> Result<(), WebpError> {
+        let chunk = build::build_chunk(fourcc, payload)
+            .map_err(Error::from)
+            .map_err(WebpError::from)?;
+        body.extend_from_slice(&chunk);
+        Ok(())
+    };
+
+    push_chunk(container::fourcc::VP8X, &vp8x_payload)?;
+    if let Some(icc) = meta.icc {
+        push_chunk(container::fourcc::ICCP, icc)?;
+    }
+    push_chunk(container::fourcc::VP8L, &payload)?;
+    if let Some(exif) = meta.exif {
+        push_chunk(container::fourcc::EXIF, exif)?;
+    }
+    if let Some(xmp) = meta.xmp {
+        push_chunk(container::fourcc::XMP, xmp)?;
+    }
+
+    // §2.4 file framing around the assembled body.
+    let file_size = (body.len() as u64) + 4;
+    if file_size > u64::from(u32::MAX) {
+        return Err(WebpError::InvalidData);
+    }
+    let mut out = Vec::with_capacity(12 + body.len());
+    out.extend_from_slice(&container::fourcc::RIFF);
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&container::fourcc::WEBP);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Stable codec identifier the VP8L lossless encoder registers under in the
+/// codec registry — the published `"webp_vp8l"` name.
+pub const CODEC_ID_VP8L: &str = "webp_vp8l";
 
 /// Repack a scan-line-order ARGB pixel buffer (`(a<<24)|(r<<16)|(g<<8)|b`)
 /// into interleaved 8-bit `[R, G, B, A]` bytes — the

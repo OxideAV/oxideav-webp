@@ -2,7 +2,31 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 116)
+## Status — 2026-05-24 (clean-room round 117)
+
+**The published-0.1.5 lossless-encode public names are restored (round 117).**
+On top of the round-115 in-crate VP8L encoder, the published encode surface
+is re-exposed: [`encode_vp8l_argb`](src/lib.rs) /
+[`encode_vp8l_argb_with`](src/lib.rs) emit a **bare** §2.6 / §3.4 `VP8L`
+bitstream (image-header + image stream, **no** RIFF wrapper) from packed
+`width * height` ARGB; the first auto-detects the §3.4 `alpha_is_used` bit,
+the second sets it explicitly (the fixed/non-RDO form).
+[`encode_vp8l_argb_with_metadata`](src/lib.rs)`(w, h, &argb, has_alpha, &meta)`
+emits a complete `.webp`, staying on the simple `VP8L` layout when opaque and
+metadata-free, else auto-promoting to the §2.7 extended `VP8X` layout
+(`VP8X` + `ICCP` + `VP8L` + `EXIF` + `XMP ` in §2.7 order, flag octet
+declaring exactly the present features). [`WebpMetadata`](src/lib.rs)
+(borrowed, `::default()`) and [`WebpMetadataOwned`](src/lib.rs) (owned) carry
+the ICC / Exif / XMP payloads; the embedded metadata reads back via
+[`extract_metadata`](src/lib.rs). The registry gains a `webp_vp8l` encoder
+codec ([`CODEC_ID_VP8L`](src/lib.rs)) accepting `Rgba` / `Rgb24` input
+(`Rgb24` streamed as opaque), with the dual-API direct factories
+[`registry::make_encoder`](src/registry.rs) /
+`make_encoder_with_metadata` / `encode_vp8l_frame`. A standalone test
+(`tests/published_encode_api.rs`, runs under `--no-default-features`) covers
+bare-bitstream shape, layout selection, and metadata round-trip. **Not yet
+restored:** the VP8 lossy `encode_vp8_lossy_*` entry points and animation
+encode (the lossy path is blocked on `oxideav-vp8`'s `Vp8Error` symbol).
 
 **The published-0.1.5 decode API shape is being restored (round 116).**
 The orphan rebuild had invented its own `decode_webp -> Result<Vec<u8>,
