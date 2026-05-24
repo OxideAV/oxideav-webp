@@ -2,10 +2,22 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 110)
+## Status — 2026-05-24 (clean-room round 111)
 
-**The VP8L lossless decode path is complete end-to-end, and the
-§2.7.1.2 `ALPH` alpha bitstream now decodes end-to-end too.**
+**The top-level still-image decode is now wired up.**
+[`decode_webp_image`](src/lib.rs) walks a `RIFF/WEBP` file and decodes a
+§2.6 / §3.4 `VP8L` lossless image — simple **or** `VP8X`-extended — all
+the way to a `DecodedWebp { width, height, rgba }`, where `rgba` is
+`width*height*4` interleaved `[R, G, B, A]` bytes (the
+`oxideav_core::PixelFormat::Rgba` layout). When a (spec-discouraged, per
+§2.7.1.2 "SHOULD NOT") `ALPH` chunk accompanies the `VP8L` image, its
+decoded alpha plane overrides the per-pixel alpha.
+[`decode_webp`](src/lib.rs) is the flat-buffer shorthand. A §2.5 `VP8 `
+lossy file is a clean `Error::Unsupported(LossyVp8)` — routed onward via
+[`extract_lossy_chunk`](src/lib.rs) rather than stub-decoded.
+
+The **VP8L lossless decode path is complete end-to-end, and the
+§2.7.1.2 `ALPH` alpha bitstream decodes end-to-end too.**
 [`decode_lossless_image`](src/lib.rs) walks a `RIFF/WEBP` file, extracts
 the `VP8L` chunk, runs the §5/§6 entropy decode, and applies the §4
 inverse-transform chain — validated bit-exact against the `lossless-1x1`,
@@ -285,9 +297,11 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
 * **Pixel decode (lossless VP8L):** **done** —
   [`decode_lossless_image`](src/lib.rs) decodes a `VP8L` chunk all the
   way to ARGB pixels (round 109). The generic [`decode_webp`](src/lib.rs)
-  entry still returns [`Error::NotImplemented`] (it would need
-  output-format packing plus the VP8 lossy + ALPH alpha paths).
-  Callers route the `VP8 ` payload via
+  / [`decode_webp_image`](src/lib.rs) entries are now wired (round 111):
+  they decode a simple or `VP8X`-extended `VP8L` file to packed
+  `[R, G, B, A]` bytes, applying an accompanying `ALPH` plane when
+  present. A `VP8 ` lossy file returns `Error::Unsupported(LossyVp8)`;
+  callers route the `VP8 ` payload via
   [`extract_lossy_chunk`](src/lib.rs) to an external VP8 decoder.
   Round 99 landed the §4 transform list (first step of the lossless
   pixel path); round 104 landed the §6.2.1 canonical-prefix-code
@@ -304,6 +318,17 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
   next.
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
+
+## What round 111 lands
+
+| Item                                              | Status                                                |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| Top-level still decode → RGBA                      | **new** — `decode_webp` / `decode_webp_image`         |
+| `DecodedWebp { width, height, rgba }`             | **new** — packed `[R, G, B, A]` (`PixelFormat::Rgba`) |
+| Simple + `VP8X`-extended `VP8L` dispatch          | **new** — both walk to the same ARGB decode           |
+| `ALPH`-over-`VP8L` alpha override                 | **new** — §2.7.1.2 plane replaces per-pixel alpha     |
+| `VP8 ` lossy → clean refusal                       | **new** — `Error::Unsupported(LossyVp8)` (not stubbed) |
+| ARGB → interleaved RGBA repack                     | **new** — `argb_to_rgba`                              |
 
 ## What round 109 lands
 
@@ -415,11 +440,16 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
 | §2.3 `build_chunk` writer     | done — generic FourCC+Size+payload+odd-pad emit     |
 | §2.7.1 `build_vp8x_chunk`     | done — typed flag-byte + 24-bit LE × 2 emit         |
 | §2.4 `build_webp_file`        | done — simple + extended `RIFF/WEBP` envelope       |
-| VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
+| VP8L bitstream decode         | done — `decode_webp` / `decode_lossless_image` → RGBA |
+| VP8 lossy bitstream decode    | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **229** (193 unit + 36 integration against the
-`docs/image/webp/fixtures/` corpus). Round 109 adds 18 unit tests
+Test count: **247** (203 unit + 44 integration against the
+`docs/image/webp/fixtures/` corpus). Round 111 adds 7 integration tests
+covering the top-level `decode_webp` / `decode_webp_image` entries
+(simple `VP8L`, color-indexed palette, RGBA-alpha repack, synthesized
+`VP8X`+`VP8L`, hand-assembled `VP8X`+`VP8L`+`ALPH` override, and the two
+`VP8 ` lossy → `Unsupported` refusals). Round 109 adds 18 unit tests
 inside `vp8l_transform::tests` (each §4.1 predictor primitive —
 `Average2` / `Clamp` / `ClampAddSubtract{Full,Half}` / `Select` /
 `predict`; the predictor border rules for the top-left, top-row, and

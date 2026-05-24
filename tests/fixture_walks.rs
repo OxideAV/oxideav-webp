@@ -15,7 +15,7 @@
 
 use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
-use oxideav_webp::build::{ImageKind, Vp8xFlags};
+use oxideav_webp::build::{build_chunk, ImageKind, Vp8xFlags};
 use oxideav_webp::container::fourcc;
 use oxideav_webp::meta_prefix::{ImageRole, MetaPrefixCodes, MetaPrefixHeader};
 use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
@@ -26,9 +26,10 @@ use oxideav_webp::vp8l_decode::{
 use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
 use oxideav_webp::{
-    build_vp8x_chunk, build_webp_file, decode_lossless_image, extract_lossless_chunk,
-    extract_lossy_chunk, parse_alph_header, parse_anim_header, parse_anmf_header, parse_container,
-    parse_vp8x_header, read_vp8l_transform_list,
+    build_vp8x_chunk, build_webp_file, decode_lossless_image, decode_webp, decode_webp_image,
+    extract_lossless_chunk, extract_lossy_chunk, parse_alph_header, parse_anim_header,
+    parse_anmf_header, parse_container, parse_vp8x_header, read_vp8l_transform_list, Error,
+    UnsupportedKind,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
@@ -1060,4 +1061,149 @@ fn round109_decode_lossless_image_returns_none_for_lossy_file() {
     // A VP8-only (lossy) file has no VP8L chunk → Ok(None).
     let out = decode_lossless_image(LOSSY_1X1).expect("lossy file parses");
     assert!(out.is_none(), "lossy file has no VP8L chunk");
+}
+
+// ---------------------------------------------------------------------
+// Round 111 — top-level `decode_webp` / `decode_webp_image` wiring.
+//
+// `decode_webp_image` walks the container, decodes the §2.6 VP8L
+// lossless image through the full §4–§6 chain, optionally overrides
+// alpha from a §2.7.1.2 ALPH chunk, and returns interleaved
+// `[R, G, B, A]` bytes. `decode_webp` is the flat-buffer shorthand.
+// ---------------------------------------------------------------------
+
+/// Pull the **full** `VP8L` chunk payload (5-byte image header plus the
+/// entropy-coded bitstream) out of a simple-lossless fixture, so a test
+/// can re-wrap it in a synthetic `VP8X`-extended (or `ALPH`-bearing)
+/// container using the crate's own §2.3 chunk builder. No external
+/// container parsing — this reuses `parse_container` + the typed handle.
+fn vp8l_payload(file: &[u8]) -> Vec<u8> {
+    let chunk = extract_lossless_chunk(file)
+        .expect("fixture walks")
+        .expect("fixture has a VP8L chunk");
+    // `bitstream()` is the full VP8L payload (header + entropy bytes).
+    chunk.bitstream().to_vec()
+}
+
+#[test]
+fn round111_decode_webp_image_simple_lossless_1x1_rgba() {
+    // Simple lossless: one VP8L chunk, no VP8X. ARGB ground truth from
+    // the round-109 decode is 0xFFB43C5A → RGBA [B4, 3C, 5A, FF].
+    let img = decode_webp_image(LOSSLESS_1X1).expect("lossless-1x1 decodes to an image");
+    assert_eq!(img.width, 1);
+    assert_eq!(img.height, 1);
+    assert_eq!(img.rgba, vec![0xB4, 0x3C, 0x5A, 0xFF]);
+    // `decode_webp` returns the same flat buffer.
+    assert_eq!(decode_webp(LOSSLESS_1X1).unwrap(), img.rgba);
+}
+
+#[test]
+fn round111_decode_webp_image_color_indexing_paletted_rgba() {
+    // 32x32 COLOR_INDEXING fixture; spot-check first/last pixels against
+    // the round-109 ARGB ground truth (0xFFFF0000 red, 0xFFFF00FF
+    // magenta) repacked to [R, G, B, A].
+    let img = decode_webp_image(LOSSLESS_COLOR_INDEXING).expect("paletted fixture decodes");
+    assert_eq!(img.width, 32);
+    assert_eq!(img.height, 32);
+    assert_eq!(img.rgba.len(), 32 * 32 * 4);
+    // px[0] = 0xFFFF0000 → R=FF G=00 B=00 A=FF.
+    assert_eq!(&img.rgba[0..4], &[0xFF, 0x00, 0x00, 0xFF]);
+    // px[1023] (last) = 0xFFFF00FF → R=FF G=00 B=FF A=FF.
+    let last = img.rgba.len() - 4;
+    assert_eq!(&img.rgba[last..], &[0xFF, 0x00, 0xFF, 0xFF]);
+}
+
+#[test]
+fn round111_decode_webp_image_32x32_rgba_carries_vp8l_alpha() {
+    // The 32x32 RGBA fixture carries real (non-opaque) alpha inside the
+    // VP8L stream itself. Top-left is fully transparent (ARGB 0x00000000),
+    // so the repacked alpha byte must be 0x00 — proving alpha survives
+    // the ARGB→RGBA repack.
+    let img = decode_webp_image(LOSSLESS_32X32_RGBA).expect("rgba fixture decodes");
+    assert_eq!(img.width, 32);
+    assert_eq!(img.height, 32);
+    // Top-left transparent corner.
+    assert_eq!(&img.rgba[0..4], &[0x00, 0x00, 0x00, 0x00]);
+    // px[1023] ARGB 0xF8F8F880 → A=F8 R=F8 G=F8 B=80 → RGBA [F8, F8, 80, F8].
+    let last = img.rgba.len() - 4;
+    assert_eq!(&img.rgba[last..], &[0xF8, 0xF8, 0x80, 0xF8]);
+}
+
+#[test]
+fn round111_decode_webp_image_extended_vp8x_plus_vp8l() {
+    // §2.7 extended-lossless: re-wrap the lossless-1x1 VP8L payload in a
+    // VP8X-fronted file via the crate's own builder, then decode. The
+    // VP8X canvas dims and the decoded pixels must match the simple case.
+    let payload = vp8l_payload(LOSSLESS_1X1);
+    let extended = build_webp_file(&payload, ImageKind::ExtendedLossless, 1, 1)
+        .expect("build VP8X + VP8L file");
+
+    // Sanity: the synthesized file really carries a VP8X chunk.
+    let c = parse_container(&extended).expect("extended file walks");
+    assert!(
+        c.first_chunk_with_fourcc(fourcc::VP8X).is_some(),
+        "synthetic file has a VP8X chunk"
+    );
+
+    let img = decode_webp_image(&extended).expect("extended VP8X+VP8L decodes");
+    assert_eq!(img.width, 1);
+    assert_eq!(img.height, 1);
+    assert_eq!(img.rgba, vec![0xB4, 0x3C, 0x5A, 0xFF]);
+}
+
+#[test]
+fn round111_decode_webp_image_vp8x_vp8l_with_alph_overrides_alpha() {
+    // §2.7.1.2: the spec discourages ALPH alongside VP8L ("SHOULD NOT"),
+    // but does not forbid it. When present, the decoded alpha plane
+    // overrides the VP8L per-pixel alpha. Hand-assemble a 1x1
+    // VP8X + VP8L + ALPH(raw, filter=none) file: the VP8L pixel is
+    // 0xFFB43C5A (RGB B4,3C,5A) and the raw alpha byte is 0x42, so the
+    // result is RGBA [B4, 3C, 5A, 42] — alpha taken from ALPH, not FF.
+    let vp8l = vp8l_payload(LOSSLESS_1X1);
+    let vp8x_payload = build_vp8x_chunk(
+        1,
+        1,
+        Vp8xFlags {
+            has_alpha: true,
+            ..Default::default()
+        },
+    )
+    .expect("build VP8X payload");
+
+    // ALPH payload: info byte 0x00 (method 0 raw, filter 0 none) + the
+    // raw alpha plane (width*height = 1 byte).
+    let alph_payload = vec![0x00u8, 0x42u8];
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&build_chunk(fourcc::VP8X, &vp8x_payload).unwrap());
+    body.extend_from_slice(&build_chunk(fourcc::ALPH, &alph_payload).unwrap());
+    body.extend_from_slice(&build_chunk(fourcc::VP8L, &vp8l).unwrap());
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&fourcc::RIFF);
+    file.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    file.extend_from_slice(&fourcc::WEBP);
+    file.extend_from_slice(&body);
+
+    let img = decode_webp_image(&file).expect("VP8X+VP8L+ALPH decodes");
+    assert_eq!(img.width, 1);
+    assert_eq!(img.height, 1);
+    // RGB from VP8L, alpha overridden by the ALPH plane (0x42).
+    assert_eq!(img.rgba, vec![0xB4, 0x3C, 0x5A, 0x42]);
+}
+
+#[test]
+fn round111_decode_webp_lossy_file_is_unsupported_not_panic() {
+    // A VP8-only lossy file is recognized but not decoded here — it
+    // returns a clean Unsupported(LossyVp8), never a stub-decode.
+    let err = decode_webp(LOSSY_1X1).expect_err("lossy file is unsupported");
+    assert_eq!(err, Error::Unsupported(UnsupportedKind::LossyVp8));
+}
+
+#[test]
+fn round111_decode_webp_lossy_with_alpha_is_unsupported() {
+    // The VP8X + ALPH + VP8 (lossy) fixture has no VP8L chunk, so its
+    // pixels can't be produced here; the lossy VP8 routing path applies.
+    let err = decode_webp(LOSSY_WITH_ALPHA).expect_err("lossy+alpha unsupported");
+    assert_eq!(err, Error::Unsupported(UnsupportedKind::LossyVp8));
 }

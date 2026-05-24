@@ -6,6 +6,33 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 111 (2026-05-24).** Top-level still-image decode is
+  wired up — `decode_webp` no longer returns `NotImplemented` for the
+  cases the crate can decode. New surface:
+  * `decode_webp_image(bytes) -> DecodedWebp` — walks the `RIFF/WEBP`
+    container, decodes a §2.6 / §3.4 `VP8L` lossless image (simple **or**
+    `VP8X`-extended) through the full §4–§6 chain, and returns the
+    `DecodedWebp { width, height, rgba }` struct. `rgba` is
+    `width*height*4` interleaved `[R, G, B, A]` bytes in scan order — the
+    `oxideav_core::PixelFormat::Rgba` layout the workspace's image crates
+    share. When a (spec-discouraged, per §2.7.1.2 "SHOULD NOT") `ALPH`
+    chunk accompanies the `VP8L` image, its decoded alpha plane overrides
+    the per-pixel alpha.
+  * `decode_webp(bytes) -> Vec<u8>` — the flat-buffer shorthand: same
+    decode, returns just the packed RGBA bytes.
+  * `Error::Unsupported(UnsupportedKind)` — a §2.5 `VP8 ` lossy file is a
+    clean `Unsupported(LossyVp8)` (route it onward with
+    `extract_lossy_chunk`); a file with no `VP8L`/`VP8 ` image-data chunk
+    (animation / header-only) is `Unsupported(NoImageData)`. Lossy is
+    **not** stub-decoded.
+  * End-to-end tests decode the `lossless-1x1`,
+    `lossless-color-indexing-paletted`, and `lossless-32x32-rgba`
+    fixtures all the way to RGBA (dims + pixel spot-checks against the
+    round-109 ARGB ground truth, including the RGBA alpha-channel
+    repack), a synthesized `VP8X`+`VP8L` extended file, and a
+    hand-assembled `VP8X`+`VP8L`+`ALPH` file proving the `ALPH` alpha
+    override.
+
 * **Clean-room round 110 (2026-05-24).** §2.7.1.2 `ALPH` alpha-channel
   bitstream decode — the alpha plane is now produced end-to-end. New
   surface in `alph`:
