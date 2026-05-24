@@ -2,6 +2,33 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-24 (clean-room round 118)
+
+**The published-0.1.5 animation-encode API (VP8L path) is restored (round 118).**
+On top of the round-115 VP8L encoder and the §2.7.1.1 `ANIM` / `ANMF` framing,
+[`build_animated_webp`](src/lib.rs) /
+[`build_animated_webp_with_options`](src/lib.rs)`(frames, opts)` assemble a
+multi-frame `.webp` (`RIFF`/`WEBP` + `VP8X(A)` + `[ICCP]` + `ANIM` +
+`ANMF…ANMF` + `[EXIF]` + `[XMP ]`). Each [`AnimFrame`](src/anim_encode.rs)
+(flat RGBA `pixels` + `width`/`height` + even `x`/`y` offset + `duration` +
+`blend` + `dispose` + `mode`) is encoded to a §2.6 `VP8L` chunk and wrapped in
+the `ANMF` Frame Data; the `VP8X` canvas is sized to cover every frame and the
+`A`/`L`/`I`/`E`/`X` flags declare exactly the features present.
+[`AnimEncoderOptions`](src/anim_encode.rs) carries `loop_count`,
+`background_rgba`, borrowed `metadata`, and a [`DeltaConfig`](src/anim_encode.rs)
+(`max_components_override` / `auto_inner_threshold_bytes` /
+`msssim_downsample_kernel` builders, [`DownsampleKernel`](src/anim_encode.rs)).
+[`AnimFrameMode`](src/anim_encode.rs)`::Lossless` is fully wired; `Auto` /
+`Delta` return `WebpError::Unsupported` (VP8 lossy + delta blocked on
+`oxideav-vp8`, #1041). [`decode_webp`](src/lib.rs) now assembles animated files
+into N `WebpFrame`s (per-frame VP8L decode + optional `ALPH` override), with
+`anim_background_rgba` / `anim_loop_count` populated. A standalone test
+(`tests/published_anim_api.rs`, runs under `--no-default-features`) covers a
+3-frame round trip, options/metadata, blend/dispose/offset, the Auto/Delta
+`Unsupported` path, and the `DeltaConfig` builders. **Not yet restored:** the
+VP8 lossy `encode_vp8_lossy_*` entry points and the `Auto`/`Delta` animation
+modes (lossy path blocked on `oxideav-vp8`).
+
 ## Status — 2026-05-24 (clean-room round 117)
 
 **The published-0.1.5 lossless-encode public names are restored (round 117).**

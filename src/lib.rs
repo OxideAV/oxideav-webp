@@ -125,6 +125,7 @@
 
 pub mod alph;
 pub mod anim;
+pub mod anim_encode;
 pub mod anmf;
 pub mod build;
 pub mod container;
@@ -806,6 +807,12 @@ pub fn decode_webp(bytes: &[u8]) -> Result<WebpImage, WebpError> {
     // Parse the container once so we can read both pixels and metadata.
     let c = container::parse(bytes).map_err(|_| WebpError::InvalidData)?;
 
+    // Animated file: an ANIM chunk introduces a sequence of ANMF frames.
+    // Decode every frame's VP8L-lossless bitstream into a separate WebpFrame.
+    if c.first_chunk_with_fourcc(container::fourcc::ANIM).is_some() {
+        return decode_animation(bytes, &c);
+    }
+
     // Pixel data: the rebuilt path decodes VP8L (simple or extended).
     // VP8 lossy and animation are reported Unsupported, not faked.
     let decoded = decode_webp_image(bytes).map_err(WebpError::from)?;
@@ -828,6 +835,110 @@ pub fn decode_webp(bytes: &[u8]) -> Result<WebpImage, WebpError> {
         anim_background_rgba: None,
         anim_loop_count: None,
     })
+}
+
+/// Decode an animated WebP (`ANIM` + per-frame `ANMF`) to a multi-frame
+/// [`WebpImage`].
+///
+/// Each §2.7.1.1 `ANMF` chunk carries a 16-byte header
+/// ([`anmf::AnmfHeader`]) followed by its "Frame Data" — a padded §2.3
+/// sub-RIFF holding the frame's bitstream. This decoder handles the
+/// §2.6 `VP8L` lossless sub-chunk (the path the in-crate animation encoder
+/// produces); an `ANMF` carrying only a §2.5 `VP8 ` lossy sub-chunk is
+/// [`WebpError::Unsupported`] (the VP8 lossy decoder is not rebuilt yet).
+///
+/// The §2.7.1.1 `ANIM` background colour and loop count populate
+/// [`WebpImage::anim_background_rgba`] / [`WebpImage::anim_loop_count`]; the
+/// per-frame `Frame Duration` populates each [`WebpFrame::duration_ms`].
+fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpImage, WebpError> {
+    // §2.7.1.1 ANIM: global background colour + loop count.
+    let anim_chunk = c
+        .first_chunk_with_fourcc(container::fourcc::ANIM)
+        .ok_or(WebpError::InvalidData)?;
+    let anim =
+        anim::AnimHeader::parse(anim_chunk.payload(bytes)).map_err(|_| WebpError::InvalidData)?;
+    let bg = anim.background_color;
+
+    let mut frames = Vec::new();
+    for anmf_chunk in c.chunks_with_fourcc(container::fourcc::ANMF) {
+        let payload = anmf_chunk.payload(bytes);
+        let header = anmf::AnmfHeader::parse(payload).map_err(|_| WebpError::InvalidData)?;
+        let frame_data = &payload[header.frame_data_offset()..];
+
+        // The Frame Data sub-RIFF is a flat list of §2.3 padded chunks. Find
+        // the VP8L bitstream sub-chunk (lossy VP8 is not decoded here).
+        let vp8l = find_subchunk(frame_data, container::fourcc::VP8L);
+        let Some(vp8l_payload) = vp8l else {
+            // A VP8 lossy sub-chunk is recognized-but-unsupported.
+            if find_subchunk(frame_data, container::fourcc::VP8).is_some() {
+                return Err(WebpError::Unsupported);
+            }
+            return Err(WebpError::InvalidData);
+        };
+
+        let chunk = vp8l_chunk::WebpLosslessChunk::from_payload(vp8l_payload)
+            .map_err(|e| WebpError::from(Error::from(e)))?;
+        let width = chunk.width();
+        let height = chunk.height();
+        let image = vp8l_transform::decode_lossless(chunk.bitstream(), width, height)
+            .map_err(|e| WebpError::from(Error::from(e)))?;
+
+        // An optional ALPH sub-chunk overrides the VP8L per-pixel alpha.
+        let mut pixels = image;
+        if let Some(alph_payload) = find_subchunk(frame_data, container::fourcc::ALPH) {
+            if let Ok(plane) = alph::decode_alpha(alph_payload, width, height) {
+                let px = pixels.pixels_mut();
+                if plane.len() == px.len() {
+                    for (p, &a) in px.iter_mut().zip(plane.iter()) {
+                        *p = (*p & 0x00ff_ffff) | (u32::from(a) << 24);
+                    }
+                }
+            }
+        }
+
+        frames.push(WebpFrame {
+            rgba: argb_to_rgba(pixels.pixels()),
+            width,
+            height,
+            duration_ms: header.duration_ms,
+        });
+    }
+
+    if frames.is_empty() {
+        return Err(WebpError::InvalidData);
+    }
+
+    Ok(WebpImage {
+        frames,
+        metadata: metadata_from_container(bytes, c),
+        anim_background_rgba: Some([bg.red, bg.green, bg.blue, bg.alpha]),
+        anim_loop_count: Some(anim.loop_count),
+    })
+}
+
+/// Walk a flat §2.3 sub-chunk list (the `ANMF` "Frame Data" sub-RIFF — no
+/// outer `RIFF`/`WEBP` header) and return the payload of the first chunk with
+/// `target` FourCC. Returns `None` on a truncated header or no match.
+fn find_subchunk(mut data: &[u8], target: container::FourCc) -> Option<&[u8]> {
+    while data.len() >= 8 {
+        let fourcc: container::FourCc = data[0..4].try_into().ok()?;
+        let size = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+        let payload_start = 8usize;
+        let payload_end = payload_start.checked_add(size)?;
+        if payload_end > data.len() {
+            return None;
+        }
+        if fourcc == target {
+            return Some(&data[payload_start..payload_end]);
+        }
+        // §2.3: odd Size is followed by one pad byte not counted in Size.
+        let advance = payload_end + (size & 1);
+        if advance > data.len() {
+            return None;
+        }
+        data = &data[advance..];
+    }
+    None
 }
 
 /// Read the file-level metadata chunks (ICC / Exif / XMP) without
@@ -997,6 +1108,20 @@ pub fn encode_vp8l_argb_with_metadata(
     out.extend_from_slice(&body);
     Ok(out)
 }
+
+// ─────────────────────── Published-shape animation encode API ───────────────────────
+//
+// The published-0.1.5 `build_animated_webp` surface, rebuilt on top of the
+// in-crate VP8L encoder + the §2.7.1.1 ANIM / ANMF container framing. Only the
+// VP8L-lossless path (`AnimFrameMode::Lossless`) is wired up; `Auto` / `Delta`
+// return `WebpError::Unsupported` (the VP8 lossy + delta paths are blocked on
+// `oxideav-vp8`, workspace task #1041). See `API-COMPAT.md`.
+
+#[doc(inline)]
+pub use anim_encode::{
+    build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions, AnimFrame,
+    AnimFrameMode, DeltaConfig, DownsampleKernel,
+};
 
 /// Stable codec identifier the VP8L lossless encoder registers under in the
 /// codec registry — the published `"webp_vp8l"` name.

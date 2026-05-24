@@ -204,6 +204,44 @@ fn fixture_animated_with_alpha_all_three_anmf_headers_decode_to_trace_values() {
 }
 
 #[test]
+fn round118_decode_webp_animated_with_alpha_yields_three_rgba_frames() {
+    // Round-118 surface: `decode_webp` assembles a genuine libwebp-encoded
+    // VP8L animation (3 ANMF frames, each a VP8L sub-chunk) into N flat-RGBA
+    // `WebpFrame`s, populating the ANIM background / loop count. The
+    // per-frame headers (from `animated-with-alpha/trace.txt`) report
+    // 64x64 / duration=100 / blend=1 / dispose=0 for all three frames; the
+    // ANIM payload is bgcolor=0xffffffff (white opaque) loop_count=0.
+    let img = decode_webp(ANIMATED_WITH_ALPHA).expect("animated VP8L file decodes");
+    assert_eq!(img.frames.len(), 3, "one WebpFrame per ANMF chunk");
+    for (i, frame) in img.frames.iter().enumerate() {
+        assert_eq!(frame.width, 64, "frame {i} width");
+        assert_eq!(frame.height, 64, "frame {i} height");
+        assert_eq!(
+            frame.duration_ms, 100,
+            "frame {i} duration (ANMF native ms)"
+        );
+        // Flat-buffer invariant: tightly packed RGBA, no stride padding.
+        assert_eq!(frame.rgba.len(), 64 * 64 * 4, "frame {i} flat RGBA length");
+    }
+    // ANIM globals surface on the WebpImage.
+    assert_eq!(
+        img.anim_background_rgba,
+        Some([0xFF, 0xFF, 0xFF, 0xFF]),
+        "ANIM background = white opaque (BGRA 0xffffffff → RGBA white)"
+    );
+    assert_eq!(
+        img.anim_loop_count,
+        Some(0),
+        "ANIM loop_count = 0 (infinite)"
+    );
+    // The three frames are not all identical (the animation actually moves).
+    assert_ne!(
+        img.frames[0].rgba, img.frames[1].rgba,
+        "frames 0 and 1 differ"
+    );
+}
+
+#[test]
 fn fixture_animated_with_alpha_anim_payload_decodes_to_white_opaque_infinite() {
     // Round-3 surface: walker → typed ANIM. Cross-checks the BGRA
     // byte order + loop-count u16 LE decode against

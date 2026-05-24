@@ -6,6 +6,32 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 118 (2026-05-24).** Re-exposed the
+  **published-0.1.5 animation-encode API** for the VP8L-lossless path, on
+  top of the round-115 VP8L encoder + the §2.7.1.1 `ANIM` / `ANMF` framing
+  (see `API-COMPAT.md`). Standalone (no `oxideav-core` dep):
+  * `build_animated_webp(frames) -> Result<Vec<u8>, WebpError>` and
+    `build_animated_webp_with_options(frames, opts)` — assemble a
+    multi-frame `.webp` (`RIFF`/`WEBP` + `VP8X(A[,L][,I][,E][,X])` +
+    [`ICCP`] + `ANIM` + `ANMF…ANMF` + [`EXIF`] + [`XMP `]). The `VP8X`
+    canvas is sized to cover every frame; each frame's pixels become a
+    §2.6 `VP8L` chunk inside the `ANMF` Frame Data.
+  * `AnimFrame { pixels, width, height, x, y, duration, blend, dispose,
+    mode }` (flat RGBA `pixels`; even `x`/`y`; `AnimFrame::new` helper),
+    `AnimFrameMode { Auto, Delta, Lossless }` (`Lossless` wired;
+    `Auto`/`Delta` → `WebpError::Unsupported`, blocked on `oxideav-vp8`
+    #1041), `AnimEncoderOptions { loop_count, background_rgba, metadata,
+    delta }`, `DeltaConfig` (`max_components_override` /
+    `auto_inner_threshold_bytes` / `msssim_downsample_kernel` builders),
+    `DownsampleKernel { Box, Gaussian }`.
+  * `decode_webp` now assembles an animated file into N `WebpFrame`s
+    (per-frame `VP8L` decode + optional `ALPH` alpha override), populating
+    `WebpImage::anim_background_rgba` / `anim_loop_count`.
+  * Standalone test `tests/published_anim_api.rs` (runs under
+    `--no-default-features`): 3-frame round trip, options + metadata,
+    blend/dispose/offset carry, `Auto`/`Delta` `Unsupported`, and the
+    `DeltaConfig` builder chain.
+
 * **Clean-room round 117 (2026-05-24).** Re-exposed the
   **published-0.1.5 lossless-encode public names** on top of the round-115
   in-crate VP8L encoder (see `API-COMPAT.md`). All available standalone
