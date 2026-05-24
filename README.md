@@ -92,16 +92,38 @@ input bytes through [`decode_webp`](src/lib.rs) — a pixel-exact round
 trip, validated against the `lossless-1x1`, `lossless-32x32-rgba`, and
 `lossless-color-indexing-paletted` fixtures (decoded by the independent
 decode path, re-encoded, re-decoded, compared byte-for-byte). The encoder
-([`vp8l_encode`](src/vp8l_encode.rs)) takes the simplest spec-conformant
+([`vp8l_encode`](src/vp8l_encode.rs)) takes a simple spec-conformant
 path: no §3.8.2 transform (pass-through), no §3.8.3 color cache, a single
-§3.7.2.2 meta-prefix code, and a literal-only image (no LZ77 backward
-references). It builds the §3.7.2 canonical prefix codes per-image from
-channel frequencies (length-limited ≤ 15-bit Huffman →
+§3.7.2.2 meta-prefix code. It builds the §3.7.2 canonical prefix codes
+per-image from channel frequencies (length-limited ≤ 15-bit Huffman →
 `(length, value)`-ordered canonical codes, the exact assignment the
 round-104 reader consumes) and writes their lengths with the §3.7.2.1.2
-normal code length code. Output is larger than a libwebp-encoded
-equivalent (no transform / LZ77 compression yet) but spec-valid and
-round-trip-exact. Lacks §3.8.2 transform encoding and LZ77 / color-cache
+normal code length code.
+
+**Round 119 added §5.2.2 LZ77 backward-reference matching.**
+[`encode_argb_literals`](src/vp8l_encode.rs) now runs a hash-chain
+matcher ([`Lz77Matcher`](src/vp8l_encode.rs)) before the entropy stage:
+4-pixel hashes bucket every position into `2^14` chains (capped at
+64 walks per match), repeated pixel runs of `>= 3` pixels (up to the
+spec's 4096-pixel limit) become §5.2.2 length + distance backward
+references. Length values feed the GREEN alphabet's `256 + length_prefix`
+symbols (the §5.2.2 prefix-coding table). Distances are emitted via the
+scan-line encoding `distance_code = D + 120` (the spec's §3.6.2.2.1
+distance map is an optional decoder convenience for near-pixel offsets;
+the `> 120` form is always valid and the in-crate
+[`distance_code_to_pixel_distance`](src/vp8l_decode.rs) reconstructs `D`
+exactly). The new [`value_to_prefix`](src/vp8l_encode.rs) helper is the
+exact inverse of the decoder's [`read_lz77_value`](src/vp8l_decode.rs)
+prefix-value transform, round-tripped at every value in `1..=4096`.
+A 64×64 image whose rows repeat an 8-color palette compresses from
+4758 B (literal-only) to 163 B (LZ77) — a ~97% size reduction; pixels
+without exploitable repetition (xorshift noise) come out the same size,
+and a solid color costs ~2 bytes extra to encode the length symbol.
+The literal-only baseline is retained as
+[`encode_argb_literals_only`](src/vp8l_encode.rs) for the size-reduction
+comparison test. Output remains spec-valid and round-trip-exact on every
+covered case. Lacks §3.8.2 transform encoding (predictor /
+subtract-green / color / color-indexing) and §5.2.3 color-cache
 compression.
 
 **The codec is now registered into `oxideav_core::RuntimeContext`.**

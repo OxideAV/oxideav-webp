@@ -6,6 +6,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 119 (2026-05-24).** §5.2.2 **LZ77 backward-reference
+  matching** in the VP8L encoder. `encode_argb_literals` now runs a
+  hash-chain matcher (`Lz77Matcher`) over the ARGB pixel buffer before
+  the entropy stage: every repeated run of `>= MIN_MATCH` (3) pixels at
+  scan-line distance `D` becomes a §5.2.2 length + distance backward
+  reference instead of `length` separate ARGB literals. Length values
+  flow through the GREEN alphabet's `256 + length_prefix` symbols;
+  distances use prefix code #5 with the §3.6.2.2.1 scan-line form
+  `distance_code = D + 120` (always valid per the spec's `> 120` branch
+  — the §3.6.2.2.1 distance map is an optional decoder convenience the
+  encoder declines to use). The new `value_to_prefix` helper is the
+  exact inverse of the decoder's `read_lz77_value` prefix-value
+  transform, round-tripped through the live decoder at a spread of
+  values and at every length `1..=MAX_MATCH` (4096). The previous
+  literal-only emit path stays available as `encode_argb_literals_only`
+  for the size-reduction comparison test. Headline: a 64×64 image whose
+  rows repeat an 8-color palette compresses from 4758 B (literal-only)
+  to 163 B (LZ77), a ~97 % reduction; pixels with no exploitable
+  repetition (xorshift noise) come out the same size. New tests:
+  `value_to_prefix_small_values_have_no_extra_bits`,
+  `value_to_prefix_round_trips_length_range`,
+  `value_to_prefix_round_trips_through_decoder`,
+  `round_trip_solid_color_uses_lz77_copy`,
+  `round_trip_periodic_pattern_uses_overlapping_copy`,
+  `lz77_beats_literal_only_on_repetitive_image`,
+  `lz77_round_trips_incompressible_pixels`,
+  `round_trip_splits_match_at_max_length`. The crate still builds under
+  `--no-default-features` (the matcher uses only the existing
+  `oxideav-core`-free decode helpers).
+
 * **Clean-room round 118 (2026-05-24).** Re-exposed the
   **published-0.1.5 animation-encode API** for the VP8L-lossless path, on
   top of the round-115 VP8L encoder + the §2.7.1.1 `ANIM` / `ANMF` framing

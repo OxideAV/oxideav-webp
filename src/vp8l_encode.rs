@@ -44,11 +44,34 @@
 //! [`crate::vp8l_prefix::PrefixCode`] reads, so a code emitted here
 //! decodes there bit-for-bit.
 //!
+//! ## §5.2.2 LZ77 backward-reference matching
+//!
+//! As of round 119, [`encode_argb_literals`] runs an optional §5.2.2
+//! backward-reference pass before emitting the image data. A hash-chain
+//! matcher ([`Lz77Matcher`]) finds repeated pixel runs; each run of
+//! `length >= MIN_MATCH` pixels at scan-line distance `D` is emitted as a
+//! §5.2.2 *length + distance code* pair instead of `length` separate ARGB
+//! literals, compressing repetitive images. The match's length is encoded
+//! via the GREEN alphabet's length-prefix symbols (`256 + prefix_code`),
+//! and the distance via prefix code #5 using the *scan-line* encoding
+//! `distance_code = D + NUM_DISTANCE_MAP_CODES` (the §5.2.2 distance map is
+//! an optional decoder convenience for nearby pixels; emitting
+//! `D + 120` is always valid and the in-crate decoder's
+//! [`crate::vp8l_decode::distance_code_to_pixel_distance`] reconstructs `D`
+//! exactly). The inverse of the §5.2.2 prefix-value transform
+//! ([`value_to_prefix`]) splits a length/distance into its prefix code and
+//! extra bits, the exact counterpart of the decoder's
+//! [`crate::vp8l_decode::read_lz77_value`].
+//!
+//! The literal-only path is still available via [`encode_argb_literals_only`]
+//! (used by the size-reduction comparison test); the default
+//! [`encode_argb_literals`] entry point chooses the LZ77 path.
+//!
 //! ## What this module does NOT do
 //!
 //! * No §3.8.2 transform encoding (predictor / color / subtract-green /
 //!   color-indexing). Pass-through only.
-//! * No §3.8.3 LZ77 match search or color cache. Literal-only.
+//! * No §3.8.3 color cache. (LZ77 backward references *are* emitted.)
 //! * No `oxideav-core` runtime dependency — this module compiles under
 //!   `--no-default-features`.
 
@@ -432,6 +455,56 @@ pub fn canonical_codes(lengths: &[u8]) -> Vec<u32> {
     codes
 }
 
+/// §5.2.2: split a length/distance `value` (≥ 1) into its *prefix code* and
+/// *extra bits*, the exact inverse of the decoder's
+/// [`crate::vp8l_decode::read_lz77_value`].
+///
+/// Returns `(prefix_code, extra_bits, extra_value)` where:
+///
+/// * `prefix_code` is the entropy-coded symbol (a GREEN length symbol is
+///   `256 + prefix_code`; a distance symbol is `prefix_code` directly),
+/// * `extra_bits` is how many raw bits follow the prefix code,
+/// * `extra_value` is the value those `extra_bits` carry (LSB-first, as the
+///   decoder's `ReadBits` consumes them).
+///
+/// The decoder reconstructs `value` as:
+///
+/// ```text
+/// if prefix_code < 4 { value = prefix_code + 1 }
+/// else {
+///     extra_bits = (prefix_code - 2) >> 1
+///     offset = (2 + (prefix_code & 1)) << extra_bits
+///     value = offset + extra_value + 1
+/// }
+/// ```
+///
+/// so feeding `extra_value` back through that formula yields `value`.
+pub fn value_to_prefix(value: u32) -> (u32, u32, u32) {
+    debug_assert!(value >= 1, "LZ77 length/distance values are 1-based");
+    if value <= 4 {
+        // prefix_code = value - 1; no extra bits (the `< 4` decoder branch).
+        return (value - 1, 0, 0);
+    }
+    // value >= 5. Find the prefix code p (>= 4) whose range
+    // [offset+1, offset + 2^extra_bits] contains `value`, where
+    // extra_bits = (p - 2) >> 1 and offset = (2 + (p & 1)) << extra_bits.
+    //
+    // Equivalently: let v0 = value - 1 (>= 4). The high bit of v0 selects
+    // the magnitude; the next bit selects the (p & 1) parity sub-band.
+    let v0 = value - 1; // >= 4
+                        // `msb` = floor(log2(v0)) >= 2.
+    let msb = 31 - v0.leading_zeros();
+    let extra_bits = msb - 1;
+    // Parity bit: the bit just below the MSB distinguishes the two
+    // sub-bands offset = 2<<e (parity 0) vs offset = 3<<e (parity 1).
+    let parity = (v0 >> (msb - 1)) & 1;
+    let prefix_code = 2 * extra_bits + 2 + parity;
+    let offset = (2 + parity) << extra_bits;
+    let extra_value = value - offset - 1;
+    debug_assert!(extra_value < (1u32 << extra_bits));
+    (prefix_code, extra_bits, extra_value)
+}
+
 /// A built prefix code ready for symbol emission: per-symbol length + code.
 #[derive(Debug, Clone)]
 struct WriteCode {
@@ -566,8 +639,235 @@ fn write_normal_code_lengths(w: &mut BitWriter, lengths: &[u8]) {
     }
 }
 
+/// Smallest backward-reference run (in pixels) the matcher will emit. A
+/// match of fewer than this many pixels rarely pays for the length +
+/// distance prefix codes versus emitting the pixels as literals, so short
+/// runs stay literal.
+pub const MIN_MATCH: usize = 3;
+
+/// Largest backward-reference run the §5.2.2 length prefix coding admits
+/// (the spec note: "The maximum backward reference length is limited to
+/// 4096."). A longer repeat is split into consecutive matches.
+pub const MAX_MATCH: usize = 4096;
+
+/// Number of low bits of the rolling pixel hash → hash-chain head buckets.
+/// `1 << HASH_BITS` heads; collisions are resolved by walking the chain.
+const HASH_BITS: usize = 14;
+/// Cap on chain steps walked per position, bounding the matcher's worst
+/// case on adversarial inputs while keeping the common-case match quality.
+const MAX_CHAIN: usize = 64;
+
+/// A single emitted token in the §5.2.2 LZ77 stream: either a raw ARGB
+/// pixel (a §5.2.1 literal) or a backward-reference copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Token {
+    /// A §5.2.1 ARGB literal pixel.
+    Literal(u32),
+    /// A §5.2.2 backward reference: copy `length` pixels from `distance`
+    /// pixels back in scan-line order.
+    Copy {
+        /// Copy length in pixels (`MIN_MATCH..=MAX_MATCH`).
+        length: usize,
+        /// Scan-line pixel distance back to the copy source (`>= 1`).
+        distance: usize,
+    },
+}
+
+/// §5.2.2 hash-chain matcher over a scan-line ARGB pixel buffer.
+///
+/// Hashes 4-pixel windows into `1 << HASH_BITS` buckets and chains every
+/// position sharing a hash, so a match search at position `p` walks only
+/// positions that begin with the same 4-pixel hash. This is the standard
+/// LZ77 greedy match structure; it finds repeated pixel runs without ever
+/// consulting any external implementation — the only correctness contract
+/// is that an emitted `Copy { length, distance }` is reproducible by the
+/// decoder's §5.2.2 copy loop, which it is for any `1 <= distance <= p` and
+/// `length <= remaining`.
+struct Lz77Matcher<'a> {
+    pixels: &'a [u32],
+    head: Vec<i32>,
+    prev: Vec<i32>,
+}
+
+impl<'a> Lz77Matcher<'a> {
+    /// Build a matcher over `pixels` with empty hash chains.
+    fn new(pixels: &'a [u32]) -> Self {
+        Self {
+            pixels,
+            head: vec![-1; 1 << HASH_BITS],
+            prev: vec![-1; pixels.len()],
+        }
+    }
+
+    /// Hash the 4-pixel window starting at `pos` (callers guarantee
+    /// `pos + 4 <= pixels.len()`). A simple multiplicative mix over the
+    /// four ARGB words, folded into `HASH_BITS` bits.
+    fn hash(&self, pos: usize) -> usize {
+        let p = self.pixels;
+        let mut h = 0u32;
+        for k in 0..4 {
+            h = h.wrapping_mul(0x9e37_79b1).wrapping_add(p[pos + k]);
+        }
+        (h >> (32 - HASH_BITS)) as usize
+    }
+
+    /// Insert `pos` at the head of its hash bucket's chain.
+    fn insert(&mut self, pos: usize) {
+        if pos + 4 > self.pixels.len() {
+            return;
+        }
+        let h = self.hash(pos);
+        self.prev[pos] = self.head[h];
+        self.head[h] = pos as i32;
+    }
+
+    /// Find the longest match for the window at `pos`, returning
+    /// `Some((length, distance))` when a run of `>= MIN_MATCH` pixels is
+    /// found. Walks at most [`MAX_CHAIN`] chain links.
+    ///
+    /// The matcher hashes 4-pixel windows, so a match search requires
+    /// `pos + 4 <= pixels.len()`. The tail of the image (fewer than 4
+    /// pixels remaining) is always emitted as literals.
+    fn find(&self, pos: usize) -> Option<(usize, usize)> {
+        let p = self.pixels;
+        let n = p.len();
+        if pos + 4 > n {
+            return None;
+        }
+        let max_len = (n - pos).min(MAX_MATCH);
+        let h = self.hash(pos);
+        let mut cand = self.head[h];
+        let mut best_len = 0usize;
+        let mut best_dist = 0usize;
+        let mut steps = 0usize;
+        while cand >= 0 && steps < MAX_CHAIN {
+            let c = cand as usize;
+            // Candidates were all inserted at positions < pos.
+            let mut len = 0usize;
+            while len < max_len && p[c + len] == p[pos + len] {
+                len += 1;
+            }
+            if len > best_len {
+                best_len = len;
+                best_dist = pos - c;
+                if len >= max_len {
+                    break;
+                }
+            }
+            cand = self.prev[c];
+            steps += 1;
+        }
+        if best_len >= MIN_MATCH {
+            Some((best_len, best_dist))
+        } else {
+            None
+        }
+    }
+}
+
+/// Run the §5.2.2 greedy hash-chain matcher over `pixels`, producing the
+/// token stream (literals + backward-reference copies) the entropy stage
+/// emits. Every `Copy` token has `1 <= distance <= position` and
+/// `MIN_MATCH <= length <= MAX_MATCH`, so the decoder's §5.2.2 copy loop
+/// reproduces the exact pixels.
+fn tokenize_lz77(pixels: &[u32]) -> Vec<Token> {
+    let n = pixels.len();
+    let mut matcher = Lz77Matcher::new(pixels);
+    let mut tokens = Vec::new();
+    let mut pos = 0usize;
+    while pos < n {
+        if let Some((len, dist)) = matcher.find(pos) {
+            tokens.push(Token::Copy {
+                length: len,
+                distance: dist,
+            });
+            // Insert every covered position into the chains so later
+            // matches can reference inside the just-copied run, then skip
+            // past the run.
+            let end = pos + len;
+            while pos < end {
+                matcher.insert(pos);
+                pos += 1;
+            }
+        } else {
+            tokens.push(Token::Literal(pixels[pos]));
+            matcher.insert(pos);
+            pos += 1;
+        }
+    }
+    tokens
+}
+
+/// The five per-symbol frequency tables for one prefix-code group: green
+/// (literals + §5.2.2 length symbols), red, blue, alpha, and distance.
+struct Frequencies {
+    green: Vec<u32>,
+    red: Vec<u32>,
+    blue: Vec<u32>,
+    alpha: Vec<u32>,
+    distance: Vec<u32>,
+}
+
+/// The §5.2.2 distance-code form this encoder uses: the *scan-line*
+/// encoding (`distance_code = D + 120`). The decoder's
+/// [`crate::vp8l_decode::distance_code_to_pixel_distance`] maps any
+/// `distance_code > 120` straight back to `distance_code - 120 == D`, so
+/// every distance round-trips without touching the §5.2.2 distance map.
+fn distance_to_code(distance: usize) -> u32 {
+    distance as u32 + crate::vp8l_decode::NUM_DISTANCE_MAP_CODES as u32
+}
+
+/// Accumulate the per-symbol frequencies for a token stream so the entropy
+/// stage can build length-optimal prefix codes before emitting.
+fn count_frequencies(tokens: &[Token]) -> Frequencies {
+    let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES;
+    let mut freqs = Frequencies {
+        green: vec![0u32; green_alphabet],
+        red: vec![0u32; 256],
+        blue: vec![0u32; 256],
+        alpha: vec![0u32; 256],
+        distance: vec![0u32; 40],
+    };
+    for &tok in tokens {
+        match tok {
+            Token::Literal(p) => {
+                let a = ((p >> 24) & 0xff) as usize;
+                let r = ((p >> 16) & 0xff) as usize;
+                let g = ((p >> 8) & 0xff) as usize;
+                let b = (p & 0xff) as usize;
+                freqs.green[g] += 1;
+                freqs.red[r] += 1;
+                freqs.blue[b] += 1;
+                freqs.alpha[a] += 1;
+            }
+            Token::Copy { length, distance } => {
+                // §5.2.2: length is a GREEN symbol `256 + length_prefix`.
+                let (len_prefix, _, _) = value_to_prefix(length as u32);
+                freqs.green[256 + len_prefix as usize] += 1;
+                // Distance prefix code (#5).
+                let (dist_prefix, _, _) = value_to_prefix(distance_to_code(distance));
+                freqs.distance[dist_prefix as usize] += 1;
+            }
+        }
+    }
+    freqs
+}
+
+/// Emit a length/distance `value` to `w`: the entropy-coded prefix symbol
+/// via `code`, then its `extra_bits` raw bits LSB-first (matching the
+/// decoder's `ReadBits`). `symbol_base` is added to the prefix code before
+/// the entropy lookup (256 for GREEN length symbols, 0 for distances).
+fn write_lz77_value(w: &mut BitWriter, code: &WriteCode, symbol_base: usize, value: u32) {
+    let (prefix, extra_bits, extra_value) = value_to_prefix(value);
+    code.write_symbol(w, symbol_base + prefix as usize);
+    if extra_bits > 0 {
+        w.write_bits(extra_value, extra_bits as usize);
+    }
+}
+
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
-/// §3.4 5-byte image-header), using the literal-only / no-transform path.
+/// §3.4 5-byte image-header), running the §5.2.2 LZ77 backward-reference
+/// matcher so repeated pixel runs compress.
 ///
 /// `pixels` is `width * height` ARGB values in scan-line order, each
 /// `(alpha << 24) | (red << 16) | (green << 8) | blue` — the same layout
@@ -575,6 +875,24 @@ fn write_normal_code_lengths(w: &mut BitWriter, lengths: &[u8]) {
 /// bytes, prefixed with the image-header and wrapped in RIFF/WEBP framing,
 /// decode back to `pixels` exactly.
 pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
+    let tokens = tokenize_lz77(pixels);
+    encode_tokens(&tokens)
+}
+
+/// Encode an ARGB image with the literal-only path (no §5.2.2 LZ77 match
+/// search): every pixel becomes a §5.2.1 ARGB literal. Retained as the
+/// baseline the round-119 size-reduction test compares the LZ77 path
+/// against; [`encode_argb_literals`] is the default entry point.
+pub fn encode_argb_literals_only(pixels: &[u32]) -> Vec<u8> {
+    let tokens: Vec<Token> = pixels.iter().map(|&p| Token::Literal(p)).collect();
+    encode_tokens(&tokens)
+}
+
+/// Shared entropy stage: from a §5.2.2 token stream, build the five prefix
+/// codes and emit the §3.8.3 image data (optional-transform terminator,
+/// color-cache-info, meta-prefix, the five prefix-code length tables, then
+/// the LZ77-coded image).
+fn encode_tokens(tokens: &[Token]) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // §3.8.2 optional-transform: none. Single `%b0` terminator.
@@ -586,32 +904,23 @@ pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
     // meta-prefix: `%b0` (single prefix-code group).
     w.write_bit(false);
 
-    // Build the five prefix codes from literal frequencies.
-    // Prefix #1 (green): alphabet 256 + 24 (length codes) + 0 (no cache).
-    // We only emit literal green symbols (< 256), no length codes.
-    let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES;
-    let mut green_freq = vec![0u32; green_alphabet];
-    let mut red_freq = vec![0u32; 256];
-    let mut blue_freq = vec![0u32; 256];
-    let mut alpha_freq = vec![0u32; 256];
-    for &p in pixels {
-        let a = (p >> 24) & 0xff;
-        let r = (p >> 16) & 0xff;
-        let g = (p >> 8) & 0xff;
-        let b = p & 0xff;
-        green_freq[g as usize] += 1;
-        red_freq[r as usize] += 1;
-        blue_freq[b as usize] += 1;
-        alpha_freq[a as usize] += 1;
-    }
-
-    let green_code = WriteCode::from_freqs(&green_freq);
-    let red_code = WriteCode::from_freqs(&red_freq);
-    let blue_code = WriteCode::from_freqs(&blue_freq);
-    let alpha_code = WriteCode::from_freqs(&alpha_freq);
-    // Prefix #5 (distance): no backward references → empty code (single
-    // symbol 0), alphabet 40.
-    let dist_code = WriteCode::empty(40);
+    // Build the five prefix codes from token frequencies. The GREEN
+    // alphabet covers literals (`< 256`) *and* the §5.2.2 length prefix
+    // symbols (`256 + length_prefix`). The distance alphabet (40 codes) is
+    // exercised only when the matcher emitted at least one copy.
+    let freqs = count_frequencies(tokens);
+    let green_code = WriteCode::from_freqs(&freqs.green);
+    let red_code = WriteCode::from_freqs(&freqs.red);
+    let blue_code = WriteCode::from_freqs(&freqs.blue);
+    let alpha_code = WriteCode::from_freqs(&freqs.alpha);
+    // Prefix #5 (distance): if no backward references were emitted, the
+    // frequency table is all-zero → `from_freqs` yields the empty code,
+    // which `WriteCode` serialises as the §3.7.2.1.1 single-symbol-0 form.
+    let dist_code = if freqs.distance.iter().any(|&f| f > 0) {
+        WriteCode::from_freqs(&freqs.distance)
+    } else {
+        WriteCode::empty(40)
+    };
 
     // data = prefix-codes lz77-coded-image.
     // prefix-code-group = 5 prefix codes, in bitstream order:
@@ -622,17 +931,28 @@ pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
     alpha_code.write_code_lengths(&mut w);
     dist_code.write_code_lengths(&mut w);
 
-    // lz77-coded-image: one ARGB literal per pixel (§3.7.3 order:
-    // green, red, blue, alpha).
-    for &p in pixels {
-        let a = ((p >> 24) & 0xff) as usize;
-        let r = ((p >> 16) & 0xff) as usize;
-        let g = ((p >> 8) & 0xff) as usize;
-        let b = (p & 0xff) as usize;
-        green_code.write_symbol(&mut w, g);
-        red_code.write_symbol(&mut w, r);
-        blue_code.write_symbol(&mut w, b);
-        alpha_code.write_symbol(&mut w, a);
+    // lz77-coded-image: each token is either a §5.2.1 ARGB literal
+    // (channel order green, red, blue, alpha) or a §5.2.2 length + distance
+    // backward reference.
+    for &tok in tokens {
+        match tok {
+            Token::Literal(p) => {
+                let a = ((p >> 24) & 0xff) as usize;
+                let r = ((p >> 16) & 0xff) as usize;
+                let g = ((p >> 8) & 0xff) as usize;
+                let b = (p & 0xff) as usize;
+                green_code.write_symbol(&mut w, g);
+                red_code.write_symbol(&mut w, r);
+                blue_code.write_symbol(&mut w, b);
+                alpha_code.write_symbol(&mut w, a);
+            }
+            Token::Copy { length, distance } => {
+                // §5.2.2: length via a GREEN length symbol (base 256), then
+                // distance via prefix code #5 (base 0).
+                write_lz77_value(&mut w, &green_code, 256, length as u32);
+                write_lz77_value(&mut w, &dist_code, 0, distance_to_code(distance));
+            }
+        }
     }
 
     w.into_bytes()
@@ -1074,5 +1394,216 @@ mod tests {
             }
             other => panic!("expected PixelBufferMismatch, got {other:?}"),
         }
+    }
+
+    // ---- §5.2.2 LZ77 prefix-value inverse ----
+
+    /// Every value `1..=4` maps to prefix code `value - 1` with no extra
+    /// bits, matching the `< 4` decoder branch.
+    #[test]
+    fn value_to_prefix_small_values_have_no_extra_bits() {
+        for v in 1u32..=4 {
+            let (p, e, x) = value_to_prefix(v);
+            assert_eq!(p, v - 1);
+            assert_eq!(e, 0);
+            assert_eq!(x, 0);
+        }
+    }
+
+    /// Round-trip every length value `1..=MAX_MATCH` through
+    /// [`value_to_prefix`] back into the §5.2.2 decoder formula.
+    #[test]
+    fn value_to_prefix_round_trips_length_range() {
+        for v in 1u32..=MAX_MATCH as u32 {
+            let (p, e, x) = value_to_prefix(v);
+            // Re-apply the §5.2.2 decoder formula.
+            let recovered = if p < 4 {
+                p + 1
+            } else {
+                let extra_bits = (p - 2) >> 1;
+                let offset = (2 + (p & 1)) << extra_bits;
+                assert_eq!(extra_bits, e);
+                offset + x + 1
+            };
+            assert_eq!(recovered, v, "value_to_prefix lost value {v}");
+        }
+    }
+
+    /// Round-trip via the live decoder helper [`crate::vp8l_decode::read_lz77_value`]
+    /// to confirm the encoder's split is bit-compatible with what the
+    /// decoder actually executes.
+    #[test]
+    fn value_to_prefix_round_trips_through_decoder() {
+        use crate::vp8l_decode::read_lz77_value;
+        use crate::vp8l_stream::BitReader;
+        // A spread of values across every prefix-code band.
+        let samples = [
+            1u32, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 16, 17, 24, 25, 32, 100, 1000, 4096,
+        ];
+        for &v in &samples {
+            let (p, e, x) = value_to_prefix(v);
+            let mut w = BitWriter::new();
+            if e > 0 {
+                w.write_bits(x, e as usize);
+            }
+            let data = w.into_bytes();
+            let mut r = BitReader::new(&data);
+            let got = read_lz77_value(&mut r, p).unwrap();
+            assert_eq!(
+                got, v,
+                "value {v} → prefix {p}, extra ({e}b: {x:b}) decoded as {got}"
+            );
+        }
+    }
+
+    // ---- §5.2.2 LZ77 matcher / encoder round-trips ----
+
+    /// A solid-color image's pixels are a single literal followed by one
+    /// long copy that covers the rest. Round trip must be exact.
+    #[test]
+    fn round_trip_solid_color_uses_lz77_copy() {
+        let w = 32u32;
+        let h = 32u32;
+        let pixels = vec![0xff20_4060u32; (w * h) as usize];
+        let tokens = tokenize_lz77(&pixels);
+        // 1 literal + ceil((1024 - 1) / 4096) copies; for 1024 pixels: 1 + 1.
+        let copies = tokens
+            .iter()
+            .filter(|t| matches!(t, Token::Copy { .. }))
+            .count();
+        assert!(
+            copies >= 1,
+            "solid-color image should emit at least one copy"
+        );
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// A repeated 4-pixel pattern (cycle length 4) compresses to a long
+    /// copy with `distance = 4`, which the §5.2.2 overlap rule
+    /// (`distance < length`) self-replicates correctly.
+    #[test]
+    fn round_trip_periodic_pattern_uses_overlapping_copy() {
+        let pattern = [0xff10_2030u32, 0xff40_5060, 0xff70_8090, 0xffa0_b0c0];
+        let w = 16u32;
+        let h = 4u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for i in 0..(w * h) {
+            pixels.push(pattern[(i % 4) as usize]);
+        }
+        let tokens = tokenize_lz77(&pixels);
+        let copies: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Copy { length, distance } => Some((*length, *distance)),
+                _ => None,
+            })
+            .collect();
+        assert!(!copies.is_empty(), "periodic pattern should emit a copy");
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// The §5.2.2 LZ77 path produces a strictly smaller chunk than the
+    /// literal-only baseline on a compressible (repetitive) image. This is
+    /// the round-119 headline measurement.
+    #[test]
+    fn lz77_beats_literal_only_on_repetitive_image() {
+        // 64x64 image whose first scan-line is a small palette of distinct
+        // colors and the remaining 63 lines copy the first line verbatim.
+        let w = 64u32;
+        let h = 64u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let palette = [
+            0xff10_2030u32,
+            0xff40_5060,
+            0xff70_8090,
+            0xffa0_b0c0,
+            0xffd0_e0f0,
+            0xff00_1122,
+            0xff33_4455,
+            0xff66_7788,
+        ];
+        for x in 0..w {
+            pixels.push(palette[(x as usize) % palette.len()]);
+        }
+        for _ in 1..h {
+            for x in 0..w {
+                pixels.push(palette[(x as usize) % palette.len()]);
+            }
+        }
+        let lz77 = encode_argb_literals(&pixels);
+        let lit_only = encode_argb_literals_only(&pixels);
+        assert!(
+            lz77.len() < lit_only.len(),
+            "LZ77 stream ({} B) not smaller than literal-only ({} B)",
+            lz77.len(),
+            lit_only.len(),
+        );
+        // And, more strongly, at least a 50% reduction on this case.
+        assert!(
+            lz77.len() * 2 < lit_only.len(),
+            "LZ77 stream ({} B) failed to halve literal-only ({} B)",
+            lz77.len(),
+            lit_only.len(),
+        );
+
+        // Round trip is exact.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// A pixel buffer with no exploitable repetition (deterministic
+    /// xorshift) still round-trips through the LZ77 encoder — even when
+    /// the matcher emits no copies and the distance code stays empty.
+    #[test]
+    fn lz77_round_trips_incompressible_pixels() {
+        let w = 17u32;
+        let h = 19u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xdead_beefu32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push(state);
+        }
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// A maximum-length copy (>= MAX_MATCH pixels of identical color) is
+    /// split into consecutive §5.2.2 copies, each bounded by `MAX_MATCH`.
+    #[test]
+    fn round_trip_splits_match_at_max_length() {
+        // A solid-color image with `> MAX_MATCH` pixels: the first row
+        // is the literal source, subsequent rows are copies.
+        let total = MAX_MATCH + 100;
+        let pixels = vec![0xff80_8080u32; total];
+        let tokens = tokenize_lz77(&pixels);
+        for tok in &tokens {
+            if let Token::Copy { length, .. } = tok {
+                assert!(
+                    *length <= MAX_MATCH,
+                    "copy length {length} exceeded MAX_MATCH"
+                );
+            }
+        }
+        // Round trip via the full encoder/decoder chain (1-row image of
+        // `total` pixels).
+        let w = total as u32;
+        let h = 1u32;
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
     }
 }
