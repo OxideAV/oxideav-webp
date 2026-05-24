@@ -129,6 +129,8 @@ pub mod anmf;
 pub mod build;
 pub mod container;
 pub mod meta_prefix;
+#[cfg(feature = "registry")]
+pub mod registry;
 pub mod vp8_chunk;
 pub mod vp8l_chunk;
 pub mod vp8l_decode;
@@ -613,10 +615,20 @@ fn argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
     out
 }
 
-/// No-op codec registration — the round-1 scaffold has no decoder
-/// to register into the runtime context.
+/// Install the WebP decoder factory and the `.webp` extension hint into
+/// `ctx` per round 112.
+///
+/// Wraps [`registry::register`]; see that module for the full breakdown
+/// of what lands in the codec / container sub-registries. The decoder
+/// covers the §2.6 / §3.4 `VP8L` lossless image (simple or
+/// `VP8X`-extended) with optional §2.7.1.2 `ALPH`-over-`VP8L` alpha
+/// override. The §2.5 `VP8 ` lossy path surfaces as a clean
+/// `oxideav_core::Error::Unsupported` — callers route lossy chunks via
+/// [`extract_lossy_chunk`] to a downstream VP8 decoder.
 #[cfg(feature = "registry")]
-pub fn register(_ctx: &mut RuntimeContext) {}
+pub fn register(ctx: &mut RuntimeContext) {
+    registry::register(ctx);
+}
 
 #[cfg(feature = "registry")]
 oxideav_core::register!("webp", register);

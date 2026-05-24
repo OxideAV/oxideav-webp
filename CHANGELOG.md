@@ -6,6 +6,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 112 (2026-05-24).** The codec is now registered into
+  `oxideav_core::RuntimeContext` — `register()` is no longer a no-op. New
+  `registry` module (gated behind the default-on `registry` feature):
+  * `registry::WebpDecoder` — an `oxideav_core::Decoder` impl over
+    `decode_webp_image`. Each `send_packet` carries one whole
+    `RIFF/WEBP` file; `receive_frame` returns a single-planar
+    `Frame::Video` of interleaved 8-bit RGBA (`PixelFormat::Rgba`,
+    stride `width * 4`). Covers §2.6 / §3.4 `VP8L` lossless (simple or
+    `VP8X`-extended) with optional §2.7.1.2 `ALPH`-over-`VP8L` alpha
+    override. A §2.5 `VP8 ` lossy file, and any animation / header-only
+    file with no `VP8L`/`VP8 ` image-data chunk, surface as
+    `oxideav_core::Error::Unsupported` (lossy callers route the chunk
+    via `extract_lossy_chunk`).
+  * `register()` / `registry::register_codecs` install one `CodecInfo`
+    under the `webp` codec id with the decoder factory and a `WEBP`
+    FourCC tag claim; `registry::register_containers` installs the
+    `.webp` file-extension hint. No encoder factory is registered.
+  * The decoder's `CodecParameters` carry the decoded `width` /
+    `height` / `PixelFormat::Rgba` after the first `receive_frame`
+    (read via `WebpDecoder::params`).
+  * `registry::decode_webp_to_frame(bytes, pts)` — a direct
+    `VideoFrame`-flavoured wrapper around `decode_webp_image`.
+  * `From<Error> for oxideav_core::Error` — `Unsupported` maps to the
+    core `Unsupported`; every other variant flows through `InvalidData`
+    carrying the sub-module's `Display` text.
+  * 10 unit tests in `registry::tests` cover the RuntimeContext install,
+    FourCC resolution, an end-to-end lossless decode through the
+    registered factory, the `VP8 ` lossy `Unsupported` refusal, the
+    params dim/format surfacing, the one-packet/one-frame contract, the
+    post-flush `Eof`, and the error conversion.
+
 * **Clean-room round 111 (2026-05-24).** Top-level still-image decode is
   wired up — `decode_webp` no longer returns `NotImplemented` for the
   cases the crate can decode. New surface:

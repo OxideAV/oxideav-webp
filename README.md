@@ -2,9 +2,27 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 111)
+## Status — 2026-05-24 (clean-room round 112)
 
-**The top-level still-image decode is now wired up.**
+**The codec is now registered into `oxideav_core::RuntimeContext`.**
+[`register`](src/lib.rs) (round 112) installs a `Decoder` factory under
+the canonical `webp` codec id plus the `.webp` file-extension hint, so
+the pipeline / `oxideav probe file.webp` can route a still WebP through
+it. The new [`registry::WebpDecoder`](src/registry.rs) wraps
+[`decode_webp_image`](src/lib.rs): each `send_packet` carries one whole
+`RIFF/WEBP` file and `receive_frame` returns a single-planar
+`Frame::Video` of interleaved 8-bit RGBA (`PixelFormat::Rgba`, stride
+`width * 4`). The decoded `width` / `height` / pixel format are surfaced
+on the decoder's [`CodecParameters`](src/registry.rs) after the first
+frame. A §2.5 `VP8 ` lossy file — and any animation / header-only file
+with no `VP8L`/`VP8 ` image-data chunk — is a clean
+`oxideav_core::Error::Unsupported`; lossy callers route the chunk via
+[`extract_lossy_chunk`](src/lib.rs) to a downstream VP8 decoder. The
+codec also claims the `WEBP` FourCC for tag-based resolution. The
+default-on `registry` feature gates the whole module, so the standalone
+(`--no-default-features`) build path stays free of `oxideav-core`.
+
+**The top-level still-image decode was wired up in round 111.**
 [`decode_webp_image`](src/lib.rs) walks a `RIFF/WEBP` file and decodes a
 §2.6 / §3.4 `VP8L` lossless image — simple **or** `VP8X`-extended — all
 the way to a `DecodedWebp { width, height, rgba }`, where `rgba` is
@@ -316,8 +334,31 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
   buffer. The §6.2.2 entropy-image *multi-group* path and the §4
   inverse-transform passes (which consume this loop's output) are
   next.
-* **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
-  still ships no decoder/encoder to the runtime context.
+* **Registry hook (round 112):** [`register`](src/lib.rs) now installs
+  a real `oxideav_core::Decoder` factory under the `webp` codec id (plus
+  the `.webp` extension hint and a `WEBP` FourCC tag claim). The
+  [`registry::WebpDecoder`](src/registry.rs) decodes a still `VP8L`
+  file — simple or `VP8X`-extended, with optional §2.7.1.2
+  `ALPH`-over-`VP8L` alpha override — to a single-planar
+  `PixelFormat::Rgba` `VideoFrame`; the §2.5 `VP8 ` lossy path and
+  animation / header-only files surface as
+  `oxideav_core::Error::Unsupported`. No encoder factory is registered
+  (the builders stay framing-only). Gated behind the default-on
+  `registry` feature.
+
+## What round 112 lands
+
+| Item                                              | Status                                                |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| `Decoder` impl over `decode_webp_image`           | **new** — `registry::WebpDecoder` (packet → RGBA frame) |
+| `register()` installs decoder factory + tag       | **new** — `CodecInfo` under `webp` id + `WEBP` FourCC |
+| `.webp` extension hint                            | **new** — `register_containers`                       |
+| RGBA `VideoFrame` (single plane, stride `w*4`)    | **new** — `PixelFormat::Rgba`                         |
+| dims / pixel format on `CodecParameters`          | **new** — refreshed after first `receive_frame`       |
+| `VP8 ` lossy → `Error::Unsupported`               | **new** — via the registered decoder path             |
+| animation / header-only → `Error::Unsupported`    | **new** — `NoImageData` → core `Unsupported`          |
+| `Error` → `oxideav_core::Error` bridge            | **new** — `Unsupported` maps to core `Unsupported`    |
+| `decode_webp_to_frame` direct helper              | **new** — framework-flavoured wrapper                 |
 
 ## What round 111 lands
 
@@ -441,11 +482,25 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
 | §2.7.1 `build_vp8x_chunk`     | done — typed flag-byte + 24-bit LE × 2 emit         |
 | §2.4 `build_webp_file`        | done — simple + extended `RIFF/WEBP` envelope       |
 | VP8L bitstream decode         | done — `decode_webp` / `decode_lossless_image` → RGBA |
-| VP8 lossy bitstream decode    | not yet — typed handle routes payload out-of-crate  |
+| `oxideav_core::Decoder` registration | done (r112) — `register()` installs the `webp` decoder factory |
+| VP8 lossy bitstream decode    | not yet — typed handle / decoder route payload out-of-crate |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **247** (203 unit + 44 integration against the
-`docs/image/webp/fixtures/` corpus). Round 111 adds 7 integration tests
+Test count: **257** (213 unit + 44 integration against the
+`docs/image/webp/fixtures/` corpus). Round 112 adds 10 unit tests inside
+`registry::tests` — `register(&mut ctx)` installs the decoder factory
+(and not an encoder) plus the `.webp` extension hint; the `WEBP` FourCC
+resolves to the `webp` codec id; `first_decoder` returns a `WebpDecoder`;
+an end-to-end `RuntimeContext → first_decoder → send_packet →
+receive_frame` decode of `lossless-1x1.webp` yields the expected RGBA
+frame and then `NeedMore`; a `VP8 ` lossy packet surfaces as
+`Error::Unsupported` through the registered decoder; the decoder's
+`CodecParameters` carry the decoded dims + `PixelFormat::Rgba` after the
+first frame; a double `send_packet` without a `receive_frame` is
+rejected; post-`flush` with no pending packet returns `Eof`;
+`decode_webp_to_frame` produces an RGBA `VideoFrame`; and the
+`Error → oxideav_core::Error` conversion maps both `Unsupported`
+variants to the core `Unsupported`. Round 111 adds 7 integration tests
 covering the top-level `decode_webp` / `decode_webp_image` entries
 (simple `VP8L`, color-indexed palette, RGBA-alpha repack, synthesized
 `VP8X`+`VP8L`, hand-assembled `VP8X`+`VP8L`+`ALPH` override, and the two
