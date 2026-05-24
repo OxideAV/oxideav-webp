@@ -973,11 +973,14 @@ fn metadata_from_container(bytes: &[u8], c: &container::WebpContainer) -> WebpFi
 /// file decodes back to the same bytes through [`decode_webp`], a
 /// pixel-exact round trip.
 ///
-/// This is the round-115 encoder: it takes the simplest spec-conformant
-/// VP8L path — no §3.8.2 transform, no §3.8.3 color cache, a single
-/// meta-prefix code, and a literal-only image (no LZ77 backward references)
-/// — building the §3.7.2 canonical prefix codes per-image from the pixel
-/// frequencies. See [`vp8l_encode::encode_webp_lossless`].
+/// This is the round-115 encoder, extended in round 119 with §5.2.2 LZ77
+/// backward-reference matching and in round 120 with the §3.5.3 / §3.8.2
+/// subtract-green forward transform. The encoder evaluates the no-transform
+/// and subtract-green paths per image and emits whichever is smaller; the
+/// LZ77 matcher runs in both. Still pass-through: §3.8.2 predictor / color
+/// / color-indexing transforms and §3.8.3 color cache. The §3.7.2 canonical
+/// prefix codes are built per-image from the pixel frequencies. See
+/// [`vp8l_encode::encode_webp_lossless`].
 pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
     vp8l_encode::encode_webp_lossless(rgba, width, height).map_err(Into::into)
 }

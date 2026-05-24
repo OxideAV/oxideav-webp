@@ -6,6 +6,34 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 120 (2026-05-24).** §3.5.3 / §3.8.2 **subtract-green
+  transform** forward path in the VP8L encoder. New `apply_subtract_green`
+  helper subtracts the green channel from red and blue per pixel
+  (`r := (r - g) & 0xff`, `b := (b - g) & 0xff`), the exact inverse of
+  the decoder's existing `vp8l_transform::inverse_subtract_green`.
+  `encode_argb_literals` now evaluates both the no-transform and the
+  subtract-green paths and emits whichever is smaller — the §3.8.2
+  transform header costs only three bits (`%b1 %b10`, transform type 2
+  with no body), so on green-correlated natural-image-like content the
+  per-channel red/blue entropy drops sharply for a near-free win;
+  uncorrelated noise falls back to no-transform (the chooser never
+  regresses). The literal-only and subtract-green-forced paths stay
+  available as `encode_argb_literals_only` and
+  `encode_argb_literals_subtract_green` for the round-119/120 size
+  comparison tests. Headline: a 32×32 synthetic green-correlated image
+  (red and blue track green plus small noise) compresses from 3243 B
+  (no-transform) to 2211 B (subtract-green) — a ~32 % size reduction.
+  Round-trip is bit-exact through `decode_lossless_image` because the
+  decoder's §4 inverse pass undoes the encoded transform. New tests:
+  `apply_subtract_green_is_inverse_of_inverse_subtract_green`,
+  `apply_subtract_green_only_touches_red_and_blue`,
+  `subtract_green_beats_no_transform_on_green_correlated_image`,
+  `encode_argb_literals_chooses_smaller_path`,
+  `subtract_green_path_round_trips_via_public_entry_points`,
+  `encode_argb_literals_does_not_regress_on_uncorrelated_noise`.
+  The crate still builds + tests under `--no-default-features` (the
+  forward transform uses no `oxideav-core` surface).
+
 * **Clean-room round 119 (2026-05-24).** §5.2.2 **LZ77 backward-reference
   matching** in the VP8L encoder. `encode_argb_literals` now runs a
   hash-chain matcher (`Lz77Matcher`) over the ARGB pixel buffer before

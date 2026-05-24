@@ -7,10 +7,17 @@
 //! produces ARGB pixels. This module produces a VP8L chunk payload from
 //! ARGB pixels, taking the simplest end-to-end path the spec admits:
 //!
-//! * **No §3.8.2 transform** — the `optional-transform` loop emits a
-//!   single `%b0` terminator (pass-through). The four transforms
-//!   (predictor / color / subtract-green / color-indexing) are all
-//!   optional; a decoder reconstructs the exact pixels without them.
+//! * **§3.8.2 optional subtract-green transform** — as of round 120 the
+//!   encoder evaluates both the no-transform and subtract-green paths and
+//!   emits whichever is smaller. The subtract-green transform (`%b1 %b10`
+//!   in the §3.8.2 grammar; transform type 2 per §3.5 Table 1) carries
+//!   no body bits and subtracts the green channel from red and blue
+//!   before the entropy stage, lowering per-pixel red/blue entropy on
+//!   natural images (the spec's §3.5.3 motivation: "this transform is
+//!   redundant, as it can be modeled using the color transform, but since
+//!   there is no additional data here, the subtract green transform can
+//!   be coded using fewer bits"). The other three transforms (predictor
+//!   / color / color-indexing) are still pass-through.
 //! * **No §3.8.3 color cache** — `color-cache-info` is the single `%b0`
 //!   bit. Every pixel is emitted directly.
 //! * **Single §3.7.2.2 meta-prefix code** — `meta-prefix` is `%b0`, so one
@@ -865,9 +872,39 @@ fn write_lz77_value(w: &mut BitWriter, code: &WriteCode, symbol_base: usize, val
     }
 }
 
+/// §3.5.3 / §3.8.2 *forward* subtract-green transform: subtract the green
+/// channel from red and blue per pixel, in place. The exact inverse of
+/// [`crate::vp8l_transform::inverse_subtract_green`], so re-applying the
+/// decoder's inverse pass after entropy decode restores the original
+/// pixels byte-for-byte.
+///
+/// Spec arithmetic: `red := (red - green) & 0xff`,
+/// `blue := (blue - green) & 0xff` (the §3.5.3 inverse is `+ green & 0xff`,
+/// so subtracting on the encode side and adding back on the decode side is
+/// a perfect round trip modulo 256).
+pub fn apply_subtract_green(pixels: &mut [u32]) {
+    for px in pixels.iter_mut() {
+        let a = (*px >> 24) & 0xff;
+        let r = (*px >> 16) & 0xff;
+        let g = (*px >> 8) & 0xff;
+        let b = *px & 0xff;
+        let r_new = r.wrapping_sub(g) & 0xff;
+        let b_new = b.wrapping_sub(g) & 0xff;
+        *px = (a << 24) | (r_new << 16) | (g << 8) | b_new;
+    }
+}
+
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
 /// §3.4 5-byte image-header), running the §5.2.2 LZ77 backward-reference
 /// matcher so repeated pixel runs compress.
+///
+/// As of round 120, the encoder also evaluates the §3.5.3 / §3.8.2
+/// **subtract-green transform** and emits whichever of the two paths is
+/// smaller. The transform header costs only three bits (`%b1 %b10`), so on
+/// natural images where the green-correlated red/blue channels shrink the
+/// per-channel entropy, subtract-green is a near-free compression win. On
+/// images where the transform doesn't help (or hurts), the no-transform
+/// path is kept.
 ///
 /// `pixels` is `width * height` ARGB values in scan-line order, each
 /// `(alpha << 24) | (red << 16) | (green << 8) | blue` — the same layout
@@ -876,26 +913,64 @@ fn write_lz77_value(w: &mut BitWriter, code: &WriteCode, symbol_base: usize, val
 /// decode back to `pixels` exactly.
 pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
     let tokens = tokenize_lz77(pixels);
-    encode_tokens(&tokens)
+    let no_tx = encode_tokens(&tokens, false);
+    // Subtract-green path: apply the forward transform, re-tokenize the
+    // residual pixels (matches change because the per-pixel values do),
+    // and prefix the §3.8.2 transform header.
+    let mut sg_pixels = pixels.to_vec();
+    apply_subtract_green(&mut sg_pixels);
+    let sg_tokens = tokenize_lz77(&sg_pixels);
+    let sg = encode_tokens(&sg_tokens, true);
+    if sg.len() < no_tx.len() {
+        sg
+    } else {
+        no_tx
+    }
 }
 
-/// Encode an ARGB image with the literal-only path (no §5.2.2 LZ77 match
-/// search): every pixel becomes a §5.2.1 ARGB literal. Retained as the
-/// baseline the round-119 size-reduction test compares the LZ77 path
-/// against; [`encode_argb_literals`] is the default entry point.
+/// Encode an ARGB image with the literal-only, no-transform path: every
+/// pixel becomes a §5.2.1 ARGB literal and no §3.8.2 transform is written.
+/// Retained as the baseline the round-119 size-reduction test compares the
+/// LZ77 path against; [`encode_argb_literals`] is the default entry point.
 pub fn encode_argb_literals_only(pixels: &[u32]) -> Vec<u8> {
     let tokens: Vec<Token> = pixels.iter().map(|&p| Token::Literal(p)).collect();
-    encode_tokens(&tokens)
+    encode_tokens(&tokens, false)
+}
+
+/// Encode an ARGB image forcing the §3.5.3 / §3.8.2 subtract-green
+/// transform on, regardless of whether it shrinks the stream. Used by the
+/// round-120 size-reduction comparison test to measure the transform's
+/// effect on a natural-image-like fixture; production callers use
+/// [`encode_argb_literals`] which picks the smaller of the two paths.
+pub fn encode_argb_literals_subtract_green(pixels: &[u32]) -> Vec<u8> {
+    let mut sg_pixels = pixels.to_vec();
+    apply_subtract_green(&mut sg_pixels);
+    let tokens = tokenize_lz77(&sg_pixels);
+    encode_tokens(&tokens, true)
 }
 
 /// Shared entropy stage: from a §5.2.2 token stream, build the five prefix
-/// codes and emit the §3.8.3 image data (optional-transform terminator,
+/// codes and emit the §3.8.3 image data (optional-transform header,
 /// color-cache-info, meta-prefix, the five prefix-code length tables, then
 /// the LZ77-coded image).
-fn encode_tokens(tokens: &[Token]) -> Vec<u8> {
+///
+/// `subtract_green` controls the §3.8.2 transform header: `false` emits a
+/// single `%b0` terminator (no transform); `true` emits `%b1 %b10 %b0` —
+/// the subtract-green transform (type 2, bodyless) followed by the end-of-
+/// list terminator.
+fn encode_tokens(tokens: &[Token], subtract_green: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
 
-    // §3.8.2 optional-transform: none. Single `%b0` terminator.
+    // §3.8.2 optional-transform.
+    if subtract_green {
+        // Present-bit `%b1`, then 2-bit TransformType `SubtractGreen` (value
+        // 2 in LSB-first bit order: bit0=0, bit1=1 — matches the spec's
+        // `%b10` MSB-first notation when read through the LSB-first
+        // `ReadBits(2)`). No body for subtract-green per §3.5.3 / §3.8.2.
+        w.write_bit(true);
+        w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
+    }
+    // End-of-list terminator.
     w.write_bit(false);
 
     // §3.8.3 spatially-coded-image = color-cache-info meta-prefix data.
@@ -1578,6 +1653,172 @@ mod tests {
         let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
         let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
         assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    // ---- §3.5.3 / §3.8.2 subtract-green forward transform ----
+
+    /// `apply_subtract_green` is the per-pixel inverse of
+    /// [`crate::vp8l_transform::inverse_subtract_green`]: subtracting
+    /// then re-adding green restores the originals, even across the
+    /// `& 0xff` wrap.
+    #[test]
+    fn apply_subtract_green_is_inverse_of_inverse_subtract_green() {
+        let mut pixels = [
+            0xff00_0000u32, // black
+            0xff7f_ff00,    // greenish
+            0xffff_ffff,    // white
+            0x8012_3456,    // mid alpha
+            0x0001_0203,    // wrapping case: r=01, g=02, b=03
+        ];
+        let original = pixels;
+        apply_subtract_green(&mut pixels);
+        // Run the decoder's inverse and confirm we're back at the start.
+        crate::vp8l_transform::inverse_subtract_green(&mut pixels);
+        assert_eq!(pixels, original);
+    }
+
+    /// `apply_subtract_green` preserves the green and alpha channels and
+    /// only mutates red/blue per the §3.5.3 spec.
+    #[test]
+    fn apply_subtract_green_only_touches_red_and_blue() {
+        let mut pixels = [0x80_70_60_50u32]; // a=80 r=70 g=60 b=50
+        apply_subtract_green(&mut pixels);
+        // a, g unchanged; r := (0x70 - 0x60) & 0xff = 0x10; b := 0xf0.
+        assert_eq!((pixels[0] >> 24) & 0xff, 0x80);
+        assert_eq!((pixels[0] >> 16) & 0xff, 0x10);
+        assert_eq!((pixels[0] >> 8) & 0xff, 0x60);
+        assert_eq!(pixels[0] & 0xff, 0xf0); // 0x50 - 0x60 = -0x10 → 0xf0
+    }
+
+    /// On a synthetic natural-image-like fixture (a gradient where red and
+    /// blue track green), the subtract-green path is strictly smaller than
+    /// the no-transform path. This is the round-120 headline measurement.
+    #[test]
+    fn subtract_green_beats_no_transform_on_green_correlated_image() {
+        // 32x32 image whose r and b channels each closely track g, so
+        // (r - g) and (b - g) cluster tightly around 0 — exactly the
+        // distribution §3.5.3 is designed to exploit.
+        let w = 32u32;
+        let h = 32u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xC0FFEE12u32;
+        for _ in 0..(w * h) {
+            // xorshift-driven green; r/b are green plus small noise.
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let g = state & 0xff;
+            let r = g.wrapping_add(((state >> 8) & 0x0f).wrapping_sub(7) & 0xff) & 0xff;
+            let b = g.wrapping_add(((state >> 16) & 0x0f).wrapping_sub(7) & 0xff) & 0xff;
+            pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+        }
+        let no_tx = {
+            let tokens = tokenize_lz77(&pixels);
+            encode_tokens(&tokens, false)
+        };
+        let sg = encode_argb_literals_subtract_green(&pixels);
+        eprintln!(
+            "[round-120] 32x32 green-correlated: no-tx={} B, subtract-green={} B ({:.1}% reduction)",
+            no_tx.len(),
+            sg.len(),
+            100.0 * (no_tx.len() as f64 - sg.len() as f64) / no_tx.len() as f64,
+        );
+        assert!(
+            sg.len() < no_tx.len(),
+            "subtract-green ({} B) did not beat no-transform ({} B)",
+            sg.len(),
+            no_tx.len(),
+        );
+
+        // Round trip through the full decode chain stays pixel-exact.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// `encode_argb_literals` picks the smaller of the two evaluated
+    /// paths, so on a green-correlated image its output equals the
+    /// subtract-green path (or smaller).
+    #[test]
+    fn encode_argb_literals_chooses_smaller_path() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        // A solid green tint with slight per-pixel red/blue noise — the
+        // subtract-green path concentrates r and b near zero.
+        let mut state = 0x12345678u32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let g = 0x80u32;
+            let r = g.wrapping_add((state & 0x0f).wrapping_sub(7) & 0xff) & 0xff;
+            let b = g.wrapping_add(((state >> 4) & 0x0f).wrapping_sub(7) & 0xff) & 0xff;
+            pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+        }
+        let chosen = encode_argb_literals(&pixels);
+        let sg = encode_argb_literals_subtract_green(&pixels);
+        let no_tx = {
+            let tokens = tokenize_lz77(&pixels);
+            encode_tokens(&tokens, false)
+        };
+        assert_eq!(chosen.len(), sg.len().min(no_tx.len()));
+    }
+
+    /// A subtract-green-encoded image survives a full encode → decode
+    /// round trip via the public entry points: the encoder writes the
+    /// §3.8.2 transform header, the decoder reads it back and applies the
+    /// §4.3 inverse, restoring the originals.
+    #[test]
+    fn subtract_green_path_round_trips_via_public_entry_points() {
+        let w = 8u32;
+        let h = 8u32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| {
+                let g = (i * 4) & 0xff;
+                let r = g.wrapping_add(3) & 0xff;
+                let b = g.wrapping_sub(2) & 0xff;
+                0xff00_0000 | (r << 16) | (g << 8) | b
+            })
+            .collect();
+        // Force the subtract-green path via the test-only entry.
+        let stream = encode_argb_literals_subtract_green(&pixels);
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// On a pure-noise image (no green correlation) the chooser falls
+    /// back to the no-transform path — `encode_argb_literals` should
+    /// never produce a stream larger than the literal-only baseline by
+    /// applying a transform that doesn't help.
+    #[test]
+    fn encode_argb_literals_does_not_regress_on_uncorrelated_noise() {
+        let w = 16u32;
+        let h = 16u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xDEAD_BEEFu32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push(state | 0xff00_0000);
+        }
+        let chosen = encode_argb_literals(&pixels);
+        let no_tx = {
+            let tokens = tokenize_lz77(&pixels);
+            encode_tokens(&tokens, false)
+        };
+        assert!(
+            chosen.len() <= no_tx.len(),
+            "chooser regressed: {} B with chooser vs {} B no-transform",
+            chosen.len(),
+            no_tx.len(),
+        );
     }
 
     /// A maximum-length copy (>= MAX_MATCH pixels of identical color) is

@@ -2,6 +2,27 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-24 (clean-room round 120)
+
+**Round 120 added the §3.5.3 / §3.8.2 subtract-green forward transform.**
+New [`apply_subtract_green`](src/vp8l_encode.rs) subtracts the green
+channel from red and blue per pixel — the exact inverse of the decoder's
+existing [`inverse_subtract_green`](src/vp8l_transform.rs).
+[`encode_argb_literals`](src/vp8l_encode.rs) now evaluates both the
+no-transform and the subtract-green paths per image and emits whichever
+is smaller. The §3.8.2 transform header costs three bits (`%b1 %b10`,
+transform type 2, no body), so on green-correlated natural-image content
+the per-channel red/blue entropy drops sharply; uncorrelated noise
+falls back to no-transform (the chooser never regresses). Headline: a
+32×32 synthetic green-correlated image compresses from 3243 B (no-tx)
+to 2211 B (subtract-green) — a ~32 % size reduction. Round trip is
+bit-exact through [`decode_lossless_image`](src/lib.rs). The literal-only
+and force-subtract-green paths stay available as
+[`encode_argb_literals_only`](src/vp8l_encode.rs) and
+[`encode_argb_literals_subtract_green`](src/vp8l_encode.rs) for the
+size-comparison tests. Lacks §3.8.2 predictor / color / color-indexing
+transform encoding and §5.2.3 color-cache compression.
+
 ## Status — 2026-05-24 (clean-room round 118)
 
 **The published-0.1.5 animation-encode API (VP8L path) is restored (round 118).**
