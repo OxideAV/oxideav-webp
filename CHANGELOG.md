@@ -6,6 +6,41 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 116 (2026-05-24).** First step of restoring the
+  **published-0.1.5 public decode API shape** so downstream consumers
+  compile again (see `API-COMPAT.md`). New published-shape decode types
+  (all available standalone, no `oxideav-core` dep):
+  * `WebpImage { frames: Vec<WebpFrame>, metadata: WebpFileMetadata,
+    anim_background_rgba: Option<[u8; 4]>, anim_loop_count: Option<u16> }`.
+  * `WebpFrame { rgba: Vec<u8>, width: u32, height: u32, duration_ms: u32 }`
+    — `rgba.len() == width * height * 4`, tightly packed `[R, G, B, A]`,
+    no stride padding (drops straight into `image::ImageBuffer::from_raw`).
+  * `WebpFileMetadata { icc: Option<Vec<u8>>, exif: Option<Vec<u8>>,
+    xmp: Option<Vec<u8>> }`.
+  * `WebpError { InvalidData, Unsupported, Eof, NeedMore }`, with
+    `From<Error>` mapping the rich internal error onto the coarse
+    published shape.
+
+### Changed
+
+* **`decode_webp` restored to the published shape.** It now returns
+  `Result<WebpImage, WebpError>` (was the rebuild's own unpublished
+  `Result<Vec<u8>, Error>`). Built on the already-rebuilt §4–§6 VP8L
+  decoder: a simple/extended-lossless file yields a single-frame
+  `WebpImage`. VP8 lossy and animation paths are reported
+  `WebpError::Unsupported` (never faked) until those decoders are
+  rebuilt. The flat-`Vec<u8>` behaviour is preserved via
+  `decode_webp(..).frames[0].rgba`; the low-level
+  `decode_webp_image -> DecodedWebp` and `decode_lossless_image` helpers
+  are unchanged and remain as additional API.
+* New `extract_metadata(bytes) -> Result<WebpFileMetadata, WebpError>` —
+  metadata-only walk (ICC / Exif / XMP), decodes no pixels.
+* New standalone integration test `tests/published_decode_api.rs`
+  (runs under `--no-default-features`): builds an in-memory RGBA buffer,
+  encodes via the VP8L lossless encoder, decodes via `decode_webp`, and
+  asserts the round-tripped `WebpFrame.rgba` is byte-exact with
+  `len == w * h * 4` — proving the flat `image`-crate buffer shape.
+
 * **Clean-room round 115 (2026-05-24).** First **VP8L lossless encoder**.
   New `vp8l_encode` module (compiles standalone, no `oxideav-core` dep):
   * `encode_webp_lossless(rgba, width, height)` — encodes an interleaved

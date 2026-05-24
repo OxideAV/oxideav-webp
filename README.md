@@ -2,7 +2,35 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 115)
+## Status — 2026-05-24 (clean-room round 116)
+
+**The published-0.1.5 decode API shape is being restored (round 116).**
+The orphan rebuild had invented its own `decode_webp -> Result<Vec<u8>,
+Error>` surface; downstream consumers depend on the *published* shape
+recorded in [`API-COMPAT.md`](API-COMPAT.md). This round restores it:
+[`decode_webp`](src/lib.rs) now returns `Result<WebpImage, WebpError>`,
+where [`WebpImage`](src/lib.rs) carries `frames: Vec<WebpFrame>`,
+`metadata: WebpFileMetadata`, `anim_background_rgba: Option<[u8; 4]>`, and
+`anim_loop_count: Option<u16>`. Each [`WebpFrame`](src/lib.rs) holds a
+flat `rgba: Vec<u8>` (`len == width * height * 4`, tightly packed
+`[R, G, B, A]`, no stride padding — wraps zero-copy as
+`image::ImageBuffer::from_raw`) plus `width`, `height`, `duration_ms`.
+[`WebpFileMetadata`](src/lib.rs) exposes `icc` / `exif` / `xmp`, and
+[`extract_metadata`](src/lib.rs) reads them without decoding pixels.
+Errors collapse to the published [`WebpError`](src/lib.rs)
+(`InvalidData` / `Unsupported` / `Eof` / `NeedMore`). The path is built
+on the already-rebuilt §4–§6 VP8L decoder: a simple/extended-lossless
+file yields a single-frame `WebpImage`; VP8 lossy and animation report
+`WebpError::Unsupported` (never faked) until those decoders are rebuilt.
+The rebuild's low-level [`decode_webp_image`](src/lib.rs) →
+`DecodedWebp` and [`decode_lossless_image`](src/lib.rs) helpers are
+unchanged and remain as additional API. A standalone test
+(`tests/published_decode_api.rs`, runs under `--no-default-features`)
+encodes an in-memory RGBA buffer, decodes via `decode_webp`, and asserts
+the round-tripped `WebpFrame.rgba` is byte-exact. **Not yet restored:**
+the published VP8 lossy / animation encode entry points and the
+`From<oxideav_vp8::Vp8Error>` conversion (blocked — `oxideav-vp8` has not
+restored a `Vp8Error` symbol).
 
 **A VP8L lossless encoder landed in round 115.**
 [`encode_webp_lossless`](src/lib.rs) takes an interleaved 8-bit RGBA
@@ -51,8 +79,10 @@ the way to a `DecodedWebp { width, height, rgba }`, where `rgba` is
 `oxideav_core::PixelFormat::Rgba` layout). When a (spec-discouraged, per
 §2.7.1.2 "SHOULD NOT") `ALPH` chunk accompanies the `VP8L` image, its
 decoded alpha plane overrides the per-pixel alpha.
-[`decode_webp`](src/lib.rs) is the flat-buffer shorthand. A §2.5 `VP8 `
-lossy file is a clean `Error::Unsupported(LossyVp8)` — routed onward via
+[`decode_webp`](src/lib.rs) is the published flat-RGBA entry point (round
+116) — it returns a `WebpImage` whose single `WebpFrame.rgba` is the same
+flat buffer. At the low level, a §2.5 `VP8 ` lossy file is a clean
+`Error::Unsupported(LossyVp8)` — routed onward via
 [`extract_lossy_chunk`](src/lib.rs) rather than stub-decoded.
 
 The **VP8L lossless decode path is complete end-to-end, and the

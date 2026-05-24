@@ -600,15 +600,189 @@ pub fn decode_webp_image(bytes: &[u8]) -> Result<DecodedWebp, Error> {
     })
 }
 
-/// Decode a still WebP file to a tightly packed 8-bit RGBA pixel buffer.
+// ─────────────────────── Published-shape decode API ───────────────────────
+//
+// The free `decode_webp` path the published crates.io releases exposed —
+// the flat, `image`-crate-compatible RGBA surface downstream consumers
+// depend on. See `API-COMPAT.md`. The `WebpImage` / `WebpFrame` /
+// `WebpFileMetadata` / `WebpError` shapes here are the published shapes;
+// the round-115 `DecodedWebp` / `decode_webp_image` / `decode_lossless_image`
+// helpers above are the rebuild's own low-level surface and stay as
+// additional API.
+
+/// A fully decoded WebP file: one frame for a still image, N frames for an
+/// animation, plus the file-level metadata and animation parameters.
 ///
-/// Convenience over [`decode_webp_image`] that drops the dimensions and
-/// returns only the `width * height * 4` interleaved `[R, G, B, A]`
-/// bytes. See [`decode_webp_image`] for the supported image kinds and
-/// the [`Error::Unsupported`] cases (`VP8 ` lossy / animation /
-/// header-only).
-pub fn decode_webp(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(decode_webp_image(bytes)?.rgba)
+/// This is the published-API decode result. The single most important
+/// consumer property is the flat-buffer shape of each [`WebpFrame::rgba`]:
+/// `width * height * 4` tightly packed `[R, G, B, A]` bytes, no per-row
+/// stride padding, so it drops straight into
+/// `image::ImageBuffer::from_raw(width, height, rgba)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebpImage {
+    /// Decoded frames. A still image yields exactly one frame; an
+    /// animation yields one per `ANMF` chunk (animation decode is not
+    /// rebuilt yet — see [`decode_webp`]).
+    pub frames: Vec<WebpFrame>,
+    /// File-level metadata (ICC / Exif / XMP), each `None` when absent.
+    pub metadata: WebpFileMetadata,
+    /// The §2.7.1.1 `ANIM` background colour as `[R, G, B, A]`, or `None`
+    /// for a non-animated file.
+    pub anim_background_rgba: Option<[u8; 4]>,
+    /// The §2.7.1.1 `ANIM` loop count (`0` = loop forever), or `None` for
+    /// a non-animated file.
+    pub anim_loop_count: Option<u16>,
+}
+
+/// A single decoded WebP frame: a flat RGBA pixel buffer plus its size
+/// and (for animations) its display duration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebpFrame {
+    /// `width * height * 4` interleaved `[R, G, B, A]` bytes in scan-line
+    /// (top-to-bottom, left-to-right) order, no stride padding.
+    pub rgba: Vec<u8>,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Per-frame display duration in milliseconds (the §2.7.1.1 `ANMF`
+    /// frame delay). `0` for a still image.
+    pub duration_ms: u32,
+}
+
+/// File-level metadata chunks, each carrying the raw chunk payload bytes
+/// when present.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebpFileMetadata {
+    /// §2.7.1.4 `ICCP` ICC color-profile payload, if present.
+    pub icc: Option<Vec<u8>>,
+    /// §2.7.1.5 `EXIF` Exif payload, if present.
+    pub exif: Option<Vec<u8>>,
+    /// §2.7.1.5 `XMP ` XMP payload, if present.
+    pub xmp: Option<Vec<u8>>,
+}
+
+/// The published-API error type for the flat [`decode_webp`] /
+/// [`extract_metadata`] decode paths.
+///
+/// This is intentionally coarse-grained — the stable shape downstream
+/// consumers match on. The internal [`Error`] enum (with its per-module
+/// variants) remains the richer surface for the low-level
+/// [`decode_webp_image`] / [`decode_lossless_image`] helpers; it maps into
+/// `WebpError` via the `From<Error>` impl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebpError {
+    /// The input is not a well-formed WebP file (bad magic, malformed
+    /// chunk structure, a sub-decoder rejected the bitstream, …).
+    InvalidData,
+    /// The file is well-formed but carries an image kind this build does
+    /// not decode yet — currently the §2.5 `VP8 ` lossy bitstream and
+    /// animation frame assembly.
+    Unsupported,
+    /// The input ended before a complete image could be read.
+    Eof,
+    /// More input is required to complete the decode (streaming callers).
+    NeedMore,
+}
+
+impl core::fmt::Display for WebpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            Self::InvalidData => "oxideav-webp: invalid WebP data",
+            Self::Unsupported => "oxideav-webp: unsupported WebP feature",
+            Self::Eof => "oxideav-webp: unexpected end of input",
+            Self::NeedMore => "oxideav-webp: more input required",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for WebpError {}
+
+/// Map the rich internal [`Error`] onto the coarse published [`WebpError`].
+///
+/// `Unsupported` / `NotImplemented` collapse to [`WebpError::Unsupported`];
+/// every other variant (a malformed container or a sub-decoder rejecting
+/// the bitstream) is [`WebpError::InvalidData`].
+impl From<Error> for WebpError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Unsupported(_) | Error::NotImplemented => WebpError::Unsupported,
+            _ => WebpError::InvalidData,
+        }
+    }
+}
+
+/// Decode a WebP file to the published flat-RGBA [`WebpImage`] shape.
+///
+/// This is the `image`-crate-compatible entry point: every returned
+/// [`WebpFrame::rgba`] is `width * height * 4` tightly packed `[R, G, B, A]`
+/// bytes (no stride padding), so a frame wraps zero-copy as
+/// `image::ImageBuffer::from_raw(frame.width, frame.height, frame.rgba)`.
+///
+/// Supported today (built on the rebuilt §4–§6 VP8L decoder):
+///
+/// * **Simple / extended lossless** (`VP8L`, optionally `VP8X`-fronted,
+///   with optional `ALPH`-over-`VP8L` alpha) → a single-frame `WebpImage`.
+///
+/// Not yet rebuilt (returns [`WebpError::Unsupported`], never a fake
+/// decode):
+///
+/// * **§2.5 `VP8 ` lossy** — needs the `oxideav-vp8` bitstream path.
+/// * **Animation** — `ANMF` frame assembly.
+///
+/// The low-level [`decode_webp_image`] / [`decode_lossless_image`] helpers
+/// expose the rebuild's internal [`DecodedWebp`] / [`vp8l_decode::DecodedImage`]
+/// surfaces for callers that want them.
+pub fn decode_webp(bytes: &[u8]) -> Result<WebpImage, WebpError> {
+    // Parse the container once so we can read both pixels and metadata.
+    let c = container::parse(bytes).map_err(|_| WebpError::InvalidData)?;
+
+    // Pixel data: the rebuilt path decodes VP8L (simple or extended).
+    // VP8 lossy and animation are reported Unsupported, not faked.
+    let decoded = decode_webp_image(bytes).map_err(WebpError::from)?;
+
+    let frame = WebpFrame {
+        rgba: decoded.rgba,
+        width: decoded.width,
+        height: decoded.height,
+        duration_ms: 0,
+    };
+
+    let metadata = metadata_from_container(bytes, &c);
+
+    // Non-animated file: ANIM fields are None. (Animation assembly is not
+    // rebuilt yet, so any animated file already errored Unsupported above
+    // via the NoImageData path.)
+    Ok(WebpImage {
+        frames: vec![frame],
+        metadata,
+        anim_background_rgba: None,
+        anim_loop_count: None,
+    })
+}
+
+/// Read the file-level metadata chunks (ICC / Exif / XMP) without
+/// decoding any pixels.
+///
+/// Walks the container and lifts the raw payloads of the §2.7.1.4 `ICCP`,
+/// §2.7.1.5 `EXIF`, and §2.7.1.5 `XMP ` chunks (each `None` when absent).
+pub fn extract_metadata(bytes: &[u8]) -> Result<WebpFileMetadata, WebpError> {
+    let c = container::parse(bytes).map_err(|_| WebpError::InvalidData)?;
+    Ok(metadata_from_container(bytes, &c))
+}
+
+/// Lift the ICC / Exif / XMP payloads out of an already-parsed container.
+fn metadata_from_container(bytes: &[u8], c: &container::WebpContainer) -> WebpFileMetadata {
+    let payload_of = |fourcc| {
+        c.first_chunk_with_fourcc(fourcc)
+            .map(|chunk| chunk.payload(bytes).to_vec())
+    };
+    WebpFileMetadata {
+        icc: payload_of(container::fourcc::ICCP),
+        exif: payload_of(container::fourcc::EXIF),
+        xmp: payload_of(container::fourcc::XMP),
+    }
 }
 
 /// Encode an interleaved 8-bit RGBA image to a complete RIFF/WEBP file

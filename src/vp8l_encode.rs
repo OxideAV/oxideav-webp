@@ -815,7 +815,7 @@ mod tests {
         let rgba = [0x12, 0x34, 0x56, 0xff];
         let file = encode_webp_lossless(&rgba, 1, 1).unwrap();
         let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded, rgba);
+        assert_eq!(decoded.frames[0].rgba, rgba);
     }
 
     #[test]
@@ -844,7 +844,7 @@ mod tests {
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
         let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded, rgba);
+        assert_eq!(decoded.frames[0].rgba, rgba);
     }
 
     #[test]
@@ -859,7 +859,7 @@ mod tests {
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
         let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded, rgba);
+        assert_eq!(decoded.frames[0].rgba, rgba);
     }
 
     #[test]
@@ -881,7 +881,7 @@ mod tests {
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
         let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded, rgba);
+        assert_eq!(decoded.frames[0].rgba, rgba);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use oxideav_webp::{
     build_vp8x_chunk, build_webp_file, decode_lossless_image, decode_webp, decode_webp_image,
     encode_webp_lossless, extract_lossless_chunk, extract_lossy_chunk, parse_alph_header,
     parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
-    read_vp8l_transform_list, Error, UnsupportedKind,
+    read_vp8l_transform_list,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
@@ -1093,8 +1093,16 @@ fn round111_decode_webp_image_simple_lossless_1x1_rgba() {
     assert_eq!(img.width, 1);
     assert_eq!(img.height, 1);
     assert_eq!(img.rgba, vec![0xB4, 0x3C, 0x5A, 0xFF]);
-    // `decode_webp` returns the same flat buffer.
-    assert_eq!(decode_webp(LOSSLESS_1X1).unwrap(), img.rgba);
+    // `decode_webp` returns the published `WebpImage` shape: one frame
+    // carrying the same flat RGBA buffer.
+    let webp = decode_webp(LOSSLESS_1X1).unwrap();
+    assert_eq!(webp.frames.len(), 1);
+    assert_eq!(webp.frames[0].rgba, img.rgba);
+    assert_eq!(webp.frames[0].width, 1);
+    assert_eq!(webp.frames[0].height, 1);
+    assert_eq!(webp.frames[0].duration_ms, 0);
+    assert_eq!(webp.anim_background_rgba, None);
+    assert_eq!(webp.anim_loop_count, None);
 }
 
 #[test]
@@ -1197,7 +1205,7 @@ fn round111_decode_webp_lossy_file_is_unsupported_not_panic() {
     // A VP8-only lossy file is recognized but not decoded here — it
     // returns a clean Unsupported(LossyVp8), never a stub-decode.
     let err = decode_webp(LOSSY_1X1).expect_err("lossy file is unsupported");
-    assert_eq!(err, Error::Unsupported(UnsupportedKind::LossyVp8));
+    assert_eq!(err, oxideav_webp::WebpError::Unsupported);
 }
 
 #[test]
@@ -1205,7 +1213,7 @@ fn round111_decode_webp_lossy_with_alpha_is_unsupported() {
     // The VP8X + ALPH + VP8 (lossy) fixture has no VP8L chunk, so its
     // pixels can't be produced here; the lossy VP8 routing path applies.
     let err = decode_webp(LOSSY_WITH_ALPHA).expect_err("lossy+alpha unsupported");
-    assert_eq!(err, Error::Unsupported(UnsupportedKind::LossyVp8));
+    assert_eq!(err, oxideav_webp::WebpError::Unsupported);
 }
 
 // ---------------------------------------------------------------------------
