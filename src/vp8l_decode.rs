@@ -297,6 +297,10 @@ pub enum DecodeError {
         /// The number of prefix-code groups that were read.
         num_prefix_groups: usize,
     },
+    /// §4 / §7.2: a transform type appeared more than once in the
+    /// `optional-transform` list. The spec mandates each transform is
+    /// used at most once.
+    DuplicateTransform,
 }
 
 impl From<BitReaderEof> for DecodeError {
@@ -365,6 +369,10 @@ impl core::fmt::Display for DecodeError {
             } => write!(
                 f,
                 "VP8L §6.2.2 image decode: meta-prefix code {meta_prefix_code} out of range for {num_prefix_groups} prefix-code group(s)"
+            ),
+            Self::DuplicateTransform => write!(
+                f,
+                "VP8L §4 transform list: a transform type appears more than once"
             ),
         }
     }
@@ -464,6 +472,25 @@ impl DecodedImage {
     /// The decoded ARGB pixels in scan-line order.
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
+    }
+
+    /// The decoded ARGB pixels in scan-line order, mutably. Used by the
+    /// §4 inverse-transform passes ([`crate::vp8l_transform`]), which
+    /// rewrite the buffer in place.
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        &mut self.pixels
+    }
+
+    /// Construct a [`DecodedImage`] from explicit dimensions and a
+    /// scan-line-order ARGB buffer. Used by the §4 color-indexing
+    /// inverse transform, which replaces the (subsampled) decoded buffer
+    /// with a freshly-sized palette-lookup buffer.
+    pub fn from_parts(width: u32, height: u32, pixels: Vec<u32>) -> Self {
+        Self {
+            width,
+            height,
+            pixels,
+        }
     }
 }
 
@@ -750,6 +777,56 @@ impl MetaPrefixIndex {
     }
 }
 
+/// Decode a §7.3 `entropy-coded-image` to a [`DecodedImage`].
+///
+/// An `entropy-coded-image = color-cache-info data` (§7.3 ABNF): a
+/// §5.2.3 `color-cache-info` bit followed by a single 5-code prefix-code
+/// group (no §6.2.2 meta-prefix layer) and the §5.2 LZ77 / color-cache
+/// data. This is the shape of the §6.2.2 entropy image, the §4.1
+/// predictor image, the §4.2 color-transform image, and the §4.4
+/// color-indexing color table — every image-data role *except* the
+/// top-level §5.1 ARGB image.
+///
+/// `reader` must be positioned at the start of the block (the
+/// `color-cache-info` bit). On return the reader sits just past the last
+/// pixel of the `width * height` image. Use this to decode a §4
+/// transform's sub-resolution body, then resume reading the next
+/// transform (or the main image) from the same reader.
+pub fn decode_entropy_coded_image(
+    reader: &mut BitReader<'_>,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, DecodeError> {
+    if width == 0 || height == 0 {
+        return Err(DecodeError::EmptyEntropyImage {
+            prefix_image_width: width,
+            prefix_image_height: height,
+        });
+    }
+
+    // The image is an entropy-coded-image: color-cache-info + one
+    // prefix-code group, no §6.2.2 meta-prefix bit. The round-106
+    // reader handles exactly that for the `EntropyCoded` role.
+    let header = MetaPrefixHeader::read(reader, ImageRole::EntropyCoded, width, height)?;
+    let group = match &header.codes {
+        MetaPrefixCodes::Single { group } => group.as_ref(),
+        // EntropyImagePending is impossible for the EntropyCoded role
+        // (no meta-prefix bit is read), but guard rather than panic.
+        MetaPrefixCodes::EntropyImagePending { .. } => {
+            return Err(DecodeError::EmptyEntropyImage {
+                prefix_image_width: width,
+                prefix_image_height: height,
+            });
+        }
+    };
+    let cache = header
+        .color_cache
+        .is_enabled()
+        .then(|| ColorCache::new(header.color_cache.code_bits));
+
+    decode_image(reader, group, cache, width, height)
+}
+
 /// Decode the §6.2.2 *entropy image* into a [`MetaPrefixIndex`].
 ///
 /// The entropy image is itself an `entropy-coded-image` (§7.3 ABNF):
@@ -770,45 +847,17 @@ pub fn decode_entropy_image(
     prefix_image_width: u32,
     prefix_image_height: u32,
 ) -> Result<MetaPrefixIndex, DecodeError> {
-    if prefix_image_width == 0 || prefix_image_height == 0 {
-        return Err(DecodeError::EmptyEntropyImage {
-            prefix_image_width,
-            prefix_image_height,
-        });
-    }
-
-    // The entropy image is an entropy-coded-image: color-cache-info +
-    // one prefix-code group, no §6.2.2 meta-prefix bit. The round-106
-    // reader handles exactly that for the `EntropyCoded` role.
-    let header = MetaPrefixHeader::read(
-        reader,
-        ImageRole::EntropyCoded,
-        prefix_image_width,
-        prefix_image_height,
-    )?;
-    let group = match &header.codes {
-        MetaPrefixCodes::Single { group } => group.as_ref(),
-        // EntropyImagePending is impossible for the EntropyCoded role
-        // (no meta-prefix bit is read), but guard rather than panic.
-        MetaPrefixCodes::EntropyImagePending { .. } => {
-            return Err(DecodeError::EmptyEntropyImage {
+    let decoded = decode_entropy_coded_image(reader, prefix_image_width, prefix_image_height)
+        .map_err(|e| match e {
+            // Map a degenerate-size rejection back onto the
+            // entropy-image-specific error to preserve the public
+            // contract of this function.
+            DecodeError::EmptyEntropyImage { .. } => DecodeError::EmptyEntropyImage {
                 prefix_image_width,
                 prefix_image_height,
-            });
-        }
-    };
-    let cache = header
-        .color_cache
-        .is_enabled()
-        .then(|| ColorCache::new(header.color_cache.code_bits));
-
-    let decoded = decode_image(
-        reader,
-        group,
-        cache,
-        prefix_image_width,
-        prefix_image_height,
-    )?;
+            },
+            other => other,
+        })?;
 
     // §6.2.2: meta_prefix_code = (entropy_pixel >> 8) & 0xffff — the
     // red+green channels of each block's entropy-image pixel.

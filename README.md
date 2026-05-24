@@ -2,7 +2,16 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 108)
+## Status — 2026-05-24 (clean-room round 109)
+
+**The VP8L lossless decode path is now complete end-to-end.**
+[`decode_lossless_image`](src/lib.rs) walks a `RIFF/WEBP` file, extracts
+the `VP8L` chunk, runs the §5/§6 entropy decode, and applies the §4
+inverse-transform chain — validated bit-exact against the `lossless-1x1`,
+`lossless-color-indexing-paletted`, and `lossless-32x32-rgba` fixture
+PNGs (the last exercising SUBTRACT_GREEN + PREDICTOR + CROSS_COLOR + a
+color cache simultaneously).
+
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
   Surfaces the chunk list (`VP8 ` / `VP8L` / `VP8X` / `ALPH` /
@@ -151,6 +160,33 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   layer is §5.2 LZ77 backward-reference + §5.2.3 color-cache *symbol*
   decode — the per-pixel decoder that consumes symbols from a
   `PrefixCodeGroup`.
+* **VP8L §4 inverse-transform passes (round 109):** new module
+  `vp8l_transform`. [`vp8l_transform::decode_lossless`] is the top-level
+  driver — it reads the §4 / §7.2 `optional-transform` list (each
+  transform's fixed fields **and** its §5-encoded `entropy-coded-image`
+  body, decoded via the new
+  [`vp8l_decode::decode_entropy_coded_image`]), tracks §4.4 width
+  subsampling, decodes the main §5.1 ARGB image at the subsampled width
+  via [`vp8l_decode::decode_argb`], then applies the inverse transforms
+  in reverse read order (§4: "last one first"):
+  * §4.1 predictor ([`vp8l_transform::inverse_predictor`]) — the 14
+    prediction modes (`Average2` / `Select` / `ClampAddSubtractFull` /
+    `ClampAddSubtractHalf`) over the TL/T/TR/L block grid, with the
+    border rules (top-left → `0xff000000`, top row → L, left column →
+    T, rightmost column uses the row's leftmost pixel as TR) and the
+    per-channel residual add.
+  * §4.2 color ([`vp8l_transform::inverse_color`]) — per-block
+    `ColorTransformElement` add-back (`ColorTransformDelta(t,c) =
+    (t*c) >> 5`, signed 8-bit), on red and blue only.
+  * §4.3 subtract-green ([`vp8l_transform::inverse_subtract_green`]) —
+    add green into red and blue.
+  * §4.4 color-indexing ([`vp8l_transform::inverse_color_table`] +
+    [`vp8l_transform::inverse_color_indexing`]) — subtraction-decode of
+    the palette, palette lookup, ≤16-color pixel un-bundling (2/4/8
+    indices per green byte), width un-subsample to the canvas width,
+    out-of-range indices → transparent black.
+  [`decode_lossless_image`](src/lib.rs) is the container-level entry
+  point. Standalone-friendly (compiles under `--no-default-features`).
 * **VP8L §6.2.2 entropy-image multi-group ARGB decode (round 108):**
   [`vp8l_decode::decode_argb`] is the full ARGB-role decode. It reads
   the round-106 [`meta_prefix::MetaPrefixHeader`] for the `Argb` role
@@ -227,8 +263,11 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   under `--no-default-features`). The §6.2.1 reader is the foundation
   every §5 / §6 consumer needs; §6.2.2 (meta prefix codes / entropy
   image) and §5.2 (the LZ77 + color-cache pixel stream) are next.
-* **Pixel decode (VP8 / VP8L / ALPH bitstream):** not implemented yet —
-  [`decode_webp`](src/lib.rs) returns [`Error::NotImplemented`].
+* **Pixel decode (lossless VP8L):** **done** —
+  [`decode_lossless_image`](src/lib.rs) decodes a `VP8L` chunk all the
+  way to ARGB pixels (round 109). The generic [`decode_webp`](src/lib.rs)
+  entry still returns [`Error::NotImplemented`] (it would need
+  output-format packing plus the VP8 lossy + ALPH alpha paths).
   Callers route the `VP8 ` payload via
   [`extract_lossy_chunk`](src/lib.rs) to an external VP8 decoder.
   Round 99 landed the §4 transform list (first step of the lossless
@@ -246,6 +285,21 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
   next.
 * **Registry hook:** [`register`](src/lib.rs) is a no-op; round 6
   still ships no decoder/encoder to the runtime context.
+
+## What round 109 lands
+
+| Item                                              | Status                                                |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| §4 transform list + bodies (driver)               | **new** — `decode_lossless` reads each tx + its body  |
+| §7.3 `entropy-coded-image` decode helper          | **new** — `decode_entropy_coded_image`                |
+| §4.1 predictor (14 modes + border rules)          | **new** — `inverse_predictor`                         |
+| §4.2 color (`ColorTransformDelta` add-back)       | **new** — `inverse_color`                             |
+| §4.3 subtract-green (add green to R/B)            | **new** — `inverse_subtract_green`                    |
+| §4.4 color-table subtraction decode               | **new** — `inverse_color_table`                       |
+| §4.4 palette lookup + ≤16-color un-bundling       | **new** — `inverse_color_indexing`                    |
+| §4 reverse-order inverse application               | **new** — `decode_lossless` (last-read-first)         |
+| §4.4 width subsampling across the chain            | **new** — tracked, then un-subsampled on inverse      |
+| End-to-end `VP8L` → ARGB                           | **new** — `decode_lossless_image` (container entry)   |
 
 ## What round 108 lands
 
@@ -345,8 +399,26 @@ Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 | VP8 / VP8L bitstream decode   | not yet — typed handle routes payload out-of-crate  |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **207** (175 unit + 32 integration against the
-`docs/image/webp/fixtures/` corpus). Round 108 adds 9 unit tests
+Test count: **229** (193 unit + 36 integration against the
+`docs/image/webp/fixtures/` corpus). Round 109 adds 18 unit tests
+inside `vp8l_transform::tests` (each §4.1 predictor primitive —
+`Average2` / `Clamp` / `ClampAddSubtract{Full,Half}` / `Select` /
+`predict`; the predictor border rules for the top-left, top-row, and
+left-column cases; the §4.2 signed `ColorTransformDelta` + a
+forward↔inverse round-trip + in-place block use; §4.3 green add-back
+with wrap; §4.4 color-table subtraction decode + no-bundling lookup +
+out-of-range → transparent black + width_bits-1 and width_bits-3
+bundling + the threshold table) plus 4 integration tests in
+`fixture_walks` that decode three real fixtures *bit-exactly* against
+their `expected.png` ARGB ground truth
+(`round109_lossless_1x1_color_indexing_decodes_end_to_end` →
+`0xFFB43C5A`,
+`round109_lossless_color_indexing_paletted_decodes_end_to_end` (8-color
+palette, width_bits=1),
+`round109_lossless_32x32_rgba_full_transform_chain_decodes_end_to_end`
+(SUBTRACT_GREEN + PREDICTOR + CROSS_COLOR + color cache), plus the
+`returns_none_for_lossy_file` guard) and a new in-crate fixture
+`tests/data/lossless-color-indexing-paletted.webp`. Round 108 adds 9 unit tests
 inside `vp8l_decode::tests` (`MetaPrefixIndex` selection + max-based
 `num_prefix_groups`; entropy-image red+green meta-code extraction
 including the high-code red-channel path; two-group per-block decode;
@@ -417,7 +489,7 @@ the fixture's own VP8L payload bytes.
 
 ## Clean-room sources
 
-Rounds 1 through 107 were implemented entirely against:
+Rounds 1 through 109 were implemented entirely against:
 
 * **RFC 9649** — WebP Image Format (`docs/image/webp/rfc9649-webp.txt`,
   also available as `rfc9649-webp.pdf`). Round 7 cites §2.6 (the
@@ -505,9 +577,34 @@ Rounds 1 through 107 were implemented entirely against:
   rule, and §6.2.3 ("Decoding Entropy-Coded Image Data") for the
   GREEN symbol `S` range dispatch (`S < 256` literal, `256 <= S <
   256 + 24` length prefix code, `S >= 256 + 24` color-cache index).
-  The §6.2.2 entropy-image *multi-group* path and the §4
-  inverse-transform passes that consume the decoded ARGB buffer are
-  still future work.
+  Round 109 cites §4 ("Transforms") for the reverse-read-order inverse
+  application ("last one first"), §4.1 ("Predictor Transform") for the
+  `block_index = (y >> size_bits) * transform_width + (x >> size_bits)`
+  block addressing, the 14-mode table, the `Average2` / `Select` /
+  `ClampAddSubtractFull` / `ClampAddSubtractHalf` definitions, the
+  border rules (left-topmost → `0xff000000`, top row → L, left column →
+  T, rightmost column uses the row's leftmost pixel as TR), and the
+  `PredictorTransformOutput` per-channel residual add; §4.2 ("Color
+  Transform") for `ColorTransformDelta(t,c) = (t*c) >> 5` (signed 8-bit
+  `t`/`c`), the `InverseTransform` add order (green→red, green→blue,
+  then red→blue using the already-corrected red), and the
+  `ColorTransformElement` ↔ sub-image channel mapping (red =
+  `red_to_blue`, green = `green_to_blue`, blue = `green_to_red`); §4.3
+  ("Subtract Green Transform") for `AddGreenToBlueAndRed`; and §4.4
+  ("Color Indexing Transform") for the `color_table_size = ReadBits(8)
+  + 1` field, the subtraction-coded color table ("adding the previous
+  color component values by each ARGB component"), the `argb =
+  color_table[GREEN(argb)]` lookup with the out-of-range → `0x00000000`
+  rule, the `width_bits` threshold table, the LSB-first packing of
+  2/4/8 indices into the green byte, and the `image_width =
+  DIV_ROUND_UP(image_width, 1 << width_bits)` subsampling. §7.2
+  ("Structure of Transforms") fixes the per-transform ABNF
+  (`predictor-image` / `color-image` = `3BIT entropy-coded-image`,
+  `color-indexing-image` = `8BIT entropy-coded-image`) and §7.3 the
+  `entropy-coded-image = color-cache-info data` shape the transform
+  bodies share. With round 109 the lossless decode path is complete;
+  remaining work is the lossy VP8 path, the ALPH alpha bitstream, and
+  output-format packing.
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`). Round 6 cites §9.1
   ("Uncompressed Data Chunk") for the 3-byte frame tag layout
@@ -542,9 +639,11 @@ Rounds 1 through 107 were implemented entirely against:
 
 No external library source — libwebp, libvpx, image-rs, webp-rs,
 etc. — was consulted. `cwebp` / `dwebp` would be permissible as
-black-box validators; rounds 1 through 99 did not invoke them
-directly (round 99 reads only the fixture bytes already committed
-to `docs/` / the in-crate `tests/data/`).
+black-box validators; rounds 1 through 109 did not invoke them
+directly. Round 109's end-to-end fixture tests validate against the
+ARGB pixels of each fixture's committed `expected.png` (a clean-room
+PNG-decode of the corpus' own ground-truth files, not any WebP
+reference output).
 
 ## License
 

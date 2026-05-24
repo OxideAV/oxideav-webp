@@ -80,8 +80,22 @@
 //!   Single-group images degrade to the round-107 path. Per §6.2.2 each
 //!   block's meta-prefix code is the red+green channels of its
 //!   entropy-image pixel (`(argb >> 8) & 0xffff`).
+//! * [`vp8l_transform::decode_lossless`] — the §4 inverse-transform
+//!   passes (round 109). Reads the §4 transform list (each transform's
+//!   fixed fields **and** its §5-encoded body), decodes the main ARGB
+//!   image at the (color-indexing-subsampled) width, then applies the
+//!   four inverse transforms in reverse read order: §4.1 predictor (14
+//!   prediction modes + border rules over the block grid), §4.2 color
+//!   (per-block `ColorTransformElement` add-back), §4.3 subtract-green
+//!   (add green into red/blue), and §4.4 color-indexing (palette lookup
+//!   plus ≤16-color pixel un-bundling). The container-level entry point,
+//!   [`decode_lossless_image`], walks the file, extracts the `VP8L`
+//!   chunk, and decodes to a [`vp8l_decode::DecodedImage`]. Bit-exact
+//!   against the `lossless-1x1`, `lossless-color-indexing-paletted`, and
+//!   `lossless-32x32-rgba` (SUBTRACT_GREEN + PREDICTOR + CROSS_COLOR +
+//!   color cache) fixture PNGs.
 //!
-//! `VP8 ` / `VP8L` bitstream decode and the actual ALPH alpha
+//! `VP8 ` lossy bitstream decode and the actual ALPH alpha
 //! bitstream remain stubs returning [`Error::NotImplemented`]; the
 //! builders are deliberately framing-only so an external encoder can
 //! pre-compute the codec payload bytes. The round-6 lossy handle and
@@ -102,6 +116,7 @@ pub mod vp8l_chunk;
 pub mod vp8l_decode;
 pub mod vp8l_prefix;
 pub mod vp8l_stream;
+pub mod vp8l_transform;
 pub mod vp8x;
 
 #[cfg(feature = "registry")]
@@ -375,6 +390,31 @@ pub fn read_vp8l_transform_list(bytes: &[u8]) -> Result<Option<vp8l_stream::Tran
     let mut reader = vp8l_stream::BitReader::new_after_image_header(chunk.bitstream());
     let list = vp8l_stream::TransformList::read(&mut reader)?;
     Ok(Some(list))
+}
+
+/// Walk a `RIFF/WEBP` buffer, extract its §2.6 / §3.4 `VP8L` chunk, and
+/// fully decode it to ARGB pixels.
+///
+/// This runs the round-108 §5/§6 entropy decode of the main ARGB image
+/// then applies the round-109 §4 inverse-transform chain
+/// ([`vp8l_transform::decode_lossless`]): predictor, color, subtract-green,
+/// and color-indexing, applied in reverse of the order the transforms
+/// were read.
+///
+/// Returns `Ok(None)` if the file carries no `VP8L` chunk. Otherwise the
+/// returned [`vp8l_decode::DecodedImage`] holds `width * height` ARGB
+/// pixels in scan-line order, each `(alpha << 24) | (red << 16) |
+/// (green << 8) | blue`.
+pub fn decode_lossless_image(bytes: &[u8]) -> Result<Option<vp8l_decode::DecodedImage>, Error> {
+    let c = container::parse(bytes)?;
+    let chunk = match vp8l_chunk::extract_lossless(bytes, &c)? {
+        Some(chunk) => chunk,
+        None => return Ok(None),
+    };
+    let width = chunk.width();
+    let height = chunk.height();
+    let image = vp8l_transform::decode_lossless(chunk.bitstream(), width, height)?;
+    Ok(Some(image))
 }
 
 /// Decode a WebP file to pixels.

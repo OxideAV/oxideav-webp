@@ -26,14 +26,15 @@ use oxideav_webp::vp8l_decode::{
 use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
 use oxideav_webp::{
-    build_vp8x_chunk, build_webp_file, extract_lossless_chunk, extract_lossy_chunk,
-    parse_alph_header, parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
-    read_vp8l_transform_list,
+    build_vp8x_chunk, build_webp_file, decode_lossless_image, extract_lossless_chunk,
+    extract_lossy_chunk, parse_alph_header, parse_anim_header, parse_anmf_header, parse_container,
+    parse_vp8x_header, read_vp8l_transform_list,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
 const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
 const LOSSLESS_32X32_RGBA: &[u8] = include_bytes!("data/lossless-32x32-rgba.webp");
+const LOSSLESS_COLOR_INDEXING: &[u8] = include_bytes!("data/lossless-color-indexing-paletted.webp");
 const EXTENDED_WITH_EXIF: &[u8] = include_bytes!("data/extended-with-exif.webp");
 const LOSSY_WITH_ALPHA: &[u8] = include_bytes!("data/lossy-with-alpha-128x128.webp");
 const ANIMATED_WITH_ALPHA: &[u8] = include_bytes!("data/animated-with-alpha.webp");
@@ -940,4 +941,75 @@ fn round108_decode_entropy_image_public_api_and_num_groups() {
     assert_eq!(index.num_prefix_groups(), 5);
     assert_eq!(index.meta_code_for(0, 0), 0);
     assert_eq!(index.meta_code_for(4, 0), 4);
+}
+
+// ---- round 109: §4 inverse transforms, end-to-end ----
+
+#[test]
+fn round109_lossless_1x1_color_indexing_decodes_end_to_end() {
+    // `lossless-1x1.webp` is a COLOR_INDEXING transform with a single
+    // palette color (packed_bits=3). The full pipeline — §4 transform
+    // list + §5 color-table body + §5/§6 main ARGB decode + §4.4 inverse
+    // color-indexing — yields the palette color in the single pixel.
+    let img = decode_lossless_image(LOSSLESS_1X1)
+        .expect("lossless-1x1 decodes")
+        .expect("lossless-1x1 has a VP8L chunk");
+    assert_eq!(img.width(), 1);
+    assert_eq!(img.height(), 1);
+    // ARGB = (alpha=255, red=180, green=60, blue=90) → 0xFFB43C5A.
+    assert_eq!(img.pixels(), &[0xFFB4_3C5Au32]);
+}
+
+#[test]
+fn round109_lossless_color_indexing_paletted_decodes_end_to_end() {
+    // 32×32 with an 8-color palette → COLOR_INDEXING with width_bits=1
+    // (2 indices bundled per green byte). End-to-end decode against the
+    // fixture's `expected.png` ARGB ground truth.
+    let img = decode_lossless_image(LOSSLESS_COLOR_INDEXING)
+        .expect("palette fixture decodes")
+        .expect("palette fixture has a VP8L chunk");
+    assert_eq!(img.width(), 32);
+    assert_eq!(img.height(), 32);
+    let px = img.pixels();
+    assert_eq!(px.len(), 1024);
+    // First row begins with 4 red, then 4 green pixels.
+    assert_eq!(&px[0..4], &[0xFFFF_0000u32; 4]);
+    assert_eq!(&px[4..8], &[0xFF00_FF00u32; 4]);
+    // Interior + corner spot checks (from expected.png).
+    assert_eq!(px[31], 0xFFDC_DCDCu32); // row 0, col 31
+    assert_eq!(px[16 * 32 + 16], 0xFFFF_0000u32); // row 16, col 16
+    assert_eq!(px[31 * 32], 0xFF00_FFFFu32); // row 31, col 0
+    assert_eq!(px[1023], 0xFFFF_00FFu32); // last pixel (magenta)
+}
+
+#[test]
+fn round109_lossless_32x32_rgba_full_transform_chain_decodes_end_to_end() {
+    // `lossless-32x32-rgba.webp` exercises three transforms at once:
+    // SUBTRACT_GREEN, then PREDICTOR (size_bits=9), then CROSS_COLOR
+    // (size_bits=3), plus a level-1 color cache on the main image. The
+    // inverse chain is applied in reverse read order. Validated against
+    // the fixture's `expected.png` ARGB ground truth (with real alpha).
+    let img = decode_lossless_image(LOSSLESS_32X32_RGBA)
+        .expect("rgba fixture decodes")
+        .expect("rgba fixture has a VP8L chunk");
+    assert_eq!(img.width(), 32);
+    assert_eq!(img.height(), 32);
+    let px = img.pixels();
+    assert_eq!(px.len(), 1024);
+    // Top-left pixel is fully transparent (0x00000000).
+    assert_eq!(px[0], 0x0000_0000u32);
+    assert_eq!(px[1], 0x0808_0080u32);
+    assert_eq!(px[7], 0x3838_0080u32);
+    // Interior + corner spot checks (from expected.png).
+    assert_eq!(px[31], 0xF8F8_0080u32); // row 0, col 31
+    assert_eq!(px[16 * 32 + 16], 0x8080_8080u32); // row 16, col 16
+    assert_eq!(px[31 * 32], 0x0000_0000u32); // row 31, col 0
+    assert_eq!(px[1023], 0xF8F8_F880u32); // last pixel
+}
+
+#[test]
+fn round109_decode_lossless_image_returns_none_for_lossy_file() {
+    // A VP8-only (lossy) file has no VP8L chunk → Ok(None).
+    let out = decode_lossless_image(LOSSY_1X1).expect("lossy file parses");
+    assert!(out.is_none(), "lossy file has no VP8L chunk");
 }

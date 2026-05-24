@@ -6,6 +6,78 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 109 (2026-05-24).** VP8L §4 inverse-transform
+  passes — the layer that consumes round-108's `decode_argb` ARGB buffer
+  and produces final pixels, closing the lossless decode path
+  end-to-end. New module `vp8l_transform` exposes:
+  * `vp8l_transform::decode_lossless(payload, width, height)` — the
+    top-level driver. Reads the §4 / §7.2 `optional-transform` list
+    (each transform's fixed fields **and** its §5-encoded
+    `entropy-coded-image` body), tracks §4.4 width subsampling, decodes
+    the main §5.1 ARGB image at the (subsampled) width via `decode_argb`,
+    then applies the inverse transforms in reverse read order (§4: "last
+    one first").
+  * `vp8l_transform::inverse_predictor` — §4.1: 14 prediction modes
+    (`Average2` / `Select` / `ClampAddSubtractFull` /
+    `ClampAddSubtractHalf`) over the TL/T/TR/L block grid, with the
+    border rules (top-left → `0xff000000`, top row → L, left column → T,
+    rightmost column uses the row's leftmost pixel as TR) and the
+    per-channel residual add.
+  * `vp8l_transform::inverse_color` — §4.2: per-block
+    `ColorTransformElement` add-back (`ColorTransformDelta(t,c) =
+    (t*c) >> 5` with signed-8-bit `t`/`c`), green→red / green→blue /
+    red→blue, on the red and blue channels only.
+  * `vp8l_transform::inverse_subtract_green` — §4.3: add green into red
+    and blue (`& 0xff`).
+  * `vp8l_transform::inverse_color_table` (§4.4 subtraction-decode of the
+    palette) + `vp8l_transform::inverse_color_indexing` (palette lookup;
+    ≤16-color pixel un-bundling of 2/4/8 indices per green byte; the
+    width un-subsample back to the canvas width; out-of-range indices →
+    transparent black `0x00000000`).
+  * `vp8l_decode::decode_entropy_coded_image(reader, width, height)` —
+    a generalized §7.3 `entropy-coded-image` decoder (color-cache-info +
+    one prefix-code group + §5.2 data, no meta-prefix layer) used to
+    decode each transform's sub-resolution body. `decode_entropy_image`
+    now delegates to it.
+  * `vp8l_decode::DecodedImage::pixels_mut` / `from_parts` (used by the
+    in-place inverse passes and the color-indexing re-size) and a new
+    `DecodeError::DuplicateTransform` variant.
+  * `decode_lossless_image(bytes)` — container-level entry point: walks
+    the file, extracts the `VP8L` chunk, and decodes it to a
+    `DecodedImage`. Returns `Ok(None)` for `VP8 `-only files.
+* 18 new unit tests in `vp8l_transform::tests` (each predictor
+  primitive; predictor border rules for the top-left / top-row / left-
+  column cases; the §4.2 signed delta + forward↔inverse round-trip + in-
+  place block use; §4.3 green add-back with wrap; §4.4 subtraction
+  decode + no-bundling lookup + out-of-range → transparent black +
+  width_bits-1/3 bundling + the threshold table) + 4 integration tests
+  in `fixture_walks` that decode three real fixtures *bit-exactly*
+  against their `expected.png` ARGB ground truth:
+  * `round109_lossless_1x1_color_indexing_decodes_end_to_end` →
+    `0xFFB43C5A`.
+  * `round109_lossless_color_indexing_paletted_decodes_end_to_end`
+    (32×32, 8-color palette, width_bits=1 bundling).
+  * `round109_lossless_32x32_rgba_full_transform_chain_decodes_end_to_end`
+    (SUBTRACT_GREEN + PREDICTOR + CROSS_COLOR + level-1 color cache,
+    real alpha).
+  * `round109_decode_lossless_image_returns_none_for_lossy_file`.
+  New in-crate fixture `tests/data/lossless-color-indexing-paletted.webp`
+  (byte-for-byte copy of the docs corpus). Test count: **229** (was
+  207).
+* The decoder is **standalone-friendly** — `vp8l_transform` compiles
+  under `--no-default-features` with no `oxideav-core` dependency.
+
+### Notes (round 109)
+
+The VP8L lossless decode path is now **complete end-to-end**: container
+walk → §4 transform list (with bodies) → §5/§6 entropy decode → §4
+inverse-transform chain → final ARGB pixels, validated bit-exact on the
+`lossless-1x1`, `lossless-color-indexing-paletted`, and
+`lossless-32x32-rgba` fixtures. `decode_webp` itself still returns
+`Error::NotImplemented` (it would need ARGB→output-format packing +
+the VP8 lossy + ALPH alpha paths); callers wanting lossless pixels use
+`decode_lossless_image`.
+
 * **Clean-room round 108 (2026-05-24).** VP8L §6.2.2 entropy-image
   multi-group ARGB decode — the piece that turns the round-106
   meta-prefix dispatch and the round-107 single-group §5.2 loop into a
