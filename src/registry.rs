@@ -47,7 +47,7 @@ use oxideav_core::{
 
 use crate::{
     decode_webp_image, encode_vp8l_argb_with_metadata, DecodedWebp, Error, UnsupportedKind,
-    WebpMetadata, WebpMetadataOwned, CODEC_ID_VP8L,
+    WebpError, WebpMetadata, WebpMetadataOwned, CODEC_ID_VP8L,
 };
 
 /// Stable on-wire identifier this crate registers under in the codec
@@ -78,6 +78,13 @@ impl From<Error> for CoreError {
             Error::NotImplemented => {
                 CoreError::Unsupported("oxideav-webp: code path not implemented yet".to_string())
             }
+            // A VP8 inter-frame (or the still-stubbed VP8 encoder) is a
+            // recognised-but-unsupported feature, not a corrupt bitstream;
+            // every other VP8 decode failure is a bitstream problem.
+            Error::Vp8(ref v) => match WebpError::from(v.clone()) {
+                WebpError::Unsupported => CoreError::Unsupported(e.to_string()),
+                _ => CoreError::InvalidData(e.to_string()),
+            },
             other => CoreError::InvalidData(other.to_string()),
         }
     }
@@ -554,12 +561,11 @@ mod tests {
     }
 
     #[test]
-    fn vp8_lossy_packet_returns_unsupported_via_registered_decoder() {
-        // The §2.5 `VP8 ` lossy path is recognised-but-unsupported by
-        // the registered decoder — the file walks cleanly but no frame
-        // is produced. This isolates the lossy refusal as a clean
-        // `Error::Unsupported`, distinct from a corrupted-bitstream
-        // `InvalidData`.
+    fn vp8_lossy_packet_decodes_via_registered_decoder() {
+        // Round 124: the §2.5 `VP8 ` lossy path is decoded through the
+        // `oxideav-vp8` sibling crate, so the registered decoder now
+        // yields a frame (previously a clean Unsupported). The 1x1
+        // cwebp fixture decodes to a single 1px RGBA frame.
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
@@ -569,13 +575,20 @@ mod tests {
             .expect("webp decoder factory");
         let pkt = Packet::new(0, TimeBase::new(1, 1000), LOSSY_1X1.to_vec());
         dec.send_packet(&pkt).expect("send_packet accepts file");
-        let err = dec
+        let frame = dec
             .receive_frame()
-            .expect_err("VP8 lossy must surface as Error::Unsupported");
-        assert!(
-            matches!(err, CoreError::Unsupported(_)),
-            "expected Error::Unsupported, got {err:?}"
-        );
+            .expect("VP8 lossy now decodes via oxideav-vp8");
+        let v = match frame {
+            Frame::Video(v) => v,
+            other => panic!("expected Frame::Video, got {other:?}"),
+        };
+        assert_eq!(v.planes.len(), 1, "RGBA is a single interleaved plane");
+        assert_eq!(v.planes[0].data.len(), 4, "1×1 image × 4 bytes/pixel");
+        // No ALPH chunk on the simple-lossy fixture → opaque alpha.
+        assert_eq!(v.planes[0].data[3], 0xff);
+        // Back to NeedMore after the single frame.
+        let again = dec.receive_frame();
+        assert!(matches!(again, Err(CoreError::NeedMore)));
     }
 
     #[test]

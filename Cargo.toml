@@ -15,6 +15,14 @@ categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
+# VP8 (lossy) bitstream decoder. Pulled in with `default-features = false`
+# so it does NOT drag the `oxideav-core` dep tree into the standalone
+# (`default-features = false`) build of this crate — only `oxideav-vp8`'s
+# own `registry` feature gates that, and we leave it off here. The lossy
+# decode + `From<oxideav_vp8::Vp8Error>` adapter are part of the standalone
+# surface (see API-COMPAT.md), so this is a non-optional dependency. vp8 is
+# at 0.2 (not 0.1) per the workspace major-bump rule.
+oxideav-vp8 = { version = "0.2", default-features = false }
 
 [features]
 default = ["registry"]

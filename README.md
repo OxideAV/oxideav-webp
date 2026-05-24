@@ -2,7 +2,24 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-25 (clean-room round 121)
+## Status — 2026-05-25 (clean-room round 124)
+
+**Round 124 wired the §2.5 `VP8 ` (lossy) decode path through the
+`oxideav-vp8` sibling crate.** The `VP8 ` chunk payload is routed to
+[`oxideav_vp8::decode_vp8`] (now that vp8 0.2 exposes a public `Vp8Error`
+at its crate root), which reconstructs the loop-filtered I420 key-frame;
+[`vp8_decode::decode_lossy_rgba`](src/vp8_decode.rs) then converts it to
+interleaved RGBA with nearest-neighbour chroma up-sampling and the RFC
+6386 §9.2 ITU-R BT.601 full-range YCbCr→RGB matrix. `decode_webp` /
+`decode_webp_image` now decode both simple-lossy (`VP8 `) and
+extended-lossy (`VP8X` + `VP8 `, with optional `ALPH`-over-`VP8 ` alpha)
+still images — the previous clean `Unsupported(LossyVp8)` refusal is
+gone. `oxideav-vp8` is pulled in with `default-features = false`, so it
+does **not** drag `oxideav-core` into the standalone build; the lossy
+decode and the published `impl From<oxideav_vp8::Vp8Error> for WebpError`
+adapter are part of the standalone surface. Still framing-only: VP8 /
+VP8L bitstream *encode* and animation `ANMF` frames carrying `VP8 ` lossy
+sub-chunks.
 
 **Round 121 added the §5.2.1 / §5.2.3 color-cache writer to the VP8L
 encoder.** [`encode_argb_literals`](src/vp8l_encode.rs) now evaluates a
@@ -184,10 +201,11 @@ it. The new [`registry::WebpDecoder`](src/registry.rs) wraps
 `Frame::Video` of interleaved 8-bit RGBA (`PixelFormat::Rgba`, stride
 `width * 4`). The decoded `width` / `height` / pixel format are surfaced
 on the decoder's [`CodecParameters`](src/registry.rs) after the first
-frame. A §2.5 `VP8 ` lossy file — and any animation / header-only file
-with no `VP8L`/`VP8 ` image-data chunk — is a clean
-`oxideav_core::Error::Unsupported`; lossy callers route the chunk via
-[`extract_lossy_chunk`](src/lib.rs) to a downstream VP8 decoder. The
+frame. As of round 124 a §2.5 `VP8 ` lossy file decodes through
+`oxideav-vp8`; an animation / header-only file with no `VP8L`/`VP8 `
+image-data chunk is still a clean `oxideav_core::Error::Unsupported`.
+The [`extract_lossy_chunk`](src/lib.rs) routing API remains for callers
+that want the raw VP8 bitstream slice instead. The
 codec also claims the `WEBP` FourCC for tag-based resolution. The
 default-on `registry` feature gates the whole module, so the standalone
 (`--no-default-features`) build path stays free of `oxideav-core`.
@@ -202,9 +220,8 @@ the way to a `DecodedWebp { width, height, rgba }`, where `rgba` is
 decoded alpha plane overrides the per-pixel alpha.
 [`decode_webp`](src/lib.rs) is the published flat-RGBA entry point (round
 116) — it returns a `WebpImage` whose single `WebpFrame.rgba` is the same
-flat buffer. At the low level, a §2.5 `VP8 ` lossy file is a clean
-`Error::Unsupported(LossyVp8)` — routed onward via
-[`extract_lossy_chunk`](src/lib.rs) rather than stub-decoded.
+flat buffer. As of round 124 a §2.5 `VP8 ` lossy file decodes too,
+through the `oxideav-vp8` sibling crate (see the status section above).
 
 The **VP8L lossless decode path is complete end-to-end, and the
 §2.7.1.2 `ALPH` alpha bitstream decodes end-to-end too.**
@@ -490,9 +507,10 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
   / [`decode_webp_image`](src/lib.rs) entries are now wired (round 111):
   they decode a simple or `VP8X`-extended `VP8L` file to packed
   `[R, G, B, A]` bytes, applying an accompanying `ALPH` plane when
-  present. A `VP8 ` lossy file returns `Error::Unsupported(LossyVp8)`;
-  callers route the `VP8 ` payload via
-  [`extract_lossy_chunk`](src/lib.rs) to an external VP8 decoder.
+  present. As of round 124 a `VP8 ` lossy file is decoded via the
+  `oxideav-vp8` sibling crate ([`vp8_decode::decode_lossy_rgba`](src/vp8_decode.rs));
+  [`extract_lossy_chunk`](src/lib.rs) still exposes the raw `VP8 `
+  payload for callers that want to route it elsewhere.
   Round 99 landed the §4 transform list (first step of the lossless
   pixel path); round 104 landed the §6.2.1 canonical-prefix-code
   reader (the entropy primitive every §5 / §6 consumer needs);
@@ -655,11 +673,20 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
 | §2.4 `build_webp_file`        | done — simple + extended `RIFF/WEBP` envelope       |
 | VP8L bitstream decode         | done — `decode_webp` / `decode_lossless_image` → RGBA |
 | `oxideav_core::Decoder` registration | done (r112) — `register()` installs the `webp` decoder factory |
-| VP8 lossy bitstream decode    | not yet — typed handle / decoder route payload out-of-crate |
+| VP8 lossy bitstream decode    | done (r124) — routed through `oxideav-vp8` → BT.601 RGBA |
 | VP8 / VP8L bitstream encode   | not yet — payload is opaque input to the builder    |
 
-Test count: **257** (213 unit + 44 integration against the
-`docs/image/webp/fixtures/` corpus). Round 112 adds 10 unit tests inside
+Test count: **339** (273 unit + 66 integration against the
+`docs/image/webp/fixtures/` corpus). Round 124 adds 5 unit tests in
+`vp8_decode::tests` (the BT.601 YCbCr→RGB matrix at neutral / primary /
+clamped chroma, plus the I420→RGBA flat-buffer + odd-dimension chroma
+up-sampling) and rewires the lossy-fixture tests: the round-111
+`decode_webp` lossy refusals become round-124 decode-and-assert-dims
+checks against the cwebp-encoded `lossy-1x1.webp` (simple) and
+`lossy-with-alpha-128x128.webp` (`VP8X` + `ALPH` + `VP8 `, asserting the
+alpha plane introduced transparency), the low-level
+`decode_webp_image` lossy path, and the registered-decoder lossy decode.
+Round 112 adds 10 unit tests inside
 `registry::tests` — `register(&mut ctx)` installs the decoder factory
 (and not an encoder) plus the `.webp` extension hint; the `WEBP` FourCC
 resolves to the `webp` codec id; `first_decoder` returns a `WebpDecoder`;

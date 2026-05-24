@@ -6,6 +6,26 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 124 (2026-05-25).** §2.5 `VP8 ` (lossy) **decode**
+  path, routed through the `oxideav-vp8` sibling crate. Re-added the
+  `oxideav-vp8 = "0.2"` dependency (vp8 0.2 now exposes a public
+  `Vp8Error` at its crate root) with `default-features = false`, so it
+  does not pull `oxideav-core` into the standalone build. New
+  `vp8_decode` module routes a `WebpLossyChunk` payload to
+  `oxideav_vp8::decode_vp8` (reconstructed, loop-filtered I420 key-frame)
+  and converts it to interleaved RGBA via nearest-neighbour chroma
+  up-sampling and the RFC 6386 §9.2 ITU-R BT.601 full-range YCbCr→RGB
+  matrix. `decode_webp` / `decode_webp_image` now decode simple-lossy and
+  `VP8X`-extended-lossy still images (with optional `ALPH`-over-`VP8 `
+  alpha) instead of the previous `Unsupported(LossyVp8)` refusal. Added
+  the published `impl From<oxideav_vp8::Vp8Error> for WebpError` adapter
+  (a VP8 inter-frame or the still-stubbed encoder maps to
+  `Unsupported`; every other decode failure to `InvalidData`) and the
+  internal `Error::Vp8` variant. Verified against the cwebp-encoded
+  `lossy-1x1.webp` (simple) and `lossy-with-alpha-128x128.webp`
+  (`VP8X` + `ALPH` + `VP8 `) fixtures; +13 tests (5 `vp8_decode` unit +
+  rewired lossy-fixture/registry tests), 339 total.
+
 * **Clean-room round 121 (2026-05-25).** §5.2.1 / §5.2.3 **color-cache
   writer** in the VP8L encoder. `encode_argb_literals` now evaluates a
   256-entry color cache (`color_cache_code_bits = 8`) alongside the

@@ -1239,19 +1239,56 @@ fn round111_decode_webp_image_vp8x_vp8l_with_alph_overrides_alpha() {
 }
 
 #[test]
-fn round111_decode_webp_lossy_file_is_unsupported_not_panic() {
-    // A VP8-only lossy file is recognized but not decoded here — it
-    // returns a clean Unsupported(LossyVp8), never a stub-decode.
-    let err = decode_webp(LOSSY_1X1).expect_err("lossy file is unsupported");
-    assert_eq!(err, oxideav_webp::WebpError::Unsupported);
+fn round124_decode_webp_lossy_1x1_decodes_via_oxideav_vp8() {
+    // Round 124: the §2.5 simple-lossy `VP8 ` chunk is now decoded
+    // through the `oxideav-vp8` sibling crate (previously a clean
+    // Unsupported). Assert the cwebp-encoded 1x1 fixture decodes to a
+    // single 1x1 flat-RGBA frame with opaque alpha.
+    let img = decode_webp(LOSSY_1X1).expect("lossy-1x1 decodes via oxideav-vp8");
+    assert_eq!(img.frames.len(), 1, "still image yields one frame");
+    let frame = &img.frames[0];
+    assert_eq!(frame.width, 1);
+    assert_eq!(frame.height, 1);
+    assert_eq!(frame.rgba.len(), 4, "1x1 RGBA is exactly 4 bytes");
+    assert_eq!(frame.rgba[3], 0xff, "no ALPH chunk → opaque alpha");
+    // Non-animated: ANIM fields absent.
+    assert_eq!(img.anim_background_rgba, None);
+    assert_eq!(img.anim_loop_count, None);
 }
 
 #[test]
-fn round111_decode_webp_lossy_with_alpha_is_unsupported() {
-    // The VP8X + ALPH + VP8 (lossy) fixture has no VP8L chunk, so its
-    // pixels can't be produced here; the lossy VP8 routing path applies.
-    let err = decode_webp(LOSSY_WITH_ALPHA).expect_err("lossy+alpha unsupported");
-    assert_eq!(err, oxideav_webp::WebpError::Unsupported);
+fn round124_decode_webp_lossy_with_alpha_decodes_to_128x128() {
+    // The VP8X + ALPH + VP8 (lossy) fixture: the VP8 bitstream supplies
+    // the opaque RGB picture and the ALPH chunk supplies the alpha plane.
+    // Round 124 decodes both; assert the dimensions and the flat-buffer
+    // length identity (pixel-exactness vs dwebp is not required).
+    let img = decode_webp(LOSSY_WITH_ALPHA).expect("lossy+alpha decodes");
+    assert_eq!(img.frames.len(), 1);
+    let frame = &img.frames[0];
+    assert_eq!(frame.width, 128);
+    assert_eq!(frame.height, 128);
+    assert_eq!(
+        frame.rgba.len(),
+        128 * 128 * 4,
+        "flat RGBA buffer, no stride padding"
+    );
+    // The fixture's ALPH chunk decodes a non-trivial alpha plane, so at
+    // least one pixel must be non-opaque (the alpha override took effect).
+    let has_transparency = frame.rgba.chunks_exact(4).any(|p| p[3] != 0xff);
+    assert!(
+        has_transparency,
+        "ALPH plane should have introduced transparency"
+    );
+}
+
+#[test]
+fn round124_decode_webp_image_lossy_low_level_path() {
+    // The low-level `decode_webp_image -> DecodedWebp` entry also routes
+    // VP8 lossy through oxideav-vp8 (round 124), no longer Unsupported.
+    let decoded = decode_webp_image(LOSSY_1X1).expect("low-level lossy decode");
+    assert_eq!(decoded.width, 1);
+    assert_eq!(decoded.height, 1);
+    assert_eq!(decoded.rgba.len(), 4);
 }
 
 // ---------------------------------------------------------------------------

@@ -103,23 +103,29 @@
 //!   `lossless-32x32-rgba` (SUBTRACT_GREEN + PREDICTOR + CROSS_COLOR +
 //!   color cache) fixture PNGs.
 //!
+//! * [`vp8_decode::decode_lossy_rgba`] — the §2.5 `VP8 ` (lossy) decode
+//!   path (round 124). Routes the `VP8 ` chunk payload to the
+//!   `oxideav-vp8` sibling crate's [`oxideav_vp8::decode_vp8`] entry
+//!   point, which reconstructs the loop-filtered I420 key-frame, then
+//!   converts it to interleaved RGBA via nearest-neighbour chroma
+//!   up-sampling and the RFC 6386 §9.2 ITU-R BT.601 full-range YCbCr→RGB
+//!   matrix.
 //! * [`decode_webp_image`] / [`decode_webp`] — the top-level still-image
 //!   entry points (round 111). They walk the container, decode a §2.6 /
 //!   §3.4 `VP8L` lossless image (simple or `VP8X`-extended) through the
 //!   full §4–§6 chain, optionally override its alpha from a §2.7.1.2
 //!   `ALPH` chunk, and return interleaved 8-bit `[R, G, B, A]` pixels
 //!   ([`DecodedWebp`]) — the `oxideav_core::PixelFormat::Rgba` layout
-//!   the workspace's image crates share. A §2.5 `VP8 ` lossy file is a
-//!   clean [`Error::Unsupported`]`(`[`UnsupportedKind::LossyVp8`]`)` —
-//!   route it onward with [`extract_lossy_chunk`].
+//!   the workspace's image crates share. As of round 124 a §2.5 `VP8 `
+//!   lossy file is also decoded (via `oxideav-vp8`), with a §2.7.1.2
+//!   `ALPH` chunk layering the alpha plane over the opaque VP8 picture.
 //!
-//! `VP8 ` lossy bitstream decode is not performed in this crate; the
-//! builders are deliberately framing-only so an external encoder can
-//! pre-compute the codec payload bytes, and the round-6 lossy handle is
-//! likewise framing-only — it surfaces canvas dims and the routing slice
-//! but performs no VP8 bitstream decode. The §2.7.1.2 ALPH alpha
-//! bitstream **is** decoded end-to-end ([`alph::decode_alpha`] /
-//! [`decode_alpha_plane`]).
+//! Both the §2.5 `VP8 ` lossy and §2.6 `VP8L` lossless image-data paths
+//! now decode end-to-end (the lossy path through the `oxideav-vp8`
+//! sibling crate). The §2.7.1.2 ALPH alpha bitstream is also decoded
+//! end-to-end ([`alph::decode_alpha`] / [`decode_alpha_plane`]). VP8 /
+//! VP8L bitstream *encode* remains framing-only — the builders take an
+//! externally pre-computed codec payload.
 
 #![warn(missing_debug_implementations)]
 
@@ -133,6 +139,7 @@ pub mod meta_prefix;
 #[cfg(feature = "registry")]
 pub mod registry;
 pub mod vp8_chunk;
+pub mod vp8_decode;
 pub mod vp8l_chunk;
 pub mod vp8l_decode;
 pub mod vp8l_encode;
@@ -168,6 +175,9 @@ pub enum Error {
     Build(build::BuildError),
     /// The §2.5 typed `VP8 ` chunk handle rejected the chunk payload.
     Lossy(vp8_chunk::WebpLossyError),
+    /// The §2.5 `VP8 ` lossy bitstream decode (delegated to the
+    /// `oxideav-vp8` sibling crate) rejected the payload.
+    Vp8(oxideav_vp8::Vp8Error),
     /// The §2.6 typed `VP8L` chunk handle rejected the chunk payload.
     Lossless(vp8l_chunk::WebpLosslessError),
     /// The §4 VP8L transform-list reader rejected the bitstream.
@@ -186,10 +196,14 @@ pub enum Error {
 /// Which image kind [`decode_webp`] declined to decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedKind {
-    /// The file's image data is a §2.5 `VP8 ` lossy bitstream. This
-    /// crate decodes only the §2.6 `VP8L` lossless bitstream so far; the
-    /// lossy payload is meant to be routed to a downstream VP8 decoder
-    /// via [`extract_lossy_chunk`].
+    /// The file's image data is a §2.5 `VP8 ` lossy bitstream that the
+    /// caller has chosen to route out-of-crate.
+    ///
+    /// As of round 124 the default still-image decode path decodes `VP8 `
+    /// lossy via the `oxideav-vp8` sibling crate, so this variant is no
+    /// longer produced by [`decode_webp`] / [`decode_webp_image`]. It is
+    /// retained for callers that explicitly route the raw VP8 bitstream
+    /// elsewhere via [`extract_lossy_chunk`].
     LossyVp8,
     /// The file carries neither a `VP8L` nor a `VP8 ` image-data chunk
     /// (e.g. an animation: the pixels live inside per-frame `ANMF`
@@ -220,6 +234,7 @@ impl core::fmt::Display for Error {
             Self::Anmf(e) => write!(f, "oxideav-webp anmf: {e}"),
             Self::Build(e) => write!(f, "oxideav-webp build: {e}"),
             Self::Lossy(e) => write!(f, "oxideav-webp lossy: {e}"),
+            Self::Vp8(e) => write!(f, "oxideav-webp vp8: {e}"),
             Self::Lossless(e) => write!(f, "oxideav-webp lossless: {e}"),
             Self::Vp8lTransform(e) => write!(f, "oxideav-webp vp8l-transform: {e}"),
             Self::Vp8lPrefix(e) => write!(f, "oxideav-webp vp8l-prefix: {e}"),
@@ -271,6 +286,12 @@ impl From<build::BuildError> for Error {
 impl From<vp8_chunk::WebpLossyError> for Error {
     fn from(e: vp8_chunk::WebpLossyError) -> Self {
         Self::Lossy(e)
+    }
+}
+
+impl From<oxideav_vp8::Vp8Error> for Error {
+    fn from(e: oxideav_vp8::Vp8Error) -> Self {
+        Self::Vp8(e)
     }
 }
 
@@ -553,23 +574,28 @@ pub struct DecodedWebp {
 ///    of an accompanying §2.7.1.2 `ALPH` chunk is present, its decoded
 ///    alpha plane overrides the per-pixel alpha channel.
 ///
-/// A §2.5 `VP8 ` lossy bitstream is **not** decoded here — it returns
-/// [`Error::Unsupported`]`(`[`UnsupportedKind::LossyVp8`]`)`. Route it to
-/// a downstream VP8 decoder with [`extract_lossy_chunk`] instead.
+/// As of round 124 a §2.5 `VP8 ` lossy bitstream is also decoded here —
+/// the `VP8 ` chunk payload is routed to the `oxideav-vp8` sibling crate
+/// ([`vp8_decode::decode_lossy_rgba`]) and a §2.7.1.2 `ALPH` chunk, when
+/// present, overrides the opaque alpha channel. (The standalone
+/// [`extract_lossy_chunk`] routing API remains available for callers that
+/// want the raw VP8 bitstream slice.)
 ///
 /// Animations and header-only files (no `VP8L`/`VP8 ` chunk) return
 /// [`Error::Unsupported`]`(`[`UnsupportedKind::NoImageData`]`)`.
 pub fn decode_webp_image(bytes: &[u8]) -> Result<DecodedWebp, Error> {
     let c = container::parse(bytes)?;
 
-    // §2.6 / §3.4: the VP8L lossless image is the only pixel source this
-    // crate decodes. Decode it (alpha is carried inside the VP8L stream).
+    // §2.6 / §3.4: the VP8L lossless image. If absent, fall back to the
+    // §2.5 `VP8 ` lossy path (decoded via the `oxideav-vp8` sibling crate),
+    // and only then to "no image data".
     let vp8l = vp8l_chunk::extract_lossless(bytes, &c)?;
     let Some(chunk) = vp8l else {
-        // No VP8L. A VP8 lossy chunk is recognized-but-unsupported here;
-        // anything else has no still-image pixel data.
-        if c.first_chunk_with_fourcc(container::fourcc::VP8).is_some() {
-            return Err(Error::Unsupported(UnsupportedKind::LossyVp8));
+        // No VP8L. A §2.5 `VP8 ` lossy chunk is decoded through
+        // `oxideav-vp8` (round 124); anything else has no still-image
+        // pixel data.
+        if let Some(vp8) = c.first_chunk_with_fourcc(container::fourcc::VP8) {
+            return decode_lossy_image(bytes, &c, vp8);
         }
         return Err(Error::Unsupported(UnsupportedKind::NoImageData));
     };
@@ -598,6 +624,42 @@ pub fn decode_webp_image(bytes: &[u8]) -> Result<DecodedWebp, Error> {
         width,
         height,
         rgba: argb_to_rgba(image.pixels()),
+    })
+}
+
+/// Decode a §2.5 `VP8 ` lossy chunk (simple-lossy or `VP8X`-extended
+/// lossy) to a [`DecodedWebp`].
+///
+/// The `VP8 ` payload is routed to the `oxideav-vp8` sibling crate's
+/// [`oxideav_vp8::decode_vp8`] entry point (round 124) via
+/// [`vp8_decode::decode_lossy_rgba`], which reconstructs the I420
+/// key-frame and converts it to interleaved RGBA. A §2.7.1.2 `ALPH`
+/// chunk alongside the `VP8 ` image (the §2.7 extended-lossy + alpha
+/// shape, e.g. `lossy-with-alpha-128x128.webp`) overrides the
+/// opaque-filled alpha channel with the decoded alpha plane.
+fn decode_lossy_image(
+    bytes: &[u8],
+    c: &container::WebpContainer,
+    vp8: &container::WebpChunk,
+) -> Result<DecodedWebp, Error> {
+    let (width, height, mut rgba) = vp8_decode::decode_lossy_rgba(vp8.payload(bytes))?;
+
+    // §2.7.1.2: an ALPH chunk alongside a VP8 lossy image carries the
+    // alpha plane (the VP8 bitstream itself is opaque YUV). Override the
+    // opaque-filled alpha with the decoded plane when the dimensions match.
+    if let Some(alph) = c.first_chunk_with_fourcc(container::fourcc::ALPH) {
+        let plane = alph::decode_alpha(alph.payload(bytes), width, height)?;
+        if plane.len() == (width as usize) * (height as usize) {
+            for (px, &a) in rgba.chunks_exact_mut(4).zip(plane.iter()) {
+                px[3] = a;
+            }
+        }
+    }
+
+    Ok(DecodedWebp {
+        width,
+        height,
+        rgba,
     })
 }
 
@@ -782,6 +844,30 @@ impl From<Error> for WebpError {
     }
 }
 
+/// Map an `oxideav-vp8` decode/encode failure onto the coarse published
+/// [`WebpError`].
+///
+/// The `oxideav-vp8` decoder refuses an inter-frame
+/// (`Vp8Error::Decode(DecodeError::Unsupported(_))`) and the encoder is
+/// still a stub (`Vp8Error::Encode(_)`); both collapse to
+/// [`WebpError::Unsupported`]. Every other decode failure — a malformed
+/// frame header, truncated partition, bad token stream — is a bitstream
+/// problem and maps to [`WebpError::InvalidData`].
+///
+/// This is the published-0.1.5 adapter the WebP lossy path is built
+/// against (see `API-COMPAT.md`).
+impl From<oxideav_vp8::Vp8Error> for WebpError {
+    fn from(e: oxideav_vp8::Vp8Error) -> Self {
+        use oxideav_vp8::{DecodeError, Vp8Error};
+        match e {
+            Vp8Error::Decode(DecodeError::Unsupported(_)) | Vp8Error::Encode(_) => {
+                WebpError::Unsupported
+            }
+            Vp8Error::Decode(_) => WebpError::InvalidData,
+        }
+    }
+}
+
 /// Decode a WebP file to the published flat-RGBA [`WebpImage`] shape.
 ///
 /// This is the `image`-crate-compatible entry point: every returned
@@ -789,16 +875,20 @@ impl From<Error> for WebpError {
 /// bytes (no stride padding), so a frame wraps zero-copy as
 /// `image::ImageBuffer::from_raw(frame.width, frame.height, frame.rgba)`.
 ///
-/// Supported today (built on the rebuilt §4–§6 VP8L decoder):
+/// Supported today (built on the rebuilt §4–§6 VP8L decoder + the
+/// `oxideav-vp8` lossy decoder):
 ///
 /// * **Simple / extended lossless** (`VP8L`, optionally `VP8X`-fronted,
 ///   with optional `ALPH`-over-`VP8L` alpha) → a single-frame `WebpImage`.
+/// * **Simple / extended lossy** (`VP8 `, optionally `VP8X`-fronted, with
+///   optional `ALPH`-over-`VP8 ` alpha) → a single-frame `WebpImage`,
+///   decoded through `oxideav-vp8` (round 124).
 ///
 /// Not yet rebuilt (returns [`WebpError::Unsupported`], never a fake
 /// decode):
 ///
-/// * **§2.5 `VP8 ` lossy** — needs the `oxideav-vp8` bitstream path.
-/// * **Animation** — `ANMF` frame assembly.
+/// * **Animation** — `ANMF` frame assembly with `VP8 ` lossy sub-chunks
+///   (lossless `ANMF` frames decode).
 ///
 /// The low-level [`decode_webp_image`] / [`decode_lossless_image`] helpers
 /// expose the rebuild's internal [`DecodedWebp`] / [`vp8l_decode::DecodedImage`]
@@ -1151,9 +1241,10 @@ fn argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
 /// of what lands in the codec / container sub-registries. The decoder
 /// covers the §2.6 / §3.4 `VP8L` lossless image (simple or
 /// `VP8X`-extended) with optional §2.7.1.2 `ALPH`-over-`VP8L` alpha
-/// override. The §2.5 `VP8 ` lossy path surfaces as a clean
-/// `oxideav_core::Error::Unsupported` — callers route lossy chunks via
-/// [`extract_lossy_chunk`] to a downstream VP8 decoder.
+/// override, and (round 124) the §2.5 `VP8 ` lossy image decoded via the
+/// `oxideav-vp8` sibling crate (with optional `ALPH`-over-`VP8 ` alpha).
+/// The standalone [`extract_lossy_chunk`] routing API stays available for
+/// callers that want the raw VP8 bitstream slice.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut RuntimeContext) {
     registry::register(ctx);
