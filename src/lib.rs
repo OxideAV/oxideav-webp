@@ -177,7 +177,11 @@ pub enum Error {
     Lossy(vp8_chunk::WebpLossyError),
     /// The §2.5 `VP8 ` lossy bitstream decode (delegated to the
     /// `oxideav-vp8` sibling crate) rejected the payload.
-    Vp8(oxideav_vp8::Vp8Error),
+    ///
+    /// Wraps `oxideav-vp8`'s published [`oxideav_vp8::DecodeError`]. (Once
+    /// vp8 publishes its `Vp8Error` umbrella — currently on vp8 master
+    /// but not on crates.io — this can widen to that type.)
+    Vp8(oxideav_vp8::DecodeError),
     /// The §2.6 typed `VP8L` chunk handle rejected the chunk payload.
     Lossless(vp8l_chunk::WebpLosslessError),
     /// The §4 VP8L transform-list reader rejected the bitstream.
@@ -289,8 +293,8 @@ impl From<vp8_chunk::WebpLossyError> for Error {
     }
 }
 
-impl From<oxideav_vp8::Vp8Error> for Error {
-    fn from(e: oxideav_vp8::Vp8Error) -> Self {
+impl From<oxideav_vp8::DecodeError> for Error {
+    fn from(e: oxideav_vp8::DecodeError) -> Self {
         Self::Vp8(e)
     }
 }
@@ -844,26 +848,25 @@ impl From<Error> for WebpError {
     }
 }
 
-/// Map an `oxideav-vp8` decode/encode failure onto the coarse published
+/// Map an `oxideav-vp8` decode failure onto the coarse published
 /// [`WebpError`].
 ///
 /// The `oxideav-vp8` decoder refuses an inter-frame
-/// (`Vp8Error::Decode(DecodeError::Unsupported(_))`) and the encoder is
-/// still a stub (`Vp8Error::Encode(_)`); both collapse to
+/// ([`oxideav_vp8::DecodeError::Unsupported`]), which collapses to
 /// [`WebpError::Unsupported`]. Every other decode failure — a malformed
 /// frame header, truncated partition, bad token stream — is a bitstream
 /// problem and maps to [`WebpError::InvalidData`].
 ///
-/// This is the published-0.1.5 adapter the WebP lossy path is built
-/// against (see `API-COMPAT.md`).
-impl From<oxideav_vp8::Vp8Error> for WebpError {
-    fn from(e: oxideav_vp8::Vp8Error) -> Self {
-        use oxideav_vp8::{DecodeError, Vp8Error};
+/// Note: API-COMPAT.md specifies a `From<oxideav_vp8::Vp8Error>` adapter
+/// (the umbrella type), but `Vp8Error` is not yet published on crates.io
+/// (it landed on vp8 master after the v0.2.0 tag). This `DecodeError`
+/// adapter covers the live decode path against the published 0.2.0 API;
+/// the `Vp8Error` adapter is a follow-up once vp8 publishes it.
+impl From<oxideav_vp8::DecodeError> for WebpError {
+    fn from(e: oxideav_vp8::DecodeError) -> Self {
         match e {
-            Vp8Error::Decode(DecodeError::Unsupported(_)) | Vp8Error::Encode(_) => {
-                WebpError::Unsupported
-            }
-            Vp8Error::Decode(_) => WebpError::InvalidData,
+            oxideav_vp8::DecodeError::Unsupported(_) => WebpError::Unsupported,
+            _ => WebpError::InvalidData,
         }
     }
 }

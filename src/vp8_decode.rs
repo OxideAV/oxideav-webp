@@ -18,8 +18,18 @@
 //! dimensions. Alpha is filled opaque (`0xff`); a §2.7.1.2 `ALPH`
 //! chunk's decoded plane is layered on by the caller in
 //! [`crate::decode_webp_image`] (`VP8 ` + `ALPH` extended-lossy).
+//!
+//! The error surface is `oxideav-vp8`'s published
+//! [`oxideav_vp8::DecodeError`]. The crate also defines a `Vp8Error`
+//! umbrella enum (on vp8 master, commit `d85d244`) that the
+//! API-COMPAT.md published surface wants a
+//! `From<oxideav_vp8::Vp8Error> for WebpError` adapter against, but that
+//! type is **not yet on crates.io** (it landed after the v0.2.0 tag), so
+//! the adapter is deferred until vp8 publishes a release carrying it.
+//! See `lib.rs` for the temporary `From<DecodeError>` adapters used in
+//! the meantime.
 
-use oxideav_vp8::{decode_vp8, Vp8DecodedFrame};
+use oxideav_vp8::{decode_vp8, DecodeError, Vp8DecodedFrame};
 
 /// Decode a §2.5 `VP8 ` lossy bitstream to interleaved RGBA.
 ///
@@ -29,7 +39,13 @@ use oxideav_vp8::{decode_vp8, Vp8DecodedFrame};
 /// tightly packed `[R, G, B, A]` bytes in scan-line order, alpha set
 /// opaque, together with the visible dimensions reported by the VP8
 /// key-frame header.
-pub fn decode_lossy_rgba(bitstream: &[u8]) -> Result<(u32, u32, Vec<u8>), oxideav_vp8::Vp8Error> {
+///
+/// The error surface is `oxideav-vp8`'s [`oxideav_vp8::DecodeError`] —
+/// the published 0.2.0 decoder error. (The crate's `Vp8Error` umbrella
+/// is not yet on crates.io; the published `From<oxideav_vp8::Vp8Error>`
+/// adapter is deferred until vp8 publishes it — see the module-level
+/// note.)
+pub fn decode_lossy_rgba(bitstream: &[u8]) -> Result<(u32, u32, Vec<u8>), DecodeError> {
     let frame = decode_vp8(bitstream)?;
     let (w, h) = (frame.width, frame.height);
     let rgba = yuv420_to_rgba(&frame);

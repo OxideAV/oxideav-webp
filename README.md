@@ -16,10 +16,12 @@ extended-lossy (`VP8X` + `VP8 `, with optional `ALPH`-over-`VP8 ` alpha)
 still images — the previous clean `Unsupported(LossyVp8)` refusal is
 gone. `oxideav-vp8` is pulled in with `default-features = false`, so it
 does **not** drag `oxideav-core` into the standalone build; the lossy
-decode and the published `impl From<oxideav_vp8::Vp8Error> for WebpError`
-adapter are part of the standalone surface. Still framing-only: VP8 /
-VP8L bitstream *encode* and animation `ANMF` frames carrying `VP8 ` lossy
-sub-chunks.
+decode and the `impl From<oxideav_vp8::DecodeError> for WebpError`
+adapter are part of the standalone surface. (The API-COMPAT.md
+`From<oxideav_vp8::Vp8Error>` adapter is deferred — vp8's `Vp8Error`
+umbrella is on vp8 master but not yet on crates.io.) Still framing-only:
+VP8 / VP8L bitstream *encode* and animation `ANMF` frames carrying
+`VP8 ` lossy sub-chunks.
 
 **Round 121 added the §5.2.1 / §5.2.3 color-cache writer to the VP8L
 encoder.** [`encode_argb_literals`](src/vp8l_encode.rs) now evaluates a

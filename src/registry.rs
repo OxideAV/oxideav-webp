@@ -78,9 +78,9 @@ impl From<Error> for CoreError {
             Error::NotImplemented => {
                 CoreError::Unsupported("oxideav-webp: code path not implemented yet".to_string())
             }
-            // A VP8 inter-frame (or the still-stubbed VP8 encoder) is a
-            // recognised-but-unsupported feature, not a corrupt bitstream;
-            // every other VP8 decode failure is a bitstream problem.
+            // A VP8 inter-frame is a recognised-but-unsupported feature,
+            // not a corrupt bitstream; every other VP8 decode failure is
+            // a bitstream problem.
             Error::Vp8(ref v) => match WebpError::from(v.clone()) {
                 WebpError::Unsupported => CoreError::Unsupported(e.to_string()),
                 _ => CoreError::InvalidData(e.to_string()),
