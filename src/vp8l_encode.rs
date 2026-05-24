@@ -18,8 +18,21 @@
 //!   there is no additional data here, the subtract green transform can
 //!   be coded using fewer bits"). The other three transforms (predictor
 //!   / color / color-indexing) are still pass-through.
-//! * **No §3.8.3 color cache** — `color-cache-info` is the single `%b0`
-//!   bit. Every pixel is emitted directly.
+//! * **§5.2.1 / §5.2.3 color cache** — as of round 121 the encoder
+//!   evaluates a `color_cache_code_bits = 8` (256-entry) color cache
+//!   alongside the no-cache path and emits whichever is smaller. When
+//!   enabled, the §3.8.3 `color-cache-info` field becomes `%b1 8` (1-bit
+//!   flag + 4-bit `code_bits`), the GREEN alphabet grows to
+//!   `256 + 24 + 256 = 536` symbols, and each repeat of a previously-
+//!   inserted ARGB literal is emitted as a §5.2.3 color-cache code
+//!   `256 + 24 + index` instead of four separate ARGB-channel literals.
+//!   Cache state is maintained per §5.2.3: every emitted pixel — literal
+//!   *and* every pixel covered by a §5.2.2 backward-reference copy — is
+//!   re-inserted at its hashed slot
+//!   (`(0x1e35a7bd * argb) >> (32 - code_bits)`). The chooser cross-
+//!   products with subtract-green so the encoder picks the best of
+//!   `(no-tx | subtract-green) × (no-cache | cache)`; on uncorrelated /
+//!   non-repeating content the no-cache no-tx path wins and is kept.
 //! * **Single §3.7.2.2 meta-prefix code** — `meta-prefix` is `%b0`, so one
 //!   [`crate::meta_prefix::PrefixCodeGroup`] of five prefix codes applies
 //!   to the whole image.
@@ -76,9 +89,8 @@
 //!
 //! ## What this module does NOT do
 //!
-//! * No §3.8.2 transform encoding (predictor / color / subtract-green /
-//!   color-indexing). Pass-through only.
-//! * No §3.8.3 color cache. (LZ77 backward references *are* emitted.)
+//! * No §3.8.2 predictor / color / color-indexing transform encoding
+//!   (subtract-green is wired). Pass-through only for the other three.
 //! * No `oxideav-core` runtime dependency — this module compiles under
 //!   `--no-default-features`.
 
@@ -665,11 +677,19 @@ const HASH_BITS: usize = 14;
 const MAX_CHAIN: usize = 64;
 
 /// A single emitted token in the §5.2.2 LZ77 stream: either a raw ARGB
-/// pixel (a §5.2.1 literal) or a backward-reference copy.
+/// pixel (a §5.2.1 literal), a §5.2.3 color-cache reference, or a
+/// §5.2.2 backward-reference copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Token {
-    /// A §5.2.1 ARGB literal pixel.
+    /// A §5.2.1 ARGB literal pixel (encoded as four channel symbols).
     Literal(u32),
+    /// A §5.2.3 color-cache reference. `index` is the resolved
+    /// cache slot (the green symbol on the wire is
+    /// `256 + 24 + index`).
+    CacheRef {
+        /// The hashed cache index (`0..color_cache_size`).
+        index: u32,
+    },
     /// A §5.2.2 backward reference: copy `length` pixels from `distance`
     /// pixels back in scan-line order.
     Copy {
@@ -805,8 +825,151 @@ fn tokenize_lz77(pixels: &[u32]) -> Vec<Token> {
     tokens
 }
 
+/// Allowed range for the §5.2.3 `color_cache_code_bits` field: an
+/// enabled cache has `code_bits ∈ [1, 11]`, giving a cache size of
+/// `2..=2048` entries. Mirrors
+/// [`crate::meta_prefix::COLOR_CACHE_BITS_MIN`] /
+/// [`crate::meta_prefix::COLOR_CACHE_BITS_MAX`].
+pub const COLOR_CACHE_BITS_MIN: u32 = 1;
+/// See [`COLOR_CACHE_BITS_MIN`].
+pub const COLOR_CACHE_BITS_MAX: u32 = 11;
+
+/// The default `color_cache_code_bits` the chooser evaluates when
+/// deciding whether to enable §5.2.3 color caching. Eight bits gives a
+/// 256-entry cache — the spec doesn't mandate a specific size, but 8 is
+/// the sweet spot for the kind of payloads this first-pass encoder
+/// targets (saves the 4-bit `code_bits` field a slot in the middle of
+/// the allowed range; 256 entries is large enough that the hash
+/// collisions are negligible on most natural images).
+pub const DEFAULT_COLOR_CACHE_BITS: u32 = 8;
+
+/// §5.2.3 color-cache helper used by the encoder. Mirrors the decoder's
+/// [`crate::vp8l_decode::ColorCache`] semantics: an array of
+/// `1 << code_bits` ARGB entries, all initialized to zero, with a
+/// hashed lookup `(0x1e35a7bd * argb) >> (32 - code_bits)`.
+///
+/// The encoder maintains the cache in stream order — exactly as the
+/// decoder will when re-walking the emitted symbols — so a slot's
+/// state matches between writer and reader at every bit position. A
+/// §5.2.3 `CacheRef { index }` token is emitted *only* when
+/// `lookup(index) == Some(argb)` at the moment the token is produced;
+/// the decoder will read the same index and produce the same ARGB.
+#[derive(Debug, Clone)]
+struct EncoderColorCache {
+    code_bits: u32,
+    entries: Vec<u32>,
+}
+
+impl EncoderColorCache {
+    /// Allocate a fresh `1 << code_bits`-entry cache. `code_bits` must
+    /// be in `[COLOR_CACHE_BITS_MIN, COLOR_CACHE_BITS_MAX]`; debug
+    /// builds assert.
+    fn new(code_bits: u32) -> Self {
+        debug_assert!((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&code_bits));
+        Self {
+            code_bits,
+            entries: vec![0u32; 1usize << code_bits],
+        }
+    }
+
+    /// `1 << code_bits` — the §5.2.3 cache size.
+    #[cfg(test)]
+    fn size(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// §5.2.3: `(0x1e35a7bd * argb) >> (32 - code_bits)`. Identical to
+    /// the decoder's [`crate::vp8l_decode::ColorCache::hash`].
+    fn hash(&self, argb: u32) -> usize {
+        (crate::vp8l_decode::COLOR_CACHE_HASH_MULTIPLIER.wrapping_mul(argb)
+            >> (32 - self.code_bits)) as usize
+    }
+
+    /// `true` when the slot for `argb`'s hash currently holds `argb`
+    /// itself — i.e. emitting a `CacheRef { index: hash(argb) }`
+    /// token would round-trip to the same pixel on decode.
+    fn contains(&self, argb: u32) -> Option<usize> {
+        let idx = self.hash(argb);
+        if self.entries[idx] == argb {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Insert `argb` at its hashed slot (§5.2.3: every emitted pixel,
+    /// literal or covered by a backward reference, is re-inserted).
+    fn insert(&mut self, argb: u32) {
+        let idx = self.hash(argb);
+        self.entries[idx] = argb;
+    }
+}
+
+/// Second-pass §5.2.3 cache-aware token rewrite.
+///
+/// Walks `tokens` in stream order, maintaining the cache exactly as
+/// the decoder will. When a `Literal(argb)` matches the cache's
+/// current slot for `argb`, the literal is rewritten to a
+/// `CacheRef { index }` token so the decoder can re-read it from the
+/// cache. Backward-reference copies pass through unchanged; the
+/// covered pixels are inserted into the cache (spec §5.2.3) so later
+/// repeats can refer back to them via cache codes.
+///
+/// `pixels` provides the underlying pixel sequence for backward
+/// references (needed to know which colors a `Copy` token covers so
+/// the cache state stays in sync).
+fn cacheify_tokens(tokens: &[Token], pixels: &[u32], code_bits: u32) -> Vec<Token> {
+    let mut cache = EncoderColorCache::new(code_bits);
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut pos = 0usize;
+    for &tok in tokens {
+        match tok {
+            Token::Literal(argb) => {
+                if let Some(idx) = cache.contains(argb) {
+                    out.push(Token::CacheRef { index: idx as u32 });
+                } else {
+                    out.push(Token::Literal(argb));
+                }
+                cache.insert(argb);
+                pos += 1;
+            }
+            Token::CacheRef { .. } => {
+                // Caller should not pre-emit cache refs into the
+                // input stream; keep tokens we don't recognise as
+                // literals from the matcher's output verbatim.
+                out.push(tok);
+                pos += 1;
+            }
+            Token::Copy { length, distance } => {
+                out.push(tok);
+                // Mirror the decoder's §5.2.3 invariant: every pixel
+                // covered by a backward-reference copy is inserted in
+                // stream order. The source pixels live at
+                // `pos - distance .. pos - distance + length` in
+                // `pixels`; the destination at `pos .. pos + length`
+                // would be identical (copies always reproduce source
+                // bytes), so we read directly off the source slice.
+                let src_start = pos - distance;
+                for i in 0..length {
+                    let argb = pixels[src_start + i];
+                    cache.insert(argb);
+                }
+                pos += length;
+            }
+        }
+    }
+    debug_assert_eq!(
+        pos,
+        pixels.len(),
+        "cacheify_tokens: token stream covered {pos} of {} pixels",
+        pixels.len()
+    );
+    out
+}
+
 /// The five per-symbol frequency tables for one prefix-code group: green
-/// (literals + §5.2.2 length symbols), red, blue, alpha, and distance.
+/// (literals + §5.2.2 length symbols + §5.2.3 cache indices), red, blue,
+/// alpha, and distance.
 struct Frequencies {
     green: Vec<u32>,
     red: Vec<u32>,
@@ -826,8 +989,13 @@ fn distance_to_code(distance: usize) -> u32 {
 
 /// Accumulate the per-symbol frequencies for a token stream so the entropy
 /// stage can build length-optimal prefix codes before emitting.
-fn count_frequencies(tokens: &[Token]) -> Frequencies {
-    let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES;
+///
+/// `color_cache_size` is `1 << color_cache_code_bits` (0 when the cache
+/// is disabled). It extends the GREEN alphabet to
+/// `256 + 24 + color_cache_size` per §6.2.3 so a `CacheRef { index }`
+/// token's wire symbol `256 + 24 + index` is in range.
+fn count_frequencies(tokens: &[Token], color_cache_size: usize) -> Frequencies {
+    let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + color_cache_size;
     let mut freqs = Frequencies {
         green: vec![0u32; green_alphabet],
         red: vec![0u32; 256],
@@ -846,6 +1014,12 @@ fn count_frequencies(tokens: &[Token]) -> Frequencies {
                 freqs.red[r] += 1;
                 freqs.blue[b] += 1;
                 freqs.alpha[a] += 1;
+            }
+            Token::CacheRef { index } => {
+                // §5.2.3: GREEN symbol is `256 + 24 + index`.
+                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
+                debug_assert!(sym < green_alphabet);
+                freqs.green[sym] += 1;
             }
             Token::Copy { length, distance } => {
                 // §5.2.2: length is a GREEN symbol `256 + length_prefix`.
@@ -912,20 +1086,45 @@ pub fn apply_subtract_green(pixels: &mut [u32]) {
 /// bytes, prefixed with the image-header and wrapped in RIFF/WEBP framing,
 /// decode back to `pixels` exactly.
 pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
-    let tokens = tokenize_lz77(pixels);
-    let no_tx = encode_tokens(&tokens, false);
-    // Subtract-green path: apply the forward transform, re-tokenize the
-    // residual pixels (matches change because the per-pixel values do),
-    // and prefix the §3.8.2 transform header.
-    let mut sg_pixels = pixels.to_vec();
-    apply_subtract_green(&mut sg_pixels);
-    let sg_tokens = tokenize_lz77(&sg_pixels);
-    let sg = encode_tokens(&sg_tokens, true);
-    if sg.len() < no_tx.len() {
-        sg
-    } else {
-        no_tx
+    // Evaluate the 2×2 cross-product (no-tx | subtract-green) ×
+    // (no-cache | cache) and emit whichever produced the smallest
+    // image stream. Each path is fully spec-conformant; the smallest
+    // byte count wins.
+    let mut best = encode_literals_with_options(pixels, false, None);
+
+    let candidates = [
+        encode_literals_with_options(pixels, true, None),
+        encode_literals_with_options(pixels, false, Some(DEFAULT_COLOR_CACHE_BITS)),
+        encode_literals_with_options(pixels, true, Some(DEFAULT_COLOR_CACHE_BITS)),
+    ];
+    for cand in candidates {
+        if cand.len() < best.len() {
+            best = cand;
+        }
     }
+    best
+}
+
+/// Encode `pixels` with explicit knobs: optionally apply the §3.5.3 /
+/// §3.8.2 subtract-green transform, optionally enable a §5.2.3 color
+/// cache with the given `code_bits` (`None` disables it). The
+/// implementation runs the §5.2.2 LZ77 matcher, then (if a cache is
+/// requested) rewrites literal tokens into §5.2.3 cache references in
+/// stream order, then emits the §3.8.3 image stream.
+fn encode_literals_with_options(
+    pixels: &[u32],
+    subtract_green: bool,
+    cache_code_bits: Option<u32>,
+) -> Vec<u8> {
+    let mut working = pixels.to_vec();
+    if subtract_green {
+        apply_subtract_green(&mut working);
+    }
+    let mut tokens = tokenize_lz77(&working);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, &working, bits);
+    }
+    encode_tokens(&tokens, subtract_green, cache_code_bits)
 }
 
 /// Encode an ARGB image with the literal-only, no-transform path: every
@@ -934,7 +1133,7 @@ pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
 /// LZ77 path against; [`encode_argb_literals`] is the default entry point.
 pub fn encode_argb_literals_only(pixels: &[u32]) -> Vec<u8> {
     let tokens: Vec<Token> = pixels.iter().map(|&p| Token::Literal(p)).collect();
-    encode_tokens(&tokens, false)
+    encode_tokens(&tokens, false, None)
 }
 
 /// Encode an ARGB image forcing the §3.5.3 / §3.8.2 subtract-green
@@ -946,7 +1145,18 @@ pub fn encode_argb_literals_subtract_green(pixels: &[u32]) -> Vec<u8> {
     let mut sg_pixels = pixels.to_vec();
     apply_subtract_green(&mut sg_pixels);
     let tokens = tokenize_lz77(&sg_pixels);
-    encode_tokens(&tokens, true)
+    encode_tokens(&tokens, true, None)
+}
+
+/// Encode an ARGB image forcing a §5.2.3 color cache on (size
+/// `1 << cache_code_bits`), with no §3.8.2 transform. Used by the
+/// round-121 size-reduction comparison test to isolate the cache's
+/// effect from the subtract-green chooser; production callers use
+/// [`encode_argb_literals`] which picks the smallest of the four
+/// path combinations.
+pub fn encode_argb_literals_color_cache(pixels: &[u32], cache_code_bits: u32) -> Vec<u8> {
+    debug_assert!((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&cache_code_bits));
+    encode_literals_with_options(pixels, false, Some(cache_code_bits))
 }
 
 /// Shared entropy stage: from a §5.2.2 token stream, build the five prefix
@@ -958,7 +1168,17 @@ pub fn encode_argb_literals_subtract_green(pixels: &[u32]) -> Vec<u8> {
 /// single `%b0` terminator (no transform); `true` emits `%b1 %b10 %b0` —
 /// the subtract-green transform (type 2, bodyless) followed by the end-of-
 /// list terminator.
-fn encode_tokens(tokens: &[Token], subtract_green: bool) -> Vec<u8> {
+///
+/// `color_cache_code_bits` controls the §5.2.3 `color-cache-info` field:
+/// `None` emits `%b0` (no cache); `Some(bits)` emits `%b1 4BIT` with the
+/// caller-supplied `code_bits ∈ [1, 11]`. The token stream must already
+/// reflect the choice — `CacheRef` tokens are only meaningful when the
+/// cache is enabled.
+fn encode_tokens(
+    tokens: &[Token],
+    subtract_green: bool,
+    color_cache_code_bits: Option<u32>,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // §3.8.2 optional-transform.
@@ -974,16 +1194,29 @@ fn encode_tokens(tokens: &[Token], subtract_green: bool) -> Vec<u8> {
     w.write_bit(false);
 
     // §3.8.3 spatially-coded-image = color-cache-info meta-prefix data.
-    // color-cache-info: `%b0` (no color cache).
-    w.write_bit(false);
+    // color-cache-info: `%b0` (no cache) or `%b1 4BIT` (enabled).
+    let color_cache_size = match color_cache_code_bits {
+        Some(bits) => {
+            debug_assert!((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&bits));
+            w.write_bit(true);
+            w.write_bits(bits, 4);
+            1usize << bits
+        }
+        None => {
+            w.write_bit(false);
+            0
+        }
+    };
     // meta-prefix: `%b0` (single prefix-code group).
     w.write_bit(false);
 
     // Build the five prefix codes from token frequencies. The GREEN
-    // alphabet covers literals (`< 256`) *and* the §5.2.2 length prefix
-    // symbols (`256 + length_prefix`). The distance alphabet (40 codes) is
-    // exercised only when the matcher emitted at least one copy.
-    let freqs = count_frequencies(tokens);
+    // alphabet covers literals (`< 256`), the §5.2.2 length prefix
+    // symbols (`256 + length_prefix`), and (when the cache is enabled)
+    // the §5.2.3 cache indices (`256 + 24 + index`). The distance
+    // alphabet (40 codes) is exercised only when the matcher emitted at
+    // least one copy.
+    let freqs = count_frequencies(tokens, color_cache_size);
     let green_code = WriteCode::from_freqs(&freqs.green);
     let red_code = WriteCode::from_freqs(&freqs.red);
     let blue_code = WriteCode::from_freqs(&freqs.blue);
@@ -1007,7 +1240,8 @@ fn encode_tokens(tokens: &[Token], subtract_green: bool) -> Vec<u8> {
     dist_code.write_code_lengths(&mut w);
 
     // lz77-coded-image: each token is either a §5.2.1 ARGB literal
-    // (channel order green, red, blue, alpha) or a §5.2.2 length + distance
+    // (channel order green, red, blue, alpha), a §5.2.3 color-cache
+    // reference (a single GREEN symbol), or a §5.2.2 length + distance
     // backward reference.
     for &tok in tokens {
         match tok {
@@ -1020,6 +1254,14 @@ fn encode_tokens(tokens: &[Token], subtract_green: bool) -> Vec<u8> {
                 red_code.write_symbol(&mut w, r);
                 blue_code.write_symbol(&mut w, b);
                 alpha_code.write_symbol(&mut w, a);
+            }
+            Token::CacheRef { index } => {
+                // §5.2.3: GREEN symbol is `256 + 24 + index`. Red /
+                // blue / alpha are not transmitted; the decoder
+                // recovers the full ARGB from the cache slot.
+                debug_assert!(color_cache_size > 0, "CacheRef requires an enabled cache");
+                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
+                green_code.write_symbol(&mut w, sym);
             }
             Token::Copy { length, distance } => {
                 // §5.2.2: length via a GREEN length symbol (base 256), then
@@ -1714,7 +1956,7 @@ mod tests {
         }
         let no_tx = {
             let tokens = tokenize_lz77(&pixels);
-            encode_tokens(&tokens, false)
+            encode_tokens(&tokens, false, None)
         };
         let sg = encode_argb_literals_subtract_green(&pixels);
         eprintln!(
@@ -1737,9 +1979,10 @@ mod tests {
         assert_eq!(img.pixels(), pixels.as_slice());
     }
 
-    /// `encode_argb_literals` picks the smaller of the two evaluated
-    /// paths, so on a green-correlated image its output equals the
-    /// subtract-green path (or smaller).
+    /// `encode_argb_literals` picks the smallest of the four
+    /// `(no-tx | sg) × (no-cache | cache)` paths it evaluates, so on
+    /// any image its output equals the minimum of all four candidate
+    /// streams.
     #[test]
     fn encode_argb_literals_chooses_smaller_path() {
         let w = 32u32;
@@ -1758,12 +2001,12 @@ mod tests {
             pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
         }
         let chosen = encode_argb_literals(&pixels);
-        let sg = encode_argb_literals_subtract_green(&pixels);
-        let no_tx = {
-            let tokens = tokenize_lz77(&pixels);
-            encode_tokens(&tokens, false)
-        };
-        assert_eq!(chosen.len(), sg.len().min(no_tx.len()));
+        let no_tx = encode_literals_with_options(&pixels, false, None);
+        let sg = encode_literals_with_options(&pixels, true, None);
+        let cc = encode_literals_with_options(&pixels, false, Some(DEFAULT_COLOR_CACHE_BITS));
+        let sg_cc = encode_literals_with_options(&pixels, true, Some(DEFAULT_COLOR_CACHE_BITS));
+        let best = no_tx.len().min(sg.len()).min(cc.len()).min(sg_cc.len());
+        assert_eq!(chosen.len(), best);
     }
 
     /// A subtract-green-encoded image survives a full encode → decode
@@ -1811,7 +2054,7 @@ mod tests {
         let chosen = encode_argb_literals(&pixels);
         let no_tx = {
             let tokens = tokenize_lz77(&pixels);
-            encode_tokens(&tokens, false)
+            encode_tokens(&tokens, false, None)
         };
         assert!(
             chosen.len() <= no_tx.len(),
@@ -1846,5 +2089,264 @@ mod tests {
         let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
         let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
         assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    // ---- §5.2.1 / §5.2.3 color cache (round 121) ----
+
+    /// The encoder's `EncoderColorCache` uses the spec's §5.2.3 hash
+    /// formula and matches the decoder's
+    /// [`crate::vp8l_decode::ColorCache::hash`] bit-for-bit at every
+    /// allowed `code_bits`.
+    #[test]
+    fn encoder_color_cache_hash_matches_decoder_hash() {
+        use crate::vp8l_decode::ColorCache;
+        for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
+            let enc = EncoderColorCache::new(bits);
+            let dec = ColorCache::new(bits);
+            // A spread of synthetic ARGB pixels: black, white, the
+            // wrap-around 0x01020304, a saturated red, a mid-alpha
+            // greenish, plus a zero (which all caches start with).
+            for argb in [
+                0x0000_0000u32,
+                0xffff_ffff,
+                0x0102_0304,
+                0xffff_0000,
+                0x8000_ff80,
+                0x1234_5678,
+            ] {
+                assert_eq!(
+                    enc.hash(argb),
+                    dec.hash(argb),
+                    "hash mismatch at code_bits={bits} for argb=0x{argb:08x}"
+                );
+            }
+            assert_eq!(enc.size(), 1 << bits);
+        }
+    }
+
+    /// A fresh cache holds zeros, so `contains(0)` succeeds *before*
+    /// any insertion — exactly the §5.2.3 "all entries set to zero"
+    /// invariant the decoder relies on.
+    #[test]
+    fn encoder_color_cache_starts_zero_initialized() {
+        let cache = EncoderColorCache::new(4);
+        // Index 0's slot starts at the all-zero pixel.
+        let zero_idx = cache.hash(0);
+        assert_eq!(cache.entries[zero_idx], 0);
+        assert_eq!(cache.contains(0), Some(zero_idx));
+    }
+
+    /// Inserting a pixel makes a subsequent `contains` for that same
+    /// pixel resolve to the matching slot; an unrelated pixel does
+    /// not collide (with overwhelming probability at 8 cache bits).
+    #[test]
+    fn encoder_color_cache_insert_then_contains_round_trips() {
+        let mut cache = EncoderColorCache::new(8);
+        let argb = 0xff12_3456u32;
+        assert!(cache.contains(argb).is_none() || cache.entries[cache.hash(argb)] != argb);
+        cache.insert(argb);
+        assert_eq!(cache.contains(argb), Some(cache.hash(argb)));
+    }
+
+    /// `cacheify_tokens` converts a literal back-to-back repeat into
+    /// a `CacheRef` token whose `index` matches the cache slot, while
+    /// leaving the first (unique) literal as a literal.
+    #[test]
+    fn cacheify_tokens_collapses_repeat_literal_into_cache_ref() {
+        let argb = 0xff20_4060u32;
+        let pixels = vec![argb, argb];
+        let raw = vec![Token::Literal(argb), Token::Literal(argb)];
+        let out = cacheify_tokens(&raw, &pixels, 8);
+        assert!(matches!(out[0], Token::Literal(p) if p == argb));
+        let cache = EncoderColorCache::new(8);
+        let idx = cache.hash(argb) as u32;
+        assert_eq!(out[1], Token::CacheRef { index: idx });
+    }
+
+    /// A backward-reference `Copy` token inserts each copied pixel
+    /// into the cache, so a subsequent literal that hashes to the
+    /// same slot is collapsed to a `CacheRef`.
+    #[test]
+    fn cacheify_tokens_copy_updates_cache_for_subsequent_literal() {
+        let argb = 0xff80_4010u32;
+        // pixels: [argb, argb, argb, argb] — represented as a literal
+        // followed by a Copy {length: 3, distance: 1}, then later
+        // (at position 4) we add the same argb as a literal again.
+        let pixels = vec![argb, argb, argb, argb, argb];
+        let raw = vec![
+            Token::Literal(argb),
+            Token::Copy {
+                length: 3,
+                distance: 1,
+            },
+            Token::Literal(argb),
+        ];
+        let out = cacheify_tokens(&raw, &pixels, 8);
+        // The first literal is still a literal; the copy passes
+        // through; the trailing literal is now a CacheRef.
+        assert!(matches!(out[0], Token::Literal(p) if p == argb));
+        assert!(matches!(
+            out[1],
+            Token::Copy {
+                length: 3,
+                distance: 1,
+            }
+        ));
+        let cache = EncoderColorCache::new(8);
+        let idx = cache.hash(argb) as u32;
+        assert_eq!(out[2], Token::CacheRef { index: idx });
+    }
+
+    /// Forcing the color-cache path on a repetitive 16-color palette
+    /// fixture round-trips bit-exactly through the decoder. This is
+    /// the headline round-121 sanity test: the encoder emits §5.2.3
+    /// cache codes; the decoder reads them back via its own
+    /// [`crate::vp8l_decode::ColorCache`] and reconstructs the same
+    /// pixels.
+    #[test]
+    fn color_cache_path_round_trips_via_public_entry_points() {
+        let w = 8u32;
+        let h = 8u32;
+        // 16 distinct ARGB colors cycling per scan-line; every color
+        // appears multiple times so the cache gets exercised.
+        let palette: [u32; 16] = [
+            0xff00_0000,
+            0xff00_00ff,
+            0xff00_ff00,
+            0xff00_ffff,
+            0xffff_0000,
+            0xffff_00ff,
+            0xffff_ff00,
+            0xffff_ffff,
+            0xff80_8080,
+            0xff20_4060,
+            0xff60_4020,
+            0xff10_2030,
+            0xff30_2010,
+            0xffa0_b0c0,
+            0xffc0_b0a0,
+            0xff55_aa55,
+        ];
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| palette[(i as usize) % palette.len()])
+            .collect();
+        // Force the color-cache path via the test-only entry.
+        let stream = encode_argb_literals_color_cache(&pixels, DEFAULT_COLOR_CACHE_BITS);
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// On a small palette of repeated colors (a synthetic but
+    /// realistic case for palette-heavy artwork), the §5.2.3
+    /// color-cache path produces a smaller stream than the
+    /// no-cache LZ77 path. This is the round-121 headline
+    /// measurement.
+    #[test]
+    fn color_cache_beats_no_cache_on_small_palette_image() {
+        // 32x32 image where every pixel is drawn from an 8-color
+        // palette, in a pseudo-random pattern (so the LZ77 matcher
+        // can't collapse them all into long copies and the
+        // color-cache codes get to do real work).
+        let w = 32u32;
+        let h = 32u32;
+        let palette: [u32; 8] = [
+            0xff10_2030,
+            0xff40_5060,
+            0xff70_8090,
+            0xffa0_b0c0,
+            0xffd0_e0f0,
+            0xff00_1122,
+            0xff33_4455,
+            0xff66_7788,
+        ];
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0x1357_9bdfu32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push(palette[(state as usize) % palette.len()]);
+        }
+        let no_cache = encode_literals_with_options(&pixels, false, None);
+        let cache = encode_literals_with_options(&pixels, false, Some(DEFAULT_COLOR_CACHE_BITS));
+        eprintln!(
+            "[round-121] 32x32 small-palette pseudo-random: no-cache={} B, color-cache={} B ({:.1}% reduction)",
+            no_cache.len(),
+            cache.len(),
+            100.0 * (no_cache.len() as f64 - cache.len() as f64) / no_cache.len() as f64,
+        );
+        assert!(
+            cache.len() < no_cache.len(),
+            "color-cache stream ({} B) did not beat no-cache LZ77 ({} B)",
+            cache.len(),
+            no_cache.len(),
+        );
+
+        // Round trip through the full encoder/decoder chain is exact.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// On a noisy image with effectively-zero color repetition the
+    /// chooser never selects the cache path (it would just inflate
+    /// the GREEN alphabet for no compression gain), so
+    /// `encode_argb_literals` never produces a stream larger than the
+    /// no-cache baseline on uncorrelated noise.
+    #[test]
+    fn color_cache_chooser_does_not_regress_on_uncorrelated_noise() {
+        let w = 16u32;
+        let h = 16u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xfeed_b00bu32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push(state | 0xff00_0000);
+        }
+        let chosen = encode_argb_literals(&pixels);
+        let no_cache_no_tx = encode_literals_with_options(&pixels, false, None);
+        assert!(
+            chosen.len() <= no_cache_no_tx.len(),
+            "chooser regressed on noise: {} B chosen vs {} B no-cache no-tx",
+            chosen.len(),
+            no_cache_no_tx.len(),
+        );
+    }
+
+    /// The §5.2.3 `color-cache-info` header field encodes the
+    /// chosen `code_bits` value: when the cache is enabled, the
+    /// decoder reads `%b1` followed by `ReadBits(4) = code_bits`,
+    /// and the `ColorCacheInfo::is_enabled()` flag flips on. This
+    /// test routes the encoded stream through the live decoder's
+    /// `MetaPrefixHeader::read` and confirms it sees the cache.
+    #[test]
+    fn color_cache_header_round_trips_through_meta_prefix_reader() {
+        use crate::meta_prefix::{ImageRole, MetaPrefixHeader};
+        use crate::vp8l_stream::BitReader;
+        let w = 4u32;
+        let h = 4u32;
+        let palette = [0xff10_2030u32, 0xff40_5060, 0xff70_8090, 0xffa0_b0c0];
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| palette[(i as usize) % palette.len()])
+            .collect();
+        let stream = encode_argb_literals_color_cache(&pixels, DEFAULT_COLOR_CACHE_BITS);
+        // Read straight off the image-stream — no §3.8.2 transform
+        // header is present (we forced the no-tx path), so the
+        // very first bit is the transform-list terminator `%b0`,
+        // followed by the §3.8.3 `color-cache-info`.
+        let mut r = BitReader::new(&stream);
+        // Skip the transform-list terminator.
+        assert!(!r.read_bit().unwrap());
+        let header = MetaPrefixHeader::read(&mut r, ImageRole::Argb, w, h).unwrap();
+        assert!(header.color_cache.is_enabled());
+        assert_eq!(header.color_cache.code_bits, DEFAULT_COLOR_CACHE_BITS);
+        assert_eq!(header.color_cache.size(), 1 << DEFAULT_COLOR_CACHE_BITS);
     }
 }

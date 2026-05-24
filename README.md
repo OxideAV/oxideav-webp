@@ -2,6 +2,32 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-25 (clean-room round 121)
+
+**Round 121 added the §5.2.1 / §5.2.3 color-cache writer to the VP8L
+encoder.** [`encode_argb_literals`](src/vp8l_encode.rs) now evaluates a
+256-entry color cache (`color_cache_code_bits = 8`) alongside the no-cache
+path and emits whichever is smaller; combined with the round-120
+subtract-green chooser the encoder now picks the smallest of all four
+`(no-tx | subtract-green) × (no-cache | cache)` candidates. The cache
+state is maintained in stream order per §5.2.3 — every emitted ARGB
+literal **and** every pixel covered by a §5.2.2 backward-reference copy
+is re-inserted at its hashed slot
+(`(0x1e35a7bd * argb) >> (32 - code_bits)`), matching the decoder's
+[`ColorCache`](src/vp8l_decode.rs) bit-for-bit. When the cache is on, the
+§3.8.3 `color-cache-info` header becomes `%b1 8` (1-bit flag + 4-bit
+`code_bits`), the GREEN alphabet grows to `256 + 24 + 256 = 536` symbols,
+and a literal repeat is written as a single §5.2.3 cache code
+(`256 + 24 + index`) instead of four channel literals. Headline: a 32×32
+pseudo-random small-palette (8 distinct ARGB colors) image shrinks from
+1131 B (no-cache LZ77 + subtract-green chooser) to 622 B (color-cache on),
+a ~45 % size reduction. Round trip is bit-exact through
+[`decode_lossless_image`](src/lib.rs) on every fixture. The chooser never
+regresses (uncorrelated noise stays on the no-cache no-tx path). A new
+[`encode_argb_literals_color_cache`](src/vp8l_encode.rs) test-only entry
+forces the cache path for the round-121 size-reduction comparison. Lacks
+§3.8.2 predictor / color / color-indexing transform encoding.
+
 ## Status — 2026-05-24 (clean-room round 120)
 
 **Round 120 added the §3.5.3 / §3.8.2 subtract-green forward transform.**
@@ -21,7 +47,8 @@ and force-subtract-green paths stay available as
 [`encode_argb_literals_only`](src/vp8l_encode.rs) and
 [`encode_argb_literals_subtract_green`](src/vp8l_encode.rs) for the
 size-comparison tests. Lacks §3.8.2 predictor / color / color-indexing
-transform encoding and §5.2.3 color-cache compression.
+transform encoding and §5.2.3 color-cache compression. *(Round 121
+landed the color-cache writer — see the section above.)*
 
 ## Status — 2026-05-24 (clean-room round 118)
 

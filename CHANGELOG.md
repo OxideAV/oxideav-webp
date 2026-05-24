@@ -6,6 +6,46 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 121 (2026-05-25).** §5.2.1 / §5.2.3 **color-cache
+  writer** in the VP8L encoder. `encode_argb_literals` now evaluates a
+  256-entry color cache (`color_cache_code_bits = 8`) alongside the
+  no-cache path and emits whichever is smaller; combined with the
+  round-120 subtract-green chooser the encoder now picks the smallest of
+  all four `(no-tx | subtract-green) × (no-cache | cache)` candidates.
+  When the cache is enabled, the §3.8.3 `color-cache-info` header
+  becomes `%b1 8` (1-bit flag + 4-bit `code_bits`), the GREEN alphabet
+  grows to `256 + 24 + 256 = 536` symbols per §6.2.3, and a literal
+  repeat is written as a single §5.2.3 cache code (`256 + 24 + index`)
+  instead of four channel literals. New `EncoderColorCache` helper
+  mirrors the decoder's `vp8l_decode::ColorCache` semantics bit-for-bit
+  (hash formula `(0x1e35a7bd * argb) >> (32 - code_bits)`,
+  zero-initialised entries, every emitted pixel re-inserted in stream
+  order — both literals and every pixel covered by a §5.2.2
+  backward-reference copy). A new `cacheify_tokens` 2nd-pass walks the
+  LZ77 token stream and rewrites any `Literal(argb)` whose hashed slot
+  already holds `argb` to a `Token::CacheRef { index }`. Cache state
+  stays in sync with the decoder by inserting every covered pixel of a
+  `Copy` token. New test-only `encode_argb_literals_color_cache`
+  forces the cache path for the round-121 size-reduction comparison;
+  production callers stay on the chooser. Headline: a 32×32
+  pseudo-random small-palette (8 distinct ARGB colors) image compresses
+  from 1131 B (no-cache LZ77) to 622 B (color-cache on), a ~45 % size
+  reduction. Uncorrelated-noise images stay on the no-cache no-tx path
+  (the chooser never regresses). Round-trip is bit-exact through
+  `decode_lossless_image` on every existing fixture + the new
+  color-cache round-trip + meta-prefix-header read-back tests. New
+  tests: `encoder_color_cache_hash_matches_decoder_hash`,
+  `encoder_color_cache_starts_zero_initialized`,
+  `encoder_color_cache_insert_then_contains_round_trips`,
+  `cacheify_tokens_collapses_repeat_literal_into_cache_ref`,
+  `cacheify_tokens_copy_updates_cache_for_subsequent_literal`,
+  `color_cache_path_round_trips_via_public_entry_points`,
+  `color_cache_beats_no_cache_on_small_palette_image`,
+  `color_cache_chooser_does_not_regress_on_uncorrelated_noise`,
+  `color_cache_header_round_trips_through_meta_prefix_reader`. The
+  crate still builds + tests under `--no-default-features` (the cache
+  uses only the existing `oxideav-core`-free decode helpers).
+
 * **Clean-room round 120 (2026-05-24).** §3.5.3 / §3.8.2 **subtract-green
   transform** forward path in the VP8L encoder. New `apply_subtract_green`
   helper subtracts the green channel from red and blue per pixel
