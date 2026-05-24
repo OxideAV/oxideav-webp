@@ -6,6 +6,40 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 115 (2026-05-24).** First **VP8L lossless encoder**.
+  New `vp8l_encode` module (compiles standalone, no `oxideav-core` dep):
+  * `encode_webp_lossless(rgba, width, height)` — encodes an interleaved
+    8-bit RGBA image (`[R, G, B, A]` scan order, the `DecodedWebp::rgba`
+    layout) to a complete RIFF/WEBP file carrying a §2.6 simple-lossless
+    `VP8L` chunk. Re-exported at the crate root as
+    `oxideav_webp::encode_webp_lossless`. The encoded file decodes back to
+    the exact input bytes through `decode_webp` — a pixel-exact round trip.
+  * Simplest spec-conformant path: §3.8.2 `optional-transform` = `%b0`
+    (no transform / pass-through), §3.8.3 `color-cache-info` = `%b0`
+    (no color cache), §3.7.2.2 `meta-prefix` = `%b0` (single prefix-code
+    group), and a literal-only §3.8.3 image (every pixel a §3.7.3 ARGB
+    literal, no LZ77 backward references). The distance prefix code (#5)
+    is the §3.7.2.1.1 single-symbol-0 form ("empty prefix codes can be
+    coded as those containing a single symbol 0").
+  * §3.7.2 canonical prefix-code construction: per-channel symbol
+    frequencies → length-limited (≤ 15-bit) Huffman code lengths
+    (`build_code_lengths`, min-heap build + length-limiting rebalance) →
+    `(length, value)`-ordered canonical codes (`canonical_codes`) — the
+    identical assignment the round-104 `vp8l_prefix::PrefixCode` reader
+    consumes. Code lengths are written with the §3.7.2.1.2 *normal code
+    length code* (or the trivial single-leaf form for constant channels).
+  * `BitWriter` — the LSB-first inverse of `vp8l_stream::BitReader`.
+  * `EncodeError` (`PixelBufferMismatch` / `InvalidDimensions` / `Build`)
+    with a `From<EncodeError>` into the crate-wide `Error`.
+  * 15 unit tests + 4 integration round trips: encode→decode is pixel-exact
+    on synthetic 1×1 / gradient / solid / 16×16-pseudo-random images and on
+    the real `lossless-1x1`, `lossless-32x32-rgba`, and
+    `lossless-color-indexing-paletted` fixtures (decoded by the independent
+    decode path, re-encoded, re-decoded, compared byte-for-byte).
+  * Encoder scope is decode-only-validated for now: no §3.8.2 transform
+    encoding, no LZ77 / color-cache compression. Files are larger than a
+    libwebp-encoded equivalent but spec-valid and round-trip-exact.
+
 * **Clean-room round 112 (2026-05-24).** The codec is now registered into
   `oxideav_core::RuntimeContext` — `register()` is no longer a no-op. New
   `registry` module (gated behind the default-on `registry` feature):

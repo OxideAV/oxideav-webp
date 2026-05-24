@@ -2,7 +2,28 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 112)
+## Status — 2026-05-24 (clean-room round 115)
+
+**A VP8L lossless encoder landed in round 115.**
+[`encode_webp_lossless`](src/lib.rs) takes an interleaved 8-bit RGBA
+buffer (`[R, G, B, A]` scan order — the `DecodedWebp::rgba` layout) plus
+dimensions and emits a complete `RIFF/WEBP` file carrying a §2.6
+simple-lossless `VP8L` chunk. The encoded file decodes back to the exact
+input bytes through [`decode_webp`](src/lib.rs) — a pixel-exact round
+trip, validated against the `lossless-1x1`, `lossless-32x32-rgba`, and
+`lossless-color-indexing-paletted` fixtures (decoded by the independent
+decode path, re-encoded, re-decoded, compared byte-for-byte). The encoder
+([`vp8l_encode`](src/vp8l_encode.rs)) takes the simplest spec-conformant
+path: no §3.8.2 transform (pass-through), no §3.8.3 color cache, a single
+§3.7.2.2 meta-prefix code, and a literal-only image (no LZ77 backward
+references). It builds the §3.7.2 canonical prefix codes per-image from
+channel frequencies (length-limited ≤ 15-bit Huffman →
+`(length, value)`-ordered canonical codes, the exact assignment the
+round-104 reader consumes) and writes their lengths with the §3.7.2.1.2
+normal code length code. Output is larger than a libwebp-encoded
+equivalent (no transform / LZ77 compression yet) but spec-valid and
+round-trip-exact. Lacks §3.8.2 transform encoding and LZ77 / color-cache
+compression.
 
 **The codec is now registered into `oxideav_core::RuntimeContext`.**
 [`register`](src/lib.rs) (round 112) installs a `Decoder` factory under

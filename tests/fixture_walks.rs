@@ -27,9 +27,9 @@ use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
 use oxideav_webp::{
     build_vp8x_chunk, build_webp_file, decode_lossless_image, decode_webp, decode_webp_image,
-    extract_lossless_chunk, extract_lossy_chunk, parse_alph_header, parse_anim_header,
-    parse_anmf_header, parse_container, parse_vp8x_header, read_vp8l_transform_list, Error,
-    UnsupportedKind,
+    encode_webp_lossless, extract_lossless_chunk, extract_lossy_chunk, parse_alph_header,
+    parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
+    read_vp8l_transform_list, Error, UnsupportedKind,
 };
 
 const LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
@@ -1206,4 +1206,66 @@ fn round111_decode_webp_lossy_with_alpha_is_unsupported() {
     // pixels can't be produced here; the lossy VP8 routing path applies.
     let err = decode_webp(LOSSY_WITH_ALPHA).expect_err("lossy+alpha unsupported");
     assert_eq!(err, Error::Unsupported(UnsupportedKind::LossyVp8));
+}
+
+// ---------------------------------------------------------------------------
+// Round 115 — VP8L lossless ENCODER round trips.
+//
+// The encoder produces a RIFF/WEBP file with a VP8L chunk that the existing
+// decoder reads back pixel-exact. These tests drive a real fixture's decoded
+// pixels through the encoder and confirm the re-decode is identical — the
+// strongest end-to-end check available (encode and decode are independent
+// code paths).
+// ---------------------------------------------------------------------------
+
+/// Decode a fixture, re-encode the RGBA, decode again, and assert the
+/// pixels survived unchanged.
+fn assert_encoder_round_trips(file: &[u8]) {
+    let original = decode_webp_image(file).expect("fixture decodes");
+    let reencoded = encode_webp_lossless(&original.rgba, original.width, original.height)
+        .expect("RGBA re-encodes to VP8L");
+    let redecoded = decode_webp_image(&reencoded).expect("re-encoded file decodes");
+    assert_eq!(redecoded.width, original.width);
+    assert_eq!(redecoded.height, original.height);
+    assert_eq!(
+        redecoded.rgba, original.rgba,
+        "encoder round trip changed pixels"
+    );
+}
+
+#[test]
+fn round115_encoder_round_trips_lossless_1x1() {
+    assert_encoder_round_trips(LOSSLESS_1X1);
+}
+
+#[test]
+fn round115_encoder_round_trips_lossless_32x32_rgba() {
+    // 32x32 with a wide spread of colors — exercises multi-bit canonical
+    // codes for all four channels through the real decoder.
+    assert_encoder_round_trips(LOSSLESS_32X32_RGBA);
+}
+
+#[test]
+fn round115_encoder_round_trips_color_indexing_fixture() {
+    // The paletted fixture decodes to few distinct colors; re-encoding it as
+    // a flat literal stream still has to round-trip exactly.
+    assert_encoder_round_trips(LOSSLESS_COLOR_INDEXING);
+}
+
+#[test]
+fn round115_encoded_file_is_a_well_formed_simple_lossless_container() {
+    let original = decode_webp_image(LOSSLESS_32X32_RGBA).unwrap();
+    let file = encode_webp_lossless(&original.rgba, original.width, original.height).unwrap();
+    // RIFF/WEBP framing with a single VP8L chunk, no VP8X.
+    let c = parse_container(&file).expect("encoded file walks");
+    assert!(c
+        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8L)
+        .is_some());
+    assert!(c
+        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8X)
+        .is_none());
+    // The typed lossless chunk handle agrees on the dimensions.
+    let chunk = extract_lossless_chunk(&file).unwrap().unwrap();
+    assert_eq!(chunk.width(), original.width);
+    assert_eq!(chunk.height(), original.height);
 }

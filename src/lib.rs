@@ -134,6 +134,7 @@ pub mod registry;
 pub mod vp8_chunk;
 pub mod vp8l_chunk;
 pub mod vp8l_decode;
+pub mod vp8l_encode;
 pub mod vp8l_prefix;
 pub mod vp8l_stream;
 pub mod vp8l_transform;
@@ -177,6 +178,8 @@ pub enum Error {
     Vp8lMetaPrefix(meta_prefix::MetaPrefixError),
     /// The §5.2 VP8L per-pixel ARGB decode loop rejected the bitstream.
     Vp8lDecode(vp8l_decode::DecodeError),
+    /// The §3.7 / §3.8 VP8L lossless encoder rejected the input.
+    Vp8lEncode(vp8l_encode::EncodeError),
 }
 
 /// Which image kind [`decode_webp`] declined to decode.
@@ -221,6 +224,7 @@ impl core::fmt::Display for Error {
             Self::Vp8lPrefix(e) => write!(f, "oxideav-webp vp8l-prefix: {e}"),
             Self::Vp8lMetaPrefix(e) => write!(f, "oxideav-webp vp8l-meta-prefix: {e}"),
             Self::Vp8lDecode(e) => write!(f, "oxideav-webp vp8l-decode: {e}"),
+            Self::Vp8lEncode(e) => write!(f, "oxideav-webp vp8l-encode: {e}"),
         }
     }
 }
@@ -296,6 +300,12 @@ impl From<meta_prefix::MetaPrefixError> for Error {
 impl From<vp8l_decode::DecodeError> for Error {
     fn from(e: vp8l_decode::DecodeError) -> Self {
         Self::Vp8lDecode(e)
+    }
+}
+
+impl From<vp8l_encode::EncodeError> for Error {
+    fn from(e: vp8l_encode::EncodeError) -> Self {
+        Self::Vp8lEncode(e)
     }
 }
 
@@ -599,6 +609,24 @@ pub fn decode_webp_image(bytes: &[u8]) -> Result<DecodedWebp, Error> {
 /// header-only).
 pub fn decode_webp(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(decode_webp_image(bytes)?.rgba)
+}
+
+/// Encode an interleaved 8-bit RGBA image to a complete RIFF/WEBP file
+/// carrying a §2.6 simple-lossless `VP8L` chunk.
+///
+/// `rgba` is `width * height * 4` bytes in scan-line (top-to-bottom,
+/// left-to-right) order, each pixel `[R, G, B, A]` — exactly the
+/// [`DecodedWebp::rgba`] layout [`decode_webp_image`] returns. The encoded
+/// file decodes back to the same bytes through [`decode_webp`], a
+/// pixel-exact round trip.
+///
+/// This is the round-115 encoder: it takes the simplest spec-conformant
+/// VP8L path — no §3.8.2 transform, no §3.8.3 color cache, a single
+/// meta-prefix code, and a literal-only image (no LZ77 backward references)
+/// — building the §3.7.2 canonical prefix codes per-image from the pixel
+/// frequencies. See [`vp8l_encode::encode_webp_lossless`].
+pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
+    vp8l_encode::encode_webp_lossless(rgba, width, height).map_err(Into::into)
 }
 
 /// Repack a scan-line-order ARGB pixel buffer (`(a<<24)|(r<<16)|(g<<8)|b`)
