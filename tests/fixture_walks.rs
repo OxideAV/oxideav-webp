@@ -111,9 +111,57 @@ fn fixture_lossy_with_alpha_alph_info_byte_decodes_to_lossless_no_filter_no_pre(
     assert_eq!(h.preprocessing, AlphPreprocessing::None);
     assert_eq!(h.reserved, 0);
     // The remaining `Chunk Size - 1` bytes are the alpha bitstream
-    // proper (out of scope for round 3).
+    // proper, decoded end-to-end by the round-110 test below.
     let bitstream = &alph.payload(LOSSY_WITH_ALPHA)[h.bitstream_offset()..];
     assert_eq!(bitstream.len(), (alph.size as usize) - 1);
+}
+
+/// FNV-1a (64-bit) over a byte slice — a small dependency-free digest
+/// used to lock the full alpha plane to a known-good value.
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[test]
+fn round110_lossy_with_alpha_decodes_full_alpha_plane_via_vp8l() {
+    // §2.7.1.2 end-to-end: ALPH method=1 (headerless VP8L image-stream
+    // with a PREDICTOR transform), filter=0 (none). The decoded alpha
+    // is lifted from the GREEN channel and the (no-op) inverse filter
+    // is applied. Dimensions are the §2.7.1 VP8X canvas (128x128).
+    //
+    // The full-plane FNV-1a digest and the corner / center / interior
+    // sample anchors below are locked to the bytes produced by the
+    // black-box `dwebp -alpha` validator over this same fixture (all
+    // 16384 bytes verified identical), per the round's clean-room
+    // allow-list (validator output as ground truth; its source unread).
+    let plane = oxideav_webp::decode_alpha_plane(LOSSY_WITH_ALPHA)
+        .expect("lossy-with-alpha decodes")
+        .expect("ALPH chunk present");
+    assert_eq!(plane.len(), 128 * 128, "full-resolution alpha plane");
+
+    let w = 128usize;
+    let at = |x: usize, y: usize| plane[y * w + x];
+
+    // Fully-transparent border corners; opaque interior.
+    assert_eq!(at(0, 0), 0);
+    assert_eq!(at(127, 0), 0);
+    assert_eq!(at(0, 127), 0);
+    assert_eq!(at(127, 127), 0);
+    assert_eq!(at(64, 64), 255);
+    assert_eq!(at(32, 96), 255);
+
+    // The plane spans the full 0..=255 range.
+    assert_eq!(*plane.iter().min().unwrap(), 0);
+    assert_eq!(*plane.iter().max().unwrap(), 255);
+    assert_eq!(plane.iter().filter(|&&v| v == 255).count(), 7845);
+
+    // Whole-plane digest lock (bit-exact vs. the validator output).
+    assert_eq!(fnv1a64(&plane), 0x42e1_6029_2eb0_d472);
 }
 
 #[test]

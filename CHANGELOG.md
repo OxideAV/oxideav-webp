@@ -6,6 +6,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 110 (2026-05-24).** §2.7.1.2 `ALPH` alpha-channel
+  bitstream decode — the alpha plane is now produced end-to-end. New
+  surface in `alph`:
+  * `alph::decode_alpha(payload, width, height)` — decodes a whole
+    `ALPH` chunk payload to a `width * height` plane of 8-bit alpha
+    values. Covers both compression methods: method 0 (raw 8-bit
+    values, length `width*height`) and method 1 (a *headerless* §3 VP8L
+    image-stream of implicit dimensions, decoded via the new
+    `vp8l_transform::decode_lossless_headerless`, with the alpha lifted
+    from the **green** channel per §2.7.1.2). Then applies the
+    §2.7.1.2 inverse filter — none / horizontal (A) / vertical (B) /
+    gradient (`clip(A+B-C)`) — as `alpha = (predictor + X) % 256`, with
+    the documented top-left (predictor 0), left-most (use pixel above),
+    and top-most (use pixel left) edge cases.
+  * `decode_alpha_plane(bytes)` — container-level entry point: walks the
+    `RIFF/WEBP` file, takes the alpha-plane dimensions from the `VP8X`
+    canvas (or the `VP8 ` keyframe header when no `VP8X` is present),
+    locates the `ALPH` chunk, and decodes. Returns `Ok(None)` when the
+    file carries no `ALPH` chunk.
+  * `AlphError` gained `DimensionsOverflow`, `RawLengthMismatch`,
+    `UnsupportedCompression`, and `Vp8l` variants.
+  * `vp8l_transform::decode_lossless_headerless(payload, width, height)`
+    — the headerless §3 image-stream decode (no 5-byte image header)
+    that the compressed alpha path reuses; the existing
+    `decode_lossless` now delegates to a shared driver.
+  * Verified bit-exact against the black-box `dwebp -alpha` validator on
+    the `lossy-with-alpha-128x128` fixture (all 16384 alpha bytes
+    identical); filter inverses are unit-tested against hand-computed
+    §2.7.1.2 vectors for all four methods.
+
 * **Clean-room round 109 (2026-05-24).** VP8L §4 inverse-transform
   passes — the layer that consumes round-108's `decode_argb` ARGB buffer
   and produces final pixels, closing the lossless decode path

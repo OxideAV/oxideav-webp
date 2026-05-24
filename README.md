@@ -2,15 +2,22 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-24 (clean-room round 109)
+## Status — 2026-05-24 (clean-room round 110)
 
-**The VP8L lossless decode path is now complete end-to-end.**
+**The VP8L lossless decode path is complete end-to-end, and the
+§2.7.1.2 `ALPH` alpha bitstream now decodes end-to-end too.**
 [`decode_lossless_image`](src/lib.rs) walks a `RIFF/WEBP` file, extracts
 the `VP8L` chunk, runs the §5/§6 entropy decode, and applies the §4
 inverse-transform chain — validated bit-exact against the `lossless-1x1`,
 `lossless-color-indexing-paletted`, and `lossless-32x32-rgba` fixture
 PNGs (the last exercising SUBTRACT_GREEN + PREDICTOR + CROSS_COLOR + a
 color cache simultaneously).
+[`decode_alpha_plane`](src/lib.rs) decodes the `ALPH` chunk to a
+full-resolution 8-bit alpha plane — both compression methods (raw +
+headerless VP8L, the latter reusing the lossless decoder and lifting
+alpha from the green channel) and all four §2.7.1.2 inverse filters —
+validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
+`lossy-with-alpha-128x128` fixture.
 
 
 * **Container walker:** RFC 9649 §2.3–§2.7 RIFF/WEBP chunk walk.
@@ -36,9 +43,21 @@ color cache simultaneously).
   `AlphCompression` covers `None` / `Lossless` / `Reserved(u8)`,
   `AlphFiltering` covers all four named methods (`None` / `Horizontal`
   / `Vertical` / `Gradient`), and `AlphPreprocessing` covers `None` /
-  `LevelReduction` / `Reserved(u8)`. The alpha bitstream itself is
-  **not** decoded — `AlphHeader::bitstream_offset()` returns the
-  fixed `1` so callers can slice it out.
+  `LevelReduction` / `Reserved(u8)`.
+* **ALPH alpha bitstream decode (round 110):** RFC 9649 §2.7.1.2
+  end-to-end. [`alph::decode_alpha`](src/alph.rs) decodes a whole
+  `ALPH` payload to a `width * height` 8-bit alpha plane: compression
+  method 0 (raw bytes) and method 1 (a *headerless* §3 VP8L
+  image-stream of implicit dimensions, decoded by
+  [`vp8l_transform::decode_lossless_headerless`](src/vp8l_transform.rs)
+  with the alpha taken from the green channel), then the §2.7.1.2
+  inverse filter (none / horizontal / vertical / gradient,
+  `alpha = (predictor + X) % 256`, with the top-left / left-most /
+  top-most edge cases). [`decode_alpha_plane`](src/lib.rs) is the
+  container-level entry point — it sources the plane dimensions from
+  `VP8X` (or the `VP8 ` keyframe) and returns `Ok(None)` for files with
+  no `ALPH` chunk. The §2.7.1.2 preprocessing hint is informational and
+  is not applied.
 * **ANIM payload parse (round 3):** RFC 9649 §2.7.1.1 typed decode of
   the 6-byte payload. [`anim::AnimHeader::parse`] / the
   [`parse_anim_header`](src/lib.rs) wrapper return
@@ -389,7 +408,7 @@ color cache simultaneously).
 | §2.7.1.1 `ANMF` field parse   | done (5×u24 LE + 6-bit Rsv + B + D info byte)       |
 | §2.7.1.1 `ANMF` Frame Data    | not yet — sub-RIFF bytes after 16-byte header opaque |
 | §2.7.1.2 `ALPH` info byte     | done (Rsv/P/F/C 2-bit decompose, typed enums)       |
-| §2.7.1.2 `ALPH` bitstream     | not yet — bytes after info byte are out of scope    |
+| §2.7.1.2 `ALPH` bitstream     | done — raw + headerless VP8L (green channel) + 4 inverse filters |
 | §2.7.1.4 `ICCP`               | surfaced as opaque chunk                            |
 | §2.7.1.5 `EXIF` / `XMP `      | surfaced as opaque chunks                           |
 | §2.7.1.6 unknown chunks       | surfaced (no special handling required by §2.7.1.6) |

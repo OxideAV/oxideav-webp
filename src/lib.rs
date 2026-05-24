@@ -18,6 +18,14 @@
 //!
 //! * [`alph::AlphHeader::parse`] — the `ALPH` info byte
 //!   (`Rsv|P|F|C`).
+//! * [`alph::decode_alpha`] — the §2.7.1.2 alpha-bitstream decode
+//!   (round 110): both compression methods (raw + headerless VP8L,
+//!   the latter lifting alpha from the GREEN channel) and the four
+//!   inverse filters (none / horizontal / vertical / gradient) with
+//!   the documented left-most / top-most edge cases, producing the
+//!   full-resolution alpha plane. [`decode_alpha_plane`] is the
+//!   container-level entry point: walk the file, take dimensions from
+//!   `VP8X` (or the `VP8 ` keyframe), find the `ALPH` chunk, decode.
 //! * [`anim::AnimHeader::parse`] — the `ANIM` 6-byte payload
 //!   (BGRA background colour + u16 loop count).
 //! * [`anmf::AnmfHeader::parse`] — the `ANMF` 16-byte per-frame
@@ -95,13 +103,13 @@
 //!   `lossless-32x32-rgba` (SUBTRACT_GREEN + PREDICTOR + CROSS_COLOR +
 //!   color cache) fixture PNGs.
 //!
-//! `VP8 ` lossy bitstream decode and the actual ALPH alpha
-//! bitstream remain stubs returning [`Error::NotImplemented`]; the
-//! builders are deliberately framing-only so an external encoder can
-//! pre-compute the codec payload bytes. The round-6 lossy handle and
-//! the round-7 lossless handle are likewise framing-only — they
-//! surface canvas dims and the routing slice but perform no VP8 /
-//! VP8L bitstream decode.
+//! `VP8 ` lossy bitstream decode remains a stub returning
+//! [`Error::NotImplemented`]; the builders are deliberately
+//! framing-only so an external encoder can pre-compute the codec
+//! payload bytes. The round-6 lossy handle is likewise framing-only —
+//! it surfaces canvas dims and the routing slice but performs no VP8
+//! bitstream decode. The §2.7.1.2 ALPH alpha bitstream **is** now
+//! decoded end-to-end ([`alph::decode_alpha`] / [`decode_alpha_plane`]).
 
 #![warn(missing_debug_implementations)]
 
@@ -275,9 +283,52 @@ pub fn parse_vp8x_header(payload: &[u8]) -> Result<vp8x::Vp8xHeader, Error> {
 /// slice returned by [`container::WebpChunk::payload`] for a chunk
 /// whose FourCC is [`container::fourcc::ALPH`]. Only the first byte
 /// is consumed by this layer; the rest of the payload is the alpha
-/// bitstream proper, which is not decoded here.
+/// bitstream proper, which is decoded by [`alph::decode_alpha`].
 pub fn parse_alph_header(payload: &[u8]) -> Result<alph::AlphHeader, Error> {
     alph::AlphHeader::parse(payload).map_err(Into::into)
+}
+
+/// Walk a `RIFF/WEBP` buffer and, if it carries a §2.7.1.2 `ALPH`
+/// chunk, fully decode the alpha bitstream to a `width * height` plane
+/// of 8-bit alpha values in scan order.
+///
+/// The alpha-plane dimensions are taken from the file in this priority
+/// order, matching how a still image carries its canvas size:
+///
+/// 1. the §2.7.1 `VP8X` canvas dimensions, if a `VP8X` chunk exists;
+/// 2. otherwise the §2.5 `VP8 ` keyframe dimensions (a simple-lossy
+///    file with an `ALPH` chunk but no `VP8X`).
+///
+/// Returns `Ok(None)` if the file is well-formed but carries no `ALPH`
+/// chunk. The decode covers both §2.7.1.2 compression methods
+/// (raw + VP8L-lossless) and all four filtering methods — see
+/// [`alph::decode_alpha`].
+///
+/// This handles the **still-image** alpha path. Per-frame (`ANMF`)
+/// alpha planes are addressed by walking the `ANMF` frame data with
+/// [`alph::decode_alpha`] directly, using the frame dimensions.
+pub fn decode_alpha_plane(bytes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    let c = container::parse(bytes)?;
+    let alph_chunk = match c.first_chunk_with_fourcc(container::fourcc::ALPH) {
+        Some(chunk) => chunk,
+        None => return Ok(None),
+    };
+
+    // Dimensions: VP8X canvas first, else the VP8 keyframe header.
+    let (width, height) = if let Some(vp8x) = c.first_chunk_with_fourcc(container::fourcc::VP8X) {
+        let hdr = vp8x::Vp8xHeader::parse(vp8x.payload(bytes))?;
+        (hdr.canvas_width, hdr.canvas_height)
+    } else if let Some(vp8) = c.first_chunk_with_fourcc(container::fourcc::VP8) {
+        let lossy = vp8_chunk::WebpLossyChunk::from_chunk(bytes, vp8)?;
+        (u32::from(lossy.width()), u32::from(lossy.height()))
+    } else {
+        // No dimension source — an ALPH with neither VP8X nor VP8 is
+        // not a shape RFC 9649 §2.5/§2.7 describes for still images.
+        return Err(Error::Alph(alph::AlphError::EmptyPayload));
+    };
+
+    let plane = alph::decode_alpha(alph_chunk.payload(bytes), width, height)?;
+    Ok(Some(plane))
 }
 
 /// Decode the §2.7.1.1 `ANIM` chunk payload to a typed

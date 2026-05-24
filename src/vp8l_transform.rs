@@ -439,6 +439,38 @@ pub fn decode_lossless(
     height: u32,
 ) -> Result<DecodedImage, DecodeError> {
     let mut reader = BitReader::new_after_image_header(payload);
+    decode_lossless_with_reader(&mut reader, width, height)
+}
+
+/// Decode a *headerless* VP8L image-stream — the §2.7.1.2 / §3 form used
+/// by the compressed `ALPH` alpha bitstream, where the 5-byte image
+/// header is omitted because the dimensions are already known from the
+/// container ("this image-stream does NOT contain any headers describing
+/// the image dimensions").
+///
+/// `payload` is the alpha bitstream proper (everything after the §2.7.1.2
+/// info byte). `width` / `height` are the implicit dimensions. The
+/// decode is otherwise identical to [`decode_lossless`]: §4 transforms,
+/// the main §5.1 ARGB image, and the inverse-transform chain. The caller
+/// extracts the alpha plane from the GREEN channel per §2.7.1.2.
+pub fn decode_lossless_headerless(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, DecodeError> {
+    let mut reader = BitReader::new(payload);
+    decode_lossless_with_reader(&mut reader, width, height)
+}
+
+/// Shared §4 transform-list + main-image decode driver, parameterised on
+/// a [`BitReader`] already positioned at the start of the §4 transform
+/// list. [`decode_lossless`] starts it past the 5-byte image header;
+/// [`decode_lossless_headerless`] starts it at bit 0.
+fn decode_lossless_with_reader(
+    reader: &mut BitReader<'_>,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, DecodeError> {
     let mut parsed: Vec<ParsedTransform> = Vec::new();
     let mut seen = [false; 4];
 
@@ -463,7 +495,7 @@ pub fn decode_lossless(
                 let block = 1u32 << size_bits;
                 let tw = div_round_up(current_width, block);
                 let th = div_round_up(height, block);
-                let image = decode_entropy_coded_image(&mut reader, tw, th)?;
+                let image = decode_entropy_coded_image(reader, tw, th)?;
                 parsed.push(ParsedTransform::Predictor {
                     size_bits,
                     transform_width: tw,
@@ -475,7 +507,7 @@ pub fn decode_lossless(
                 let block = 1u32 << size_bits;
                 let tw = div_round_up(current_width, block);
                 let th = div_round_up(height, block);
-                let image = decode_entropy_coded_image(&mut reader, tw, th)?;
+                let image = decode_entropy_coded_image(reader, tw, th)?;
                 parsed.push(ParsedTransform::Color {
                     size_bits,
                     transform_width: tw,
@@ -489,7 +521,7 @@ pub fn decode_lossless(
                 let color_table_size = reader.read_bits(8)? + 1;
                 // Color table: a `color_table_size × 1` entropy-coded
                 // image, subtraction-coded.
-                let table_img = decode_entropy_coded_image(&mut reader, color_table_size, 1)?;
+                let table_img = decode_entropy_coded_image(reader, color_table_size, 1)?;
                 let mut color_table = table_img.pixels().to_vec();
                 inverse_color_table(&mut color_table);
                 // §4.4: image_width is subsampled by width_bits.
@@ -501,7 +533,7 @@ pub fn decode_lossless(
     }
 
     // Main §5.1 ARGB image, decoded at the (possibly subsampled) width.
-    let mut image = decode_argb(&mut reader, current_width, height)?;
+    let mut image = decode_argb(reader, current_width, height)?;
 
     // §4: apply inverse transforms in reverse read order. Width may grow
     // back when a color-indexing transform is undone.
