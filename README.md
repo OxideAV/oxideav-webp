@@ -2,6 +2,68 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-25 (clean-room round 131)
+
+**Round 131 landed the published §2.5 `VP8 ` (lossy) encoder API
+surface** — every function name, type, constant, and registry entry the
+published-0.1.5 release exposed per [`API-COMPAT.md`](API-COMPAT.md), so
+downstream consumers compile and a future round wires the encoder body
+in without API churn.
+
+**Status: API-shape stub.** The wiring to a real VP8 lossy bitstream
+is blocked on `oxideav-vp8 = "0.2"`'s encoder, which today ships only
+**Phase 1**: [`oxideav_vp8::encode_silent_keyframe`](https://docs.rs/oxideav-vp8/0.2.0/oxideav_vp8/fn.encode_silent_keyframe.html)
+emits a structurally valid VP8 keyframe but **ignores the caller's
+pixels entirely** (every MB carries `mb_skip_coeff = 1` with
+`DC_PRED` → constant-grey picture). Wiring that through a WebP RIFF
+wrapper would produce garbage bytes — the exact failure mode the
+round-131 directive forbids — so this round lands the API shape only:
+each entry point validates input dims / buffer length then returns
+[`WebpError::Unsupported`](src/lib.rs) (free functions) or
+[`oxideav_core::Error::Unsupported`] (trait impl). No call ever
+returns `Ok(bytes)`.
+
+What landed:
+
+* Standalone free functions —
+  [`encode_vp8_lossy_rgba`](src/lib.rs),
+  [`encode_vp8_lossy_rgb24`](src/lib.rs),
+  [`encode_vp8_lossy_yuv420p`](src/lib.rs),
+  [`encode_vp8_lossy_yuva420p`](src/lib.rs).
+* New module [`encoder_vp8`](src/encoder_vp8.rs) carrying the direct
+  factory family — `make_encoder_with_quality` / `_with_qindex` /
+  `_with_target_size` (and `_and_metadata` / `_and_freq_deltas`
+  variants) — plus
+  [`Vp8FreqDeltas`](src/encoder_vp8.rs),
+  [`Vp8PsyStats`](src/encoder_vp8.rs),
+  [`compute_psy_stats`](src/encoder_vp8.rs),
+  [`freq_deltas_for_qindex`](src/encoder_vp8.rs),
+  [`quality_to_qindex`](src/encoder_vp8.rs), and the
+  `QUALITY_*` / `QINDEX_*` / `DEFAULT_QUALITY` constants.
+* Registry side — `CODEC_ID_VP8 = "webp_vp8"`,
+  [`WebpVp8LossyEncoder`](src/registry.rs) `Encoder` trait impl,
+  [`make_vp8_lossy_encoder`](src/registry.rs) factory; the codec is
+  registered alongside `webp_vp8l` so a `first_encoder` lookup against
+  the lossy id works.
+* The [`encoder_vp8`](src/encoder_vp8.rs) module-level doc-comment
+  enumerates the **precise** missing primitives on the
+  `oxideav-vp8` side that block real wiring: forward §14.3 WHT /
+  §14.4 DCT, forward §14.1 quantization, a pixel-driven §12
+  intra-prediction search, a per-MB encode driver consuming a
+  16×16 luma + 8×8 chroma block, and a top-level
+  "encode I420 → VP8 keyframe" entry. Once those land, the bodies
+  of the published entries above become a thin call into the new
+  vp8 encoder + the existing [`build::build_webp_file`](src/build.rs)
+  RIFF wrapper.
+
+18 new published-API tests + 4 inline `encoder_vp8` unit tests cover
+buffer-length validation, the quality/qindex mapping, the
+`Vp8FreqDeltas` / `Vp8PsyStats` stub semantics, and the registry-side
+construction + `send_frame` → `Unsupported` contract. The day
+`oxideav-vp8`'s pixel encoder lands, the
+`*_validates_then_unsupported` tests start failing — a deliberate
+change-detector. Total: **380** tests (was 347).
+
 ## Status — 2026-05-25 (clean-room round 130)
 
 **Round 130 added a §5.2.2 width-aware distance-code chooser to the VP8L

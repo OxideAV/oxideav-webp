@@ -46,8 +46,9 @@ use oxideav_core::{
 };
 
 use crate::{
-    decode_webp_image, encode_vp8l_argb_with_metadata, DecodedWebp, Error, UnsupportedKind,
-    WebpError, WebpMetadata, WebpMetadataOwned, CODEC_ID_VP8L,
+    decode_webp_image, encode_vp8l_argb_with_metadata, encoder_vp8::Vp8FreqDeltas, DecodedWebp,
+    Error, UnsupportedKind, WebpError, WebpMetadata, WebpMetadataOwned, CODEC_ID_VP8,
+    CODEC_ID_VP8L,
 };
 
 /// Stable on-wire identifier this crate registers under in the codec
@@ -419,6 +420,164 @@ pub fn encode_vp8l_frame(
         .map_err(|e| CoreError::InvalidData(e.to_string()))
 }
 
+// ───────────────────────── VP8 (lossy) encoder — registry-side stub ─────────────────────────
+//
+// API surface for the published `webp_vp8` codec id. Construction succeeds
+// (so consumers can pre-build their encoder graph), but `send_frame` fails
+// with `Error::Unsupported` — the upstream `oxideav-vp8 = "0.2"` encoder
+// emits a constant-grey frame for any pixel input today, so producing a
+// `.webp` from the stub would be the "garbage bytes" failure mode the
+// round-131 directive forbids. See `encoder_vp8` for the full gap report.
+
+/// Configuration the [`WebpVp8LossyEncoder`] carries between construction
+/// (via the [`crate::encoder_vp8::make_encoder_with_quality`] family) and
+/// the eventual `send_frame` call.
+///
+/// `pub(crate)` so the factories in [`crate::encoder_vp8`] can build it;
+/// not part of the published surface (the surface is the factory family
+/// itself).
+#[derive(Debug, Clone)]
+pub(crate) struct Vp8LossyEncoderConfig {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pix: Option<PixelFormat>,
+    pub(crate) qindex: u8,
+    pub(crate) freq_deltas: Vp8FreqDeltas,
+    pub(crate) metadata: WebpMetadataOwned,
+}
+
+/// Default factory for the `webp_vp8` codec id — the entry the
+/// `CodecRegistry` calls when an encoder is requested without further
+/// configuration.
+///
+/// Constructs the encoder at the libwebp-default quality
+/// ([`crate::encoder_vp8::DEFAULT_QUALITY`] = 75.0) with no per-band freq
+/// deltas and no embedded metadata. Pixel-driven encoding is the gap;
+/// see [`crate::encoder_vp8`].
+pub fn make_vp8_lossy_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
+    crate::encoder_vp8::make_encoder_with_quality(params, crate::encoder_vp8::DEFAULT_QUALITY)
+}
+
+/// WebP VP8 (lossy) [`Encoder`] trait impl — API-shape stub.
+///
+/// One frame in → one `.webp` packet out *once the upstream
+/// `oxideav-vp8` encoder lands the pixel path*. Today the implementation
+/// validates the input frame against the configured dimensions / pixel
+/// format and refuses with [`oxideav_core::Error::Unsupported`] rather
+/// than emitting a constant-grey image wrapped in WebP framing. See the
+/// [`crate::encoder_vp8`] module-level note.
+#[derive(Debug)]
+pub struct WebpVp8LossyEncoder {
+    output_params: CodecParameters,
+    cfg: Vp8LossyEncoderConfig,
+    pending_out: VecDeque<Packet>,
+    eof: bool,
+}
+
+impl WebpVp8LossyEncoder {
+    pub(crate) fn new(output_params: CodecParameters, cfg: Vp8LossyEncoderConfig) -> Self {
+        Self {
+            output_params,
+            cfg,
+            pending_out: VecDeque::new(),
+            eof: false,
+        }
+    }
+
+    /// Baseline qindex this encoder was constructed with (RFC 6386 §9.6
+    /// `y_ac_qi`, 0..=127). Exposed so callers building the encoder
+    /// through the registry path can read back the quality the factory
+    /// settled on.
+    pub fn qindex(&self) -> u8 {
+        self.cfg.qindex
+    }
+
+    /// Per-band quantiser deltas this encoder was constructed with.
+    pub fn freq_deltas(&self) -> Vp8FreqDeltas {
+        self.cfg.freq_deltas
+    }
+
+    /// Borrowed view of the embedded metadata (ICC / Exif / XMP) the
+    /// encoder would emit on every output `.webp`.
+    pub fn metadata(&self) -> WebpMetadata<'_> {
+        self.cfg.metadata.as_borrowed()
+    }
+
+    /// Encoder-side dimensions read out of the `CodecParameters` the
+    /// factory was built with: `(width, height)`.
+    ///
+    /// Currently exposed for symmetry with [`WebpVp8lEncoder`] and so a
+    /// future round can wire the dims directly into the
+    /// `oxideav-vp8` encoder driver without re-routing them through
+    /// `output_params`.
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.cfg.width, self.cfg.height)
+    }
+}
+
+impl Encoder for WebpVp8LossyEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.output_params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {
+        let Frame::Video(v) = frame else {
+            return Err(CoreError::invalid("webp_vp8 encoder: video frames only"));
+        };
+        // Catch caller bugs (wrong dims, missing planes) at the API boundary,
+        // even though we cannot complete the encode yet.
+        let plane = v
+            .planes
+            .first()
+            .ok_or_else(|| CoreError::invalid("webp_vp8 encoder: frame has no planes"))?;
+        let expected_per_pixel = match self.cfg.pix {
+            Some(PixelFormat::Rgba) | Some(PixelFormat::Yuva420P) => 4,
+            Some(PixelFormat::Rgb24) | Some(PixelFormat::Yuv420P) => 3,
+            // Permit an unknown pixel format — we'll surface Unsupported
+            // below anyway, and a future round may declare more formats.
+            _ => 0,
+        };
+        if expected_per_pixel != 0 {
+            let min_stride = (self.cfg.width as usize).saturating_mul(expected_per_pixel);
+            if plane.stride < min_stride {
+                return Err(CoreError::invalid(format!(
+                    "webp_vp8 encoder: plane stride {} smaller than width*{} = {}",
+                    plane.stride, expected_per_pixel, min_stride,
+                )));
+            }
+        }
+
+        // Encoder body is the gap — see encoder_vp8 module note.
+        let _ = v;
+        Err(CoreError::Unsupported(
+            "oxideav-webp webp_vp8 encoder: lossy VP8 encode is API-shape only; \
+             oxideav-vp8 0.2 lacks the §13/§14 pixel-driven encode driver \
+             (see oxideav_webp::encoder_vp8 module note for the precise gap)"
+                .to_string(),
+        ))
+    }
+
+    fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
+        if let Some(p) = self.pending_out.pop_front() {
+            return Ok(p);
+        }
+        if self.eof {
+            Err(CoreError::Eof)
+        } else {
+            Err(CoreError::NeedMore)
+        }
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
 // ───────────────────────── Registration ─────────────────────────
 
 /// Register the WebP decoder factory into a [`CodecRegistry`].
@@ -455,6 +614,30 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .capabilities(vp8l_caps)
             .decoder(make_decoder)
             .encoder(make_encoder),
+    );
+
+    // VP8 (lossy) codec — registered as an API-shape stub. The decoder is
+    // the same `make_decoder` factory that handles the published
+    // `"webp"` codec id (it walks the file container, then routes any §2.5
+    // `VP8 ` chunk to `oxideav-vp8`); the encoder factory builds the
+    // [`WebpVp8LossyEncoder`] which validates inputs but cannot produce a
+    // real bitstream yet — see `encoder_vp8` for the gap. Declared `lossy`
+    // (not `lossless`) so a `first_encoder(...)` lookup that requests a
+    // lossy encoder doesn't pick up the VP8L lossless one instead.
+    let vp8_caps = CodecCapabilities::video("webp_vp8_sw")
+        .with_intra_only(true)
+        .with_max_size(16384, 16384)
+        .with_pixel_formats(vec![
+            PixelFormat::Yuv420P,
+            PixelFormat::Yuva420P,
+            PixelFormat::Rgba,
+            PixelFormat::Rgb24,
+        ]);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_VP8))
+            .capabilities(vp8_caps)
+            .decoder(make_decoder)
+            .encoder(make_vp8_lossy_encoder),
     );
 }
 

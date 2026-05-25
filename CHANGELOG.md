@@ -6,6 +6,38 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 131 (2026-05-25).** Published §2.5 `VP8 ` (lossy)
+  **encoder API surface** — the `encode_vp8_lossy_rgba` /
+  `encode_vp8_lossy_rgb24` / `encode_vp8_lossy_yuv420p` /
+  `encode_vp8_lossy_yuva420p` free functions, the new `encoder_vp8`
+  module with `make_encoder_with_quality` / `_with_qindex` /
+  `_with_target_size` (and `_and_metadata` / `_and_freq_deltas`
+  variants), `Vp8FreqDeltas`, `Vp8PsyStats`, `compute_psy_stats`,
+  `freq_deltas_for_qindex`, `quality_to_qindex`,
+  `DEFAULT_QUALITY` / `QUALITY_MIN..=QUALITY_MAX` / `QINDEX_MIN..=QINDEX_MAX`,
+  and the registry-side `CODEC_ID_VP8 = "webp_vp8"` codec id with the
+  `WebpVp8LossyEncoder` `Encoder` trait impl + `make_vp8_lossy_encoder`
+  factory. **Status:** API-shape stubs. Every entry point validates
+  input dims / buffer length and then returns
+  `WebpError::Unsupported` (free functions) /
+  `oxideav_core::Error::Unsupported` (trait impl). The wiring to a
+  real VP8 lossy bitstream is blocked on the §13 / §14 pixel-driven
+  encode round on the `oxideav-vp8` sibling crate: the current
+  `oxideav-vp8 = "0.2"` encoder ships Phase 1
+  ([`oxideav_vp8::encode_silent_keyframe`]) which emits a structurally
+  valid VP8 keyframe but **ignores the caller's pixels** (every MB is
+  `mb_skip_coeff = 1` with `DC_PRED` → constant-grey picture). Wiring
+  that through to a WebP RIFF wrapper would produce garbage bytes —
+  the exact failure mode the round-131 directive forbids — so this
+  round lands the API shape only and reports the gap. The
+  `encoder_vp8` module-level doc-comment enumerates the precise
+  missing primitives on `oxideav-vp8` (forward WHT / forward DCT /
+  forward quantization / per-MB pixel-driven encode driver / top-level
+  I420 → keyframe driver). Once those land, the function bodies become
+  a thin call into the new vp8 encoder + the existing
+  `build::build_webp_file` RIFF wrapper — no API churn. 18 new
+  published-API tests + 4 new inline unit tests; total 380 (was 347).
+
 * **Clean-room round 130 (2026-05-25).** §5.2.2 **width-aware distance-code
   chooser** for the VP8L lossless encoder. Each backward reference now
   picks the smaller of the scan-line code (`D + 120`, the round-119

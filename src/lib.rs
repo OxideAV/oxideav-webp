@@ -135,6 +135,7 @@ pub mod anim_encode;
 pub mod anmf;
 pub mod build;
 pub mod container;
+pub mod encoder_vp8;
 pub mod meta_prefix;
 #[cfg(feature = "registry")]
 pub mod registry;
@@ -1418,6 +1419,156 @@ pub fn encode_vp8l_argb_with_metadata(
     out.extend_from_slice(&container::fourcc::WEBP);
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+// ─────────────────────── Published-shape VP8 (lossy) encode API ───────────────────────
+//
+// The published-0.1.5 `encode_vp8_lossy_*` surface from `API-COMPAT.md`,
+// rebuilt as **API-shape stubs**: every entry point returns
+// `WebpError::Unsupported` because the sibling `oxideav-vp8 = "0.2"` crate's
+// encoder is currently mid-Phase 2 — `encode_silent_keyframe` ships, but it
+// ignores the caller's pixels and emits a constant-grey frame. Wiring those
+// pixels through to a constant-grey VP8 stream wrapped in WebP RIFF would
+// produce *garbage bytes that decode to the wrong picture*, exactly the
+// failure mode the round-131 directive explicitly forbids.
+//
+// Once `oxideav-vp8` lands the §13 / §14 pixel-driven encode round (see the
+// `encoder_vp8` module-level gap report for the exact missing primitives),
+// the function bodies below become a thin pair of calls: convert the input
+// to I420, hand it to the new vp8 encoder for a real bitstream, then wrap
+// with `build::build_webp_file` (already implemented). The function
+// signatures are stable now so downstream consumers compile against the
+// final shape and the encode-side wiring lands without an API churn.
+
+/// Stable codec identifier the VP8 lossy encoder registers under in the
+/// codec registry — the published `"webp_vp8"` name. The matching VP8L
+/// (lossless) constant is [`CODEC_ID_VP8L`].
+pub const CODEC_ID_VP8: &str = "webp_vp8";
+
+/// Encode a planar I420 (YUV 4:2:0) picture to a complete §2.5 simple-lossy
+/// `.webp` file.
+///
+/// **Stub — returns [`WebpError::Unsupported`].** The wiring to
+/// `oxideav-vp8`'s encoder is blocked on the §13 / §14 pixel-driven encode
+/// round (see [`encoder_vp8`] module-level note); the function signature is
+/// the published-0.1.5 shape so callers compile against the final API.
+///
+/// `y` is the `width * height` luma plane; `u` / `v` are
+/// `((width+1)/2) * ((height+1)/2)` chroma planes. `meta` is embedded into
+/// the file's optional `VP8X` / `ICCP` / `EXIF` / `XMP ` chunks per the
+/// published convention.
+pub fn encode_vp8_lossy_yuv420p(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    _meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>, WebpError> {
+    validate_yuv420_lengths(width, height, y, u, v)?;
+    Err(WebpError::Unsupported)
+}
+
+/// Encode a planar YUVA420P (I420 luma+chroma + a full-resolution alpha
+/// plane) picture to a complete §2.7 extended-lossy `.webp` file
+/// (`VP8X` + `VP8 ` + `ALPH`).
+///
+/// **Stub — returns [`WebpError::Unsupported`].** See
+/// [`encode_vp8_lossy_yuv420p`].
+pub fn encode_vp8_lossy_yuva420p(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    a: &[u8],
+    _meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>, WebpError> {
+    validate_yuv420_lengths(width, height, y, u, v)?;
+    let alpha_expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(WebpError::InvalidData)?;
+    if a.len() != alpha_expected {
+        return Err(WebpError::InvalidData);
+    }
+    Err(WebpError::Unsupported)
+}
+
+/// Encode an interleaved 8-bit RGBA image to a complete §2.5 / §2.7 lossy
+/// `.webp` file.
+///
+/// **Stub — returns [`WebpError::Unsupported`].** See
+/// [`encode_vp8_lossy_yuv420p`].
+///
+/// `rgba` is `width * height * 4` bytes in scan-line (top-to-bottom,
+/// left-to-right) order, each pixel `[R, G, B, A]` — the same layout
+/// [`WebpFrame::rgba`] uses. `quality` is the libwebp-style 0..=100 scale
+/// ([`encoder_vp8::DEFAULT_QUALITY`] is 75.0). When the wiring lands, an
+/// image whose alpha channel is not all-`0xff` auto-promotes to the §2.7
+/// `VP8X` + `VP8 ` + `ALPH` extended-lossy layout; opaque images emit the
+/// simple `VP8 ` layout.
+pub fn encode_vp8_lossy_rgba(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    _quality: f32,
+    _meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>, WebpError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(WebpError::InvalidData)?;
+    if rgba.len() != expected {
+        return Err(WebpError::InvalidData);
+    }
+    Err(WebpError::Unsupported)
+}
+
+/// Encode an interleaved 8-bit RGB24 image to a complete §2.5 simple-lossy
+/// `.webp` file (every pixel treated as fully opaque).
+///
+/// **Stub — returns [`WebpError::Unsupported`].** See
+/// [`encode_vp8_lossy_yuv420p`]. The published-0.1.5 convention requires
+/// this path to **stream** the RGB→internal conversion without
+/// materialising an intermediate RGBA buffer — that constraint will be
+/// enforced once the real wiring lands.
+pub fn encode_vp8_lossy_rgb24(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    _quality: f32,
+    _meta: &WebpMetadata<'_>,
+) -> Result<Vec<u8>, WebpError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or(WebpError::InvalidData)?;
+    if rgb.len() != expected {
+        return Err(WebpError::InvalidData);
+    }
+    Err(WebpError::Unsupported)
+}
+
+/// Common length validator for the YUV 4:2:0 inputs of the lossy encoder
+/// family. Surfaces the published [`WebpError::InvalidData`] on any
+/// dimension / buffer mismatch.
+fn validate_yuv420_lengths(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Result<(), WebpError> {
+    let w = width as usize;
+    let h = height as usize;
+    let luma = w.checked_mul(h).ok_or(WebpError::InvalidData)?;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let chroma = cw.checked_mul(ch).ok_or(WebpError::InvalidData)?;
+    if y.len() != luma || u.len() != chroma || v.len() != chroma {
+        return Err(WebpError::InvalidData);
+    }
+    Ok(())
 }
 
 // ─────────────────────── Published-shape animation encode API ───────────────────────
