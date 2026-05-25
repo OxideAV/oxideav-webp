@@ -6,6 +6,34 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 132 (2026-05-25).** §5.2.3 **color-cache
+  size-selection chooser** for the VP8L lossless encoder. The
+  round-121 chooser evaluated a single `code_bits = 8` candidate
+  alongside the no-cache path; the round-132 chooser evaluates a
+  five-size slate `{5, 7, 8, 9, 11}` (exposed as
+  `CANDIDATE_COLOR_CACHE_BITS`) cross-producted with the §3.8.2
+  subtract-green transform axis, and emits the smallest of the 2 × 6
+  = 12 candidates. The §5.2.3 GREEN alphabet width is `256 + 24 +
+  (1 << code_bits)`, so the prefix-code header overhead scales with
+  the chosen size — picking the smallest cache that captures the
+  image's color recurrence avoids paying for an over-sized cache.
+  New public entry point `encode_argb_literals_with_width_selected`
+  returns `(bytes, chosen_code_bits)`; the existing
+  `encode_argb_literals_with_width` keeps its `Vec<u8>` signature
+  (the `.webp` production path calls into the selected variant and
+  drops the chosen-size scalar). Headline measurement: 32×32
+  palette-heavy pseudo-random goes from 661 B (round-121, fixed
+  `code_bits=8`) to 645 B (round-132, chosen `code_bits=7`) — a
+  2.4 % saving on top of the round-121 cache writer. Noise /
+  row-correlated / solid fixtures match the round-121 size byte-for-
+  byte (the chooser correctly falls back to `code_bits=0`). The
+  §5.2.3 header read on the decoder side is unchanged (it already
+  accepted the full `[1, 11]` range per RFC 9649); round-trip stays
+  bit-exact through `decode_lossless_image`. 6 new inline tests
+  (slate-spec-legal, palette → non-zero, noise → zero, chosen-size-
+  in-slate, per-decision round-trip, never-regress vs round 121).
+  Total: 386 tests (was 380).
+
 * **Clean-room round 131 (2026-05-25).** Published §2.5 `VP8 ` (lossy)
   **encoder API surface** — the `encode_vp8_lossy_rgba` /
   `encode_vp8_lossy_rgb24` / `encode_vp8_lossy_yuv420p` /

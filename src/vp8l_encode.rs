@@ -862,6 +862,32 @@ pub const COLOR_CACHE_BITS_MAX: u32 = 11;
 /// collisions are negligible on most natural images).
 pub const DEFAULT_COLOR_CACHE_BITS: u32 = 8;
 
+/// Round-132 §5.2.3 size-selection slate: the chooser cross-products each
+/// of these `code_bits` values (alongside the disabled-cache option) with
+/// the §3.8.2 subtract-green transform candidate set, then emits the
+/// smallest resulting byte stream.
+///
+/// The slate spans the §5.2.3 allowed range [`COLOR_CACHE_BITS_MIN`] ..=
+/// [`COLOR_CACHE_BITS_MAX`] with five evenly spread sizes:
+///
+/// * `5` → 32 entries  — cheap to populate; fits tiny palettes.
+/// * `7` → 128 entries — covers small/medium palettes (the 4-bit
+///   `code_bits` header field cost is amortised over more reuse).
+/// * `8` → 256 entries — the round-121 single-size default; kept as the
+///   middle "sweet spot" for typical natural-image content.
+/// * `9` → 512 entries — for images with denser color spreads where
+///   8-bit collisions start to bite.
+/// * `11` → 2048 entries — the §5.2.3 maximum; pays off only when the
+///   image has thousands of distinct colors that recur enough to amortise
+///   the wider GREEN alphabet's prefix-code-length overhead.
+///
+/// The "no cache" option (encoded as `code_bits = 0` per §5.2.3) is
+/// implicit: [`encode_argb_literals_with_width`] always evaluates the
+/// `None` candidate as the baseline. The disabled-cache + the five
+/// listed sizes give six cache-axis candidates per transform-axis option,
+/// for a 2 × 6 = 12-way cross-product.
+pub const CANDIDATE_COLOR_CACHE_BITS: [u32; 5] = [5, 7, DEFAULT_COLOR_CACHE_BITS, 9, 11];
+
 /// §5.2.3 color-cache helper used by the encoder. Mirrors the decoder's
 /// [`crate::vp8l_decode::ColorCache`] semantics: an array of
 /// `1 << code_bits` ARGB entries, all initialized to zero, with a
@@ -1168,29 +1194,74 @@ pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
     encode_argb_literals_with_width(pixels, 1)
 }
 
-/// Width-aware variant of [`encode_argb_literals`]: same 2×2
-/// `(no-tx | subtract-green) × (no-cache | cache)` chooser, but each
-/// candidate threads `image_width` into [`encode_tokens`] so the
-/// §5.2.2 distance-map optimisation is exercised. The production
-/// `.webp` path ([`encode_vp8l_payload`] → [`encode_webp_lossless`] /
-/// [`encode_vp8l_argb`]) uses this entry; the no-width
-/// [`encode_argb_literals`] is retained for test callers that exercise
-/// the entropy stage without spatial structure.
+/// Width-aware variant of [`encode_argb_literals`]: cross-products the
+/// §3.8.2 subtract-green transform axis (`no-tx | subtract-green`) with
+/// the round-132 §5.2.3 color-cache size axis
+/// (`no-cache | each of [`CANDIDATE_COLOR_CACHE_BITS`]`), and emits the
+/// smallest resulting byte stream. Each candidate threads `image_width`
+/// into [`encode_tokens`] so the §5.2.2 distance-map optimisation is
+/// exercised. The production `.webp` path ([`encode_vp8l_payload`] →
+/// [`encode_webp_lossless`] / [`encode_vp8l_argb`]) uses this entry; the
+/// no-width [`encode_argb_literals`] is retained for test callers that
+/// exercise the entropy stage without spatial structure.
+///
+/// Round 132 widened the cache axis from "0 or 8" (round 121) to a slate
+/// of five sizes per [`CANDIDATE_COLOR_CACHE_BITS`]. The §5.2.3 GREEN
+/// alphabet's width is `256 + 24 + (1 << code_bits)`, so the prefix-code
+/// header overhead scales with the chosen `code_bits`; picking the
+/// smallest size that captures the image's color recurrence avoids paying
+/// for an over-sized cache.
 pub fn encode_argb_literals_with_width(pixels: &[u32], image_width: u32) -> Vec<u8> {
-    debug_assert!(image_width >= 1);
-    let mut best = encode_literals_with_options(pixels, false, None, image_width);
+    encode_argb_literals_with_width_selected(pixels, image_width).0
+}
 
-    let candidates = [
-        encode_literals_with_options(pixels, true, None, image_width),
-        encode_literals_with_options(pixels, false, Some(DEFAULT_COLOR_CACHE_BITS), image_width),
-        encode_literals_with_options(pixels, true, Some(DEFAULT_COLOR_CACHE_BITS), image_width),
-    ];
-    for cand in candidates {
-        if cand.len() < best.len() {
-            best = cand;
+/// Like [`encode_argb_literals_with_width`] but also returns the
+/// §5.2.3 `color_cache_code_bits` value the chooser selected (`0` when
+/// the no-cache path won).
+///
+/// The chooser walks the 2 × (1 + N) candidate grid (where
+/// `N = CANDIDATE_COLOR_CACHE_BITS.len()`), evaluates each combination's
+/// produced byte length, and returns the smallest along with the cache
+/// size of the winning candidate. The returned `code_bits` is always in
+/// `{0} ∪ CANDIDATE_COLOR_CACHE_BITS` — `0` for "no cache enabled",
+/// any other value for "this `code_bits` chosen". The byte stream itself
+/// is bit-exact decodable through [`crate::decode_lossless_image`] in
+/// every case (the chooser only ever compares spec-conformant outputs).
+pub fn encode_argb_literals_with_width_selected(
+    pixels: &[u32],
+    image_width: u32,
+) -> (Vec<u8>, u32) {
+    debug_assert!(image_width >= 1);
+
+    // Baseline: no-tx, no-cache. Tracked separately so we always have a
+    // valid winner even if every cross-product candidate inflates.
+    let mut best_bytes = encode_literals_with_options(pixels, false, None, image_width);
+    let mut best_code_bits: u32 = 0;
+
+    // No-tx × every cache size.
+    for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+        let cand = encode_literals_with_options(pixels, false, Some(bits), image_width);
+        if cand.len() < best_bytes.len() {
+            best_bytes = cand;
+            best_code_bits = bits;
         }
     }
-    best
+    // Subtract-green × no-cache.
+    let cand = encode_literals_with_options(pixels, true, None, image_width);
+    if cand.len() < best_bytes.len() {
+        best_bytes = cand;
+        best_code_bits = 0;
+    }
+    // Subtract-green × every cache size.
+    for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+        let cand = encode_literals_with_options(pixels, true, Some(bits), image_width);
+        if cand.len() < best_bytes.len() {
+            best_bytes = cand;
+            best_code_bits = bits;
+        }
+    }
+
+    (best_bytes, best_code_bits)
 }
 
 /// Encode `pixels` with explicit knobs: optionally apply the §3.5.3 /
@@ -2804,6 +2875,357 @@ mod tests {
         let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
         let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
         assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    // ---- §5.2.3 color-cache size selection (round 132) ----
+
+    /// `CANDIDATE_COLOR_CACHE_BITS` lists every cache size the chooser
+    /// evaluates. The slate must be a strict subset of the spec-allowed
+    /// `[COLOR_CACHE_BITS_MIN, COLOR_CACHE_BITS_MAX]` range (no `0`, no
+    /// `>11`), monotonically increasing, and contain
+    /// `DEFAULT_COLOR_CACHE_BITS` so the round-121 baseline is always
+    /// among the candidates.
+    #[test]
+    fn color_cache_candidate_slate_is_spec_legal_and_monotone() {
+        assert!(!CANDIDATE_COLOR_CACHE_BITS.is_empty());
+        let mut prev: Option<u32> = None;
+        for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+            assert!(
+                (COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&bits),
+                "candidate {bits} outside §5.2.3 [{COLOR_CACHE_BITS_MIN}..{COLOR_CACHE_BITS_MAX}]",
+            );
+            if let Some(p) = prev {
+                assert!(
+                    bits > p,
+                    "candidate slate not monotone at {bits} (prev {p})"
+                );
+            }
+            prev = Some(bits);
+        }
+        assert!(
+            CANDIDATE_COLOR_CACHE_BITS.contains(&DEFAULT_COLOR_CACHE_BITS),
+            "DEFAULT_COLOR_CACHE_BITS={DEFAULT_COLOR_CACHE_BITS} missing from candidate slate",
+        );
+    }
+
+    /// On a palette-heavy synthetic image the chooser must pick a
+    /// non-zero cache size: every pixel is drawn from a small palette
+    /// repeated in a pseudo-random order, so each repeat is a
+    /// `CacheRef` win that more than pays for the §5.2.3 header.
+    /// (a) of the round-132 brief.
+    #[test]
+    fn size_selection_picks_nonzero_on_palette_heavy_image() {
+        let w = 64u32;
+        let h = 64u32;
+        let palette: [u32; 12] = [
+            0xff10_2030,
+            0xff40_5060,
+            0xff70_8090,
+            0xffa0_b0c0,
+            0xffd0_e0f0,
+            0xff00_1122,
+            0xff33_4455,
+            0xff66_7788,
+            0xff99_aabb,
+            0xffcc_ddee,
+            0xff11_2233,
+            0xff44_5566,
+        ];
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0x1357_9bdfu32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push(palette[(state as usize) % palette.len()]);
+        }
+        let (_, chosen) = encode_argb_literals_with_width_selected(&pixels, w);
+        assert_ne!(
+            chosen, 0,
+            "palette-heavy image should engage the §5.2.3 color cache, got code_bits=0",
+        );
+        assert!(
+            CANDIDATE_COLOR_CACHE_BITS.contains(&chosen),
+            "chosen code_bits {chosen} not in candidate slate",
+        );
+    }
+
+    /// On uncorrelated ARGB noise the chooser must select size 0
+    /// (no cache): every pixel is distinct, so cache references would
+    /// never fire and the wider GREEN alphabet only inflates the
+    /// prefix-code lengths. (b) of the round-132 brief.
+    #[test]
+    fn size_selection_picks_zero_on_noise_image() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xfeed_b00bu32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push(state | 0xff00_0000);
+        }
+        let (_, chosen) = encode_argb_literals_with_width_selected(&pixels, w);
+        assert_eq!(
+            chosen, 0,
+            "uncorrelated noise should not engage the color cache, got code_bits={chosen}",
+        );
+    }
+
+    /// Across a varied suite of inputs the selected `code_bits` is
+    /// always either `0` (disabled) or a value in
+    /// `CANDIDATE_COLOR_CACHE_BITS` — never outside the spec-allowed
+    /// range, never a value the chooser wasn't asked to evaluate.
+    /// (c) of the round-132 brief.
+    #[test]
+    fn selected_size_is_always_zero_or_in_candidate_slate() {
+        // Spread of inputs: palette-heavy, noise, row-correlated,
+        // solid, tiny.
+        let mut suites: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+        // Palette-heavy 32x32.
+        {
+            let w = 32u32;
+            let h = 32u32;
+            let palette: [u32; 6] = [
+                0xff00_0000,
+                0xffff_ffff,
+                0xff80_0000,
+                0xff00_8000,
+                0xff00_0080,
+                0xff80_8080,
+            ];
+            let mut pixels = Vec::with_capacity((w * h) as usize);
+            let mut state = 0xc0ff_eeeeu32;
+            for _ in 0..(w * h) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                pixels.push(palette[(state as usize) % palette.len()]);
+            }
+            suites.push((w, h, pixels));
+        }
+        // Pure noise 16x16.
+        {
+            let w = 16u32;
+            let h = 16u32;
+            let mut pixels = Vec::with_capacity((w * h) as usize);
+            let mut state = 0xdead_beefu32;
+            for _ in 0..(w * h) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                pixels.push(state | 0xff00_0000);
+            }
+            suites.push((w, h, pixels));
+        }
+        // Row-correlated 32x32 (every row repeats row 0).
+        {
+            let w = 32u32;
+            let h = 32u32;
+            let mut row0 = Vec::with_capacity(w as usize);
+            let mut state = 0x1234_5678u32;
+            for _ in 0..w {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                row0.push((state & 0x00ff_ffff) | 0xff00_0000);
+            }
+            let mut pixels = Vec::with_capacity((w * h) as usize);
+            for _ in 0..h {
+                pixels.extend_from_slice(&row0);
+            }
+            suites.push((w, h, pixels));
+        }
+        // Solid color 8x8.
+        {
+            let w = 8u32;
+            let h = 8u32;
+            let pixels = vec![0xff12_3456u32; (w * h) as usize];
+            suites.push((w, h, pixels));
+        }
+        // Tiny 1x1.
+        suites.push((1, 1, vec![0xffaa_5500u32]));
+
+        for (w, _h, pixels) in &suites {
+            let (_, chosen) = encode_argb_literals_with_width_selected(pixels, *w);
+            assert!(
+                chosen == 0 || CANDIDATE_COLOR_CACHE_BITS.contains(&chosen),
+                "chosen code_bits {chosen} (w={w}) not in {{0}} ∪ {:?}",
+                CANDIDATE_COLOR_CACHE_BITS,
+            );
+            // And the chosen size is in the §5.2.3 spec range.
+            assert!(
+                chosen == 0 || (COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&chosen),
+                "chosen code_bits {chosen} (w={w}) outside §5.2.3 [{COLOR_CACHE_BITS_MIN}..{COLOR_CACHE_BITS_MAX}]",
+            );
+        }
+    }
+
+    /// The chosen byte stream round-trips bit-exactly through the
+    /// decoder for every cache-size decision the chooser can make.
+    /// (d) of the round-132 brief.
+    #[test]
+    fn selected_stream_round_trips_bit_exact_for_each_decision() {
+        // Each suite is chosen to drive a different cache decision:
+        // palette-heavy → non-zero size; noise → size 0; tiny solid →
+        // size 0 (no recurrence opportunity that beats the header
+        // cost on so few pixels).
+        let suites: [(u32, u32, &str); 3] = [
+            (32, 32, "palette-heavy"),
+            (16, 16, "noise"),
+            (4, 4, "solid"),
+        ];
+        for (w, h, label) in suites {
+            let pixels: Vec<u32> = match label {
+                "palette-heavy" => {
+                    let palette: [u32; 8] = [
+                        0xff10_2030,
+                        0xff40_5060,
+                        0xff70_8090,
+                        0xffa0_b0c0,
+                        0xffd0_e0f0,
+                        0xff00_1122,
+                        0xff33_4455,
+                        0xff66_7788,
+                    ];
+                    let mut p = Vec::with_capacity((w * h) as usize);
+                    let mut state = 0x9876_5432u32;
+                    for _ in 0..(w * h) {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        p.push(palette[(state as usize) % palette.len()]);
+                    }
+                    p
+                }
+                "noise" => {
+                    let mut p = Vec::with_capacity((w * h) as usize);
+                    let mut state = 0x0baf_face_u32;
+                    for _ in 0..(w * h) {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        p.push(state | 0xff00_0000);
+                    }
+                    p
+                }
+                "solid" => vec![0xff7f_8081u32; (w * h) as usize],
+                _ => unreachable!(),
+            };
+
+            let (_bytes, chosen) = encode_argb_literals_with_width_selected(&pixels, w);
+            // Cache-size decision is in-range.
+            assert!(
+                chosen == 0 || CANDIDATE_COLOR_CACHE_BITS.contains(&chosen),
+                "{label}: chosen code_bits {chosen} unexpected",
+            );
+            // Round-trip via the production path (which feeds the
+            // chooser internally).
+            let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+            let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+            let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+            assert_eq!(
+                img.pixels(),
+                pixels.as_slice(),
+                "{label}: round-trip mismatch at chosen code_bits={chosen}",
+            );
+        }
+    }
+
+    /// The round-132 multi-size chooser is never *worse* than the
+    /// round-121 single-size chooser on any of the test fixtures:
+    /// since the round-121 candidate (no-cache | cache@8) is a strict
+    /// subset of the round-132 grid (no-cache | cache @ {5,7,8,9,11}),
+    /// the round-132 winner is at most as large.
+    #[test]
+    fn round132_chooser_never_regresses_against_round121_single_size() {
+        let fixtures: [(u32, u32, &str); 4] = [
+            (32, 32, "palette"),
+            (16, 16, "noise"),
+            (24, 24, "row-corr"),
+            (8, 8, "solid"),
+        ];
+        for (w, h, label) in fixtures {
+            let pixels: Vec<u32> = match label {
+                "palette" => {
+                    let palette: [u32; 10] = [
+                        0xff10_2030,
+                        0xff40_5060,
+                        0xff70_8090,
+                        0xffa0_b0c0,
+                        0xffd0_e0f0,
+                        0xff00_1122,
+                        0xff33_4455,
+                        0xff66_7788,
+                        0xff99_aabb,
+                        0xffcc_ddee,
+                    ];
+                    let mut p = Vec::with_capacity((w * h) as usize);
+                    let mut state = 0x5a5a_a5a5u32;
+                    for _ in 0..(w * h) {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        p.push(palette[(state as usize) % palette.len()]);
+                    }
+                    p
+                }
+                "noise" => {
+                    let mut p = Vec::with_capacity((w * h) as usize);
+                    let mut state = 0xf00d_baadu32;
+                    for _ in 0..(w * h) {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        p.push(state | 0xff00_0000);
+                    }
+                    p
+                }
+                "row-corr" => {
+                    let mut row0 = Vec::with_capacity(w as usize);
+                    let mut state = 0xcafe_d00du32;
+                    for _ in 0..w {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        row0.push((state & 0x00ff_ffff) | 0xff00_0000);
+                    }
+                    let mut p = Vec::with_capacity((w * h) as usize);
+                    for _ in 0..h {
+                        p.extend_from_slice(&row0);
+                    }
+                    p
+                }
+                "solid" => vec![0xffc0_ffeeu32; (w * h) as usize],
+                _ => unreachable!(),
+            };
+
+            // Round-121 single-size emulation: min of (no-tx | sg) ×
+            // (None | Some(8)).
+            let r121 = {
+                let mut best = encode_literals_with_options(&pixels, false, None, w);
+                for cand in [
+                    encode_literals_with_options(&pixels, true, None, w),
+                    encode_literals_with_options(&pixels, false, Some(DEFAULT_COLOR_CACHE_BITS), w),
+                    encode_literals_with_options(&pixels, true, Some(DEFAULT_COLOR_CACHE_BITS), w),
+                ] {
+                    if cand.len() < best.len() {
+                        best = cand;
+                    }
+                }
+                best.len()
+            };
+            let (bytes, chosen) = encode_argb_literals_with_width_selected(&pixels, w);
+            let r132 = bytes.len();
+            eprintln!(
+                "[round-132] {label} {w}x{h}: round-121={r121} B, round-132={r132} B (chosen code_bits={chosen})",
+            );
+            assert!(
+                r132 <= r121,
+                "{label}: round-132 chooser regressed: {r132} B vs round-121 {r121} B",
+            );
+        }
     }
 
     /// The chooser must never inflate a distance: the chosen code's

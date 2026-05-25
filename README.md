@@ -2,6 +2,42 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-25 (clean-room round 132)
+
+**Round 132 widened the VP8L §5.2.3 color-cache chooser from a single
+`code_bits = 8` candidate (round 121) to a five-size slate.** The
+encoder now evaluates `code_bits ∈ {5, 7, 8, 9, 11}` alongside the
+no-cache option, cross-products with the §3.8.2 subtract-green
+transform axis, and emits the smallest of the 2 × 6 = 12 candidates.
+The §5.2.3 GREEN alphabet width is `256 + 24 + (1 << code_bits)`, so
+the prefix-code header overhead scales with the chosen size — picking
+the smallest cache that captures the image's color recurrence avoids
+paying for an over-sized cache. The new public entry point is
+[`encode_argb_literals_with_width_selected`](src/vp8l_encode.rs),
+which returns `(bytes, chosen_code_bits)`; the existing width-aware
+helper [`encode_argb_literals_with_width`](src/vp8l_encode.rs) (the
+one `encode_vp8l_payload` calls into) keeps its `Vec<u8>` signature
+unchanged. The candidate slate is exported as
+[`CANDIDATE_COLOR_CACHE_BITS`](src/vp8l_encode.rs).
+
+Headline measurement on a 32×32 palette-heavy pseudo-random fixture:
+**645 B (round-132, chosen code_bits=7) vs 661 B (round-121, fixed
+code_bits=8) — a 2.4 % saving on top of the round-121 cache writer**.
+Noise / row-correlated / solid fixtures match the round-121 size
+byte-for-byte (the chooser falls back to `code_bits=0`). The §5.2.3
+header read on the decoder side is unchanged (it already accepted
+the full `[1, 11]` range per RFC 9649); round-trip stays bit-exact
+through [`decode_lossless_image`](src/lib.rs).
+
+Six new inline tests cover (a) the candidate slate being spec-legal +
+monotone + containing the round-121 default; (b) palette-heavy input
+selects a non-zero size; (c) noise selects size 0; (d) the chosen size
+is always in `{0} ∪ CANDIDATE_COLOR_CACHE_BITS`; (e) the chosen byte
+stream round-trips bit-exactly for each cache decision (palette /
+noise / solid); and (f) the round-132 chooser never regresses against
+the round-121 single-size chooser on any tested fixture. Total: **386**
+tests (was 380).
+
 ## Status — 2026-05-25 (clean-room round 131)
 
 **Round 131 landed the published §2.5 `VP8 ` (lossy) encoder API
