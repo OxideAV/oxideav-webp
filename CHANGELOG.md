@@ -6,6 +6,33 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 136 (2026-05-25).** §3.7.2.1.1 **simple code length
+  code** emission for the VP8L lossless encoder. The encoder previously
+  always wrote each of the five prefix codes' length tables with the
+  §3.7.2.1.2 *normal code length code* (a 19-symbol code-length-code plus
+  per-symbol lengths). It now dispatches to the cheaper §3.7.2.1.1
+  *simple* form whenever the length table describes 1 or 2 symbols at
+  code length 1, all in the `[0..255]` range the simple form admits —
+  exactly the form `build_code_lengths` produces for single-color
+  channels and the empty distance code. The simple form encodes the
+  whole table in 3–11 bits (`%b1` flag + 1-bit `num_symbols-1` + 1-bit
+  `is_first_8bits` + a 1- or 8-bit `symbol0` + an optional 8-bit
+  `symbol1`), versus the normal form's ≥18-bit header, and picks the
+  narrow 1-bit `symbol0` field for the very common single-symbol-0
+  (empty) distance code. Both forms describe the identical length table,
+  so per-symbol code emission and the decoder's reconstruction are
+  unaffected; the choice only shrinks the meta-block header. Bit-exact
+  round trip holds on every fixture. Headline measurement: re-encoding
+  the seven lossless fixtures totals **1634 B with the simple path vs
+  2658 B normal-only — a 1024 B (38.5 %) header reduction**, ranging
+  from −81.6 % on `lossless-1x1` (174 → 32 B) and −75.6 % on
+  `lossless-32x32-rgb` (328 → 80 B) down to −16.8 % on the natural
+  128×128 image (1038 → 864 B). Six new inline tests cover the
+  `simple_code_symbols` classifier (1-symbol / 2-symbol eligible;
+  length≠1, 3-symbol, symbol>255, all-zero ineligible), the 1- and
+  2-symbol round trips through the round-104 prefix reader, and the
+  measured byte win over the normal form for the empty distance code.
+
 * **Clean-room round 135 (2026-05-25).** §3.5.4 / §4.4 **color-indexing
   (palette) transform encoding** for the VP8L lossless encoder — the
   last unimplemented VP8L transform on the encode side. When the image

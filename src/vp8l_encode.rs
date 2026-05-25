@@ -55,9 +55,16 @@
 //! 2. builds a length-limited (≤ [`MAX_CODE_LENGTH`]) canonical
 //!    Huffman code-length assignment from those frequencies
 //!    ([`build_code_lengths`]);
-//! 3. writes the code lengths to the stream with the §3.7.2.1.2 *normal
-//!    code length code* (or the trivial single-symbol form), then writes
-//!    each symbol with the canonical code derived from the lengths.
+//! 3. writes the code lengths to the stream with whichever §3.7.2.1
+//!    variant is cheaper — the §3.7.2.1.1 *simple code length code* when
+//!    the table is 1 or 2 length-1 symbols in `[0..255]`
+//!    ([`simple_code_symbols`] / [`write_simple_code_lengths`]), else the
+//!    §3.7.2.1.2 *normal code length code* — then writes each symbol with
+//!    the canonical code derived from the lengths. Both code-length-code
+//!    forms describe the identical length table, so symbol emission and
+//!    the decoder's reconstruction are unaffected by the choice; the
+//!    simple form just shrinks the header for low-entropy meta-blocks
+//!    (single-color channels, the empty distance code).
 //!
 //! The canonical code assignment ([`canonical_codes`]) is the identical
 //! `(length, value)`-ordered rule the decoder's
@@ -592,11 +599,109 @@ impl WriteCode {
         }
     }
 
-    /// Write this code's per-symbol lengths to `w` using the §3.7.2.1.2
-    /// *normal code length code* (the general form that can represent any
-    /// length table, including the single-leaf one).
+    /// Write this code's per-symbol lengths to `w`.
+    ///
+    /// Dispatches on whichever §3.7.2.1 variant is cheaper for this length
+    /// table: the §3.7.2.1.1 *simple code length code* when the table
+    /// describes 1 or 2 length-1 symbols, all in the `[0..255]` range the
+    /// simple form admits; otherwise the §3.7.2.1.2 *normal code length
+    /// code*. Both encode the identical length table, so the per-symbol
+    /// code emission ([`write_symbol`](Self::write_symbol)) — and therefore
+    /// the decoder's reconstruction — is unaffected by the choice.
     fn write_code_lengths(&self, w: &mut BitWriter) {
-        write_normal_code_lengths(w, &self.lengths);
+        match simple_code_symbols(&self.lengths) {
+            Some(symbols) => write_simple_code_lengths(w, &symbols),
+            None => write_normal_code_lengths(w, &self.lengths),
+        }
+    }
+}
+
+/// If `lengths` describes a code the §3.7.2.1.1 *simple code length code*
+/// can represent, return its used symbols (1 or 2 of them); otherwise
+/// `None`.
+///
+/// The simple form is the special case where "only 1 or 2 prefix symbols
+/// are in the range `[0..255]` with code length 1; all other prefix code
+/// lengths are implicitly zeros." So the table qualifies iff every nonzero
+/// length is exactly 1, there are 1 or 2 such symbols, and each fits in the
+/// `[0..255]` range the simple form's symbol fields can carry (symbol1 is
+/// always 8 bits; symbol0 is 1 or 8 bits).
+///
+/// This is exactly the form [`build_code_lengths`] produces for a
+/// single-used-symbol alphabet (one symbol at length 1) and for a
+/// two-used-symbol alphabet (both at length 1, the only complete two-leaf
+/// code) — including the §3.7.2.1.1-note empty-code case the encoder spells
+/// as a single symbol 0.
+fn simple_code_symbols(lengths: &[u8]) -> Option<Vec<usize>> {
+    let mut used: Vec<usize> = Vec::with_capacity(2);
+    for (sym, &l) in lengths.iter().enumerate() {
+        match l {
+            0 => {}
+            1 => {
+                if sym > 255 {
+                    // The simple form's symbol fields top out at 255.
+                    return None;
+                }
+                used.push(sym);
+                if used.len() > 2 {
+                    return None;
+                }
+            }
+            // A length other than 0 or 1 cannot be expressed by the simple
+            // form (every described leaf is at depth 1).
+            _ => return None,
+        }
+    }
+    if used.is_empty() {
+        // An all-zero table is the empty code; the encoder never builds one
+        // (the empty distance code is spelled as a single symbol 0), but
+        // guard anyway since the simple form can't represent zero symbols.
+        None
+    } else {
+        Some(used)
+    }
+}
+
+/// Write a length table with the §3.7.2.1.1 *simple code length code*.
+///
+/// `symbols` holds the 1 or 2 length-1 symbols (each `<= 255`), exactly as
+/// returned by [`simple_code_symbols`]. The emitted layout mirrors the
+/// decoder's `read_simple_code_lengths`:
+///
+/// ```text
+/// %b1                      ; simple flag
+/// num_symbols-1 (1 bit)    ; 0 → 1 symbol, 1 → 2 symbols
+/// is_first_8bits (1 bit)   ; 0 → symbol0 in [0..1] (1 bit), 1 → [0..255] (8 bits)
+/// symbol0 (1 or 8 bits)
+/// [ symbol1 (8 bits) ]     ; present iff num_symbols == 2
+/// ```
+fn write_simple_code_lengths(w: &mut BitWriter, symbols: &[usize]) {
+    debug_assert!(
+        matches!(symbols.len(), 1 | 2),
+        "simple code length code carries 1 or 2 symbols"
+    );
+    debug_assert!(
+        symbols.iter().all(|&s| s <= 255),
+        "simple code length code symbols fit in [0..255]"
+    );
+    // Simple flag.
+    w.write_bit(true);
+    // num_symbols - 1.
+    w.write_bits((symbols.len() - 1) as u32, 1);
+    // symbol0 uses the 1-bit field only when it fits in [0..1]; otherwise
+    // the 8-bit field. Picking the narrow field whenever possible shaves the
+    // table by 7 bits for the very common single-symbol-0 (empty) code.
+    let symbol0 = symbols[0];
+    if symbol0 <= 1 {
+        w.write_bit(false); // is_first_8bits = 0
+        w.write_bits(symbol0 as u32, 1);
+    } else {
+        w.write_bit(true); // is_first_8bits = 1
+        w.write_bits(symbol0 as u32, 8);
+    }
+    if symbols.len() == 2 {
+        // symbol1 is always 8 bits, range [0..255].
+        w.write_bits(symbols[1] as u32, 8);
     }
 }
 
@@ -2577,6 +2682,95 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let decoded = PrefixCode::read(&mut r, 40).unwrap();
         assert_eq!(decoded.single_symbol(), Some(0));
+    }
+
+    // ---- §3.7.2.1.1 simple code length code ----
+
+    #[test]
+    fn simple_code_symbols_classifies_tables() {
+        // Single length-1 symbol → eligible.
+        let mut l = vec![0u8; 40];
+        l[7] = 1;
+        assert_eq!(simple_code_symbols(&l), Some(vec![7]));
+        // Two length-1 symbols → eligible, returned in ascending order.
+        let mut l = vec![0u8; 256];
+        l[3] = 1;
+        l[200] = 1;
+        assert_eq!(simple_code_symbols(&l), Some(vec![3, 200]));
+        // A length other than 0/1 disqualifies.
+        let mut l = vec![0u8; 8];
+        l[1] = 1;
+        l[2] = 2;
+        assert_eq!(simple_code_symbols(&l), None);
+        // Three length-1 symbols disqualifies.
+        let mut l = vec![0u8; 8];
+        l[0] = 1;
+        l[1] = 1;
+        l[2] = 1;
+        assert_eq!(simple_code_symbols(&l), None);
+        // A length-1 symbol above 255 disqualifies (GREEN can exceed 255).
+        let mut l = vec![0u8; 300];
+        l[280] = 1;
+        assert_eq!(simple_code_symbols(&l), None);
+        // All-zero table disqualifies.
+        assert_eq!(simple_code_symbols(&[0u8; 8]), None);
+    }
+
+    #[test]
+    fn simple_code_one_symbol_round_trips() {
+        // A code over a 256-symbol alphabet using only symbol 200.
+        let mut freq = vec![0u32; 256];
+        freq[200] = 17;
+        let code = WriteCode::from_freqs(&freq);
+        let mut w = BitWriter::new();
+        code.write_code_lengths(&mut w);
+        // First emitted bit must be the simple flag (1).
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0] & 1, 1, "simple flag bit not set");
+        let mut r = BitReader::new(&bytes);
+        let decoded = PrefixCode::read(&mut r, 256).unwrap();
+        assert_eq!(decoded.single_symbol(), Some(200));
+    }
+
+    #[test]
+    fn simple_code_two_symbols_round_trips() {
+        let mut freq = vec![0u32; 256];
+        freq[5] = 9;
+        freq[201] = 9;
+        let code = WriteCode::from_freqs(&freq);
+        let mut w = BitWriter::new();
+        code.write_code_lengths(&mut w);
+        // Emit a short symbol sequence with the built code.
+        let seq = [5usize, 201, 5, 5, 201];
+        for &s in &seq {
+            code.write_symbol(&mut w, s);
+        }
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        let decoded = PrefixCode::read(&mut r, 256).unwrap();
+        for &s in &seq {
+            assert_eq!(decoded.read_symbol(&mut r).unwrap() as usize, s);
+        }
+    }
+
+    #[test]
+    fn simple_code_is_smaller_than_normal_for_single_symbol() {
+        // The simple form must be no larger than the normal form for a
+        // 1-symbol table; for the empty (single-symbol-0) distance code it is
+        // dramatically smaller.
+        let code = WriteCode::empty(40);
+        let mut simple = BitWriter::new();
+        code.write_code_lengths(&mut simple); // dispatches to simple
+        let mut normal = BitWriter::new();
+        write_normal_code_lengths(&mut normal, &code.lengths);
+        assert!(
+            simple.bit_position() < normal.bit_position(),
+            "simple {} bits not smaller than normal {} bits",
+            simple.bit_position(),
+            normal.bit_position()
+        );
+        // Symbol 0 with is_first_8bits=0: flag + num-1 + is_8 + 1-bit symbol.
+        assert_eq!(simple.bit_position(), 4);
     }
 
     // ---- image-header ----

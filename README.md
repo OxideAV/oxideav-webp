@@ -2,7 +2,31 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-25 (clean-room round 135)
+## Status — 2026-05-25 (clean-room round 136)
+
+**Round 136 added the VP8L §3.7.2.1.1 simple code length code to the
+encoder's prefix-code emission.** Each of the five prefix codes was
+previously written with the §3.7.2.1.2 *normal code length code* (a
+19-symbol code-length-code header plus per-symbol lengths). The encoder
+now picks the cheaper §3.7.2.1.1 *simple* form whenever a code's length
+table is 1 or 2 length-1 symbols in `[0..255]` — the form
+[`build_code_lengths`](src/vp8l_encode.rs) yields for single-color
+channels and the empty distance code — encoding the whole table in 3–11
+bits (`%b1` flag + `num_symbols-1` + `is_first_8bits` + a 1/8-bit
+`symbol0` + optional 8-bit `symbol1`) vs the normal form's ≥18-bit
+header. The narrow 1-bit `symbol0` field is used for the common
+single-symbol-0 (empty) distance code. Both forms describe the identical
+length table, so symbol emission and the decoder's reconstruction are
+unchanged ([`simple_code_symbols`](src/vp8l_encode.rs) /
+[`write_simple_code_lengths`](src/vp8l_encode.rs) mirror the decoder's
+`read_simple_code_lengths`). Headline measurement: re-encoding the seven
+lossless fixtures totals **1634 B with the simple path vs 2658 B
+normal-only — a 1024 B (38.5 %) header reduction**, from −81.6 % on
+`lossless-1x1` (174 → 32 B) and −75.6 % on `lossless-32x32-rgb`
+(328 → 80 B) to −16.8 % on the natural 128×128 image (1038 → 864 B).
+Six new inline tests cover the classifier, the 1- and 2-symbol round
+trips through the prefix reader, and the measured win over the normal
+form. Round trip stays bit-exact on every fixture.
 
 **Round 135 added the VP8L §3.5.4 / §4.4 color-indexing (palette)
 transform to the encoder — the last unimplemented VP8L transform on the
