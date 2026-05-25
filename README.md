@@ -2,6 +2,55 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 140)
+
+**Round 140 wired the round-139 VP8L *near-lossless* preprocessing pass
+into the animated-WebP encoder path.** The still-image entry point
+`encode_vp8l_argb_with_near_lossless` was already in place; round 140
+extends the per-frame surface so `build_animated_webp` /
+`build_animated_webp_with_options` honour the same `[0..=100]` knob
+*per frame*. The change is API-additive — a new optional
+[`AnimFrame::near_lossless_quality: Option<u8>`](src/anim_encode.rs)
+field plus a chainable
+[`with_near_lossless_quality(Option<u8>)`](src/anim_encode.rs) builder —
+and defaults to `None`, the no-op identity, so every existing
+animated-WebP test fixture continues to produce its pre-round-140 bit
+pattern. The preprocessing is applied identically across the
+full-keyframe ([`AnimFrameMode::Lossless`]) and dirty-rect
+([`AnimFrameMode::Delta`] / [`AnimFrameMode::Auto`]) emission paths;
+each frame's knob feeds into its per-frame `VP8L` bitstream
+independently, so an animation can mix lossless and near-lossless
+frames freely.
+
+**Three round-140 guarantees** are pinned by integration tests in
+[`tests/published_anim_near_lossless_api.rs`](tests/published_anim_near_lossless_api.rs):
+(a) **`None` (default) and `Some(100)` are byte-exact-equal to the
+pre-round-140 baseline** on every fixture tested — the no-op
+short-circuit (`if let Some(q) = quality { near_lossless::apply(...) }`)
+guarantees byte-exact equivalence whenever the knob is left at the
+default or explicitly at 100. (b) **`Some(60)` shrinks a 3-frame
+animated WebP** on a deterministic 64×64 noisy fixture (37,364 B →
+**28,180 B**, a **−24.58 % reduction**) with every decoded per-frame
+PSNR at **46.25 dB** — well above the ≥ 40 dB floor the test enforces.
+(c) **Decoder round-trip recovers the quantized pixels exactly**: the
+full-keyframe path matches the still-image `near_lossless::quantize` of
+the source byte-for-byte; the dirty-rect path matches an `f0`-with-
+quantized-sub-rect composite; alpha round-trips unchanged at q=40 on a
+non-opaque-alpha fixture. Per-frame monotonicity q=80 < q=60 < q=40 <
+q=0 holds on a single-frame 48×48 fixture (32,888 / 28,180 / 23,548 /
+14,280 bytes respectively, vs. 37,364 B baseline — −12 % / −25 % /
+−37 % / −62 %; PSNR per the still-image quality table).
+
+What landed: a 30-line `apply_near_lossless_if_requested` helper +
+two-line call-sites in `emit_full_anmf` and `emit_dirty_anmf`; the
+public `AnimFrame` struct gains one field and one builder; the
+`AnimFrame::new` default leaves it `None`; the literal-construction
+test fixture (`tests/published_anim_api.rs::frame_blend_dispose_and_offset_fields_are_carried`)
+updated to spell out the new field. 11 new integration tests +
+1 inline builder-round-trip test. Total: **464** tests green (was 453:
++11 from this round). Both default and `--no-default-features` builds
+pass clippy + fmt clean.
+
 ## Status — 2026-05-26 (clean-room round 139)
 
 **Round 139 added the VP8L lossless encoder's *near-lossless*

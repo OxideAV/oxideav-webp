@@ -45,6 +45,7 @@
 use crate::anmf::{BlendingMethod, DisposalMethod};
 use crate::build::{self, Vp8xFlags};
 use crate::container::fourcc;
+use crate::near_lossless;
 use crate::vp8l_encode;
 use crate::{Error, WebpError, WebpMetadata};
 
@@ -107,6 +108,26 @@ pub struct AnimFrame {
     pub dispose: DisposalMethod,
     /// Per-frame compression mode.
     pub mode: AnimFrameMode,
+    /// Per-frame VP8L **near-lossless** preprocessing quality, on the
+    /// same `[0..=100]` scale documented in [`crate::near_lossless`]:
+    /// `100` (or any value ≥ 100) is a no-op identical to the baseline
+    /// encoder, `0` is maximum RGB-channel quantization. `None` (the
+    /// default) is equivalent to `Some(100)` — no quantization is
+    /// applied, and the per-frame VP8L bitstream is byte-exact-equal to
+    /// the pre-round-140 baseline.
+    ///
+    /// The preprocessing rounds each frame's R, G, B channels to the
+    /// nearest multiple of `2^n` (where
+    /// `n = near_lossless::bits_to_drop_for_quality(quality)`) *before*
+    /// the VP8L encode runs. Alpha is preserved bit-exactly. The
+    /// resulting `VP8L` chunk decodes back to the **quantized** pixels
+    /// through [`crate::decode_webp`] — no decoder change is needed.
+    ///
+    /// Applied identically to the full-keyframe ([`AnimFrameMode::Lossless`])
+    /// and dirty-rect ([`AnimFrameMode::Delta`] / [`AnimFrameMode::Auto`])
+    /// emission paths; the [`AnimFrameMode::Auto`] size comparison is made
+    /// between the two *quantized* candidates.
+    pub near_lossless_quality: Option<u8>,
 }
 
 impl AnimFrame {
@@ -130,7 +151,17 @@ impl AnimFrame {
             blend: BlendingMethod::Overwrite,
             dispose: DisposalMethod::None,
             mode: AnimFrameMode::Lossless,
+            near_lossless_quality: None,
         }
+    }
+
+    /// Builder helper: set the per-frame near-lossless quality knob
+    /// in-place and return `self`. Equivalent to assigning
+    /// [`AnimFrame::near_lossless_quality`] directly; `None` (or
+    /// `Some(100)`) is the no-op baseline.
+    pub fn with_near_lossless_quality(mut self, quality: Option<u8>) -> Self {
+        self.near_lossless_quality = quality;
+        self
     }
 }
 
@@ -663,8 +694,11 @@ fn emit_full_anmf(
     h: u32,
     pixels: &[u8],
 ) -> Result<Vec<u8>, WebpError> {
-    let argb = rgba_to_argb(pixels);
+    let mut argb = rgba_to_argb(pixels);
     let has_alpha = pixels.chunks_exact(4).any(|px| px[3] != 0xff);
+    // Per-frame near-lossless preprocessing — no-op when the knob is
+    // `None` (default) or `Some(q)` with `q ≥ 100`. See `AnimFrame::near_lossless_quality`.
+    apply_near_lossless_if_requested(&mut argb, f.near_lossless_quality);
     let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, w, h, has_alpha)
         .map_err(Error::from)
         .map_err(WebpError::from)?;
@@ -687,8 +721,14 @@ fn emit_full_anmf(
 /// The caller's `dispose` is overridden to `None` regardless of what they
 /// passed — preserving it would corrupt the next frame's reference state.
 fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Vec<u8>, WebpError> {
-    let argb = rgba_to_argb(sub_rgba);
+    let mut argb = rgba_to_argb(sub_rgba);
     let has_alpha = sub_rgba.chunks_exact(4).any(|px| px[3] != 0xff);
+    // Per-frame near-lossless preprocessing — applied identically to the
+    // dirty-rect sub-frame so an `AnimFrameMode::Delta` / `::Auto` frame
+    // with the knob set quantizes the *changed* sub-rectangle in the
+    // same way a full keyframe would. No-op when the knob is `None`
+    // (default) or `Some(q)` with `q ≥ 100`.
+    apply_near_lossless_if_requested(&mut argb, f.near_lossless_quality);
     let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, rect.w, rect.h, has_alpha)
         .map_err(Error::from)
         .map_err(WebpError::from)?;
@@ -742,6 +782,24 @@ fn push_u24_le(out: &mut Vec<u8>, v: u32) {
     out.push((v & 0xFF) as u8);
     out.push(((v >> 8) & 0xFF) as u8);
     out.push(((v >> 16) & 0xFF) as u8);
+}
+
+/// Run the VP8L near-lossless preprocessing pass on a packed-ARGB buffer
+/// when the per-frame knob is set to a value below 100. `None` and
+/// `Some(q)` with `q ≥ 100` are no-ops — the buffer is left untouched,
+/// guaranteeing byte-exact equivalence to the pre-round-140 baseline for
+/// the default `AnimFrame::new` construction.
+///
+/// Delegates to [`near_lossless::apply`] for the actual per-channel
+/// quantization; this helper exists only to centralise the
+/// `None | Some(100)` fast-path check across the full-keyframe and
+/// dirty-rect emission paths.
+fn apply_near_lossless_if_requested(argb: &mut [u32], quality: Option<u8>) {
+    if let Some(q) = quality {
+        // `near_lossless::apply` already short-circuits on `n == 0`, so
+        // we don't need a second check here.
+        near_lossless::apply(argb, q);
+    }
 }
 
 /// Repack interleaved `[R, G, B, A]` bytes into packed ARGB

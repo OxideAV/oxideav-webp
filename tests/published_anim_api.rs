@@ -137,6 +137,7 @@ fn frame_blend_dispose_and_offset_fields_are_carried() {
         blend: BlendingMethod::Overwrite,
         dispose: DisposalMethod::Background,
         mode: AnimFrameMode::Lossless,
+        near_lossless_quality: None,
     };
     let file = build_animated_webp(&[frame]).expect("build offset frame");
     let img = decode_webp(&file).expect("decode");

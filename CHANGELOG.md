@@ -6,6 +6,45 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 140 (2026-05-26).** **Per-frame near-lossless
+  preprocessing in the animated-WebP encoder.** The round-139 still-image
+  `near_lossless::apply` preprocessor is now wired into the
+  [`build_animated_webp`](src/anim_encode.rs) /
+  [`build_animated_webp_with_options`](src/anim_encode.rs) path via a new
+  optional `AnimFrame::near_lossless_quality: Option<u8>` field
+  (defaulting to `None`, the no-op identity). A builder helper
+  `AnimFrame::with_near_lossless_quality(Option<u8>) -> Self` matches the
+  rest of the per-frame chainable construction. The preprocessing is
+  applied identically to the full-keyframe
+  ([`AnimFrameMode::Lossless`]) and dirty-rect
+  ([`AnimFrameMode::Delta`] / [`AnimFrameMode::Auto`]) emission paths —
+  each frame's quality knob feeds into its per-frame VP8L bitstream
+  independently, so an animation can mix lossless (`None` / `Some(100)`)
+  and near-lossless frames freely.
+
+  **Three round-140 guarantees** are pinned by integration tests in
+  [`tests/published_anim_near_lossless_api.rs`](tests/published_anim_near_lossless_api.rs):
+  (a) `None` (default) and `Some(100)` produce byte-exact-equal output
+  to the pre-round-140 baseline encoder on every tested fixture, so
+  existing animated-WebP test fixtures keep their bit pattern; the
+  `None | Some(q ≥ 100)` no-op short-circuit lives in
+  `apply_near_lossless_if_requested` and delegates to
+  `near_lossless::apply`. (b) `Some(60)` produces a strictly smaller
+  3-frame animated WebP than `Some(100)` on a deterministic 64×64
+  high-entropy fixture (37,364 B → 28,180 B, **−24.58 %**) with every
+  decoded per-frame PSNR ≥ 46.25 dB — well above the ≥ 40 dB floor the
+  test enforces. (c) The decoded RGBA matches the still-image
+  `near_lossless::quantize` of the source byte-for-byte (full-keyframe
+  path) and matches the f0-with-quantized-sub-rect composite for the
+  dirty-rect path; alpha round-trips unchanged at q=40 on a
+  non-opaque-alpha fixture. Per-frame chunk-size monotonicity at
+  q=80 < q=60 < q=40 < q=0 is verified on a single-frame 48×48 fixture.
+  Mixed-quality test confirms that a per-frame knob is honoured frame
+  by frame.
+
+  11 new integration tests + 1 inline builder-round-trip test. Default
+  + `--no-default-features` builds both clippy + fmt clean.
+
 * **Clean-room round 139 (2026-05-26).** **VP8L lossless encoder
   *near-lossless* preprocessing.** A new
   [`near_lossless`](src/near_lossless.rs) module exposes the in-place
