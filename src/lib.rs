@@ -931,7 +931,8 @@ pub fn decode_webp(bytes: &[u8]) -> Result<WebpImage, WebpError> {
 }
 
 /// Decode an animated WebP (`ANIM` + per-frame `ANMF`) to a multi-frame
-/// [`WebpImage`].
+/// [`WebpImage`], compositing each frame's sub-rectangle onto a shared
+/// canvas per RFC 9649 §2.7.1.1.
 ///
 /// Each §2.7.1.1 `ANMF` chunk carries a 16-byte header
 /// ([`anmf::AnmfHeader`]) followed by its "Frame Data" — a padded §2.3
@@ -940,9 +941,29 @@ pub fn decode_webp(bytes: &[u8]) -> Result<WebpImage, WebpError> {
 /// produces); an `ANMF` carrying only a §2.5 `VP8 ` lossy sub-chunk is
 /// [`WebpError::Unsupported`] (the VP8 lossy decoder is not rebuilt yet).
 ///
+/// **Canvas compositing (round 127):** the canvas is sized from the
+/// §2.7.1 `VP8X` chunk and initialised to the §2.7.1.1 `ANIM`
+/// `Background Color`. Each frame's pixels are then placed at its
+/// `(Frame X, Frame Y)` offset with the §2.7.1.1 disposal/blending
+/// rules:
+///
+/// * Before drawing a frame, the **previous** frame's disposal method
+///   is applied (only to that previous frame's sub-rectangle). `None`
+///   leaves the canvas as is; `Background` fills the previous rect with
+///   the `ANIM` background colour.
+/// * The current frame is then drawn into its rect using its blending
+///   method: `Overwrite` replaces the rect's pixels byte-for-byte;
+///   `AlphaBlend` composites RGBA over the existing canvas using the
+///   §2.7.1.1 "Alpha-blending" formula
+///   `blend.A = src.A + dst.A * (1 - src.A / 255)` (8-bit integer
+///   approximation, no gamma linearisation).
+///
+/// The per-frame `Frame Duration` populates each
+/// [`WebpFrame::duration_ms`]; `width` / `height` on each returned
+/// frame are the **canvas** dimensions (every frame is a full-canvas
+/// snapshot after rendering — what an animation player would display).
 /// The §2.7.1.1 `ANIM` background colour and loop count populate
-/// [`WebpImage::anim_background_rgba`] / [`WebpImage::anim_loop_count`]; the
-/// per-frame `Frame Duration` populates each [`WebpFrame::duration_ms`].
+/// [`WebpImage::anim_background_rgba`] / [`WebpImage::anim_loop_count`].
 fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpImage, WebpError> {
     // §2.7.1.1 ANIM: global background colour + loop count.
     let anim_chunk = c
@@ -951,6 +972,31 @@ fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpIm
     let anim =
         anim::AnimHeader::parse(anim_chunk.payload(bytes)).map_err(|_| WebpError::InvalidData)?;
     let bg = anim.background_color;
+
+    // §2.7.1 VP8X canvas dimensions — the canvas every ANMF composites onto.
+    let vp8x_chunk = c
+        .first_chunk_with_fourcc(container::fourcc::VP8X)
+        .ok_or(WebpError::InvalidData)?;
+    let vp8x =
+        vp8x::Vp8xHeader::parse(vp8x_chunk.payload(bytes)).map_err(|_| WebpError::InvalidData)?;
+    let canvas_w = vp8x.canvas_width;
+    let canvas_h = vp8x.canvas_height;
+
+    // Initialise canvas to the ANIM background colour (RGBA, scan order).
+    let bg_rgba = [bg.red, bg.green, bg.blue, bg.alpha];
+    let canvas_bytes = canvas_w
+        .checked_mul(canvas_h)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(WebpError::InvalidData)? as usize;
+    let mut canvas: Vec<u8> = Vec::with_capacity(canvas_bytes);
+    for _ in 0..(canvas_bytes / 4) {
+        canvas.extend_from_slice(&bg_rgba);
+    }
+
+    // Track the previous frame's rect + dispose for the §2.7.1.1
+    // "Before rendering each frame, the previous frame's Disposal method
+    // is applied" rule.
+    let mut prev_rect: Option<(u32, u32, u32, u32, anmf::DisposalMethod)> = None;
 
     let mut frames = Vec::new();
     for anmf_chunk in c.chunks_with_fourcc(container::fourcc::ANMF) {
@@ -971,15 +1017,15 @@ fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpIm
 
         let chunk = vp8l_chunk::WebpLosslessChunk::from_payload(vp8l_payload)
             .map_err(|e| WebpError::from(Error::from(e)))?;
-        let width = chunk.width();
-        let height = chunk.height();
-        let image = vp8l_transform::decode_lossless(chunk.bitstream(), width, height)
+        let sub_w = chunk.width();
+        let sub_h = chunk.height();
+        let image = vp8l_transform::decode_lossless(chunk.bitstream(), sub_w, sub_h)
             .map_err(|e| WebpError::from(Error::from(e)))?;
 
         // An optional ALPH sub-chunk overrides the VP8L per-pixel alpha.
         let mut pixels = image;
         if let Some(alph_payload) = find_subchunk(frame_data, container::fourcc::ALPH) {
-            if let Ok(plane) = alph::decode_alpha(alph_payload, width, height) {
+            if let Ok(plane) = alph::decode_alpha(alph_payload, sub_w, sub_h) {
                 let px = pixels.pixels_mut();
                 if plane.len() == px.len() {
                     for (p, &a) in px.iter_mut().zip(plane.iter()) {
@@ -988,13 +1034,58 @@ fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpIm
                 }
             }
         }
+        let sub_rgba = argb_to_rgba(pixels.pixels());
 
+        // §2.7.1.1: "Before rendering each frame, the previous frame's
+        // Disposal method is applied" — clears the previous rect to bg
+        // for dispose=Background; no-op for dispose=None.
+        if let Some((px, py, pw, ph, anmf::DisposalMethod::Background)) = prev_rect {
+            fill_canvas_rect(&mut canvas, canvas_w, px, py, pw, ph, bg_rgba);
+        }
+
+        // §2.7.1.1: the frame must fit inside the canvas. Reject any
+        // frame that overflows the canvas — that's a malformed file.
+        let right = header.x.checked_add(sub_w).ok_or(WebpError::InvalidData)?;
+        let bottom = header.y.checked_add(sub_h).ok_or(WebpError::InvalidData)?;
+        if right > canvas_w || bottom > canvas_h {
+            return Err(WebpError::InvalidData);
+        }
+
+        // Draw the current frame into its rect using its blending method.
+        match header.blend {
+            anmf::BlendingMethod::Overwrite => {
+                blit_rect_overwrite(
+                    &mut canvas,
+                    canvas_w,
+                    header.x,
+                    header.y,
+                    sub_w,
+                    sub_h,
+                    &sub_rgba,
+                );
+            }
+            anmf::BlendingMethod::AlphaBlend => {
+                blit_rect_alpha_blend(
+                    &mut canvas,
+                    canvas_w,
+                    header.x,
+                    header.y,
+                    sub_w,
+                    sub_h,
+                    &sub_rgba,
+                );
+            }
+        }
+
+        // Snapshot the full canvas as this frame's display state.
         frames.push(WebpFrame {
-            rgba: argb_to_rgba(pixels.pixels()),
-            width,
-            height,
+            rgba: canvas.clone(),
+            width: canvas_w,
+            height: canvas_h,
             duration_ms: header.duration_ms,
         });
+
+        prev_rect = Some((header.x, header.y, sub_w, sub_h, header.dispose));
     }
 
     if frames.is_empty() {
@@ -1007,6 +1098,130 @@ fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpIm
         anim_background_rgba: Some([bg.red, bg.green, bg.blue, bg.alpha]),
         anim_loop_count: Some(anim.loop_count),
     })
+}
+
+/// Fill an axis-aligned rectangle of `canvas` with `rgba`. Bounds are
+/// pre-validated by the caller (`x + w <= canvas_w`).
+fn fill_canvas_rect(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    rgba: [u8; 4],
+) {
+    let canvas_w = canvas_w as usize;
+    let cw_bytes = canvas_w * 4;
+    let x = x as usize;
+    let y = y as usize;
+    let w = w as usize;
+    let h = h as usize;
+    for row in 0..h {
+        let off = (y + row) * cw_bytes + x * 4;
+        for col in 0..w {
+            canvas[off + col * 4] = rgba[0];
+            canvas[off + col * 4 + 1] = rgba[1];
+            canvas[off + col * 4 + 2] = rgba[2];
+            canvas[off + col * 4 + 3] = rgba[3];
+        }
+    }
+}
+
+/// Copy `src` (flat `w*h*4` RGBA) into `canvas` at `(x, y)`, replacing the
+/// destination pixels byte-for-byte (§2.7.1.1 blending method `1`).
+fn blit_rect_overwrite(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    src: &[u8],
+) {
+    let canvas_w = canvas_w as usize;
+    let cw_bytes = canvas_w * 4;
+    let x = x as usize;
+    let y = y as usize;
+    let w = w as usize;
+    let h = h as usize;
+    let sw_bytes = w * 4;
+    for row in 0..h {
+        let src_off = row * sw_bytes;
+        let dst_off = (y + row) * cw_bytes + x * 4;
+        canvas[dst_off..dst_off + sw_bytes].copy_from_slice(&src[src_off..src_off + sw_bytes]);
+    }
+}
+
+/// Composite `src` over `canvas` at `(x, y)` per the §2.7.1.1
+/// "Alpha-blending" formula (8-bit integer approximation, sRGB space,
+/// no gamma linearisation — matching the spec's stated 8-bit formula).
+fn blit_rect_alpha_blend(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    src: &[u8],
+) {
+    let canvas_w = canvas_w as usize;
+    let cw_bytes = canvas_w * 4;
+    let x = x as usize;
+    let y = y as usize;
+    let w = w as usize;
+    let h = h as usize;
+    for row in 0..h {
+        for col in 0..w {
+            let src_off = (row * w + col) * 4;
+            let dst_off = (y + row) * cw_bytes + (x + col) * 4;
+            let sr = src[src_off] as u32;
+            let sg = src[src_off + 1] as u32;
+            let sb = src[src_off + 2] as u32;
+            let sa = src[src_off + 3] as u32;
+            // Fast path: fully-opaque source → equivalent to overwrite
+            // (matches "If the current frame does not have an alpha
+            // channel, assume the alpha value is 255, effectively
+            // replacing the rectangle").
+            if sa == 255 {
+                canvas[dst_off] = sr as u8;
+                canvas[dst_off + 1] = sg as u8;
+                canvas[dst_off + 2] = sb as u8;
+                canvas[dst_off + 3] = 255;
+                continue;
+            }
+            // Fully-transparent source → leave dst unchanged.
+            if sa == 0 {
+                continue;
+            }
+            let dr = canvas[dst_off] as u32;
+            let dg = canvas[dst_off + 1] as u32;
+            let db = canvas[dst_off + 2] as u32;
+            let da = canvas[dst_off + 3] as u32;
+            // §2.7.1.1: blend.A = src.A + dst.A * (1 - src.A / 255)
+            // Done in 8-bit fixed point: dst_factor = dst.A * (255 - src.A) / 255
+            let dst_factor = (da * (255 - sa) + 127) / 255;
+            let out_a = sa + dst_factor;
+            // blend.RGB = (src.RGB * src.A + dst.RGB * dst.A
+            //              * (1 - src.A / 255)) / blend.A
+            // out_a == 0 path: both src and dst are fully transparent → RGB
+            // is undefined and the spec sets blend.RGB := 0; checked_div
+            // returns None, which we fold into a 0 RGB output.
+            let out_r = (sr * sa + dr * dst_factor + out_a / 2)
+                .checked_div(out_a)
+                .unwrap_or(0);
+            let out_g = (sg * sa + dg * dst_factor + out_a / 2)
+                .checked_div(out_a)
+                .unwrap_or(0);
+            let out_b = (sb * sa + db * dst_factor + out_a / 2)
+                .checked_div(out_a)
+                .unwrap_or(0);
+            canvas[dst_off] = out_r.min(255) as u8;
+            canvas[dst_off + 1] = out_g.min(255) as u8;
+            canvas[dst_off + 2] = out_b.min(255) as u8;
+            canvas[dst_off + 3] = out_a.min(255) as u8;
+        }
+    }
 }
 
 /// Walk a flat §2.3 sub-chunk list (the `ANMF` "Frame Data" sub-RIFF — no

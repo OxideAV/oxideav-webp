@@ -6,6 +6,66 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 127 (2026-05-25).** `AnimFrameMode::Auto` and
+  `AnimFrameMode::Delta` are no longer `WebpError::Unsupported` — both
+  now encode the caller's frames against the previous canvas using a
+  **lossless dirty-rectangle delta** path on top of the existing VP8L
+  encoder. `Delta` always emits the dirty-rect sub-frame (or, for the
+  first frame / a frame whose dirty rect spans the whole canvas, a full
+  keyframe); `Auto` evaluates both candidates and emits the smaller
+  bitstream. Both honour the §2.7.1.1 `B = 1` / `D = 0`
+  (overwrite, no dispose) ANMF semantics so the encoded file round-trips
+  byte-for-byte through `decode_webp`'s canvas compositor. The
+  even-offset constraint of §2.7.1.1 is preserved by aligning the dirty
+  rect's top-left down to the nearest even coordinate. Identical
+  consecutive frames emit a degenerate 2×2 sub-frame so duration timing
+  is preserved without re-encoding. Headline: a 128×128 frame pair with
+  an 8×8 changed block compresses from 87 476 B (all-Lossless) to
+  43 986 B (Delta or Auto) — ~50 % size reduction with a byte-exact
+  round trip. The original lossy-keyframe-vs-inter-frame-delta `Auto`
+  semantics will return once `oxideav-vp8` ships a real lossy encoder;
+  the dirty-rect path remains useful on lossless input regardless. New
+  tests: `auto_and_delta_modes_emit_valid_files_round_127`,
+  `dirty_rect_shrinks_anmf_payload_for_localised_change`,
+  `auto_mode_picks_dirty_rect_on_localised_change`,
+  `dirty_rect_canvas_coords_covers_only_the_changed_pixels`,
+  `dirty_rect_is_none_on_identical_frames` (lib unit), and
+  `auto_and_delta_modes_round_trip_byte_exact`,
+  `delta_mode_three_frames_round_trip_byte_exact`,
+  `auto_mode_picks_dirty_rect_on_small_localised_change`
+  (`published_anim_api.rs`). 345 tests total.
+
+* **Clean-room round 127 (2026-05-25).** Decoder-side §2.7.1.1
+  **canvas compositing**. `decode_webp` / `decode_animation` now sizes
+  a canvas from the §2.7.1 `VP8X` chunk, initialises it to the
+  §2.7.1.1 `ANIM` `Background Color`, applies the previous frame's
+  disposal method (`None` or `Background`) to its sub-rectangle, then
+  draws the current frame at its `(x, y)` offset using its blending
+  method: `Overwrite` copies the sub-rect pixels verbatim onto the
+  canvas; `AlphaBlend` runs the §2.7.1.1 8-bit integer approximation
+  of `blend.A = src.A + dst.A * (1 - src.A / 255)` /
+  `blend.RGB = (src.RGB * src.A + dst.RGB * dst.A *
+  (1 - src.A / 255)) / blend.A` (sRGB space, no gamma
+  linearisation — matching the spec's stated 8-bit formula). Each
+  returned `WebpFrame.rgba` is the full canvas snapshot after that
+  frame is rendered, sized `canvas_w × canvas_h` (replacing the prior
+  per-sub-rect-only convention). Frames whose declared rect overflows
+  the canvas are rejected as `InvalidData`. The libwebp-encoded
+  `animated-with-alpha.webp` fixture (all three ANMFs at offset (0,0)
+  spanning the full 64×64 canvas) keeps decoding to the same per-frame
+  RGBA buffers as before. New helpers: `lib::fill_canvas_rect`,
+  `lib::blit_rect_overwrite`, `lib::blit_rect_alpha_blend`.
+
+* **Clean-room round 127 (2026-05-25).** `AnimFrame::new` default
+  `blend` switched from `BlendingMethod::AlphaBlend` to
+  `BlendingMethod::Overwrite` so a full-canvas frame round-trips
+  byte-for-byte through the new canvas compositor. Callers that need
+  alpha-blending of a translucent sub-frame onto the existing canvas
+  must build the struct literally and set `blend:
+  BlendingMethod::AlphaBlend`. This is a behavioural change vs prior
+  rounds (the existing `published_anim_api.rs` tests against varying-
+  alpha frames updated to use the new semantics).
+
 * **Clean-room round 124 (2026-05-25).** §2.5 `VP8 ` (lossy) **decode**
   path, routed through the `oxideav-vp8` sibling crate. Re-added the
   `oxideav-vp8 = "0.2"` dependency (vp8 0.2 now exposes a public

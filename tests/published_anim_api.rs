@@ -121,7 +121,11 @@ fn build_animated_webp_with_options_carries_loop_bg_and_metadata() {
 #[test]
 fn frame_blend_dispose_and_offset_fields_are_carried() {
     // A frame placed at an even offset with explicit blend/dispose must
-    // produce a parseable file whose decoded duration matches.
+    // produce a parseable file whose decoded duration matches, and the
+    // canvas-compositing decoder (round 127) returns a full-canvas frame
+    // sized to cover the rect (`max(x+w, y+h)`) with the sub-rect filled
+    // by the input pixels and the rest left as the ANIM background
+    // (transparent black by default).
     let (w, h) = (2u32, 2u32);
     let frame = AnimFrame {
         pixels: make_rgba(w, h, 5, true),
@@ -137,21 +141,163 @@ fn frame_blend_dispose_and_offset_fields_are_carried() {
     let file = build_animated_webp(&[frame]).expect("build offset frame");
     let img = decode_webp(&file).expect("decode");
     assert_eq!(img.frames.len(), 1);
-    assert_eq!(img.frames[0].duration_ms, 42);
-    assert_eq!(img.frames[0].rgba, make_rgba(w, h, 5, true));
+    let f = &img.frames[0];
+    assert_eq!(f.duration_ms, 42);
+    // Canvas dims = (x + w, y + h) = (4, 6).
+    assert_eq!(f.width, 4);
+    assert_eq!(f.height, 6);
+    assert_eq!(f.rgba.len(), (4 * 6 * 4) as usize);
+    // Sub-rect at (2,4) holds the input pixels exactly (Overwrite blend).
+    let src = make_rgba(w, h, 5, true);
+    for row in 0..h {
+        for col in 0..w {
+            let src_off = ((row * w + col) * 4) as usize;
+            let dst_off = (((4 + row) * 4 + (2 + col)) * 4) as usize;
+            assert_eq!(
+                f.rgba[dst_off..dst_off + 4],
+                src[src_off..src_off + 4],
+                "sub-rect pixel ({col},{row}) round-trips byte-exact"
+            );
+        }
+    }
+    // Pixels outside the sub-rect are the ANIM bg (transparent black default).
+    for row in 0..6u32 {
+        for col in 0..4u32 {
+            let in_sub = (2..4).contains(&col) && (4..6).contains(&row);
+            if !in_sub {
+                let off = ((row * 4 + col) * 4) as usize;
+                assert_eq!(
+                    &f.rgba[off..off + 4],
+                    &[0, 0, 0, 0],
+                    "outside-sub-rect pixel ({col},{row}) = ANIM bg"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn auto_and_delta_modes_report_unsupported() {
-    let (w, h) = (2u32, 2u32);
-    let mut frame = AnimFrame::new(w, h, make_rgba(w, h, 0, true), 100);
-    frame.mode = AnimFrameMode::Auto;
-    assert_eq!(
-        build_animated_webp(&[frame.clone()]),
-        Err(WebpError::Unsupported)
+fn auto_and_delta_modes_round_trip_byte_exact() {
+    // Round 127: Auto and Delta are no longer `Unsupported`. Both modes
+    // encode the caller's frames against the previous canvas and the
+    // file round-trips byte-for-byte through `decode_webp`'s canvas
+    // compositor — same observable behaviour as Lossless, just with a
+    // (potentially) smaller bitstream for slow-motion / cartoon content
+    // where most pixels are unchanged frame-to-frame.
+    let (w, h) = (8u32, 8u32);
+    let base = make_rgba(w, h, 0, true);
+    let mut moved = base.clone();
+    // Twiddle a single pixel at (3, 4) so frame 1 differs from frame 0.
+    moved[(4 * 8 + 3) * 4] ^= 0xff;
+
+    for mode in [AnimFrameMode::Auto, AnimFrameMode::Delta] {
+        let f0 = AnimFrame::new(w, h, base.clone(), 100);
+        let mut f1 = AnimFrame::new(w, h, moved.clone(), 150);
+        f1.mode = mode;
+        let file = build_animated_webp(&[f0, f1]).expect("build animated webp");
+        let img = decode_webp(&file).expect("decode animation");
+        assert_eq!(img.frames.len(), 2, "{mode:?}: one WebpFrame per ANMF");
+        assert_eq!(
+            img.frames[0].rgba, base,
+            "{mode:?}: frame 0 round-trips byte-exact"
+        );
+        assert_eq!(
+            img.frames[1].rgba, moved,
+            "{mode:?}: frame 1 round-trips byte-exact"
+        );
+        assert_eq!(img.frames[1].duration_ms, 150);
+    }
+}
+
+#[test]
+fn delta_mode_three_frames_round_trip_byte_exact() {
+    // Three consecutive frames where only small per-frame regions differ
+    // — the realistic Delta use case. Every frame round-trips byte-for-
+    // byte and the encoded file is materially smaller than the same
+    // sequence emitted as full Lossless keyframes.
+    let (w, h) = (24u32, 24u32);
+    let f0_px = make_rgba(w, h, 1, true);
+    let mut f1_px = f0_px.clone();
+    // Frame 1: change a 4×4 block at (10,10).
+    for row in 10..14 {
+        for col in 10..14 {
+            let off = (row * w as usize + col) * 4;
+            f1_px[off] ^= 0xff;
+            f1_px[off + 1] ^= 0xff;
+        }
+    }
+    // Frame 2: same as frame 1, but with an extra 4×4 change at (4,4).
+    let mut f2_px = f1_px.clone();
+    for row in 4..8 {
+        for col in 4..8 {
+            let off = (row * w as usize + col) * 4;
+            f2_px[off + 2] ^= 0xff;
+        }
+    }
+
+    let f0 = AnimFrame::new(w, h, f0_px.clone(), 80);
+    let mut f1 = AnimFrame::new(w, h, f1_px.clone(), 80);
+    f1.mode = AnimFrameMode::Delta;
+    let mut f2 = AnimFrame::new(w, h, f2_px.clone(), 80);
+    f2.mode = AnimFrameMode::Delta;
+
+    let file = build_animated_webp(&[f0.clone(), f1.clone(), f2.clone()]).expect("build delta");
+    let img = decode_webp(&file).expect("decode");
+    assert_eq!(img.frames.len(), 3);
+    assert_eq!(img.frames[0].rgba, f0_px, "frame 0 round-trips");
+    assert_eq!(img.frames[1].rgba, f1_px, "frame 1 round-trips");
+    assert_eq!(img.frames[2].rgba, f2_px, "frame 2 round-trips");
+
+    // Compare against an all-Lossless emit of the same content.
+    let f1_l = {
+        let mut x = AnimFrame::new(w, h, f1_px, 80);
+        x.mode = AnimFrameMode::Lossless;
+        x
+    };
+    let f2_l = {
+        let mut x = AnimFrame::new(w, h, f2_px, 80);
+        x.mode = AnimFrameMode::Lossless;
+        x
+    };
+    let file_lossless = build_animated_webp(&[f0, f1_l, f2_l]).expect("build lossless");
+    assert!(
+        file.len() < file_lossless.len(),
+        "3-frame delta ({} B) beats 3-frame lossless ({} B)",
+        file.len(),
+        file_lossless.len(),
     );
-    frame.mode = AnimFrameMode::Delta;
-    assert_eq!(build_animated_webp(&[frame]), Err(WebpError::Unsupported));
+}
+
+#[test]
+fn auto_mode_picks_dirty_rect_on_small_localised_change() {
+    // A 32×32 frame pair with a 2-pixel change in the middle. Auto
+    // should produce a file noticeably smaller than the equivalent
+    // Lossless re-encode of frame 1.
+    let (w, h) = (32u32, 32u32);
+    let base = make_rgba(w, h, 0, true);
+    let mut moved = base.clone();
+    let off = (16 * 32 + 16) * 4;
+    moved[off] ^= 0xff;
+    moved[off + 1] ^= 0xff;
+
+    let f0_lossless = AnimFrame::new(w, h, base.clone(), 80);
+    let mut f1_lossless = AnimFrame::new(w, h, moved.clone(), 80);
+    f1_lossless.mode = AnimFrameMode::Lossless;
+    let mut f1_auto = AnimFrame::new(w, h, moved, 80);
+    f1_auto.mode = AnimFrameMode::Auto;
+
+    let file_lossless =
+        build_animated_webp(&[f0_lossless.clone(), f1_lossless]).expect("lossless build");
+    let file_auto = build_animated_webp(&[f0_lossless, f1_auto]).expect("auto build");
+
+    assert!(
+        file_auto.len() < file_lossless.len(),
+        "auto-mode ({} B) must beat lossless ({} B) on a 2-pixel change",
+        file_auto.len(),
+        file_lossless.len(),
+    );
+    // Avoid an unused import warning if WebpError stops being referenced.
+    let _ = WebpError::InvalidData;
 }
 
 #[test]

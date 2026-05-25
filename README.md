@@ -2,6 +2,42 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-25 (clean-room round 127)
+
+**Round 127 implemented `AnimFrameMode::Auto` / `::Delta` (lossless
+dirty-rect deltas) and §2.7.1.1 canvas compositing on the decode side.**
+
+The animation encoder now offers three modes:
+
+* `Lossless` — full-canvas VP8L keyframe per frame, as before.
+* `Delta` (new) — emits only the **dirty rectangle** of each frame
+  (bounding box of pixels differing from the previous canvas) as a §2.6
+  `VP8L` sub-frame placed at its `(x, y)` offset with `B = 1`
+  (overwrite) / `D = 0` (no dispose). The first frame and any frame
+  whose dirty rect spans the whole canvas fall back to a full keyframe.
+* `Auto` (new) — evaluates both the full-canvas keyframe and the
+  dirty-rect sub-frame and emits whichever produces a smaller bitstream.
+
+Headline: a 128×128 frame pair where only an 8×8 block changes
+compresses from 87 476 B (all-Lossless) to 43 986 B (Delta or Auto) —
+**~50 % size reduction** with a byte-exact round trip. Both modes are
+**lossless**; the original lossy-keyframe-vs-inter-frame-delta `Auto`
+semantics will return once `oxideav-vp8` ships a real lossy encoder.
+
+Decoder-side, [`decode_webp`](src/lib.rs) now **composites** each `ANMF`
+sub-frame onto a shared canvas per RFC 9649 §2.7.1.1, honouring the
+per-frame `B` (blending: alpha-blend vs overwrite) and `D` (disposal:
+none vs background) bits — including the §2.7.1.1 alpha-blending
+formula `blend.A = src.A + dst.A * (1 - src.A / 255)` (8-bit integer
+approximation, sRGB space). Returned `WebpFrame.rgba` is now a
+full-canvas snapshot per frame (a playback-ready buffer), with
+`width` / `height` set to the §2.7.1 `VP8X` canvas dimensions instead
+of the per-frame sub-rect dims. `AnimFrame::new`'s default `blend` is
+now `Overwrite` so single-frame round-trips remain byte-exact.
+
+Still framing-only: VP8 / VP8L bitstream *encode* (the lossy keyframe
+path) and `Auto`/`Delta` evaluation against a lossy candidate.
+
 ## Status — 2026-05-25 (clean-room round 124)
 
 **Round 124 wired the §2.5 `VP8 ` (lossy) decode path through the

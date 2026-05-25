@@ -19,15 +19,28 @@
 //! file decodes back through [`crate::decode_webp`] (animation path) to the
 //! exact input pixels.
 //!
-//! ## What this module does NOT do
+//! ## Auto / Delta encoding (round 127)
 //!
-//! The [`AnimFrameMode::Auto`] and [`AnimFrameMode::Delta`] modes need the
-//! VP8 *lossy* bitstream encoder and inter-frame delta detection, which are
-//! blocked on the `oxideav-vp8` dependency (workspace task #1041). Selecting
-//! them returns [`WebpError::Unsupported`] rather than silently falling back
-//! to a lossless encode. The [`DeltaConfig`] / [`DownsampleKernel`] knobs are
-//! re-exposed for API-shape compatibility but only feed the (still blocked)
-//! delta path.
+//! [`AnimFrameMode::Lossless`] always emits the full caller-supplied frame
+//! at its `(x, y)` offset as a single VP8L keyframe. [`AnimFrameMode::Delta`]
+//! and [`AnimFrameMode::Auto`] take advantage of the §2.7.1.1
+//! `B = 1` (overwrite) / `D = 0` (no dispose) ANMF semantics to encode only
+//! the **dirty rectangle** of each frame against the previous canvas:
+//!
+//! * `Delta` always emits the dirty-rect sub-frame (or, for the first frame,
+//!   the full caller-supplied frame — there is no "previous canvas" yet);
+//!   pixels outside the dirty rect remain whatever the previous frame left
+//!   on the canvas, so the §2.7.1.1 disposal/blending rules naturally
+//!   reconstruct the caller's full canvas frame on decode.
+//! * `Auto` evaluates both the dirty-rect sub-frame and the full-canvas
+//!   keyframe and emits whichever produces a smaller VP8L bitstream.
+//!
+//! Both modes are **lossless** — every encoded byte round-trips through
+//! [`crate::decode_webp`] to the exact caller-provided pixels, the same as
+//! `Lossless`. The [`DeltaConfig`] / [`DownsampleKernel`] knobs are
+//! preserved for API-shape compatibility but the dirty-rect algorithm
+//! does not consult them yet (they were originally intended for a
+//! lossy-aware MS-SSIM quality gate).
 
 use crate::anmf::{BlendingMethod, DisposalMethod};
 use crate::build::{self, Vp8xFlags};
@@ -44,23 +57,24 @@ const ANIM_PAYLOAD_LEN: usize = 6;
 /// How a single animation frame's pixels are compressed into its `ANMF`
 /// "Frame Data" bitstream subchunk.
 ///
-/// Reproduces the published-0.1.5 variant set. Only [`Self::Lossless`] is
-/// wired up in this build; the lossy / delta modes are blocked on the
-/// `oxideav-vp8` bitstream encoder (workspace task #1041) and surface a
-/// [`WebpError::Unsupported`].
+/// Reproduces the published-0.1.5 variant set. All three modes are wired
+/// in this build; the round-127 `Auto` and `Delta` paths encode the
+/// caller's full-canvas frame as a **lossless dirty-rect sub-frame**
+/// against the previous canvas (the original lossy keyframe vs. inter-frame
+/// delta choice is deferred until the `oxideav-vp8` lossy encoder is ready,
+/// at which point `Auto` will also evaluate a lossy candidate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AnimFrameMode {
-    /// Pick the smaller of a lossy keyframe and an inter-frame delta per
-    /// frame. **Blocked** — needs the VP8 lossy encoder; returns
-    /// [`WebpError::Unsupported`].
+    /// Evaluate both the full-canvas VP8L keyframe and the dirty-rect VP8L
+    /// sub-frame and emit whichever is smaller. Falls back to the
+    /// full-canvas keyframe for the first frame and for frames whose
+    /// dirty rect happens to cover the whole canvas.
     #[default]
     Auto,
-    /// Encode the frame as an inter-frame delta against the previous canvas.
-    /// **Blocked** — needs the VP8 lossy encoder; returns
-    /// [`WebpError::Unsupported`].
+    /// Always emit the dirty-rect sub-frame (the §2.7.1.1 `B = 1` / `D = 0`
+    /// overwrite-no-dispose path). First frame is always the full canvas.
     Delta,
-    /// Encode the frame as a standalone §2.6 `VP8L` lossless keyframe. Fully
-    /// supported.
+    /// Encode the frame as a standalone §2.6 `VP8L` lossless keyframe.
     Lossless,
 }
 
@@ -96,8 +110,15 @@ pub struct AnimFrame {
 }
 
 impl AnimFrame {
-    /// Construct an opaque, top-left, alpha-blended, non-disposed lossless
+    /// Construct a top-left, **overwrite-blended**, non-disposed lossless
     /// frame from a flat RGBA buffer — the common case.
+    ///
+    /// `BlendingMethod::Overwrite` (§2.7.1.1 `B = 1`) is the default so a
+    /// full-canvas frame round-trips byte-for-byte through
+    /// [`crate::decode_webp`]'s canvas-compositing path. Callers that want
+    /// §2.7.1.1 alpha-blending of a translucent sub-frame onto the existing
+    /// canvas must build the struct literally and set `blend:
+    /// BlendingMethod::AlphaBlend`.
     pub fn new(width: u32, height: u32, pixels: Vec<u8>, duration: u32) -> Self {
         Self {
             pixels,
@@ -106,7 +127,7 @@ impl AnimFrame {
             x: 0,
             y: 0,
             duration,
-            blend: BlendingMethod::AlphaBlend,
+            blend: BlendingMethod::Overwrite,
             dispose: DisposalMethod::None,
             mode: AnimFrameMode::Lossless,
         }
@@ -212,15 +233,22 @@ pub fn build_animated_webp(frames: &[AnimFrame]) -> Result<Vec<u8>, WebpError> {
 /// The §2.7.1 `VP8X` canvas is sized to cover every frame
 /// (`max(frame.x + frame.width)` × `max(frame.y + frame.height)`). The `A`
 /// (animation) flag is always set; `L` (alpha) is set when any frame carries
-/// a non-opaque pixel; `I` / `E` / `X` follow the supplied metadata. Each
-/// frame's [`AnimFrameMode::Lossless`] pixels are encoded to a §2.6 `VP8L`
-/// chunk via [`crate::vp8l_encode::encode_vp8l_argb_with`] and wrapped in the
-/// `ANMF` "Frame Data" sub-RIFF.
+/// a non-opaque pixel; `I` / `E` / `X` follow the supplied metadata.
 ///
-/// [`AnimFrameMode::Auto`] / [`AnimFrameMode::Delta`] frames return
-/// [`WebpError::Unsupported`] (the VP8 lossy + delta paths are blocked on
-/// `oxideav-vp8`). An empty `frames` slice, a frame whose `pixels` length
-/// disagrees with `width * height * 4`, or an odd `x` / `y` offset is
+/// Each frame's [`AnimFrameMode::Lossless`] pixels are encoded to a §2.6
+/// `VP8L` chunk via [`crate::vp8l_encode::encode_vp8l_argb_with`] and
+/// wrapped in the `ANMF` "Frame Data" sub-RIFF as-is.
+///
+/// **Round 127**: [`AnimFrameMode::Delta`] encodes only the dirty rectangle
+/// (the bounding box of pixels that differ from the previous canvas) as the
+/// `ANMF` sub-frame, with `B = 1` (overwrite) and `D = 0` (no dispose). The
+/// first frame, and any frame whose dirty rect happens to span the whole
+/// canvas, fall back to a full keyframe. [`AnimFrameMode::Auto`] evaluates
+/// both candidates and picks the smaller bitstream. Both modes round-trip
+/// byte-for-byte through [`crate::decode_webp`]'s canvas compositor.
+///
+/// An empty `frames` slice, a frame whose `pixels` length disagrees with
+/// `width * height * 4`, or an odd `x` / `y` offset is
 /// [`WebpError::InvalidData`].
 pub fn build_animated_webp_with_options(
     frames: &[AnimFrame],
@@ -236,11 +264,6 @@ pub fn build_animated_webp_with_options(
     let mut any_alpha = false;
 
     for f in frames {
-        match f.mode {
-            AnimFrameMode::Lossless => {}
-            // Lossy keyframe / inter-frame delta need the VP8 lossy encoder.
-            AnimFrameMode::Auto | AnimFrameMode::Delta => return Err(WebpError::Unsupported),
-        }
         if f.width == 0 || f.height == 0 {
             return Err(WebpError::InvalidData);
         }
@@ -289,10 +312,31 @@ pub fn build_animated_webp_with_options(
         push(fourcc::ICCP, icc)?;
     }
     push(fourcc::ANIM, &build_anim_payload(opts))?;
-    for f in frames {
-        let anmf_payload = build_anmf_payload(f)?;
+
+    // Track the canvas state the decoder will see right *before* this
+    // iteration's frame is drawn. Initialised to the ANIM bg colour to
+    // mirror the decoder's §2.7.1.1 "canvas is cleared at the start" rule.
+    let mut prev_canvas = build_initial_canvas(canvas_width, canvas_height, opts.background_rgba);
+    let bg_rgba = opts.background_rgba;
+    // Per the decoder: before drawing each frame after the first, the
+    // *previous* frame's dispose method is applied to *its* rect.
+    let mut prev_disposal: Option<(u32, u32, u32, u32, DisposalMethod)> = None;
+
+    for (idx, f) in frames.iter().enumerate() {
+        // Apply previous frame's dispose to the predicted-canvas tracker.
+        if let Some((px, py, pw, ph, DisposalMethod::Background)) = prev_disposal {
+            fill_canvas_rect_in_place(&mut prev_canvas, canvas_width, px, py, pw, ph, bg_rgba);
+        }
+        let anmf_payload =
+            build_anmf_payload_with_prev(f, canvas_width, canvas_height, &prev_canvas, idx == 0)?;
         push(fourcc::ANMF, &anmf_payload)?;
+        // Update the canvas tracker with this frame's drawn pixels
+        // (matching the decoder's blend method).
+        composite_frame_onto_canvas(&mut prev_canvas, canvas_width, f);
+        // Remember this frame's rect + dispose for the next iteration.
+        prev_disposal = Some((f.x, f.y, f.width, f.height, f.dispose));
     }
+
     if let Some(exif) = meta.exif {
         push(fourcc::EXIF, exif)?;
     }
@@ -313,6 +357,200 @@ pub fn build_animated_webp_with_options(
     Ok(out)
 }
 
+/// Build a fresh canvas filled with `bg` per §2.7.1.1 — what the decoder
+/// initialises the canvas to before drawing the first frame.
+fn build_initial_canvas(width: u32, height: u32, bg: [u8; 4]) -> Vec<u8> {
+    let pixels = (width as usize) * (height as usize);
+    let mut canvas = Vec::with_capacity(pixels * 4);
+    for _ in 0..pixels {
+        canvas.extend_from_slice(&bg);
+    }
+    canvas
+}
+
+/// Fill the sub-rectangle `(x, y, w, h)` of `canvas` with `rgba` — mirrors
+/// the decoder's `fill_canvas_rect` when applying a previous frame's
+/// `DisposalMethod::Background`.
+fn fill_canvas_rect_in_place(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    rgba: [u8; 4],
+) {
+    let cw_bytes = (canvas_w as usize) * 4;
+    for row in 0..(h as usize) {
+        let off = ((y as usize) + row) * cw_bytes + (x as usize) * 4;
+        for col in 0..(w as usize) {
+            canvas[off + col * 4] = rgba[0];
+            canvas[off + col * 4 + 1] = rgba[1];
+            canvas[off + col * 4 + 2] = rgba[2];
+            canvas[off + col * 4 + 3] = rgba[3];
+        }
+    }
+}
+
+/// Composite a frame onto `canvas` exactly the way the decoder will, so
+/// the next iteration's dirty-rect diff is computed against the same
+/// reference state. Honours the frame's `blend` method — `Overwrite`
+/// (the default and the one Auto/Delta forces) copies the rect bytes
+/// verbatim; `AlphaBlend` runs the §2.7.1.1 8-bit alpha-blending formula.
+fn composite_frame_onto_canvas(canvas: &mut [u8], canvas_w: u32, f: &AnimFrame) {
+    let cw = canvas_w as usize;
+    let cw_bytes = cw * 4;
+    let fw = f.width as usize;
+    let fh = f.height as usize;
+    let fx = f.x as usize;
+    let fy = f.y as usize;
+    match f.blend {
+        BlendingMethod::Overwrite => {
+            let src_stride = fw * 4;
+            for row in 0..fh {
+                let src_off = row * src_stride;
+                let dst_off = (fy + row) * cw_bytes + fx * 4;
+                canvas[dst_off..dst_off + src_stride]
+                    .copy_from_slice(&f.pixels[src_off..src_off + src_stride]);
+            }
+        }
+        BlendingMethod::AlphaBlend => {
+            for row in 0..fh {
+                for col in 0..fw {
+                    let src_off = (row * fw + col) * 4;
+                    let dst_off = (fy + row) * cw_bytes + (fx + col) * 4;
+                    let sa = f.pixels[src_off + 3] as u32;
+                    if sa == 255 {
+                        canvas[dst_off..dst_off + 4]
+                            .copy_from_slice(&f.pixels[src_off..src_off + 4]);
+                    } else if sa == 0 {
+                        // src fully transparent → leave dst.
+                    } else {
+                        let sr = f.pixels[src_off] as u32;
+                        let sg = f.pixels[src_off + 1] as u32;
+                        let sb = f.pixels[src_off + 2] as u32;
+                        let dr = canvas[dst_off] as u32;
+                        let dg = canvas[dst_off + 1] as u32;
+                        let db = canvas[dst_off + 2] as u32;
+                        let da = canvas[dst_off + 3] as u32;
+                        let dst_factor = (da * (255 - sa) + 127) / 255;
+                        let out_a = sa + dst_factor;
+                        let out_r = (sr * sa + dr * dst_factor + out_a / 2)
+                            .checked_div(out_a)
+                            .unwrap_or(0);
+                        let out_g = (sg * sa + dg * dst_factor + out_a / 2)
+                            .checked_div(out_a)
+                            .unwrap_or(0);
+                        let out_b = (sb * sa + db * dst_factor + out_a / 2)
+                            .checked_div(out_a)
+                            .unwrap_or(0);
+                        canvas[dst_off] = out_r.min(255) as u8;
+                        canvas[dst_off + 1] = out_g.min(255) as u8;
+                        canvas[dst_off + 2] = out_b.min(255) as u8;
+                        canvas[dst_off + 3] = out_a.min(255) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Dirty-rect (bounding box of changed pixels) of `f.pixels` against the
+/// `prev` canvas, expressed in canvas coordinates. Returns `None` when no
+/// pixel differs — Delta/Auto then emit a degenerate 2×2 transparent rect
+/// (the smallest representable ANMF) to preserve duration timing.
+fn dirty_rect_canvas_coords(
+    f: &AnimFrame,
+    canvas_w: u32,
+    canvas_h: u32,
+    prev: &[u8],
+) -> Option<DirtyRect> {
+    let cw = canvas_w as usize;
+    let _ = canvas_h;
+    let cw_bytes = cw * 4;
+    let fw = f.width as usize;
+    let fh = f.height as usize;
+    let fx = f.x as usize;
+    let fy = f.y as usize;
+
+    let mut min_x = usize::MAX;
+    let mut min_y = usize::MAX;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut any_diff = false;
+
+    for row in 0..fh {
+        let src_row_off = row * fw * 4;
+        let dst_row_off = (fy + row) * cw_bytes + fx * 4;
+        for col in 0..fw {
+            let s = &f.pixels[src_row_off + col * 4..src_row_off + col * 4 + 4];
+            let d = &prev[dst_row_off + col * 4..dst_row_off + col * 4 + 4];
+            if s != d {
+                any_diff = true;
+                let cx = fx + col;
+                let cy = fy + row;
+                if cx < min_x {
+                    min_x = cx;
+                }
+                if cy < min_y {
+                    min_y = cy;
+                }
+                if cx > max_x {
+                    max_x = cx;
+                }
+                if cy > max_y {
+                    max_y = cy;
+                }
+            }
+        }
+    }
+
+    if !any_diff {
+        return None;
+    }
+
+    // §2.7.1.1 stores Frame X / Frame Y as coord/2, so the dirty rect's
+    // top-left must be aligned to even coordinates. Round down to the
+    // nearest even.
+    let aligned_min_x = min_x & !1;
+    let aligned_min_y = min_y & !1;
+
+    Some(DirtyRect {
+        x: aligned_min_x as u32,
+        y: aligned_min_y as u32,
+        w: ((max_x + 1) - aligned_min_x) as u32,
+        h: ((max_y + 1) - aligned_min_y) as u32,
+    })
+}
+
+/// Extract a sub-rectangle of `f.pixels` covering `rect` (in canvas
+/// coordinates). Returns the flat RGBA buffer the VP8L encoder will
+/// consume. `rect` must lie fully inside the frame `f`.
+fn extract_subrect_from_frame(f: &AnimFrame, rect: DirtyRect) -> Vec<u8> {
+    let fw = f.width as usize;
+    let fx = f.x as usize;
+    let fy = f.y as usize;
+    let rx = rect.x as usize;
+    let ry = rect.y as usize;
+    let rw = rect.w as usize;
+    let rh = rect.h as usize;
+    let mut out = Vec::with_capacity(rw * rh * 4);
+    for row in 0..rh {
+        let src_row = (ry - fy) + row;
+        let src_off = (src_row * fw + (rx - fx)) * 4;
+        out.extend_from_slice(&f.pixels[src_off..src_off + rw * 4]);
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirtyRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
 /// Build the 6-byte §2.7.1.1 Figure 8 `ANIM` payload: BGRA background colour
 /// (the `[R,G,B,A]` option re-ordered to on-disk `[B,G,R,A]`) + LE u16 loop
 /// count.
@@ -328,40 +566,175 @@ fn build_anim_payload(opts: &AnimEncoderOptions<'_>) -> Vec<u8> {
     p
 }
 
-/// Build a single `ANMF` chunk payload: the 16-byte §2.7.1.1 Figure 9 header
-/// followed by the per-frame "Frame Data" sub-RIFF (a §2.6 `VP8L` chunk).
-fn build_anmf_payload(f: &AnimFrame) -> Result<Vec<u8>, WebpError> {
-    // Encode the frame's pixels to a bare VP8L bitstream (image-header +
-    // image stream), then wrap as a VP8L chunk for the Frame Data sub-RIFF.
-    let argb = rgba_to_argb(&f.pixels);
-    let has_alpha = f.pixels.chunks_exact(4).any(|px| px[3] != 0xff);
-    let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, f.width, f.height, has_alpha)
+/// Build a single `ANMF` chunk payload, taking the previous-canvas state
+/// into account for [`AnimFrameMode::Auto`] / [`AnimFrameMode::Delta`].
+///
+/// For [`AnimFrameMode::Lossless`], the frame is always encoded as a full
+/// keyframe at its declared `(x, y, width, height)` — the caller's
+/// `blend`/`dispose` flags are honoured verbatim.
+///
+/// For [`AnimFrameMode::Delta`], the dirty rect (bounding box of pixels
+/// differing from `prev`) is encoded as the ANMF sub-frame with
+/// `B = 1` / `D = 0`. On `is_first_frame`, no `prev` to diff against, so
+/// `Delta` falls back to a full-canvas keyframe (same emission as
+/// `Lossless` with the caller's `(x,y,w,h)`).
+///
+/// For [`AnimFrameMode::Auto`], both candidates are encoded and the
+/// smaller VP8L bitstream wins.
+fn build_anmf_payload_with_prev(
+    f: &AnimFrame,
+    canvas_w: u32,
+    canvas_h: u32,
+    prev: &[u8],
+    is_first_frame: bool,
+) -> Result<Vec<u8>, WebpError> {
+    match f.mode {
+        AnimFrameMode::Lossless => emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels),
+        AnimFrameMode::Delta => {
+            if is_first_frame {
+                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)
+            } else {
+                let rect =
+                    dirty_rect_canvas_coords(f, canvas_w, canvas_h, prev).unwrap_or(DirtyRect {
+                        // Identical-to-previous: emit a 2×2 transparent
+                        // overwrite at (0,0) — duration is preserved and
+                        // re-applying transparent black over the bg
+                        // pixels is a no-op when bg is transparent black.
+                        // The decoder's compositor sees this as a write
+                        // of the same pixels.
+                        x: f.x,
+                        y: f.y,
+                        w: 2.min(f.width),
+                        h: 2.min(f.height),
+                    });
+                let sub_rgba = extract_subrect_from_frame(f, rect);
+                emit_dirty_anmf(f, rect, &sub_rgba)
+            }
+        }
+        AnimFrameMode::Auto => {
+            // Always evaluate the full-frame candidate (and use it for the
+            // first frame regardless).
+            let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)?;
+            if is_first_frame {
+                return Ok(full);
+            }
+            let Some(rect) = dirty_rect_canvas_coords(f, canvas_w, canvas_h, prev) else {
+                // Frame is identical to previous canvas — a 2×2 transparent
+                // delta is smaller than any non-trivial full frame.
+                let degen_rect = DirtyRect {
+                    x: f.x,
+                    y: f.y,
+                    w: 2.min(f.width),
+                    h: 2.min(f.height),
+                };
+                let sub_rgba = extract_subrect_from_frame(f, degen_rect);
+                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba)?;
+                return Ok(if delta.len() < full.len() {
+                    delta
+                } else {
+                    full
+                });
+            };
+            // If the dirty rect covers the whole declared frame rect,
+            // there's no win from a sub-frame.
+            if rect.w == f.width && rect.h == f.height && rect.x == f.x && rect.y == f.y {
+                return Ok(full);
+            }
+            let sub_rgba = extract_subrect_from_frame(f, rect);
+            let delta = emit_dirty_anmf(f, rect, &sub_rgba)?;
+            Ok(if delta.len() < full.len() {
+                delta
+            } else {
+                full
+            })
+        }
+    }
+}
+
+/// Encode `pixels` (`w*h*4` flat RGBA) as a §2.6 `VP8L` chunk wrapped in
+/// the §2.7.1.1 Figure 9 16-byte ANMF header at `(x, y, w, h)` with the
+/// caller's blend/dispose/duration. Used by both the full-keyframe and
+/// dirty-rect emission paths.
+fn emit_full_anmf(
+    f: &AnimFrame,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    pixels: &[u8],
+) -> Result<Vec<u8>, WebpError> {
+    let argb = rgba_to_argb(pixels);
+    let has_alpha = pixels.chunks_exact(4).any(|px| px[3] != 0xff);
+    let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, w, h, has_alpha)
         .map_err(Error::from)
         .map_err(WebpError::from)?;
     let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
+    Ok(build_anmf_header_then_data(
+        x,
+        y,
+        w,
+        h,
+        f.duration,
+        f.blend,
+        f.dispose,
+        &frame_data,
+    ))
+}
 
+/// Emit an ANMF carrying only the dirty `rect` sub-frame, forced to
+/// `B = 1` (overwrite) and `D = 0` (no dispose) so the decoder's
+/// compositor reconstructs the caller's full-canvas frame bit-exactly.
+/// The caller's `dispose` is overridden to `None` regardless of what they
+/// passed — preserving it would corrupt the next frame's reference state.
+fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Vec<u8>, WebpError> {
+    let argb = rgba_to_argb(sub_rgba);
+    let has_alpha = sub_rgba.chunks_exact(4).any(|px| px[3] != 0xff);
+    let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, rect.w, rect.h, has_alpha)
+        .map_err(Error::from)
+        .map_err(WebpError::from)?;
+    let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
+    Ok(build_anmf_header_then_data(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        f.duration,
+        BlendingMethod::Overwrite,
+        DisposalMethod::None,
+        &frame_data,
+    ))
+}
+
+/// Splice the 16-byte §2.7.1.1 Figure 9 header in front of the per-frame
+/// Frame Data sub-RIFF and return the complete ANMF chunk payload.
+#[allow(clippy::too_many_arguments)]
+fn build_anmf_header_then_data(
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    duration: u32,
+    blend: BlendingMethod,
+    dispose: DisposalMethod,
+    frame_data: &[u8],
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(ANMF_HEADER_LEN + frame_data.len());
-    // §2.7.1.1 Figure 9: Frame X / Y stored as coord/2 (uint24 LE).
-    push_u24_le(&mut payload, f.x / 2);
-    push_u24_le(&mut payload, f.y / 2);
-    // Frame Width / Height Minus One (uint24 LE).
-    push_u24_le(&mut payload, f.width - 1);
-    push_u24_le(&mut payload, f.height - 1);
-    // Frame Duration (uint24 LE, ms).
-    push_u24_le(&mut payload, f.duration & 0x00FF_FFFF);
-    // Reserved(6) | B | D info byte.
-    let b_bit = match f.blend {
+    push_u24_le(&mut payload, x / 2);
+    push_u24_le(&mut payload, y / 2);
+    push_u24_le(&mut payload, w - 1);
+    push_u24_le(&mut payload, h - 1);
+    push_u24_le(&mut payload, duration & 0x00FF_FFFF);
+    let b_bit = match blend {
         BlendingMethod::AlphaBlend => 0,
         BlendingMethod::Overwrite => 1,
     };
-    let d_bit = match f.dispose {
+    let d_bit = match dispose {
         DisposalMethod::None => 0,
         DisposalMethod::Background => 1,
     };
     payload.push((b_bit << 1) | d_bit);
-
-    payload.extend_from_slice(&frame_data);
-    Ok(payload)
+    payload.extend_from_slice(frame_data);
+    payload
 }
 
 /// Push the low 24 bits of `v` as three little-endian bytes.
@@ -406,15 +779,117 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_delta_modes_are_unsupported() {
-        let mut f = AnimFrame::new(2, 2, solid_rgba(2, 2, [1, 2, 3, 255]), 100);
-        f.mode = AnimFrameMode::Auto;
-        assert_eq!(
-            build_animated_webp(&[f.clone()]),
-            Err(WebpError::Unsupported)
+    fn auto_and_delta_modes_emit_valid_files_round_127() {
+        // Round 127: Auto + Delta are wired up against the §2.7.1.1
+        // overwrite-no-dispose path. Selecting them no longer returns
+        // Unsupported; the encoded file is structurally valid and the
+        // container walker accepts it.
+        for mode in [AnimFrameMode::Auto, AnimFrameMode::Delta] {
+            let mut f = AnimFrame::new(2, 2, solid_rgba(2, 2, [1, 2, 3, 255]), 100);
+            f.mode = mode;
+            let file = build_animated_webp(&[f]).unwrap_or_else(|e| {
+                panic!("mode {mode:?} must build a valid file in round 127, got {e:?}")
+            });
+            assert_eq!(&file[0..4], b"RIFF");
+            assert_eq!(&file[8..12], b"WEBP");
+            let c = crate::container::parse(&file).expect("parseable container");
+            assert!(c.first_chunk_with_fourcc(fourcc::ANMF).is_some());
+        }
+    }
+
+    #[test]
+    fn dirty_rect_shrinks_anmf_payload_for_localised_change() {
+        // Build a 16×16 canvas-aligned frame pair where only a 4×4 block
+        // in the centre differs. A Delta-mode emit must produce a
+        // strictly smaller ANMF chunk than a Lossless full-frame emit.
+        let w = 16u32;
+        let h = 16u32;
+        let mut f0 = AnimFrame::new(w, h, solid_rgba(w, h, [200, 100, 50, 255]), 80);
+        f0.mode = AnimFrameMode::Lossless;
+        let mut f1_pixels = solid_rgba(w, h, [200, 100, 50, 255]);
+        for row in 6..10 {
+            for col in 6..10 {
+                let off = (row * w as usize + col) * 4;
+                f1_pixels[off] = 0;
+                f1_pixels[off + 1] = 0;
+                f1_pixels[off + 2] = 0;
+                f1_pixels[off + 3] = 255;
+            }
+        }
+        let mut f1_lossless = AnimFrame::new(w, h, f1_pixels.clone(), 80);
+        f1_lossless.mode = AnimFrameMode::Lossless;
+        let mut f1_delta = AnimFrame::new(w, h, f1_pixels.clone(), 80);
+        f1_delta.mode = AnimFrameMode::Delta;
+
+        let file_lossless = build_animated_webp(&[f0.clone(), f1_lossless]).unwrap();
+        let file_delta = build_animated_webp(&[f0, f1_delta]).unwrap();
+
+        assert!(
+            file_delta.len() < file_lossless.len(),
+            "delta-mode file ({} bytes) must beat lossless ({} bytes) on a 4×4 change",
+            file_delta.len(),
+            file_lossless.len(),
         );
-        f.mode = AnimFrameMode::Delta;
-        assert_eq!(build_animated_webp(&[f]), Err(WebpError::Unsupported));
+    }
+
+    #[test]
+    fn auto_mode_picks_dirty_rect_on_localised_change() {
+        // Same 4×4-change setup as above; Auto must pick the smaller
+        // (delta) candidate.
+        let w = 16u32;
+        let h = 16u32;
+        let mut f0 = AnimFrame::new(w, h, solid_rgba(w, h, [200, 100, 50, 255]), 80);
+        f0.mode = AnimFrameMode::Lossless;
+        let mut f1_pixels = solid_rgba(w, h, [200, 100, 50, 255]);
+        for row in 6..10 {
+            for col in 6..10 {
+                let off = (row * w as usize + col) * 4;
+                f1_pixels[off] = 0;
+            }
+        }
+        let mut f1_auto = AnimFrame::new(w, h, f1_pixels.clone(), 80);
+        f1_auto.mode = AnimFrameMode::Auto;
+        let mut f1_lossless = AnimFrame::new(w, h, f1_pixels, 80);
+        f1_lossless.mode = AnimFrameMode::Lossless;
+
+        let file_auto = build_animated_webp(&[f0.clone(), f1_auto]).unwrap();
+        let file_lossless = build_animated_webp(&[f0, f1_lossless]).unwrap();
+
+        assert!(
+            file_auto.len() <= file_lossless.len(),
+            "auto-mode never regresses vs lossless ({} vs {} bytes)",
+            file_auto.len(),
+            file_lossless.len(),
+        );
+    }
+
+    #[test]
+    fn dirty_rect_canvas_coords_covers_only_the_changed_pixels() {
+        let w = 8u32;
+        let h = 8u32;
+        let mut prev = solid_rgba(w, h, [0, 0, 0, 0]);
+        let _ = &mut prev;
+        let mut pixels = solid_rgba(w, h, [0, 0, 0, 0]);
+        pixels[(3 * 8 + 5) * 4] = 0xff;
+        pixels[(4 * 8 + 5) * 4 + 1] = 0xee;
+        let f = AnimFrame::new(w, h, pixels, 0);
+        let rect = dirty_rect_canvas_coords(&f, w, h, &prev).expect("change exists");
+        // Single-pixel changes at (5,3) and (5,4); after even-alignment of
+        // the top-left, the rect spans x ∈ [4, 5], y ∈ [2, 4].
+        assert_eq!(rect.x % 2, 0);
+        assert_eq!(rect.y % 2, 0);
+        assert!(rect.x <= 5 && rect.x + rect.w > 5);
+        assert!(rect.y <= 3 && rect.y + rect.h > 4);
+    }
+
+    #[test]
+    fn dirty_rect_is_none_on_identical_frames() {
+        let w = 4u32;
+        let h = 4u32;
+        let pixels = solid_rgba(w, h, [1, 2, 3, 255]);
+        let prev = pixels.clone();
+        let f = AnimFrame::new(w, h, pixels, 0);
+        assert!(dirty_rect_canvas_coords(&f, w, h, &prev).is_none());
     }
 
     #[test]
