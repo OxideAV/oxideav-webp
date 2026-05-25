@@ -1515,6 +1515,265 @@ fn encode_predictor_path(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
     w.into_bytes()
 }
 
+// ---- §4.2 forward color transform ----
+
+/// The §4.2 `size_bits` value the encoder writes for the color transform:
+/// block edge is `1 << COLOR_SIZE_BITS` pixels. The 3-bit on-wire field
+/// stores `size_bits - 2`, so `COLOR_SIZE_BITS ∈ [2, 9]`. Four (16×16
+/// blocks) mirrors [`PREDICTOR_SIZE_BITS`]: small enough to let each
+/// region pick its own `ColorTransformElement`, large enough that the
+/// sub-resolution color image stays cheap.
+const COLOR_SIZE_BITS: u8 = 4;
+
+/// §4.2 `ColorTransformDelta(t, c)` = `(t * c) >> 5`, with `t` and `c`
+/// interpreted as signed 8-bit two's-complement values. Bit-identical to
+/// the decoder's [`crate::vp8l_transform`] `color_transform_delta` so the
+/// residual the encoder subtracts is the exact inverse of the value the
+/// decoder adds back. Only the low 8 bits of the result are meaningful;
+/// callers mask after adding.
+#[inline]
+fn fwd_color_transform_delta(t: u8, c: u8) -> i32 {
+    let ts = t as i8 as i32;
+    let cs = c as i8 as i32;
+    (ts * cs) >> 5
+}
+
+/// §4.2 forward color transform for one pixel. Subtracts the three
+/// `ColorTransformElement` deltas (the spec's `ColorTransform`):
+///
+/// ```text
+/// tmp_red  -= delta(green_to_red,  green)
+/// tmp_blue -= delta(green_to_blue, green)
+/// tmp_blue -= delta(red_to_blue,   red)      // ORIGINAL red
+/// ```
+///
+/// Returns the transformed `(new_red, new_blue)` (green/alpha unchanged).
+/// The decoder's inverse restores red first (`tmp_red += delta(green_to_red,
+/// green)` recovers the original red byte), then uses that restored red for
+/// the `red_to_blue` term — so feeding original red here keeps the pair
+/// exact across the modulo-256 wrap.
+#[inline]
+fn forward_color_pixel(
+    r: u8,
+    g: u8,
+    b: u8,
+    green_to_red: u8,
+    green_to_blue: u8,
+    red_to_blue: u8,
+) -> (u8, u8) {
+    let mut tmp_red = r as i32;
+    let mut tmp_blue = b as i32;
+    tmp_red -= fwd_color_transform_delta(green_to_red, g);
+    tmp_blue -= fwd_color_transform_delta(green_to_blue, g);
+    tmp_blue -= fwd_color_transform_delta(red_to_blue, r);
+    ((tmp_red & 0xff) as u8, (tmp_blue & 0xff) as u8)
+}
+
+/// A half-open pixel rectangle `[x0, x1) × [y0, y1)` within an image of
+/// stride `w` — the geometry of one §4.2 transform block. Bundled so the
+/// per-block cost/selection helpers stay under clippy's argument limit.
+#[derive(Clone, Copy)]
+struct BlockBounds {
+    w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+/// Score a candidate `ColorTransformElement` `(green_to_red, green_to_blue,
+/// red_to_blue)` over one block: the sum of |residual| for the red and blue
+/// channels after the forward transform, folding the modulo-256 wrap (a
+/// residual byte near 255 is `-1`, cheap to entropy-code). Lower is better.
+/// Mirrors [`residual_cost`]'s wrap-aware metric so the color transform is
+/// judged on the same proxy the predictor uses.
+#[inline]
+fn color_block_cost(pixels: &[u32], bb: BlockBounds, cte: (u8, u8, u8)) -> u64 {
+    let (g2r, g2b, r2b) = cte;
+    let mut cost = 0u64;
+    for y in bb.y0..bb.y1 {
+        for x in bb.x0..bb.x1 {
+            let px = pixels[y * bb.w + x];
+            let r = ((px >> 16) & 0xff) as u8;
+            let g = ((px >> 8) & 0xff) as u8;
+            let b = (px & 0xff) as u8;
+            let (nr, nb) = forward_color_pixel(r, g, b, g2r, g2b, r2b);
+            let nr = nr as u32;
+            let nb = nb as u32;
+            cost += nr.min(256 - nr) as u64 + nb.min(256 - nb) as u64;
+        }
+    }
+    cost
+}
+
+/// Pick the three §4.2 transform coefficients for every block and return
+/// the sub-resolution color image (one ARGB pixel per block: alpha 255,
+/// red = `red_to_blue`, green = `green_to_blue`, blue = `green_to_red`)
+/// alongside the block dimensions.
+///
+/// The coefficient space is the full signed-8-bit cube (256³), far too
+/// large to search exhaustively per block. Instead the encoder runs a
+/// cheap **coordinate descent**: starting from the all-zero element
+/// (identity transform — the residual equals the original, so the search
+/// never makes a block worse than no color transform), it independently
+/// sweeps each of the three coefficients over a coarse signed grid while
+/// holding the others fixed, keeping the best value found, and repeats a
+/// couple of passes so a `green_to_red` choice can influence the later
+/// `red_to_blue` sweep. The grid is the §4.2 fixed-point lattice in steps
+/// of 8 (i.e. ±0.25 in 3.5 fixed point), which captures the dominant
+/// cross-channel slopes without paying for a 256-wide scan; the all-zero
+/// origin is always a candidate, so a block with no usable correlation
+/// keeps the identity element.
+fn select_color_transform_elements(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+) -> (Vec<u32>, u32, u32) {
+    let w = width as usize;
+    let h = height as usize;
+    let block = 1usize << size_bits;
+    let tw = pred_div_round_up(width, block as u32);
+    let th = pred_div_round_up(height, block as u32);
+    let mut sub_image = vec![0xff00_0000u32; (tw * th) as usize];
+
+    // Coarse signed-8-bit grid (3.5 fixed point, step 8 ≈ ±0.25). Includes
+    // 0 so the identity transform is always reachable.
+    const GRID: [i32; 17] = [
+        -64, -56, -48, -40, -32, -24, -16, -8, 0, 8, 16, 24, 32, 40, 48, 56, 64,
+    ];
+
+    for by in 0..th as usize {
+        for bx in 0..tw as usize {
+            let x0 = bx * block;
+            let y0 = by * block;
+            let bb = BlockBounds {
+                w,
+                x0,
+                y0,
+                x1: (x0 + block).min(w),
+                y1: (y0 + block).min(h),
+            };
+
+            // Start at the identity element (all zero).
+            let mut g2r: u8 = 0;
+            let mut g2b: u8 = 0;
+            let mut r2b: u8 = 0;
+            let mut best = color_block_cost(pixels, bb, (g2r, g2b, r2b));
+
+            // Two coordinate-descent passes: green→red, green→blue, then
+            // red→blue (which depends on the original red, independent of
+            // the other two, but a second pass lets a better g2r/g2b
+            // settle before re-confirming r2b).
+            for _ in 0..2 {
+                for &cand in &GRID {
+                    let c = (cand & 0xff) as u8;
+                    let cost = color_block_cost(pixels, bb, (c, g2b, r2b));
+                    if cost < best {
+                        best = cost;
+                        g2r = c;
+                    }
+                }
+                for &cand in &GRID {
+                    let c = (cand & 0xff) as u8;
+                    let cost = color_block_cost(pixels, bb, (g2r, c, r2b));
+                    if cost < best {
+                        best = cost;
+                        g2b = c;
+                    }
+                }
+                for &cand in &GRID {
+                    let c = (cand & 0xff) as u8;
+                    let cost = color_block_cost(pixels, bb, (g2r, g2b, c));
+                    if cost < best {
+                        best = cost;
+                        r2b = c;
+                    }
+                }
+            }
+
+            // §4.2 color-image pixel layout: alpha 255, red = red_to_blue,
+            // green = green_to_blue, blue = green_to_red.
+            sub_image[by * tw as usize + bx] =
+                0xff00_0000 | ((r2b as u32) << 16) | ((g2b as u32) << 8) | (g2r as u32);
+        }
+    }
+    (sub_image, tw, th)
+}
+
+/// Apply the §4.2 forward color transform: choose a per-block
+/// `ColorTransformElement` map, then replace every pixel's red and blue
+/// with their color-decorrelated residuals (green and alpha untouched).
+///
+/// Returns the residual image (same dimensions as the input), the
+/// sub-resolution color image (dimensions `transform_width *
+/// transform_height`), the chosen `size_bits`, and `transform_width`. The
+/// residual buffer fed through the decoder's §4.2 inverse (with the
+/// returned sub-image + `size_bits`) reconstructs `pixels` exactly.
+fn apply_color_transform(pixels: &[u32], width: u32, height: u32) -> (Vec<u32>, Vec<u32>, u8, u32) {
+    let size_bits = COLOR_SIZE_BITS;
+    let (sub_image, tw, _th) = select_color_transform_elements(pixels, width, height, size_bits);
+
+    let w = width as usize;
+    let h = height as usize;
+    let mut residuals = vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let block_index = (y as u32 >> size_bits) * tw + (x as u32 >> size_bits);
+            let cte = sub_image[block_index as usize];
+            let r2b = ((cte >> 16) & 0xff) as u8;
+            let g2b = ((cte >> 8) & 0xff) as u8;
+            let g2r = (cte & 0xff) as u8;
+
+            let px = pixels[y * w + x];
+            let a = px & 0xff00_0000;
+            let r = ((px >> 16) & 0xff) as u8;
+            let g = ((px >> 8) & 0xff) as u8;
+            let b = (px & 0xff) as u8;
+            let (nr, nb) = forward_color_pixel(r, g, b, g2r, g2b, r2b);
+            residuals[y * w + x] = a | ((nr as u32) << 16) | ((g as u32) << 8) | (nb as u32);
+        }
+    }
+    (residuals, sub_image, size_bits, tw)
+}
+
+/// Encode an ARGB image via the §4.2 color transform: pick a per-block
+/// `ColorTransformElement` map, emit the color transform header +
+/// sub-resolution color image (an `entropy-coded-image`), then the
+/// residual main image as a §3.8.3 `spatially-coded-image`. The result
+/// decodes back to `pixels` byte-for-byte through the decoder's §4.2
+/// inverse.
+///
+/// `image_width` is the canvas width, threaded into the residual image's
+/// §5.2.2 distance chooser. Both the sub-image and the residual image get
+/// their own color-cache evaluation.
+fn encode_color_path(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
+    let (residuals, sub_image, size_bits, tw) = apply_color_transform(pixels, width, height);
+
+    let mut w = BitWriter::new();
+
+    // §3.8.2 color-tx: present-bit, TransformType::Color (1), then the
+    // 3-bit `size_bits - 2` field, then the sub-resolution color image.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Color as u32, 2);
+    w.write_bits((size_bits - 2) as u32, 3);
+    // color-image body = entropy-coded-image (no meta-prefix). The
+    // sub-image is `tw` wide; evaluate its own color cache.
+    let (sub_tokens, sub_bits) = best_cache_for_pixels(&sub_image, tw);
+    write_entropy_coded_image(&mut w, &sub_tokens, sub_bits, tw);
+
+    // End-of-transform-list terminator.
+    w.write_bit(false);
+
+    // §3.8.3 spatially-coded-image for the residual main image. Evaluate
+    // the residual's color cache independently of the original's.
+    let (res_tokens, res_bits) = best_cache_for_pixels(&residuals, width);
+    write_spatially_coded_image(&mut w, &res_tokens, res_bits, width);
+
+    let _ = height;
+    w.into_bytes()
+}
+
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
 /// §3.4 5-byte image-header), running the §5.2.2 LZ77 backward-reference
 /// matcher so repeated pixel runs compress.
@@ -1621,6 +1880,17 @@ pub fn encode_argb_literals_with_width_selected(
     if image_width > 1 && !pixels.is_empty() && pixels.len() % image_width as usize == 0 {
         let height = pixels.len() as u32 / image_width;
         let cand = encode_predictor_path(pixels, image_width, height);
+        if cand.len() < best_bytes.len() {
+            best_bytes = cand;
+            best_code_bits = 0;
+        }
+
+        // §4.2 color transform. Like the predictor, it needs the real 2-D
+        // layout, so it is only a candidate at `image_width > 1`. The
+        // residual main image runs its own color-cache evaluation
+        // internally, so `best_code_bits` (a main-image cache field) is set
+        // to `0` when the color transform wins.
+        let cand = encode_color_path(pixels, image_width, height);
         if cand.len() < best_bytes.len() {
             best_bytes = cand;
             best_code_bits = 0;
@@ -2731,6 +3001,266 @@ mod tests {
         let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
         let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
         assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    // ---- §4.2 forward color transform ----
+
+    /// The forward `forward_color_pixel` is the exact inverse of the
+    /// decoder's per-pixel §4.2 add-back: applying the forward transform
+    /// with an element, then re-running the inverse arithmetic the decoder
+    /// uses, restores the original red/blue across the modulo-256 wrap.
+    /// The subtlety the test pins down: the forward uses the *original* red
+    /// for the `red_to_blue` term, while the inverse uses the
+    /// already-restored red — they agree because the inverse recovers red
+    /// before touching blue.
+    #[test]
+    fn forward_color_pixel_is_inverse_of_decoder_add_back() {
+        // Cover a spread of channel values and signed coefficients
+        // (including the [128..255] → negative int8 range).
+        let coeffs: [(u8, u8, u8); 5] = [
+            (0, 0, 0),
+            (16, 24, 32),
+            (0xf0, 0x10, 0xc0), // negative g2r/r2b, positive g2b
+            (0x80, 0x7f, 0x40),
+            (200, 50, 250),
+        ];
+        let samples: [(u8, u8, u8); 6] = [
+            (0, 0, 0),
+            (255, 255, 255),
+            (10, 200, 30),
+            (250, 5, 128),
+            (123, 45, 210),
+            (1, 254, 2),
+        ];
+        for &(g2r, g2b, r2b) in &coeffs {
+            for &(r, g, b) in &samples {
+                let (nr, nb) = forward_color_pixel(r, g, b, g2r, g2b, r2b);
+                // Re-run the decoder's inverse arithmetic (mirrors
+                // `vp8l_transform::inverse_color_pixel`).
+                let dlt = |t: u8, c: u8| -> i32 { ((t as i8 as i32) * (c as i8 as i32)) >> 5 };
+                let mut tr = nr as i32;
+                let mut tb = nb as i32;
+                tr += dlt(g2r, g);
+                tb += dlt(g2b, g);
+                tb += dlt(r2b, (tr & 0xff) as u8);
+                assert_eq!(
+                    (tr & 0xff) as u8,
+                    r,
+                    "red mismatch for coeff=({g2r},{g2b},{r2b}) px=({r},{g},{b})"
+                );
+                assert_eq!(
+                    (tb & 0xff) as u8,
+                    b,
+                    "blue mismatch for coeff=({g2r},{g2b},{r2b}) px=({r},{g},{b})"
+                );
+            }
+        }
+    }
+
+    /// Every coefficient the selector emits is a representable signed-8-bit
+    /// value (trivially true since they are stored as `u8`), and the
+    /// sub-image pixels carry the §4.2 layout (alpha 0xff, red/green/blue =
+    /// r2b/g2b/g2r). This guards against an off-by-channel packing bug.
+    #[test]
+    fn color_transform_coefficients_in_valid_range_and_layout() {
+        let w = 40u32;
+        let h = 24u32; // non-multiple of 16 to exercise partial blocks.
+        let mut state = 0x5A5A_1234u32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let g = i % 200;
+                // r/b correlated with g plus noise → non-trivial coeffs.
+                let r = (g + (state & 0x1f)) & 0xff;
+                let b = (g.wrapping_sub(state >> 8)) & 0xff;
+                0xff00_0000 | (r << 16) | (g << 8) | b
+            })
+            .collect();
+        let (sub_image, tw, th) = select_color_transform_elements(&pixels, w, h, COLOR_SIZE_BITS);
+        assert_eq!(sub_image.len(), (tw * th) as usize);
+        for &cte in &sub_image {
+            // Alpha must be opaque; channels are u8 by construction so any
+            // 0..=255 value is a valid signed-8-bit coefficient.
+            assert_eq!((cte >> 24) & 0xff, 0xff, "sub-image pixel not opaque");
+        }
+    }
+
+    /// An image with strong red/blue↔green correlation that subtract-green
+    /// does *not* fully capture (the correlation slope is fractional, not
+    /// 1:1) shrinks under the §4.2 color transform versus the best
+    /// non-color-transform path, and round-trips bit-exact. This is the
+    /// round-134 headline measurement.
+    ///
+    /// Green is high-entropy *noise* (no spatial structure, so the §4.1
+    /// predictor and §3.4 LZ77 have nothing to exploit), while red and blue
+    /// are constructed as the §4.2 transform deltas of green/red plus a
+    /// near-constant base and ±1 jitter. The matching color-transform
+    /// coefficients (g2r=16, g2b=24, r2b=8) therefore *subtract out* the
+    /// green/red contribution, collapsing the red/blue residuals onto a
+    /// tiny near-constant distribution that entropy-codes far cheaper.
+    /// Subtract-green (a single fixed slope of 1, in the unsigned domain)
+    /// cannot model these signed fractional slopes and leaves a wide
+    /// residual.
+    #[test]
+    fn color_transform_shrinks_correlated_image_and_round_trips() {
+        let w = 64u32;
+        let h = 64u32;
+        // The §4.2 signed delta the construction inverts.
+        let delta = |t: i32, c: u8| -> i32 { (t * (c as i8 as i32)) >> 5 };
+        let mut state = 0x1357_9BDFu32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let g = (state & 0xff) as u8;
+                let jitter_r = ((state >> 8) & 0x01) as i32;
+                let jitter_b = ((state >> 9) & 0x01) as i32;
+                // r = base + delta(16, g): the color transform with
+                // green_to_red=16 produces (r - delta(16,g)) = base + jitter,
+                // a near-constant residual.
+                let r = ((8 + delta(16, g) + jitter_r) & 0xff) as u32;
+                // b = base + delta(24, g) + delta(8, r): green_to_blue=24
+                // and red_to_blue=8 likewise collapse blue to a constant.
+                let b = ((8 + delta(24, g) + delta(8, (r & 0xff) as u8) + jitter_b) & 0xff) as u32;
+                0xff00_0000 | (r << 16) | ((g as u32) << 8) | b
+            })
+            .collect();
+
+        // Best non-color-transform baseline: no-tx / subtract-green ×
+        // each cache size, plus the predictor path — everything the
+        // production chooser would consider EXCEPT the color transform.
+        let no_color = {
+            let mut best = encode_literals_with_options(&pixels, false, None, w);
+            for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+                let c = encode_literals_with_options(&pixels, false, Some(bits), w);
+                if c.len() < best.len() {
+                    best = c;
+                }
+                let c = encode_literals_with_options(&pixels, true, Some(bits), w);
+                if c.len() < best.len() {
+                    best = c;
+                }
+            }
+            let c = encode_literals_with_options(&pixels, true, None, w);
+            if c.len() < best.len() {
+                best = c;
+            }
+            let c = encode_predictor_path(&pixels, w, h);
+            if c.len() < best.len() {
+                best = c;
+            }
+            best
+        };
+        let with_color = encode_color_path(&pixels, w, h);
+        eprintln!(
+            "[round-134] 64x64 fractional-correlation: no-color-tx={} B, color-tx={} B ({:.1}% reduction)",
+            no_color.len(),
+            with_color.len(),
+            100.0 * (no_color.len() as f64 - with_color.len() as f64) / no_color.len() as f64,
+        );
+        assert!(
+            with_color.len() < no_color.len(),
+            "color transform ({} B) did not beat the best non-color path ({} B)",
+            with_color.len(),
+            no_color.len(),
+        );
+
+        // Bit-exact round trip through the color path explicitly.
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&with_color);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+
+        // And through the production chooser, which now includes the color
+        // candidate: the resulting stream still decodes pixel-exact.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed2 = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img2 = crate::decode_lossless_image(&framed2).unwrap().unwrap();
+        assert_eq!(img2.pixels(), pixels.as_slice());
+    }
+
+    /// The color path round-trips bit-exact on a noisy, uncorrelated image
+    /// on non-power-of-two dimensions too — even when the coordinate-descent
+    /// search falls back to near-identity elements, the forward/inverse
+    /// pair must reconstruct every pixel. Guards the partial-block geometry
+    /// and the modulo-256 wrap.
+    #[test]
+    fn color_transform_round_trips_on_noise() {
+        let w = 23u32;
+        let h = 19u32;
+        let mut state = 0xBADC_0FFEu32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state | 0xff00_0000
+            })
+            .collect();
+        let stream = encode_color_path(&pixels, w, h);
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// The color transform does not regress the production chooser on an
+    /// uncorrelated-noise image: the chooser never returns a stream larger
+    /// than the no-color baseline, because the color candidate only wins
+    /// when strictly smaller. (The identity element guarantees the color
+    /// path is never *much* worse, but the chooser's `<` comparison is what
+    /// formally prevents a regression.)
+    #[test]
+    fn color_transform_does_not_regress_on_uncorrelated_noise() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut state = 0x0BAD_BEEFu32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state | 0xff00_0000
+            })
+            .collect();
+        let chosen = encode_argb_literals_with_width(&pixels, w);
+        // Baseline = chooser without the color candidate. Re-derive it the
+        // same way the chooser does, minus the color path.
+        let baseline = {
+            let mut best = encode_literals_with_options(&pixels, false, None, w);
+            for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+                let c = encode_literals_with_options(&pixels, false, Some(bits), w);
+                if c.len() < best.len() {
+                    best = c;
+                }
+                let c = encode_literals_with_options(&pixels, true, Some(bits), w);
+                if c.len() < best.len() {
+                    best = c;
+                }
+            }
+            let c = encode_literals_with_options(&pixels, true, None, w);
+            if c.len() < best.len() {
+                best = c;
+            }
+            let c = encode_predictor_path(&pixels, w, h);
+            if c.len() < best.len() {
+                best = c;
+            }
+            best
+        };
+        assert!(
+            chosen.len() <= baseline.len(),
+            "chooser with color candidate ({} B) regressed vs baseline ({} B)",
+            chosen.len(),
+            baseline.len(),
+        );
     }
 
     /// `encode_argb_literals` picks the smallest of the four

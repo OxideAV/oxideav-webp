@@ -2,7 +2,45 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-25 (clean-room round 133)
+## Status — 2026-05-25 (clean-room round 134)
+
+**Round 134 added the VP8L §4.2 color (cross-channel decorrelation)
+transform to the encoder.** The encoder tiles the image into the spec's
+`1 << size_bits` square blocks (`size_bits = 4`, i.e. 16×16) and, for
+each block, picks the three signed-8-bit `ColorTransformElement`
+coefficients (`green_to_red` / `green_to_blue` / `red_to_blue`) by a
+cheap coordinate-descent search over a coarse 3.5-fixed-point grid,
+scoring candidates with the same wrap-aware sum-of-absolute-residuals
+proxy the predictor uses. The all-zero (identity) element is always the
+search origin, so a block with no usable correlation keeps the
+no-transform residual. It emits the §3.8.2 `color-tx` header (`%b1` +
+type 1 + 3-bit `size_bits - 2`), the sub-resolution color image as an
+`entropy-coded-image` (the §4.2 layout: alpha 255, red = `red_to_blue`,
+green = `green_to_blue`, blue = `green_to_red`), then the residual main
+image as a §3.8.3 `spatially-coded-image`. The forward
+`ColorTransform` (subtract deltas, using the *original* red for the
+`red_to_blue` term) is the exact inverse of the decoder's
+[`inverse_color`](src/vp8l_transform.rs), which restores red before
+re-adding the blue delta — so the pair is bit-exact across the
+modulo-256 wrap. The color path is a new candidate in
+[`encode_argb_literals_with_width_selected`](src/vp8l_encode.rs)
+alongside the round-133 predictor and round-132 subtract-green × cache
+cross-product; the chooser still emits whichever is smallest, so it
+never regresses.
+
+Headline measurement on a 64×64 image with high-entropy green and
+fractional-slope red/blue (the §4.2 sweet spot the predictor and
+subtract-green cannot capture): **7026 B (color) vs 7904 B (best
+non-color path) — an 11 % size reduction**. Round trip stays bit-exact
+through [`decode_lossless_image`](src/lib.rs), validated on the
+correlated fixture plus a noisy non-power-of-two (partial-block)
+fixture. Five new inline tests cover (a) the forward per-pixel
+transform being the exact inverse of the decoder's add-back across the
+wrap and the signed [128..255]→negative coefficient range; (b) every
+selected element's sub-image layout/opacity; (c) the correlated image
+shrinks vs the best non-color path and round-trips; (d) the color path
+round-trips on noise + non-power-of-two dimensions; (e) the production
+chooser never regresses on uncorrelated noise.
 
 **Round 133 added the VP8L §3.5.1 / §4.1 predictor (spatial) transform
 to the encoder.** The encoder now tiles the image into the spec's

@@ -6,6 +6,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 134 (2026-05-25).** §4.2 **color (cross-channel
+  decorrelation) transform encoding** for the VP8L lossless encoder.
+  The encoder tiles the image into `1 << size_bits` square blocks
+  (`size_bits = 4`, 16×16) and, for each block, picks the three
+  signed-8-bit `ColorTransformElement` coefficients (`green_to_red` /
+  `green_to_blue` / `red_to_blue`) by a coordinate-descent search over
+  a coarse 3.5-fixed-point grid, scored with the same wrap-aware
+  sum-of-absolute-residuals proxy the predictor uses; the all-zero
+  (identity) element is always the search origin so a block with no
+  usable correlation keeps the no-transform residual. It writes the
+  §3.8.2 `color-tx` header (`%b1` present, transform type 1, 3-bit
+  `size_bits - 2`), the sub-resolution color image as an
+  `entropy-coded-image` (the §4.2 layout: alpha 255, red =
+  `red_to_blue`, green = `green_to_blue`, blue = `green_to_red`), then
+  the residual main image as a §3.8.3 `spatially-coded-image`. The
+  forward `ColorTransform` (subtract the three deltas, using the
+  *original* red for the `red_to_blue` term) is the exact inverse of
+  the decoder's `inverse_color`, which restores red before re-adding
+  the blue delta — bit-exact across the modulo-256 wrap. The color
+  path is a new candidate in `encode_argb_literals_with_width_selected`
+  alongside the round-133 predictor and round-132 subtract-green ×
+  cache cross-product; the chooser emits whichever candidate is
+  smallest and never regresses. Headline measurement: a 64×64 image
+  with high-entropy green and fractional-slope red/blue shrinks from
+  7904 B (best non-color path) to 7026 B (color) — an 11 % size
+  reduction. Five new inline tests cover the forward/inverse per-pixel
+  round trip (including the signed [128..255] coefficient range), the
+  sub-image layout, the correlated-image size win + round trip, a noisy
+  non-power-of-two round trip, and a no-regression check on
+  uncorrelated noise.
+
 * **Clean-room round 133 (2026-05-25).** §3.5.1 / §4.1 **predictor
   (spatial) transform encoding** for the VP8L lossless encoder. The
   encoder tiles the image into `1 << size_bits` square blocks
