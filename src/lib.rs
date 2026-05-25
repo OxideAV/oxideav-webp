@@ -137,6 +137,7 @@ pub mod build;
 pub mod container;
 pub mod encoder_vp8;
 pub mod meta_prefix;
+pub mod near_lossless;
 #[cfg(feature = "registry")]
 pub mod registry;
 pub mod vp8_chunk;
@@ -1337,6 +1338,46 @@ pub fn encode_vp8l_argb_with(
     vp8l_encode::encode_vp8l_argb_with(argb, width, height, has_alpha)
         .map_err(Error::from)
         .map_err(WebpError::from)
+}
+
+/// Encode an ARGB image to a bare §2.6 / §3.4 `VP8L` bitstream after an
+/// optional **near-lossless** preprocessing pass — the encoder-side
+/// pixel-quantization step the cwebp `-near_lossless` flag controls.
+///
+/// `near_lossless_quality` is the same `[0..=100]` knob documented in
+/// [`near_lossless`]: **100 = lossless (no-op)** and **0 = maximum
+/// quantization**. The preprocessing rounds R, G, B to multiples of
+/// `2^n` (where `n = near_lossless::bits_to_drop_for_quality(quality)`)
+/// before the standard VP8L encode pipeline runs; alpha is left
+/// untouched. The output is a perfectly normal `VP8L` chunk payload that
+/// decodes back to the **quantized** ARGB values bit-exactly through
+/// [`decode_webp`] — no decoder change is needed.
+///
+/// At `quality = 100` (or any value ≥ 100) the preprocessing is a no-op
+/// and this function is byte-exact-equivalent to
+/// [`encode_vp8l_argb_with`] for the same `has_alpha` setting.
+///
+/// The compression win comes from the entropy stages (LZ77 / color-cache /
+/// Huffman) seeing fewer distinct colors and longer runs once low-order
+/// bits have been zeroed — a typical win on natural-image content at
+/// `quality = 60` is around 5–15 % at a PSNR floor that the
+/// [`near_lossless`] module-level documentation pins above 40 dB even at
+/// the worst-case rounding.
+pub fn encode_vp8l_argb_with_near_lossless(
+    argb: &[u32],
+    width: u32,
+    height: u32,
+    has_alpha: bool,
+    near_lossless_quality: u8,
+) -> Result<Vec<u8>, WebpError> {
+    let n = near_lossless::bits_to_drop_for_quality(near_lossless_quality);
+    if n == 0 {
+        // No-op fast path — guarantees byte-exact equivalence to the
+        // baseline encoder without allocating a quantized copy.
+        return encode_vp8l_argb_with(argb, width, height, has_alpha);
+    }
+    let quantized = near_lossless::quantize(argb, near_lossless_quality);
+    encode_vp8l_argb_with(&quantized, width, height, has_alpha)
 }
 
 /// Encode an ARGB image to a complete `.webp` file carrying a §2.6 `VP8L`

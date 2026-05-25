@@ -2,6 +2,59 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 139)
+
+**Round 139 added the VP8L lossless encoder's *near-lossless*
+preprocessing pass — the encoder-side pixel-quantization step the cwebp
+`-near_lossless` knob controls.** A new
+[`near_lossless`](src/near_lossless.rs) module exposes
+[`apply(&mut [u32], quality)`](src/near_lossless.rs) — an in-place RGB
+quantizer that rounds each color channel to the nearest multiple of
+`2^n` where `n = bits_to_drop_for_quality(quality)` (the spec text does
+not normatively define the formula; round 139 documents the chosen
+mapping `n = clamp((100 - q + 19) / 20, 0, 5)` explicitly so
+reproducibility is a property of *our* encoder). Alpha is preserved
+exactly. The new public entry point
+[`encode_vp8l_argb_with_near_lossless(argb, w, h, has_alpha, quality)`](src/lib.rs)
+runs the preprocessing then hands the (quantized) pixels to the
+existing VP8L pipeline — no decoder change is needed, the result is a
+perfectly normal `VP8L` chunk that round-trips bit-exactly through
+[`decode_webp`](src/lib.rs) to the *quantized* pixels.
+
+**Three round-139 guarantees** are pinned by integration tests in
+[`tests/published_near_lossless_api.rs`](tests/published_near_lossless_api.rs):
+(a) **`quality = 100` is byte-exact-equal to the baseline encoder** on
+every fixture tested (1×1, 3×5, 7×4, 16×16, 64×64 natural-gradient,
+96×96 noisy) — the no-op fast path returns from
+`encode_vp8l_argb_with` directly without allocating a quantized copy;
+(b) **`quality = 60` produces a smaller bitstream than `quality = 100`**
+on a deterministic 96×96 high-entropy fixture (27,770 B → 20,860 B, a
+**−24.9 % size reduction**), with PSNR 46.25 dB — well above the
+≥ 40 dB floor the test pins (typical-case worst error is `step/2 = 2`
+at `n = 2`, putting the floor at ~42 dB);
+(c) **decoder round-trip recovers the quantized ARGB exactly** at every
+quality level (q=60 and q=0 are explicit fixtures), and **alpha
+round-trips unchanged** through encode-quantize-decode at q=40 on a
+non-opaque image. Full quality table on the same noisy fixture: q=100
+27,770 B (no-op identity), q=95 / q=80 24,327 B / 51.20 dB,
+**q=60 20,860 B / 46.25 dB**, q=40 17,394 B / 40.43 dB, q=20 13,916 B /
+34.09 dB, q=0 10,451 B / 27.45 dB.
+
+What landed: a new 350-line `near_lossless` module with the
+`bits_to_drop_for_quality` mapping, the `quantize_channel` per-byte
+round-half-up-with-clamp primitive, `apply` (in-place) +
+`quantize` (out-of-place), and 12 inline tests covering the bucket
+mapping, monotonicity, clamp behaviour, error bounds (`step - 1` worst
+case, `step / 2` typical), alpha preservation across every quality
+level, and apply/quantize equivalence. A new `lib.rs` entry point
+`encode_vp8l_argb_with_near_lossless` provides the wrapper; 9
+integration tests + 1 measurement helper cover the three guarantees
+above plus dimension-mismatch error propagation, `quality > 100`
+clamping, the q=0 maximum-quantization round-trip, and the alpha
+preservation through full encode+decode. Total: **453** tests green
+(was 433: +20 from this round). Both `default` and
+`--no-default-features` builds pass clippy + fmt clean.
+
 ## Status — 2026-05-26 (clean-room round 138)
 
 **Round 138 lifted the §2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / §2.7.1.5

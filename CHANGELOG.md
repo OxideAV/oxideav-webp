@@ -6,6 +6,61 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 139 (2026-05-26).** **VP8L lossless encoder
+  *near-lossless* preprocessing.** A new
+  [`near_lossless`](src/near_lossless.rs) module exposes the in-place
+  RGB-channel quantizer `near_lossless::apply(&mut [u32], quality)` plus
+  its out-of-place sibling `near_lossless::quantize`; both round each
+  color channel to the nearest multiple of `2^n` where
+  `n = bits_to_drop_for_quality(quality)` per the documented mapping
+  `n = clamp((100 - q + 19) / 20, 0, 5)` — `q = 100` → 0 (no-op),
+  `q ∈ 80..=99` → 1, `q ∈ 60..=79` → 2, `q ∈ 40..=59` → 3,
+  `q ∈ 20..=39` → 4, `q ∈ 0..=19` → 5. Alpha is preserved bit-exactly
+  (the preprocessing never touches it). The new public entry point
+  [`encode_vp8l_argb_with_near_lossless(argb, w, h, has_alpha, quality)`](src/lib.rs)
+  runs the preprocessing pass and hands the (quantized) pixels to the
+  existing VP8L encoder — no decoder-side change is needed, the result
+  is a perfectly normal `VP8L` chunk that decodes back through
+  [`decode_webp`](src/lib.rs) to the quantized pixels bit-exactly.
+  RFC 9649 does not normatively define the near-lossless formula
+  (it is an encoder choice); the chosen mapping + per-channel
+  round-half-up-with-clamp rounding rule is documented in the module-
+  level docstring so reproducibility is a property of *our* encoder
+  rather than a portable cross-encoder guarantee.
+
+  **Three round-139 guarantees** are pinned by integration tests in
+  [`tests/published_near_lossless_api.rs`](tests/published_near_lossless_api.rs):
+  (a) `quality = 100` is byte-exact-equal to the baseline encoder on
+  every tested fixture (1×1, 3×5, 7×4, 16×16, 64×64 natural-gradient,
+  96×96 noisy); the no-op fast path returns from
+  `encode_vp8l_argb_with` directly. (b) `quality = 60` produces a
+  strictly smaller bitstream than `quality = 100` on a deterministic
+  96×96 high-entropy fixture (27,770 B → 20,860 B, **−24.9 %**) with
+  PSNR 46.25 dB — well above the test's ≥ 40 dB floor. (c) Decoder
+  round-trip recovers the quantized ARGB exactly at q=60 and q=0; alpha
+  round-trips unchanged through the full encode-decode cycle at q=40 on
+  a non-opaque image. Quality table on the noisy fixture: q=100 →
+  27,770 B (identity); q=95 / q=80 → 24,327 B / 51.20 dB; q=60 →
+  20,860 B / 46.25 dB; q=40 → 17,394 B / 40.43 dB; q=20 → 13,916 B /
+  34.09 dB; q=0 → 10,451 B / 27.45 dB.
+
+  Twelve new inline tests cover: the `bits_to_drop_for_quality` bucket
+  table, monotonic non-decreasing behaviour as quality drops, the
+  `quantize_channel` identity at `n = 0`, round-to-nearest behaviour at
+  `n = 1` and `n = 2`, the `255 → largest multiple of step ≤ 255` clamp
+  rule (`n = 1` → 254, `n = 2` → 252, `n = 5` → 224), the documented
+  error bounds (`step - 1` worst case across the upper clamp window,
+  `step / 2` tighter bound outside it), and `result % step == 0` over
+  every byte value × `n` combination. ARGB-level tests cover the
+  byte-for-byte identity at `q = 100` and `q > 100`, alpha preservation
+  across every quality level, the `q = 60 → multiples of 4` invariant,
+  per-channel error bound across `[0..255]` for every quality, and
+  apply/quantize equivalence at every quality step. Nine integration
+  tests + 1 measurement helper exercise the three guarantees end-to-end
+  plus dimension-mismatch error propagation and the alpha-through-the-
+  full-decode-cycle case. Total: **453** tests green (+20 from round
+  138).
+
 * **Clean-room round 138 (2026-05-26).** **`build::build_webp_file_with_metadata`
   — typed §2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / §2.7.1.5 `XMP ` writer at
   the container-builder layer.** The high-level
