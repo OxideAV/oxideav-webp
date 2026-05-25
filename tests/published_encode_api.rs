@@ -138,3 +138,132 @@ fn encode_vp8l_argb_rejects_dimension_mismatch() {
     let err = encode_vp8l_argb(&argb, 2, 2).expect_err("mismatch rejected");
     assert_eq!(err, WebpError::InvalidData);
 }
+
+// ─────────── Per-kind metadata round-trips (round 138) ───────────
+//
+// The round-115 encoder pre-existed `encode_vp8l_argb_with_metadata`
+// with all-three-set / all-three-absent coverage. Round 138 adds the
+// per-kind isolation tests that verify each of ICC / Exif / XMP can
+// be set on its own and round-trip through `extract_metadata` /
+// `decode_webp` without the other two leaking into the output. These
+// guard the §2.7.1 flag-octet's `I` / `E` / `X` bits against a stray
+// OR that would mis-declare features the file doesn't carry.
+
+#[test]
+fn encode_vp8l_argb_with_metadata_icc_only_round_trips() {
+    let (w, h) = (3u32, 3u32);
+    let argb = make_argb(w, h, true);
+    let icc = b"icc-only-profile-bytes-with-odd-length".to_vec();
+    let meta = WebpMetadata {
+        icc: Some(&icc),
+        exif: None,
+        xmp: None,
+    };
+    let file = encode_vp8l_argb_with_metadata(w, h, &argb, false, &meta).expect("icc-only .webp");
+    let read = extract_metadata(&file).expect("extract_metadata");
+    assert_eq!(read.icc.as_deref(), Some(&icc[..]));
+    assert_eq!(read.exif, None);
+    assert_eq!(read.xmp, None);
+    // Pixels survive.
+    let img = decode_webp(&file).expect("decode");
+    assert_eq!(img.frames[0].rgba, argb_to_rgba(&argb));
+}
+
+#[test]
+fn encode_vp8l_argb_with_metadata_exif_only_round_trips() {
+    let (w, h) = (3u32, 3u32);
+    let argb = make_argb(w, h, true);
+    let exif = b"Exif\x00\x00MM\x00*\x00\x00\x00\x08".to_vec();
+    let meta = WebpMetadata {
+        icc: None,
+        exif: Some(&exif),
+        xmp: None,
+    };
+    let file = encode_vp8l_argb_with_metadata(w, h, &argb, false, &meta).expect("exif-only .webp");
+    let read = extract_metadata(&file).expect("extract_metadata");
+    assert_eq!(read.icc, None);
+    assert_eq!(read.exif.as_deref(), Some(&exif[..]));
+    assert_eq!(read.xmp, None);
+    let img = decode_webp(&file).expect("decode");
+    assert_eq!(img.frames[0].rgba, argb_to_rgba(&argb));
+}
+
+#[test]
+fn encode_vp8l_argb_with_metadata_xmp_only_round_trips() {
+    let (w, h) = (3u32, 3u32);
+    let argb = make_argb(w, h, true);
+    let xmp = b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>".to_vec();
+    let meta = WebpMetadata {
+        icc: None,
+        exif: None,
+        xmp: Some(&xmp),
+    };
+    let file = encode_vp8l_argb_with_metadata(w, h, &argb, false, &meta).expect("xmp-only .webp");
+    let read = extract_metadata(&file).expect("extract_metadata");
+    assert_eq!(read.icc, None);
+    assert_eq!(read.exif, None);
+    assert_eq!(read.xmp.as_deref(), Some(&xmp[..]));
+    let img = decode_webp(&file).expect("decode");
+    assert_eq!(img.frames[0].rgba, argb_to_rgba(&argb));
+}
+
+#[test]
+fn encode_vp8l_argb_with_metadata_absent_kinds_round_trip_as_absent() {
+    // Asymmetric coverage: set only Exif, confirm ICC / XMP read back
+    // as None (not just empty Vecs or a stale slice from a previous
+    // call).
+    let (w, h) = (2u32, 2u32);
+    let argb = make_argb(w, h, true);
+    let exif = b"only-exif-set".to_vec();
+    let meta = WebpMetadata {
+        icc: None,
+        exif: Some(&exif),
+        xmp: None,
+    };
+    let file = encode_vp8l_argb_with_metadata(w, h, &argb, false, &meta).unwrap();
+    let read = extract_metadata(&file).unwrap();
+    assert!(
+        read.icc.is_none(),
+        "ICC must round-trip as None when absent"
+    );
+    assert!(
+        read.xmp.is_none(),
+        "XMP must round-trip as None when absent"
+    );
+    assert_eq!(read.exif.as_deref(), Some(&exif[..]));
+}
+
+// ─────────── build::build_webp_file_with_metadata published surface ───────────
+
+#[test]
+fn build_webp_file_with_metadata_round_trips_through_decoder() {
+    // Hand the build:: writer a real VP8L bitstream + metadata, parse
+    // the produced container, and confirm both the bitstream and the
+    // metadata payloads recover byte-for-byte.
+    use oxideav_webp::build::{build_webp_file_with_metadata, ImageKind, MetadataPayloads};
+
+    let (w, h) = (4u32, 4u32);
+    let argb = make_argb(w, h, true);
+    let bare = encode_vp8l_argb(&argb, w, h).expect("bare VP8L");
+
+    let icc = b"build_with_metadata_icc".to_vec();
+    let exif = b"build_with_metadata_exif".to_vec();
+    let xmp = b"build_with_metadata_xmp".to_vec();
+    let meta = MetadataPayloads {
+        icc: Some(&icc),
+        exif: Some(&exif),
+        xmp: Some(&xmp),
+    };
+    let file = build_webp_file_with_metadata(&bare, ImageKind::Lossless, w, h, meta)
+        .expect("build_webp_file_with_metadata");
+
+    // Pixels still decode through the published decoder.
+    let img = decode_webp(&file).expect("decode");
+    assert_eq!(img.frames[0].rgba, argb_to_rgba(&argb));
+
+    // Metadata reads back through the published extract_metadata.
+    let read = extract_metadata(&file).expect("extract_metadata");
+    assert_eq!(read.icc.as_deref(), Some(&icc[..]));
+    assert_eq!(read.exif.as_deref(), Some(&exif[..]));
+    assert_eq!(read.xmp.as_deref(), Some(&xmp[..]));
+}

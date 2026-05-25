@@ -2,7 +2,32 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-26 (clean-room round 137)
+## Status — 2026-05-26 (clean-room round 138)
+
+**Round 138 lifted the §2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / §2.7.1.5
+`XMP ` metadata writer up to the container-builder layer.** The
+high-level `encode_vp8l_argb_with_metadata` (round 115) already emitted
+the three metadata chunks for the VP8L pixel path, but the standalone
+`build::` module — the byte-pushing builders external encoders use to
+frame their own payloads — had no equivalent. Round 138 adds
+[`build::build_webp_file_with_metadata`](src/build.rs) +
+[`build::MetadataPayloads`](src/build.rs): a borrowed three-`Option<&[u8]>`
+bag plus a writer that picks the simple §2.5 / §2.6 layout when the bag
+is empty (byte-for-byte identical to `build::build_webp_file`) and the
+§2.7 extended layout when any kind is set, emitting chunks in the spec's
+order — `VP8X` first, `ICCP` before the bitstream, the `VP8 ` / `VP8L`
+bitstream, then `EXIF` and `XMP ` after — with the §2.7.1 flag octet
+(`I` / `E` / `X`) declaring exactly the kinds present. Twelve new tests
+in `build::tests` cover the per-kind isolation (each of ICC / Exif / XMP
+on its own sets only its own flag and emits only its own chunk),
+odd-length pad-byte behaviour, empty-payload edge case, and equivalence
+with `build_webp_file` on the no-metadata fast path; five new
+integration tests in `tests/published_encode_api.rs` exercise the
+per-kind isolation through `encode_vp8l_argb_with_metadata` +
+`extract_metadata` and round-trip a real VP8L bitstream through
+`build_webp_file_with_metadata`. All 428 tests green
+(337 lib + 50 + 8 + 4 + 11 + 18 + 0 integration). The build module's
+docstring now reflects that the metadata-chunk gap is closed.
 
 **Round 137 replaced the encoder's heuristic length-limited Huffman
 post-pass with a from-scratch *Package-Merge* (Larmore–Hirschberg 1990)
@@ -655,6 +680,16 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
     (one `VP8 ` / `VP8L` chunk); the `Extended*` variants emit `VP8X`
     + bitstream per §2.7's chunk-ordering rule. The §2.4 `File Size`
     field is computed as `4 + body.len()` per the RFC.
+  * [`build::build_webp_file_with_metadata(payload, image_kind, w, h, meta)`](src/build.rs)
+    (round 138) — §2.4 file writer extended with the §2.7.1.4 `ICCP`
+    and §2.7.1.5 `EXIF` / `XMP ` metadata chunks. Takes a
+    [`build::MetadataPayloads`](src/build.rs) borrowed bag of three
+    optional payloads; auto-promotes a simple `ImageKind` to the
+    extended `VP8X` layout whenever any metadata kind is set; emits
+    chunks in the §2.7 order (`VP8X` → `ICCP` → bitstream → `EXIF` →
+    `XMP `) and sets exactly the §2.7.1 `I` / `E` / `X` flag bits the
+    payloads imply. Byte-for-byte equivalent to `build_webp_file` on
+    the empty-metadata fast path.
   * Canvas-dim validation matches the parser's MUSTs symmetrically
     (zero / above 2^24 / product cap > 2^32 - 1).
   * Standalone-friendly: every public function compiles cleanly
@@ -1009,12 +1044,13 @@ validated bit-exact (all 16384 bytes) against `dwebp -alpha` on the
 | §2.7.1.1 `ANMF` Frame Data    | not yet — sub-RIFF bytes after 16-byte header opaque |
 | §2.7.1.2 `ALPH` info byte     | done (Rsv/P/F/C 2-bit decompose, typed enums)       |
 | §2.7.1.2 `ALPH` bitstream     | done — raw + headerless VP8L (green channel) + 4 inverse filters |
-| §2.7.1.4 `ICCP`               | surfaced as opaque chunk                            |
-| §2.7.1.5 `EXIF` / `XMP `      | surfaced as opaque chunks                           |
+| §2.7.1.4 `ICCP`               | read + **write** (r138 `build_webp_file_with_metadata`) |
+| §2.7.1.5 `EXIF` / `XMP `      | read + **write** (r138 `build_webp_file_with_metadata`) |
 | §2.7.1.6 unknown chunks       | surfaced (no special handling required by §2.7.1.6) |
 | §2.3 `build_chunk` writer     | done — generic FourCC+Size+payload+odd-pad emit     |
 | §2.7.1 `build_vp8x_chunk`     | done — typed flag-byte + 24-bit LE × 2 emit         |
 | §2.4 `build_webp_file`        | done — simple + extended `RIFF/WEBP` envelope       |
+| §2.4 `build_webp_file_with_metadata` | done (r138) — emits `VP8X` + optional `ICCP` / `EXIF` / `XMP ` in §2.7 order |
 | VP8L bitstream decode         | done — `decode_webp` / `decode_lossless_image` → RGBA |
 | `oxideav_core::Decoder` registration | done (r112) — `register()` installs the `webp` decoder factory |
 | VP8 lossy bitstream decode    | done (r124) — routed through `oxideav-vp8` → BT.601 RGBA |

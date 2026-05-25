@@ -6,6 +6,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 138 (2026-05-26).** **`build::build_webp_file_with_metadata`
+  — typed §2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / §2.7.1.5 `XMP ` writer at
+  the container-builder layer.** The high-level
+  `encode_vp8l_argb_with_metadata` (round 115) already framed metadata
+  inline for the VP8L pixel path; round 138 lifts the same logic into
+  the standalone `build::` module so external encoders can wrap any
+  `VP8 ` / `VP8L` bitstream payload with the §2.7 metadata chunks
+  without re-implementing the chunk-ordering rule. A new
+  [`build::MetadataPayloads`] borrowed bag carries the three optional
+  payloads; the writer picks the simple §2.5 / §2.6 layout when the bag
+  is empty (byte-for-byte identical to `build::build_webp_file`) and
+  auto-promotes to the §2.7 extended layout when any kind is present.
+  The emitted chunk order matches RFC 9649 §2.7 verbatim: `VP8X` first,
+  `ICCP` before the bitstream, the `VP8 ` / `VP8L` bitstream, then
+  `EXIF` and `XMP ` after — and the §2.7.1 flag octet (`I` / `E` / `X`
+  bits) declares exactly the kinds that follow, never an extra
+  unconditional OR. Twelve new tests in `build::tests` cover: empty
+  metadata + simple kind = byte-for-byte equivalence to
+  `build_webp_file`; simple kind + metadata auto-promotes to extended
+  with the right flag set; all-three-set emits in §2.7 order; per-kind
+  isolation (each of ICC / Exif / XMP individually sets only its own
+  flag and emits only its own chunk); odd-length payloads trigger the
+  §2.3 pad byte; empty metadata payloads (zero-length) still emit the
+  chunk + set the flag; extended kind + empty metadata matches
+  `build_webp_file`; canvas-validation errors propagate. Five new
+  integration tests in `tests/published_encode_api.rs` cover the
+  per-kind isolation at the published-API level
+  (`encode_vp8l_argb_with_metadata` + `extract_metadata`) plus a
+  round-trip through `build::build_webp_file_with_metadata` with a real
+  VP8L bitstream.
+
 * **Clean-room round 137 (2026-05-26).** **Optimal length-limited Huffman
   via Package-Merge.** The round-136 encoder built canonical Huffman from
   histograms, then post-passed with a heuristic depth-limiter ("lengthen
