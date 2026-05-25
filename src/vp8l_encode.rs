@@ -1774,6 +1774,196 @@ fn encode_color_path(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
     w.into_bytes()
 }
 
+// ---- §4.4 forward color-indexing (palette) transform ----
+
+/// §4.4 threshold: the maximum distinct-color count for which the
+/// color-indexing transform is applicable. Above this the palette would
+/// not fit the 8-bit `color_table_size` field (`ReadBits(8) + 1`).
+const COLOR_INDEXING_MAX_COLORS: usize = 256;
+
+/// §4.4 pixel-bundling `width_bits` for a given palette size, per the
+/// spec's Table 3 ("Color Table Size to Bundled Pixel Bit Width
+/// Mapping"). Bit-identical to the decoder's
+/// [`crate::vp8l_transform`] `color_indexing_width_bits`, so the
+/// subsampled width the encoder packs to matches the width the decoder
+/// reads the main image at.
+#[inline]
+fn fwd_color_indexing_width_bits(color_table_size: usize) -> u8 {
+    if color_table_size <= 2 {
+        3
+    } else if color_table_size <= 4 {
+        2
+    } else if color_table_size <= 16 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Collect the distinct ARGB colors of `pixels` in first-appearance
+/// (scan-line) order, returning `None` the moment the count would exceed
+/// [`COLOR_INDEXING_MAX_COLORS`] — at which point the §4.4 transform is
+/// inapplicable and the chooser skips it.
+///
+/// First-appearance order is one valid palette ordering; the spec places
+/// no constraint on the palette order (the index is what matters), so
+/// any deterministic ordering round-trips. First-appearance keeps the
+/// build a single O(n) pass with a 2^24-entry presence bitmap keyed on
+/// the low 24 bits plus an alpha disambiguation list, falling back to a
+/// linear scan only when two colors share their low 24 bits.
+fn build_palette(pixels: &[u32]) -> Option<Vec<u32>> {
+    let mut palette: Vec<u32> = Vec::new();
+    // 2^24-bit presence map over the low 24 bits (RGB) as a fast reject;
+    // collisions (same RGB, different alpha) fall through to the linear
+    // membership check against `palette`. 2 MiB heap, freed on return.
+    let mut seen_low = vec![0u8; 1 << 21]; // 2^24 bits.
+    for &px in pixels {
+        let low = (px & 0x00ff_ffff) as usize;
+        let byte = low >> 3;
+        let bit = 1u8 << (low & 7);
+        if seen_low[byte] & bit == 0 {
+            seen_low[byte] |= bit;
+            palette.push(px);
+            if palette.len() > COLOR_INDEXING_MAX_COLORS {
+                return None;
+            }
+        } else if !palette.contains(&px) {
+            // Same low-24 bits, different full ARGB (alpha differs).
+            palette.push(px);
+            if palette.len() > COLOR_INDEXING_MAX_COLORS {
+                return None;
+            }
+        }
+    }
+    Some(palette)
+}
+
+/// §4.4 forward subtraction-coding of the color table, the inverse of the
+/// decoder's [`crate::vp8l_transform::inverse_color_table`]. Entry `i` is
+/// replaced by the per-channel `(entry[i] - entry[i-1]) mod 256`; entry 0
+/// is left as-is. The decoder reconstructs by running prefix sums, so the
+/// stored deltas (typically low-entropy) decode back to the original
+/// palette exactly.
+fn forward_color_table(color_table: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(color_table.len());
+    for (i, &cur) in color_table.iter().enumerate() {
+        if i == 0 {
+            out.push(cur);
+            continue;
+        }
+        let prev = color_table[i - 1];
+        let a = (((cur >> 24) & 0xff).wrapping_sub((prev >> 24) & 0xff)) & 0xff;
+        let r = (((cur >> 16) & 0xff).wrapping_sub((prev >> 16) & 0xff)) & 0xff;
+        let g = (((cur >> 8) & 0xff).wrapping_sub((prev >> 8) & 0xff)) & 0xff;
+        let b = ((cur & 0xff).wrapping_sub(prev & 0xff)) & 0xff;
+        out.push((a << 24) | (r << 16) | (g << 8) | b);
+    }
+    out
+}
+
+/// §4.4 forward pixel replacement + bundling. Given `pixels` (canvas
+/// `width × height`) and the `index_of` map from ARGB color to palette
+/// index, produce the packed main image at the subsampled width
+/// `DIV_ROUND_UP(width, 1 << width_bits)`.
+///
+/// Each output pixel is opaque (`alpha = 255`, `red = blue = 0`) with the
+/// palette index(es) in its green channel. When `width_bits == 0` one
+/// index occupies the whole green byte; otherwise `count = 1 << width_bits`
+/// indices are bundled LSB-first into one green byte (`bits = 8 / count`
+/// per index), exactly matching the decoder's
+/// [`crate::vp8l_transform::inverse_color_indexing`] un-bundling. Indices
+/// beyond the row's last column (the partial trailing bundle) are zero,
+/// which the decoder never reads back because the un-bundler stops at
+/// `orig_width`.
+fn apply_color_indexing(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    index_of: &impl Fn(u32) -> u8,
+    width_bits: u8,
+) -> (Vec<u32>, u32) {
+    let w = width as usize;
+    let h = height as usize;
+    let count = 1usize << width_bits;
+    let bits = 8 / count; // 8, 4, 2, or 1 bits per index.
+    let packed_w = pred_div_round_up(width, count as u32) as usize;
+    let mut packed = vec![0xff00_0000u32; packed_w * h];
+    for y in 0..h {
+        for px in 0..packed_w {
+            let mut green = 0u32;
+            for j in 0..count {
+                let x = px * count + j;
+                if x >= w {
+                    break;
+                }
+                let index = index_of(pixels[y * w + x]) as u32;
+                green |= index << (j * bits);
+            }
+            packed[y * packed_w + px] = 0xff00_0000 | (green << 8);
+        }
+    }
+    (packed, packed_w as u32)
+}
+
+/// Encode an ARGB image via the §4.4 color-indexing (palette) transform:
+/// build the palette, emit the §3.8.2 color-indexing transform header
+/// (present-bit, `TransformType::ColorIndexing`, 8-bit `color_table_size -
+/// 1`), then the palette as a §3.8.2 `entropy-coded-image` (a
+/// `color_table_size × 1` image, subtraction-coded), then the index image
+/// (one palette index per pixel, packed into the green channel with §4.4
+/// pixel-bundling for palettes ≤ 16 colors) as a §3.8.3
+/// `spatially-coded-image` at the subsampled width.
+///
+/// Returns `None` when the image has more than [`COLOR_INDEXING_MAX_COLORS`]
+/// distinct colors (the transform is inapplicable). The returned bytes
+/// decode back to `pixels` byte-for-byte through the decoder's §4.4
+/// inverse.
+fn encode_color_indexing_path(pixels: &[u32], width: u32, height: u32) -> Option<Vec<u8>> {
+    let palette = build_palette(pixels)?;
+    if palette.is_empty() {
+        return None;
+    }
+    let color_table_size = palette.len();
+    let width_bits = fwd_color_indexing_width_bits(color_table_size);
+
+    // Color-to-index lookup. The palette is small (≤256), so a flat
+    // 256-slot map keyed on the low byte plus a linear fallback would be
+    // overkill; a HashMap keeps the closure simple and the build O(n).
+    let mut index_map = std::collections::HashMap::with_capacity(color_table_size);
+    for (i, &c) in palette.iter().enumerate() {
+        index_map.insert(c, i as u8);
+    }
+    let index_of = |c: u32| -> u8 { index_map[&c] };
+
+    let (packed, packed_w) = apply_color_indexing(pixels, width, height, &index_of, width_bits);
+
+    let mut w = BitWriter::new();
+
+    // §3.8.2 color-indexing-tx: present-bit, TransformType::ColorIndexing
+    // (3), then the 8-bit `color_table_size - 1` field.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::ColorIndexing as u32, 2);
+    w.write_bits((color_table_size - 1) as u32, 8);
+
+    // color-indexing-image body = entropy-coded-image (no meta-prefix),
+    // a `color_table_size × 1` subtraction-coded palette. Evaluate its own
+    // color cache.
+    let table = forward_color_table(&palette);
+    let (table_tokens, table_bits) = best_cache_for_pixels(&table, color_table_size as u32);
+    write_entropy_coded_image(&mut w, &table_tokens, table_bits, color_table_size as u32);
+
+    // End-of-transform-list terminator.
+    w.write_bit(false);
+
+    // §3.8.3 spatially-coded-image for the packed index image at the
+    // subsampled width. Evaluate its own color cache.
+    let (idx_tokens, idx_bits) = best_cache_for_pixels(&packed, packed_w);
+    write_spatially_coded_image(&mut w, &idx_tokens, idx_bits, packed_w);
+
+    let _ = height;
+    Some(w.into_bytes())
+}
+
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
 /// §3.4 5-byte image-header), running the §5.2.2 LZ77 backward-reference
 /// matcher so repeated pixel runs compress.
@@ -1894,6 +2084,22 @@ pub fn encode_argb_literals_with_width_selected(
         if cand.len() < best_bytes.len() {
             best_bytes = cand;
             best_code_bits = 0;
+        }
+
+        // §4.4 color-indexing (palette) transform. Applicable only when the
+        // image has ≤ 256 distinct colors; `encode_color_indexing_path`
+        // returns `None` otherwise, so high-color images skip it without
+        // paying for a doomed encode. On a low-color image the palette path
+        // replaces every pixel with a single index byte (and bundles 2/4/8
+        // indices per byte for palettes ≤ 16 colors), so it typically wins
+        // by a wide margin. The packed index image runs its own color-cache
+        // evaluation internally, so `best_code_bits` (a main-image cache
+        // field) is set to `0` when the color-indexing transform wins.
+        if let Some(cand) = encode_color_indexing_path(pixels, image_width, height) {
+            if cand.len() < best_bytes.len() {
+                best_bytes = cand;
+                best_code_bits = 0;
+            }
         }
     }
 
@@ -3263,6 +3469,247 @@ mod tests {
         );
     }
 
+    // ---- §4.4 color-indexing (palette) transform ----
+
+    /// §4.4 width_bits mapping matches the decoder's Table 3 thresholds.
+    #[test]
+    fn color_indexing_width_bits_matches_table_3() {
+        assert_eq!(fwd_color_indexing_width_bits(1), 3);
+        assert_eq!(fwd_color_indexing_width_bits(2), 3);
+        assert_eq!(fwd_color_indexing_width_bits(3), 2);
+        assert_eq!(fwd_color_indexing_width_bits(4), 2);
+        assert_eq!(fwd_color_indexing_width_bits(5), 1);
+        assert_eq!(fwd_color_indexing_width_bits(16), 1);
+        assert_eq!(fwd_color_indexing_width_bits(17), 0);
+        assert_eq!(fwd_color_indexing_width_bits(256), 0);
+    }
+
+    /// `build_palette` collects distinct colors in first-appearance order
+    /// and rejects images with more than 256 distinct colors.
+    #[test]
+    fn build_palette_collects_distinct_and_rejects_high_color() {
+        let pixels = [
+            0xff11_2233u32,
+            0xff44_5566,
+            0xff11_2233, // repeat
+            0xaa11_2233, // same RGB, different alpha → distinct
+        ];
+        let pal = build_palette(&pixels).unwrap();
+        assert_eq!(pal, vec![0xff11_2233, 0xff44_5566, 0xaa11_2233]);
+
+        // 257 distinct colors → None.
+        let many: Vec<u32> = (0..257u32).map(|i| 0xff00_0000 | i).collect();
+        assert!(build_palette(&many).is_none());
+        // Exactly 256 distinct colors → Some.
+        let edge: Vec<u32> = (0..256u32).map(|i| 0xff00_0000 | i).collect();
+        assert_eq!(build_palette(&edge).unwrap().len(), 256);
+    }
+
+    /// `forward_color_table` is the exact inverse of the decoder's
+    /// subtraction-decoding, so feeding its output through
+    /// `inverse_color_table` restores the original palette.
+    #[test]
+    fn forward_color_table_inverts_decoder() {
+        let palette = vec![0xff11_2233u32, 0xee44_5566, 0x80ab_cdef, 0x00ff_0010];
+        let mut decoded = forward_color_table(&palette);
+        crate::vp8l_transform::inverse_color_table(&mut decoded);
+        assert_eq!(decoded, palette);
+    }
+
+    /// A ≤16-color synthetic image picks the color-indexing transform with
+    /// pixel-bundling and shrinks substantially versus every non-palette
+    /// candidate; the resulting stream is bit-exact decodable.
+    #[test]
+    fn color_indexing_bundled_shrinks_and_round_trips() {
+        let w = 64u32;
+        let h = 64u32;
+        // 8-color palette → width_bits = 1 (two indices per green byte).
+        let palette = [
+            0xff10_2030u32,
+            0xff40_5060,
+            0xff70_8090,
+            0xffa0_b0c0,
+            0xffd0_e0f0,
+            0xff00_1122,
+            0xff33_4455,
+            0xff66_7788,
+        ];
+        let mut state = 0x2468_ACE0u32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                palette[(state as usize) % palette.len()]
+            })
+            .collect();
+
+        // Confirm the palette path bundles (width_bits = 1 for 8 colors).
+        assert_eq!(fwd_color_indexing_width_bits(palette.len()), 1);
+
+        // Best non-palette baseline: everything the production chooser
+        // considers EXCEPT the color-indexing transform.
+        let no_palette = {
+            let mut best = encode_literals_with_options(&pixels, false, None, w);
+            for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+                let c = encode_literals_with_options(&pixels, false, Some(bits), w);
+                if c.len() < best.len() {
+                    best = c;
+                }
+                let c = encode_literals_with_options(&pixels, true, Some(bits), w);
+                if c.len() < best.len() {
+                    best = c;
+                }
+            }
+            let c = encode_literals_with_options(&pixels, true, None, w);
+            if c.len() < best.len() {
+                best = c;
+            }
+            let c = encode_predictor_path(&pixels, w, h);
+            if c.len() < best.len() {
+                best = c;
+            }
+            let c = encode_color_path(&pixels, w, h);
+            if c.len() < best.len() {
+                best = c;
+            }
+            best
+        };
+        let with_palette = encode_color_indexing_path(&pixels, w, h).unwrap();
+        eprintln!(
+            "[round-135] 64x64 8-color bundled: no-palette={} B, palette={} B ({:.1}% reduction)",
+            no_palette.len(),
+            with_palette.len(),
+            100.0 * (no_palette.len() as f64 - with_palette.len() as f64) / no_palette.len() as f64,
+        );
+        assert!(
+            with_palette.len() < no_palette.len(),
+            "color-indexing ({} B) did not beat the best non-palette path ({} B)",
+            with_palette.len(),
+            no_palette.len(),
+        );
+
+        // Bit-exact round trip through the palette path explicitly.
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&with_palette);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+
+        // And through the production chooser, which now includes the palette
+        // candidate and should pick it.
+        let chosen = encode_argb_literals_with_width(&pixels, w);
+        assert_eq!(
+            chosen.len(),
+            with_palette.len(),
+            "production chooser did not select the color-indexing path"
+        );
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed2 = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img2 = crate::decode_lossless_image(&framed2).unwrap().unwrap();
+        assert_eq!(img2.pixels(), pixels.as_slice());
+    }
+
+    /// An unbundled palette (17..256 colors, width_bits = 0) round-trips
+    /// bit-exact: one index per green byte, no pixel-bundling.
+    #[test]
+    fn color_indexing_unbundled_round_trips() {
+        let w = 40u32;
+        let h = 30u32;
+        // 64-color palette → width_bits = 0 (no bundling).
+        let palette: Vec<u32> = (0..64u32)
+            .map(|i| 0xff00_0000 | (i * 0x0004_0301))
+            .collect();
+        assert_eq!(fwd_color_indexing_width_bits(palette.len()), 0);
+        let mut state = 0xDEAD_BEEFu32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                palette[(state as usize) % palette.len()]
+            })
+            .collect();
+
+        let with_palette = encode_color_indexing_path(&pixels, w, h).unwrap();
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&with_palette);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+
+        // The chooser should pick it on this low-color image.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed2 = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img2 = crate::decode_lossless_image(&framed2).unwrap().unwrap();
+        assert_eq!(img2.pixels(), pixels.as_slice());
+    }
+
+    /// Bundling on a non-power-of-two width exercises the partial trailing
+    /// bundle: the last green byte of each row holds fewer than `count`
+    /// indices, and the decoder's un-bundler must stop at `orig_width`.
+    /// Covers width_bits = 2 (4 indices/byte) and width_bits = 3 (8/byte).
+    #[test]
+    fn color_indexing_bundled_partial_row_round_trips() {
+        for palette_len in [2usize, 4] {
+            // palette_len 2 → width_bits 3 (8/byte); 4 → width_bits 2 (4/byte).
+            let w = 23u32; // not a multiple of 8 or 4.
+            let h = 7u32;
+            let palette: Vec<u32> = (0..palette_len as u32)
+                .map(|i| 0xff00_0000 | (i * 0x0011_2233))
+                .collect();
+            let mut state = 0x0F0F_0F0Fu32 ^ palette_len as u32;
+            let pixels: Vec<u32> = (0..(w * h))
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    palette[(state as usize) % palette.len()]
+                })
+                .collect();
+            let with_palette = encode_color_indexing_path(&pixels, w, h).unwrap();
+            let header = build_image_header(w, h, false);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&with_palette);
+            let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+            let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+            assert_eq!(
+                img.pixels(),
+                pixels.as_slice(),
+                "palette_len {palette_len} partial-row round trip failed"
+            );
+        }
+    }
+
+    /// A > 256-color image is NOT eligible for the color-indexing transform:
+    /// `encode_color_indexing_path` returns `None` and the production
+    /// chooser falls back to a non-palette path, still decoding bit-exact.
+    #[test]
+    fn color_indexing_rejected_on_high_color_image() {
+        let w = 40u32;
+        let h = 40u32;
+        // 1600 pixels, almost all distinct → > 256 colors.
+        let mut state = 0xABCD_1234u32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state | 0xff00_0000
+            })
+            .collect();
+        assert!(build_palette(&pixels).is_none());
+        assert!(encode_color_indexing_path(&pixels, w, h).is_none());
+
+        // The chooser still produces a valid, decodable stream.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
     /// `encode_argb_literals` picks the smallest of the four
     /// `(no-tx | sg) × (no-cache | cache)` paths it evaluates, so on
     /// any image its output equals the minimum of all four candidate
@@ -4010,15 +4457,22 @@ mod tests {
         );
     }
 
-    /// On a palette-heavy synthetic image the chooser must pick a
-    /// non-zero cache size: every pixel is drawn from a small palette
-    /// repeated in a pseudo-random order, so each repeat is a
-    /// `CacheRef` win that more than pays for the §5.2.3 header.
-    /// (a) of the round-132 brief.
+    /// On a palette-heavy synthetic image the §5.2.3 color-cache axis must
+    /// pick a non-zero cache size: every pixel is drawn from a small palette
+    /// repeated in a pseudo-random order, so each repeat is a `CacheRef` win
+    /// that more than pays for the §5.2.3 header. (a) of the round-132 brief.
+    ///
+    /// As of round 135 the production chooser ([`encode_argb_literals_with_width_selected`])
+    /// also evaluates the §4.4 color-indexing transform, which wins outright
+    /// on a 12-color image (it replaces each pixel with a one-byte index and
+    /// reports `code_bits = 0`, since its caches are internal to the packed
+    /// index image). To keep this test scoped to the cache-size axis — the
+    /// round-132 brief's actual subject — it exercises the
+    /// no-transform × cache cross-product directly via
+    /// [`best_cache_for_pixels`] rather than the full transform chooser.
     #[test]
     fn size_selection_picks_nonzero_on_palette_heavy_image() {
         let w = 64u32;
-        let h = 64u32;
         let palette: [u32; 12] = [
             0xff10_2030,
             0xff40_5060,
@@ -4033,15 +4487,19 @@ mod tests {
             0xff11_2233,
             0xff44_5566,
         ];
-        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut pixels = Vec::with_capacity((w * 64) as usize);
         let mut state = 0x1357_9bdfu32;
-        for _ in 0..(w * h) {
+        for _ in 0..(w * 64) {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
             pixels.push(palette[(state as usize) % palette.len()]);
         }
-        let (_, chosen) = encode_argb_literals_with_width_selected(&pixels, w);
+        // Cache-size axis only: `best_cache_for_pixels` cross-products the
+        // no-cache baseline against every candidate cache size and returns
+        // the winner's `code_bits`. The palette repeats reward a cache hit.
+        let (_, chosen_bits) = best_cache_for_pixels(&pixels, w);
+        let chosen = chosen_bits.unwrap_or(0);
         assert_ne!(
             chosen, 0,
             "palette-heavy image should engage the §5.2.3 color cache, got code_bits=0",

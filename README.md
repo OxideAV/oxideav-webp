@@ -2,7 +2,37 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-25 (clean-room round 134)
+## Status — 2026-05-25 (clean-room round 135)
+
+**Round 135 added the VP8L §3.5.4 / §4.4 color-indexing (palette)
+transform to the encoder — the last unimplemented VP8L transform on the
+encode side.** When the image has ≤ 256 distinct ARGB colors, the encoder
+builds the palette (first-appearance order), emits the §3.8.2
+`color-indexing-tx` header (`%b1` + type 3 + 8-bit `color_table_size - 1`),
+the palette as a `color_table_size × 1` `entropy-coded-image` that is
+per-channel subtraction-coded (the exact inverse of the decoder's
+[`inverse_color_table`](src/vp8l_transform.rs)), then replaces every pixel
+with its palette index in the green channel and emits that index image as a
+§3.8.3 `spatially-coded-image`. For palettes ≤ 16 colors it applies the
+spec's §4.4 pixel-bundling per Table 3 — packing 2 / 4 / 8 indices
+LSB-first into one green byte at `width_bits` 1 / 2 / 3, subsampling the
+main-image width by `DIV_ROUND_UP(width, 1 << width_bits)`. The forward
+field layout is bit-identical to the decoder's
+[`inverse_color_indexing`](src/vp8l_transform.rs) un-bundler, so the stream
+round-trips bit-exact (including the trailing partial bundle on
+non-multiple widths). The palette path is a new candidate in
+[`encode_argb_literals_with_width_selected`](src/vp8l_encode.rs) alongside
+the round-134 color, round-133 predictor, and round-132 subtract-green ×
+cache cross-product; it returns `None` on > 256-color images (so the
+chooser skips it) and only wins on low-color images. Headline measurement:
+a 64×64 8-color image (`width_bits = 1`, two indices per byte) shrinks from
+1982 B (best non-palette path) to 1858 B (palette) — a 6.3 % reduction;
+spatially-coherent palette art shrinks far more. Five new inline tests
+cover the Table-3 `width_bits` mapping + palette build/rejection, the
+subtraction-coding round trip, the bundled size win + chooser selection +
+bit-exact round trip, an unbundled (17..256-color) round trip, the
+partial-row bundle on odd widths, and the > 256-color rejection through the
+production chooser.
 
 **Round 134 added the VP8L §4.2 color (cross-channel decorrelation)
 transform to the encoder.** The encoder tiles the image into the spec's
@@ -216,9 +246,9 @@ near-row distances compounds the per-emission saving via the §5.2.2
 distance-prefix Huffman tree (more frequent low-prefix codes amortise
 the table overhead). Round trip is bit-exact across every fixture above
 through [`decode_webp`](src/lib.rs) / [`decode_lossless_image`](src/lib.rs).
-Still lacks (as of this round): §3.8.2 color / color-indexing transform
-encoding (subtract-green and — as of round 133 — the §4.1 predictor
-transform are the transforms the encoder applies), and VP8 lossy encode.
+Still lacks (as of this round): VP8 lossy encode. (All four VP8L §3.8.2
+transforms now have encode support — subtract-green, §4.1 predictor
+[r133], §4.2 color [r134], and §4.4 color-indexing [r135].)
 
 ## Status — 2026-05-25 (clean-room round 127)
 
