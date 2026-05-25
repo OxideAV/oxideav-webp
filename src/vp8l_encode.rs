@@ -1168,6 +1168,353 @@ pub fn apply_subtract_green(pixels: &mut [u32]) {
     }
 }
 
+// ---- §3.5.1 / §4.1 forward predictor transform ----
+
+/// The number of §4.1 prediction modes (`[0..13]`).
+const NUM_PREDICTOR_MODES: u8 = 14;
+
+/// The §4.1 `size_bits` value the encoder writes: block edge is
+/// `1 << PREDICTOR_SIZE_BITS` pixels. The 3-bit on-wire field stores
+/// `size_bits - 2`, so `PREDICTOR_SIZE_BITS ∈ [2, 9]`. Four (16×16 blocks)
+/// balances per-block mode granularity against the cost of the
+/// sub-resolution predictor image: smaller blocks adapt the predictor to
+/// local image structure but inflate the sub-image, larger blocks shrink
+/// the sub-image but force one mode over a wide area.
+const PREDICTOR_SIZE_BITS: u8 = 4;
+
+/// §4.1 `(a + b) / 2` per ARGB channel. Bit-identical to the decoder's
+/// `average2` so the forward residual the encoder subtracts is the exact
+/// inverse of the value the decoder will add back.
+#[inline]
+fn pred_average2(a: u32, b: u32) -> u32 {
+    let f = |sh: u32| -> u32 {
+        let ca = (a >> sh) & 0xff;
+        let cb = (b >> sh) & 0xff;
+        (ca + cb) / 2
+    };
+    (f(24) << 24) | (f(16) << 16) | (f(8) << 8) | f(0)
+}
+
+/// §4.1 `Clamp(a)` to `[0, 255]`.
+#[inline]
+fn pred_clamp(a: i32) -> i32 {
+    a.clamp(0, 255)
+}
+
+/// §4.1 `ClampAddSubtractFull(a, b, c) = Clamp(a + b - c)` per channel.
+#[inline]
+fn pred_clamp_add_subtract_full(a: u32, b: u32, c: u32) -> u32 {
+    let f = |sh: u32| -> u32 {
+        let ca = ((a >> sh) & 0xff) as i32;
+        let cb = ((b >> sh) & 0xff) as i32;
+        let cc = ((c >> sh) & 0xff) as i32;
+        pred_clamp(ca + cb - cc) as u32
+    };
+    (f(24) << 24) | (f(16) << 16) | (f(8) << 8) | f(0)
+}
+
+/// §4.1 `ClampAddSubtractHalf(a, b) = Clamp(a + (a - b) / 2)` per channel.
+#[inline]
+fn pred_clamp_add_subtract_half(a: u32, b: u32) -> u32 {
+    let f = |sh: u32| -> u32 {
+        let ca = ((a >> sh) & 0xff) as i32;
+        let cb = ((b >> sh) & 0xff) as i32;
+        pred_clamp(ca + (ca - cb) / 2) as u32
+    };
+    (f(24) << 24) | (f(16) << 16) | (f(8) << 8) | f(0)
+}
+
+/// §4.1 `Select(L, T, TL)`: whichever of `L` / `T` is closer (Manhattan
+/// distance) to the per-channel `L + T - TL` estimate.
+#[inline]
+fn pred_select(l: u32, t: u32, tl: u32) -> u32 {
+    let ch = |p: u32, sh: u32| ((p >> sh) & 0xff) as i32;
+    let p_alpha = ch(l, 24) + ch(t, 24) - ch(tl, 24);
+    let p_red = ch(l, 16) + ch(t, 16) - ch(tl, 16);
+    let p_green = ch(l, 8) + ch(t, 8) - ch(tl, 8);
+    let p_blue = ch(l, 0) + ch(t, 0) - ch(tl, 0);
+
+    let p_l = (p_alpha - ch(l, 24)).abs()
+        + (p_red - ch(l, 16)).abs()
+        + (p_green - ch(l, 8)).abs()
+        + (p_blue - ch(l, 0)).abs();
+    let p_t = (p_alpha - ch(t, 24)).abs()
+        + (p_red - ch(t, 16)).abs()
+        + (p_green - ch(t, 8)).abs()
+        + (p_blue - ch(t, 0)).abs();
+
+    if p_l < p_t {
+        l
+    } else {
+        t
+    }
+}
+
+/// §4.1: compute the prediction for `mode ∈ [0..13]` given the four
+/// already-encoded neighbours. Bit-identical to the decoder's `predict`;
+/// see [`crate::vp8l_transform::inverse_predictor`].
+fn pred_predict(mode: u8, l: u32, t: u32, tr: u32, tl: u32) -> u32 {
+    match mode {
+        0 => 0xff00_0000,
+        1 => l,
+        2 => t,
+        3 => tr,
+        4 => tl,
+        5 => pred_average2(pred_average2(l, tr), t),
+        6 => pred_average2(l, tl),
+        7 => pred_average2(l, t),
+        8 => pred_average2(tl, t),
+        9 => pred_average2(t, tr),
+        10 => pred_average2(pred_average2(l, tl), pred_average2(t, tr)),
+        11 => pred_select(l, t, tl),
+        12 => pred_clamp_add_subtract_full(l, t, tl),
+        13 => pred_clamp_add_subtract_half(pred_average2(l, t), tl),
+        _ => 0xff00_0000,
+    }
+}
+
+/// §4.1 forward residual: `residual = actual - pred` per channel, wrapped
+/// to 8 bits. The exact inverse of the decoder's `add_pred`
+/// (`final = residual + pred`), so a decode of the residual restores the
+/// original pixel byte-for-byte.
+#[inline]
+fn sub_pred(actual: u32, pred: u32) -> u32 {
+    let f = |sh: u32| -> u32 {
+        let ca = (actual >> sh) & 0xff;
+        let cp = (pred >> sh) & 0xff;
+        ca.wrapping_sub(cp) & 0xff
+    };
+    (f(24) << 24) | (f(16) << 16) | (f(8) << 8) | f(0)
+}
+
+/// `DIV_ROUND_UP(num, den)` (§3.5.1) — the ceil-division used for the
+/// predictor sub-resolution image dimensions.
+#[inline]
+fn pred_div_round_up(num: u32, den: u32) -> u32 {
+    num.div_ceil(den)
+}
+
+/// The §4.1 prediction value for pixel `(x, y)` given the
+/// already-reconstructed `pixels` buffer and the block's `mode`. Applies
+/// the §4.1 border rules: the left-topmost pixel predicts `0xff000000`,
+/// the top row predicts L, the left column predicts T, and the rightmost
+/// column substitutes the row's leftmost pixel for TR. Identical to the
+/// decoder's per-pixel branch in
+/// [`crate::vp8l_transform::inverse_predictor`].
+#[inline]
+fn predict_at(pixels: &[u32], w: usize, x: usize, y: usize, mode: u8) -> u32 {
+    let idx = y * w + x;
+    if x == 0 && y == 0 {
+        0xff00_0000
+    } else if y == 0 {
+        pixels[idx - 1]
+    } else if x == 0 {
+        pixels[idx - w]
+    } else {
+        let l = pixels[idx - 1];
+        let t = pixels[idx - w];
+        let tl = pixels[idx - w - 1];
+        let tr = if x == w - 1 {
+            // Rightmost column: TR is the row's leftmost pixel.
+            pixels[idx - w - (w - 1)]
+        } else {
+            pixels[idx - w + 1]
+        };
+        pred_predict(mode, l, t, tr, tl)
+    }
+}
+
+/// Per-channel sum of absolute residuals for one prediction — a cheap
+/// proxy for the post-entropy cost. A block whose residuals cluster near
+/// zero (or wrap near 255, which is `-1`) costs fewer bits, so the score
+/// folds the modulo-256 wrap by treating each residual byte as the
+/// distance to the nearer of `0` and `256`.
+#[inline]
+fn residual_cost(actual: u32, pred: u32) -> u32 {
+    let res = sub_pred(actual, pred);
+    let mut cost = 0u32;
+    for sh in [24u32, 16, 8, 0] {
+        let r = (res >> sh) & 0xff;
+        // Distance to the nearer of 0 / 256: small magnitudes (whether
+        // a small positive residual or a small wrap-around negative one)
+        // score low, matching the entropy stage's bias toward 0.
+        cost += r.min(256 - r);
+    }
+    cost
+}
+
+/// Pick the §4.1 prediction mode for every block of the image and return
+/// the sub-resolution predictor image (one ARGB pixel per block, mode in
+/// the green channel) alongside the block dimensions.
+///
+/// For each block the encoder scores all 14 modes by the
+/// [`residual_cost`] proxy summed over the block's pixels, predicting from
+/// the *original* (un-transformed) neighbour pixels — the decoder
+/// reconstructs from those same already-decoded originals, so the
+/// prediction the encoder scores is the prediction the decoder computes.
+/// The lowest-cost mode wins; ties resolve to the lower mode index.
+fn select_predictor_modes(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+) -> (Vec<u32>, u32, u32) {
+    let w = width as usize;
+    let h = height as usize;
+    let block = 1usize << size_bits;
+    let tw = pred_div_round_up(width, block as u32);
+    let th = pred_div_round_up(height, block as u32);
+    let mut sub_image = vec![0xff00_0000u32; (tw * th) as usize];
+
+    for by in 0..th as usize {
+        for bx in 0..tw as usize {
+            let x0 = bx * block;
+            let y0 = by * block;
+            let x1 = (x0 + block).min(w);
+            let y1 = (y0 + block).min(h);
+
+            let mut best_mode = 0u8;
+            let mut best_cost = u64::MAX;
+            for mode in 0..NUM_PREDICTOR_MODES {
+                let mut cost = 0u64;
+                'rows: for y in y0..y1 {
+                    for x in x0..x1 {
+                        let pred = predict_at(pixels, w, x, y, mode);
+                        cost += residual_cost(pixels[y * w + x], pred) as u64;
+                        if cost >= best_cost {
+                            // This mode has already lost; skip the rest of
+                            // the block. The partial `cost` is only used to
+                            // bail, never to win (it is `>= best_cost`).
+                            break 'rows;
+                        }
+                    }
+                }
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mode = mode;
+                }
+            }
+            // Mode lives in the green channel; alpha 0xff keeps the
+            // sub-image pixels opaque (alpha is irrelevant to the decoder,
+            // which reads only green).
+            sub_image[by * tw as usize + bx] = 0xff00_0000 | ((best_mode as u32) << 8);
+        }
+    }
+    (sub_image, tw, th)
+}
+
+/// Apply the §4.1 forward predictor transform: choose a per-block mode map,
+/// then replace every pixel with its residual (`actual - pred`).
+///
+/// Returns the residual image (same dimensions as the input), the
+/// sub-resolution predictor image (mode in green, dimensions
+/// `transform_width * transform_height`), the chosen `size_bits`, and
+/// `transform_width`. The residual buffer fed through the decoder's
+/// §4.1 inverse (with the returned sub-image + `size_bits`) reconstructs
+/// `pixels` exactly.
+fn apply_predictor_transform(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+) -> (Vec<u32>, Vec<u32>, u8, u32) {
+    let size_bits = PREDICTOR_SIZE_BITS;
+    let (sub_image, tw, _th) = select_predictor_modes(pixels, width, height, size_bits);
+
+    let w = width as usize;
+    let h = height as usize;
+    let mut residuals = vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let block_index = (y as u32 >> size_bits) * tw + (x as u32 >> size_bits);
+            let mode = ((sub_image[block_index as usize] >> 8) & 0xff) as u8;
+            let pred = predict_at(pixels, w, x, y, mode);
+            residuals[y * w + x] = sub_pred(pixels[y * w + x], pred);
+        }
+    }
+    (residuals, sub_image, size_bits, tw)
+}
+
+/// Encode the residual main image as a §5.2.2 token stream with an
+/// optional §5.2.3 color cache, picking the smaller of (no-cache,
+/// each-candidate-cache). Returns the winning tokens, the chosen
+/// cache `code_bits` (`None` for no cache), and that path's `image_width`.
+///
+/// Shared by the predictor path: the residual image runs the same LZ77 +
+/// color-cache machinery as the no-transform path, so the cache axis is
+/// re-evaluated against the residual distribution (not the original).
+fn best_cache_for_pixels(working: &[u32], image_width: u32) -> (Vec<Token>, Option<u32>) {
+    let base_tokens = tokenize_lz77(working);
+    let mut best_len = {
+        let mut w = BitWriter::new();
+        write_entropy_coded_image_probe(&mut w, &base_tokens, None, image_width);
+        w.into_bytes().len()
+    };
+    let mut best_tokens = base_tokens.clone();
+    let mut best_bits: Option<u32> = None;
+    for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+        let toks = cacheify_tokens(&base_tokens, working, bits);
+        let mut w = BitWriter::new();
+        write_entropy_coded_image_probe(&mut w, &toks, Some(bits), image_width);
+        let len = w.into_bytes().len();
+        if len < best_len {
+            best_len = len;
+            best_tokens = toks;
+            best_bits = Some(bits);
+        }
+    }
+    (best_tokens, best_bits)
+}
+
+/// Thin wrapper that measures an `entropy-coded-image` body's encoded
+/// length for the [`best_cache_for_pixels`] chooser. Identical bytes to
+/// what the residual main image emits (modulo the meta-prefix bit, which
+/// is a single bit and so does not change the relative ordering of the
+/// candidates), so the chooser's winner is a faithful proxy.
+fn write_entropy_coded_image_probe(
+    w: &mut BitWriter,
+    tokens: &[Token],
+    color_cache_code_bits: Option<u32>,
+    image_width: u32,
+) {
+    write_entropy_coded_image(w, tokens, color_cache_code_bits, image_width);
+}
+
+/// Encode an ARGB image via the §4.1 predictor transform: pick a per-block
+/// mode map, emit the predictor transform header + sub-resolution
+/// predictor image (an `entropy-coded-image`), then the residual main
+/// image as a §3.8.3 `spatially-coded-image`. The result decodes back to
+/// `pixels` byte-for-byte through the decoder's §4.1 inverse.
+///
+/// `image_width` is the canvas width, threaded into the residual image's
+/// §5.2.2 distance chooser. Both the sub-image and the residual image get
+/// their own color-cache evaluation.
+fn encode_predictor_path(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
+    let (residuals, sub_image, size_bits, tw) = apply_predictor_transform(pixels, width, height);
+
+    let mut w = BitWriter::new();
+
+    // §3.8.2 predictor-tx: present-bit, TransformType::Predictor (0), then
+    // the 3-bit `size_bits - 2` field, then the sub-resolution image.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    w.write_bits((size_bits - 2) as u32, 3);
+    // predictor-image body = entropy-coded-image (no meta-prefix). The
+    // sub-image is `tw` wide; evaluate its own color cache.
+    let (sub_tokens, sub_bits) = best_cache_for_pixels(&sub_image, tw);
+    write_entropy_coded_image(&mut w, &sub_tokens, sub_bits, tw);
+
+    // End-of-transform-list terminator.
+    w.write_bit(false);
+
+    // §3.8.3 spatially-coded-image for the residual main image. Evaluate
+    // the residual's color cache independently of the original's.
+    let (res_tokens, res_bits) = best_cache_for_pixels(&residuals, width);
+    write_spatially_coded_image(&mut w, &res_tokens, res_bits, width);
+
+    let _ = height;
+    w.into_bytes()
+}
+
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
 /// §3.4 5-byte image-header), running the §5.2.2 LZ77 backward-reference
 /// matcher so repeated pixel runs compress.
@@ -1258,6 +1605,25 @@ pub fn encode_argb_literals_with_width_selected(
         if cand.len() < best_bytes.len() {
             best_bytes = cand;
             best_code_bits = bits;
+        }
+    }
+
+    // §4.1 predictor transform. The transform needs the real 2-D layout,
+    // so it is only a candidate when `image_width` reflects the true
+    // canvas width (`> 1`) and evenly divides the pixel count — always the
+    // case on the production `.webp` path ([`encode_vp8l_payload`] passes
+    // the actual width). The width-less test entries pass `image_width =
+    // 1`, which degenerates the geometry to a 1×N column where the spatial
+    // predictor is meaningless; those callers keep the round-119 / round-130
+    // behaviour unchanged. The residual main image runs its own
+    // color-cache evaluation internally, so the reported `best_code_bits`
+    // (a main-image cache field) is set to `0` when the predictor wins.
+    if image_width > 1 && !pixels.is_empty() && pixels.len() % image_width as usize == 0 {
+        let height = pixels.len() as u32 / image_width;
+        let cand = encode_predictor_path(pixels, image_width, height);
+        if cand.len() < best_bytes.len() {
+            best_bytes = cand;
+            best_code_bits = 0;
         }
     }
 
@@ -1366,8 +1732,56 @@ fn encode_tokens(
     w.write_bit(false);
 
     // §3.8.3 spatially-coded-image = color-cache-info meta-prefix data.
+    write_spatially_coded_image(&mut w, tokens, color_cache_code_bits, image_width);
+    w.into_bytes()
+}
+
+/// Write a §3.8.3 `spatially-coded-image` body (`color-cache-info
+/// meta-prefix data`) into an existing [`BitWriter`]. This is the §3.8.3
+/// main-image form — it carries the single-`%b0` `meta-prefix` field, so
+/// it is *not* the same as the predictor / color sub-image's
+/// `entropy-coded-image` form ([`write_entropy_coded_image`]), which omits
+/// `meta-prefix` entirely (§3.8.2 grammar: `predictor-image =/
+/// color-cache-info data`, no meta-prefix). Factored out of
+/// [`encode_tokens`] so the predictor-transform path can reuse the same
+/// `color-cache-info` + `prefix-codes` + `lz77-coded-image` writer for the
+/// residual main image.
+fn write_spatially_coded_image(
+    w: &mut BitWriter,
+    tokens: &[Token],
+    color_cache_code_bits: Option<u32>,
+    image_width: u32,
+) {
+    let color_cache_size = write_color_cache_info(w, color_cache_code_bits);
+    // meta-prefix: `%b0` (single prefix-code group).
+    w.write_bit(false);
+    write_prefix_codes_and_image(w, tokens, color_cache_size, image_width);
+}
+
+/// Write a §3.8.2 / §3.8.3 `entropy-coded-image` body (`color-cache-info
+/// data`) into an existing [`BitWriter`]. Used for a predictor / color
+/// transform's sub-resolution image: per the §3.8.2 grammar the
+/// `predictor-image` / `color-image` payload after the 3-bit `size_bits`
+/// field is an `entropy-coded-image`, which (unlike the main
+/// `spatially-coded-image`) has **no** `meta-prefix` field. The decoder's
+/// [`crate::vp8l_transform::decode_lossless`] reads these sub-images with
+/// `decode_entropy_coded_image`, which likewise skips the meta-prefix.
+fn write_entropy_coded_image(
+    w: &mut BitWriter,
+    tokens: &[Token],
+    color_cache_code_bits: Option<u32>,
+    image_width: u32,
+) {
+    let color_cache_size = write_color_cache_info(w, color_cache_code_bits);
+    write_prefix_codes_and_image(w, tokens, color_cache_size, image_width);
+}
+
+/// Write a §3.8.3 `color-cache-info` field and return the resulting cache
+/// size (`0` when disabled). `None` emits `%b0`; `Some(bits)` emits
+/// `%b1 4BIT` with `bits ∈ [COLOR_CACHE_BITS_MIN, COLOR_CACHE_BITS_MAX]`.
+fn write_color_cache_info(w: &mut BitWriter, color_cache_code_bits: Option<u32>) -> usize {
     // color-cache-info: `%b0` (no cache) or `%b1 4BIT` (enabled).
-    let color_cache_size = match color_cache_code_bits {
+    match color_cache_code_bits {
         Some(bits) => {
             debug_assert!((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&bits));
             w.write_bit(true);
@@ -1378,10 +1792,21 @@ fn encode_tokens(
             w.write_bit(false);
             0
         }
-    };
-    // meta-prefix: `%b0` (single prefix-code group).
-    w.write_bit(false);
+    }
+}
 
+/// Write a §3.8.3 `data` field (`prefix-codes lz77-coded-image`): build the
+/// five §3.7.2 prefix codes from `tokens`, emit their code-length tables in
+/// bitstream order (green, red, blue, alpha, distance), then emit the
+/// LZ77-coded image. Shared by [`write_spatially_coded_image`] and
+/// [`write_entropy_coded_image`]; the only structural difference between the
+/// two callers is the preceding `meta-prefix` bit.
+fn write_prefix_codes_and_image(
+    w: &mut BitWriter,
+    tokens: &[Token],
+    color_cache_size: usize,
+    image_width: u32,
+) {
     // Build the five prefix codes from token frequencies. The GREEN
     // alphabet covers literals (`< 256`), the §5.2.2 length prefix
     // symbols (`256 + length_prefix`), and (when the cache is enabled)
@@ -1405,11 +1830,11 @@ fn encode_tokens(
     // data = prefix-codes lz77-coded-image.
     // prefix-code-group = 5 prefix codes, in bitstream order:
     // green, red, blue, alpha, distance.
-    green_code.write_code_lengths(&mut w);
-    red_code.write_code_lengths(&mut w);
-    blue_code.write_code_lengths(&mut w);
-    alpha_code.write_code_lengths(&mut w);
-    dist_code.write_code_lengths(&mut w);
+    green_code.write_code_lengths(w);
+    red_code.write_code_lengths(w);
+    blue_code.write_code_lengths(w);
+    alpha_code.write_code_lengths(w);
+    dist_code.write_code_lengths(w);
 
     // lz77-coded-image: each token is either a §5.2.1 ARGB literal
     // (channel order green, red, blue, alpha), a §5.2.3 color-cache
@@ -1422,10 +1847,10 @@ fn encode_tokens(
                 let r = ((p >> 16) & 0xff) as usize;
                 let g = ((p >> 8) & 0xff) as usize;
                 let b = (p & 0xff) as usize;
-                green_code.write_symbol(&mut w, g);
-                red_code.write_symbol(&mut w, r);
-                blue_code.write_symbol(&mut w, b);
-                alpha_code.write_symbol(&mut w, a);
+                green_code.write_symbol(w, g);
+                red_code.write_symbol(w, r);
+                blue_code.write_symbol(w, b);
+                alpha_code.write_symbol(w, a);
             }
             Token::CacheRef { index } => {
                 // §5.2.3: GREEN symbol is `256 + 24 + index`. Red /
@@ -1433,21 +1858,19 @@ fn encode_tokens(
                 // recovers the full ARGB from the cache slot.
                 debug_assert!(color_cache_size > 0, "CacheRef requires an enabled cache");
                 let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
-                green_code.write_symbol(&mut w, sym);
+                green_code.write_symbol(w, sym);
             }
             Token::Copy { length, distance } => {
                 // §5.2.2: length via a GREEN length symbol (base 256), then
                 // distance via prefix code #5 (base 0). The chooser must
                 // agree with `count_frequencies` so the prefix-code Huffman
                 // tree we built actually contains the prefix slot we look up.
-                write_lz77_value(&mut w, &green_code, 256, length as u32);
+                write_lz77_value(w, &green_code, 256, length as u32);
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
-                write_lz77_value(&mut w, &dist_code, 0, raw_code);
+                write_lz77_value(w, &dist_code, 0, raw_code);
             }
         }
     }
-
-    w.into_bytes()
 }
 
 /// Build the §3.4 / §7.1 5-byte VP8L image-header.
@@ -2157,6 +2580,155 @@ mod tests {
         // Round trip through the full decode chain stays pixel-exact.
         let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
         let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    // ---- §3.5.1 / §4.1 forward predictor transform ----
+
+    /// The forward `sub_pred` residual is the exact per-channel inverse of
+    /// the decoder's `add_pred`: predicting with mode M, subtracting, then
+    /// adding the same prediction back restores the original pixel across
+    /// the modulo-256 wrap.
+    #[test]
+    fn sub_pred_is_inverse_of_add_pred() {
+        let cases = [
+            (0xff12_3456u32, 0xff10_3050u32),
+            (0x0001_0203, 0xfffe_fdfc), // wrap on every channel
+            (0x8090_a0b0, 0x1020_3040 | 0x8000_0000),
+        ];
+        for (actual, pred) in cases {
+            let res = sub_pred(actual, pred);
+            // Re-add per channel (the decoder's `add_pred` arithmetic).
+            let f = |sh: u32| ((res >> sh) & 0xff).wrapping_add((pred >> sh) & 0xff) & 0xff;
+            let restored = (f(24) << 24) | (f(16) << 16) | (f(8) << 8) | f(0);
+            assert_eq!(restored, actual, "sub_pred/add_pred round trip failed");
+        }
+    }
+
+    /// Every per-block mode the selector emits is a valid §4.1 predictor
+    /// index in `0..=13` (the green channel of the sub-resolution image).
+    #[test]
+    fn predictor_modes_are_always_in_range() {
+        let w = 40u32;
+        let h = 37u32;
+        // A mixed image: a diagonal gradient overlaid with a little noise,
+        // so different blocks legitimately prefer different modes.
+        let mut state = 0xA1B2C3D4u32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let x = i % w;
+                let y = i / w;
+                let base = (x + y) & 0xff;
+                let g = base;
+                let r = (base.wrapping_add(state & 7)) & 0xff;
+                let b = (base.wrapping_add((state >> 3) & 7)) & 0xff;
+                0xff00_0000 | (r << 16) | (g << 8) | b
+            })
+            .collect();
+        let (sub_image, tw, th) = select_predictor_modes(&pixels, w, h, PREDICTOR_SIZE_BITS);
+        assert_eq!(sub_image.len(), (tw * th) as usize);
+        for &p in &sub_image {
+            let mode = (p >> 8) & 0xff;
+            assert!(mode <= 13, "selected predictor mode {mode} out of [0..13]");
+        }
+    }
+
+    /// On a smooth gradient (where neighbouring pixels are tightly
+    /// correlated) the §4.1 predictor transform shrinks the stream versus
+    /// the no-predictor baseline, and the full encode → decode round trip
+    /// is bit-exact.
+    #[test]
+    fn predictor_transform_shrinks_smooth_gradient_and_round_trips() {
+        let w = 64u32;
+        let h = 64u32;
+        // A smooth 2-D gradient: each channel ramps with x and y, so the
+        // gradient-style predictors (T/L/Average/ClampAddSubtract) leave
+        // residuals clustered near zero.
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| {
+                let x = i % w;
+                let y = i / w;
+                let r = (x * 3 + y) & 0xff;
+                let g = (x + y * 2) & 0xff;
+                let b = ((x * 2 + y * 3) / 2) & 0xff;
+                0xff00_0000 | (r << 16) | (g << 8) | b
+            })
+            .collect();
+
+        // No-predictor baseline at the same width (best of no-tx /
+        // subtract-green × cache, but WITHOUT the predictor candidate).
+        let no_pred = {
+            let mut best = encode_literals_with_options(&pixels, false, None, w);
+            for &bits in &CANDIDATE_COLOR_CACHE_BITS {
+                let c = encode_literals_with_options(&pixels, false, Some(bits), w);
+                if c.len() < best.len() {
+                    best = c;
+                }
+            }
+            let c = encode_literals_with_options(&pixels, true, None, w);
+            if c.len() < best.len() {
+                best = c;
+            }
+            best
+        };
+        let with_pred = encode_predictor_path(&pixels, w, h);
+        eprintln!(
+            "[round-133] 64x64 smooth gradient: no-predictor={} B, predictor={} B ({:.1}% reduction)",
+            no_pred.len(),
+            with_pred.len(),
+            100.0 * (no_pred.len() as f64 - with_pred.len() as f64) / no_pred.len() as f64,
+        );
+        assert!(
+            with_pred.len() < no_pred.len(),
+            "predictor transform ({} B) did not beat no-predictor ({} B)",
+            with_pred.len(),
+            no_pred.len(),
+        );
+
+        // Bit-exact round trip through the predictor path explicitly.
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&with_pred);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+
+        // And through the production chooser, which now includes the
+        // predictor candidate: the smooth gradient should make the chooser
+        // pick a stream no larger than the no-predictor baseline.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed2 = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img2 = crate::decode_lossless_image(&framed2).unwrap().unwrap();
+        assert_eq!(img2.pixels(), pixels.as_slice());
+        assert!(bare.len() <= header.len() + no_pred.len());
+    }
+
+    /// The predictor path round-trips on a non-smooth (noisy) image too:
+    /// even when the residuals don't shrink the stream, the decoder
+    /// reconstructs the originals exactly. Guards against any mismatch
+    /// between the encoder's forward prediction and the decoder's inverse.
+    #[test]
+    fn predictor_transform_round_trips_on_noise() {
+        let w = 31u32; // deliberately non-power-of-two to exercise the
+        let h = 29u32; // partial right/bottom blocks and DIV_ROUND_UP.
+        let mut state = 0xDEAD_F00Du32;
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state | 0xff00_0000
+            })
+            .collect();
+        let stream = encode_predictor_path(&pixels, w, h);
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
         let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
         assert_eq!(img.pixels(), pixels.as_slice());
     }

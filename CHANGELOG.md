@@ -6,6 +6,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 133 (2026-05-25).** §3.5.1 / §4.1 **predictor
+  (spatial) transform encoding** for the VP8L lossless encoder. The
+  encoder tiles the image into `1 << size_bits` square blocks
+  (`size_bits = 4`, 16×16) and, for each block, scores all 14
+  prediction modes `[0..13]` by a per-channel sum-of-absolute-residuals
+  proxy (folding the modulo-256 wrap so small negative residuals score
+  low) and picks the cheapest. It writes the §3.8.2 `predictor-tx`
+  header (`%b1` present, transform type 0, 3-bit `size_bits - 2`), the
+  sub-resolution predictor image as an `entropy-coded-image` (mode in
+  the green channel, no meta-prefix per the §3.8.2 grammar), then the
+  residual main image as a §3.8.3 `spatially-coded-image`. The forward
+  predictor primitives (`Average2` / `Select` / `ClampAddSubtractFull`
+  / `ClampAddSubtractHalf` and the §4.1 left-topmost / top-row /
+  left-column / rightmost-column border rules) are bit-identical to the
+  decoder's `inverse_predictor`, so `residual = actual − pred` is the
+  exact inverse of the decoder's `final = residual + pred`. The
+  predictor path is a new candidate in
+  `encode_argb_literals_with_width_selected` alongside the round-132
+  subtract-green × cache cross-product; the chooser emits whichever
+  candidate is smallest and never regresses. Headline measurement:
+  64×64 smooth 2-D gradient goes from 10377 B (no-predictor) to 308 B
+  (predictor) — a 97 % size reduction. The residual main image and the
+  predictor sub-image each run their own §5.2.3 color-cache evaluation.
+  Round trip stays bit-exact through `decode_lossless_image`, validated
+  on smooth, noisy, and non-power-of-two (partial-block) fixtures. Four
+  new inline tests cover (a) `sub_pred`/`add_pred` inverse across the
+  wrap; (b) every selected mode ∈ `0..=13`; (c) the gradient shrinks
+  and round-trips; (d) the predictor path round-trips on noise +
+  non-power-of-two dimensions.
+
 * **Clean-room round 132 (2026-05-25).** §5.2.3 **color-cache
   size-selection chooser** for the VP8L lossless encoder. The
   round-121 chooser evaluated a single `code_bits = 8` candidate

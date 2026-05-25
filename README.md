@@ -2,7 +2,39 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-25 (clean-room round 132)
+## Status — 2026-05-25 (clean-room round 133)
+
+**Round 133 added the VP8L §3.5.1 / §4.1 predictor (spatial) transform
+to the encoder.** The encoder now tiles the image into the spec's
+`1 << size_bits` square blocks (`size_bits = 4`, i.e. 16×16) and, for
+each block, scores all 14 prediction modes `[0..13]` by a per-channel
+sum-of-absolute-residuals proxy (folding the modulo-256 wrap so small
+negative residuals score low), picking the cheapest mode. It emits the
+§3.8.2 `predictor-tx` header (`%b1` + type 0 + 3-bit `size_bits - 2`),
+the sub-resolution predictor image as an `entropy-coded-image` (mode in
+the green channel, no meta-prefix per the §3.8.2 grammar), then the
+residual main image as a §3.8.3 `spatially-coded-image`. The forward
+predictor primitives (`Average2` / `Select` / `ClampAddSubtractFull` /
+`ClampAddSubtractHalf` and the §4.1 border rules) are bit-identical to
+the decoder's [`inverse_predictor`](src/vp8l_transform.rs), so
+`residual = actual − pred` is the exact inverse of the decoder's
+`final = residual + pred`. The predictor path is a new candidate in
+[`encode_argb_literals_with_width_selected`](src/vp8l_encode.rs)
+alongside the round-132 subtract-green × cache cross-product; the
+chooser still emits whichever candidate is smallest, so it never
+regresses.
+
+Headline measurement on a 64×64 smooth 2-D gradient: **308 B
+(predictor) vs 10377 B (no-predictor) — a 97 % size reduction**, the
+gradient picking gradient-style predictors as expected. The residual
+main image and the predictor sub-image each run their own §5.2.3
+color-cache evaluation. Round trip stays bit-exact through
+[`decode_lossless_image`](src/lib.rs), validated on smooth, noisy, and
+non-power-of-two (partial-block) fixtures. Four new inline tests cover
+(a) `sub_pred` being the exact inverse of `add_pred` across the wrap;
+(b) every selected mode ∈ `0..=13`; (c) the gradient shrinks vs.
+no-predictor and round-trips; (d) the predictor path round-trips on
+noise + non-power-of-two dimensions.
 
 **Round 132 widened the VP8L §5.2.3 color-cache chooser from a single
 `code_bits = 8` candidate (round 121) to a five-size slate.** The
@@ -146,9 +178,9 @@ near-row distances compounds the per-emission saving via the §5.2.2
 distance-prefix Huffman tree (more frequent low-prefix codes amortise
 the table overhead). Round trip is bit-exact across every fixture above
 through [`decode_webp`](src/lib.rs) / [`decode_lossless_image`](src/lib.rs).
-Still lacks: §3.8.2 predictor / color / color-indexing transform
-encoding (subtract-green is the only transform the encoder applies),
-and VP8 lossy encode.
+Still lacks (as of this round): §3.8.2 color / color-indexing transform
+encoding (subtract-green and — as of round 133 — the §4.1 predictor
+transform are the transforms the encoder applies), and VP8 lossy encode.
 
 ## Status — 2026-05-25 (clean-room round 127)
 
