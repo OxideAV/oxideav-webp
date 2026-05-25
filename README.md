@@ -2,6 +2,56 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-25 (clean-room round 130)
+
+**Round 130 added a §5.2.2 width-aware distance-code chooser to the VP8L
+encoder.** Each backward reference now picks the *smaller* of two valid
+distance-code forms:
+
+* The round-119 *scan-line* code `distance_code = D + 120`.
+* Any §5.2.2 *distance-map* code `c ∈ 1..=120` whose `(xi, yi) =
+  DISTANCE_MAP[c-1]` reconstructs to `D` for the image width
+  (`xi + yi * W`, clamped to 1).
+
+The decoder's [`distance_code_to_pixel_distance`](src/vp8l_decode.rs) is
+identical for both forms, so the round trip is byte-exact regardless of
+which code the encoder emitted. Picking the smaller raw code feeds
+[`value_to_prefix`](src/vp8l_encode.rs) through low-prefix slots
+(codes `1..=4` use 0 extra bits; code `5` uses 1 extra bit; …) instead
+of the high-prefix slots that `D + 120` for typical row distances would
+fall into — a row-distance match on a 256-wide image goes from prefix 16
+(8-ish bits Huffman + 7 extra) to prefix 0 (1–4 bits Huffman + 0 extra),
+shrinking the per-match cost by ~7 bits. The new public helper is
+[`pixel_distance_to_distance_code`](src/vp8l_encode.rs); the new
+internal entry point is `encode_argb_literals_with_width(pixels,
+image_width)`, wired into `encode_vp8l_payload` so every `.webp`
+produced via [`encode_webp_lossless`](src/lib.rs) /
+[`encode_vp8l_argb`](src/lib.rs) / the animation encoders threads the
+actual width into the chooser. The width-less
+[`encode_argb_literals`](src/vp8l_encode.rs) is retained for callers
+that exercise the entropy stage without spatial structure; it defaults
+to width = 1, which disables the optimisation (no distance-map entry
+reconstructs typical distances at a single-pixel-wide row).
+
+Headline measurements (encoder-stream byte count, identical pixel
+content, width-1 baseline vs round-130 width-aware path):
+
+| Fixture                               | width=1 (round-119) | width-aware (round-130) | Δ      |
+|---------------------------------------|---------------------:|-------------------------:|--------|
+| 256×256 row-repeating                 | 972 B                | 958 B                    | -1.4 % |
+| 128×128 row-correlated                | 522 B                | 519 B                    | -0.6 % |
+| 64×64 row-shifted (per-row `(y%4)`)   | 328 B                | 326 B                    | -0.6 % |
+| 64×64 photo-like (ramp + small noise) | 3 923 B              | 3 919 B                  | -0.1 % |
+
+Real-world photographic content with many short backward references at
+near-row distances compounds the per-emission saving via the §5.2.2
+distance-prefix Huffman tree (more frequent low-prefix codes amortise
+the table overhead). Round trip is bit-exact across every fixture above
+through [`decode_webp`](src/lib.rs) / [`decode_lossless_image`](src/lib.rs).
+Still lacks: §3.8.2 predictor / color / color-indexing transform
+encoding (subtract-green is the only transform the encoder applies),
+and VP8 lossy encode.
+
 ## Status — 2026-05-25 (clean-room round 127)
 
 **Round 127 implemented `AnimFrameMode::Auto` / `::Delta` (lossless

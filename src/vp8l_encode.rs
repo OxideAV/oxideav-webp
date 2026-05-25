@@ -72,16 +72,35 @@
 //! `length >= MIN_MATCH` pixels at scan-line distance `D` is emitted as a
 //! §5.2.2 *length + distance code* pair instead of `length` separate ARGB
 //! literals, compressing repetitive images. The match's length is encoded
-//! via the GREEN alphabet's length-prefix symbols (`256 + prefix_code`),
-//! and the distance via prefix code #5 using the *scan-line* encoding
-//! `distance_code = D + NUM_DISTANCE_MAP_CODES` (the §5.2.2 distance map is
-//! an optional decoder convenience for nearby pixels; emitting
-//! `D + 120` is always valid and the in-crate decoder's
-//! [`crate::vp8l_decode::distance_code_to_pixel_distance`] reconstructs `D`
-//! exactly). The inverse of the §5.2.2 prefix-value transform
-//! ([`value_to_prefix`]) splits a length/distance into its prefix code and
-//! extra bits, the exact counterpart of the decoder's
-//! [`crate::vp8l_decode::read_lz77_value`].
+//! via the GREEN alphabet's length-prefix symbols (`256 + prefix_code`).
+//!
+//! As of round 130 the encoder picks the **smaller** of two distance-code
+//! forms per backward reference:
+//!
+//! 1. The *scan-line* encoding `distance_code = D + NUM_DISTANCE_MAP_CODES`
+//!    (always valid, was the round-119 default).
+//! 2. Any §5.2.2 *distance map* code `c ∈ 1..=120` whose
+//!    `(xi, yi) = DISTANCE_MAP[c-1]` satisfies `max(xi + yi*W, 1) == D` for
+//!    the image width `W`. These small codes feed the §5.2.2 distance
+//!    prefix code through low-prefix slots (codes `1..=4` use 0 extra bits,
+//!    code `5` uses 1 extra bit) instead of the high-prefix slots that
+//!    `D + 120` for typical row distances would fall into.
+//!
+//! The reconstruction in
+//! [`crate::vp8l_decode::distance_code_to_pixel_distance`] is identical for
+//! both forms (`xi + yi*W` clamped to 1), so round-trips remain bit-exact.
+//! Photo-like content with vertical correlation (every scan-line referring
+//! to the row above) sees a dramatic improvement: a row-distance match on
+//! a 256-wide image goes from prefix 16 (8-ish bits Huffman + 7 extra) to
+//! prefix 0 (1–4 bits Huffman + 0 extra), shrinking the per-match cost by
+//! ~10 bits. The width-aware helper is
+//! [`pixel_distance_to_distance_code`]; the round-119 scan-line-only
+//! form is still used as the chooser's fallback whenever no distance-map
+//! code matches.
+//!
+//! The inverse of the §5.2.2 prefix-value transform ([`value_to_prefix`])
+//! splits a length/distance into its prefix code and extra bits, the exact
+//! counterpart of the decoder's [`crate::vp8l_decode::read_lz77_value`].
 //!
 //! The literal-only path is still available via [`encode_argb_literals_only`]
 //! (used by the size-reduction comparison test); the default
@@ -978,13 +997,58 @@ struct Frequencies {
     distance: Vec<u32>,
 }
 
-/// The §5.2.2 distance-code form this encoder uses: the *scan-line*
-/// encoding (`distance_code = D + 120`). The decoder's
-/// [`crate::vp8l_decode::distance_code_to_pixel_distance`] maps any
-/// `distance_code > 120` straight back to `distance_code - 120 == D`, so
-/// every distance round-trips without touching the §5.2.2 distance map.
+/// Legacy §5.2.2 *scan-line* distance encoding (`distance_code = D + 120`).
+///
+/// The decoder's [`crate::vp8l_decode::distance_code_to_pixel_distance`]
+/// maps any `distance_code > 120` straight back to `distance_code - 120 == D`,
+/// so this is always a valid round-trip. Retained as the unit-test reference
+/// (so the round-130 chooser can be measured against the round-119 baseline)
+/// — production paths use [`pixel_distance_to_distance_code`], which picks
+/// the smaller of the scan-line code and any matching distance-map code.
+#[cfg(test)]
 fn distance_to_code(distance: usize) -> u32 {
     distance as u32 + crate::vp8l_decode::NUM_DISTANCE_MAP_CODES as u32
+}
+
+/// §5.2.2 distance-code chooser: pick the smaller of the scan-line code
+/// (`D + 120`) and any §5.2.2 distance-map code `c ∈ 1..=120` that
+/// reconstructs `D` for the given `image_width`.
+///
+/// A distance-map entry `(xi, yi)` at index `c-1` reconstructs to
+/// `max(xi + yi * image_width, 1)` per the decoder's
+/// [`crate::vp8l_decode::distance_code_to_pixel_distance`]. The chooser
+/// scans all 120 entries and returns the **smallest** raw code that
+/// reconstructs to `distance` — smaller raw codes feed
+/// [`value_to_prefix`] through low-prefix slots (codes `1..=4` use 0
+/// extra bits; code `5` uses 1 extra bit; …), which then enter the
+/// distance prefix-code's Huffman tree with the highest frequencies and
+/// the shortest emitted lengths.
+///
+/// The reconstruction is identical to the legacy scan-line form, so the
+/// decoder produces the exact same pixel distance and the round-trip
+/// stays bit-exact.
+///
+/// Panics in debug builds when `distance == 0` (callers guarantee
+/// `1 <= distance <= position` per §5.2.2's backward-reference invariant).
+pub fn pixel_distance_to_distance_code(distance: usize, image_width: u32) -> u32 {
+    debug_assert!(distance >= 1, "§5.2.2 distance must be >= 1");
+    let scan_line_code = distance as u32 + crate::vp8l_decode::NUM_DISTANCE_MAP_CODES as u32;
+    let mut best = scan_line_code;
+    let width_i32 = image_width as i32;
+    for (idx, &(xi, yi)) in crate::vp8l_decode::DISTANCE_MAP.iter().enumerate() {
+        // The decoder computes `xi + yi * W` and clamps to 1. Match the
+        // exact reconstruction so we never emit a code that would resolve
+        // to a different distance.
+        let raw = xi + yi * width_i32;
+        let mapped = if raw < 1 { 1 } else { raw as usize };
+        if mapped == distance {
+            let candidate = (idx + 1) as u32;
+            if candidate < best {
+                best = candidate;
+            }
+        }
+    }
+    best
 }
 
 /// Accumulate the per-symbol frequencies for a token stream so the entropy
@@ -994,7 +1058,14 @@ fn distance_to_code(distance: usize) -> u32 {
 /// is disabled). It extends the GREEN alphabet to
 /// `256 + 24 + color_cache_size` per §6.2.3 so a `CacheRef { index }`
 /// token's wire symbol `256 + 24 + index` is in range.
-fn count_frequencies(tokens: &[Token], color_cache_size: usize) -> Frequencies {
+///
+/// `image_width` is needed to feed [`pixel_distance_to_distance_code`] so
+/// the frequency table matches the prefix codes the emit loop will choose
+/// for each backward reference. Passing `1` (the legacy width-less form)
+/// disables the §5.2.2 distance-map optimisation — only codes 1..=8 can
+/// possibly match at width 1, so all row-style matches fall back to the
+/// scan-line `D + 120` form.
+fn count_frequencies(tokens: &[Token], color_cache_size: usize, image_width: u32) -> Frequencies {
     let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + color_cache_size;
     let mut freqs = Frequencies {
         green: vec![0u32; green_alphabet],
@@ -1025,8 +1096,11 @@ fn count_frequencies(tokens: &[Token], color_cache_size: usize) -> Frequencies {
                 // §5.2.2: length is a GREEN symbol `256 + length_prefix`.
                 let (len_prefix, _, _) = value_to_prefix(length as u32);
                 freqs.green[256 + len_prefix as usize] += 1;
-                // Distance prefix code (#5).
-                let (dist_prefix, _, _) = value_to_prefix(distance_to_code(distance));
+                // Distance prefix code (#5). Width-aware chooser picks the
+                // smaller of scan-line `D + 120` and any §5.2.2 distance-map
+                // code reconstructing to `D` for `image_width`.
+                let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                let (dist_prefix, _, _) = value_to_prefix(raw_code);
                 freqs.distance[dist_prefix as usize] += 1;
             }
         }
@@ -1086,16 +1160,30 @@ pub fn apply_subtract_green(pixels: &mut [u32]) {
 /// bytes, prefixed with the image-header and wrapped in RIFF/WEBP framing,
 /// decode back to `pixels` exactly.
 pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
-    // Evaluate the 2×2 cross-product (no-tx | subtract-green) ×
-    // (no-cache | cache) and emit whichever produced the smallest
-    // image stream. Each path is fully spec-conformant; the smallest
-    // byte count wins.
-    let mut best = encode_literals_with_options(pixels, false, None);
+    // Width-less entry: feed `image_width = 1`, which disables the §5.2.2
+    // distance-map chooser (no map entry reconstructs to a "row" distance
+    // when the row is a single pixel wide). Production callers go through
+    // [`encode_argb_literals_with_width`] via [`encode_vp8l_payload`] so
+    // the optimisation is wired for `.webp` output.
+    encode_argb_literals_with_width(pixels, 1)
+}
+
+/// Width-aware variant of [`encode_argb_literals`]: same 2×2
+/// `(no-tx | subtract-green) × (no-cache | cache)` chooser, but each
+/// candidate threads `image_width` into [`encode_tokens`] so the
+/// §5.2.2 distance-map optimisation is exercised. The production
+/// `.webp` path ([`encode_vp8l_payload`] → [`encode_webp_lossless`] /
+/// [`encode_vp8l_argb`]) uses this entry; the no-width
+/// [`encode_argb_literals`] is retained for test callers that exercise
+/// the entropy stage without spatial structure.
+pub fn encode_argb_literals_with_width(pixels: &[u32], image_width: u32) -> Vec<u8> {
+    debug_assert!(image_width >= 1);
+    let mut best = encode_literals_with_options(pixels, false, None, image_width);
 
     let candidates = [
-        encode_literals_with_options(pixels, true, None),
-        encode_literals_with_options(pixels, false, Some(DEFAULT_COLOR_CACHE_BITS)),
-        encode_literals_with_options(pixels, true, Some(DEFAULT_COLOR_CACHE_BITS)),
+        encode_literals_with_options(pixels, true, None, image_width),
+        encode_literals_with_options(pixels, false, Some(DEFAULT_COLOR_CACHE_BITS), image_width),
+        encode_literals_with_options(pixels, true, Some(DEFAULT_COLOR_CACHE_BITS), image_width),
     ];
     for cand in candidates {
         if cand.len() < best.len() {
@@ -1115,6 +1203,7 @@ fn encode_literals_with_options(
     pixels: &[u32],
     subtract_green: bool,
     cache_code_bits: Option<u32>,
+    image_width: u32,
 ) -> Vec<u8> {
     let mut working = pixels.to_vec();
     if subtract_green {
@@ -1124,7 +1213,7 @@ fn encode_literals_with_options(
     if let Some(bits) = cache_code_bits {
         tokens = cacheify_tokens(&tokens, &working, bits);
     }
-    encode_tokens(&tokens, subtract_green, cache_code_bits)
+    encode_tokens(&tokens, subtract_green, cache_code_bits, image_width)
 }
 
 /// Encode an ARGB image with the literal-only, no-transform path: every
@@ -1133,7 +1222,9 @@ fn encode_literals_with_options(
 /// LZ77 path against; [`encode_argb_literals`] is the default entry point.
 pub fn encode_argb_literals_only(pixels: &[u32]) -> Vec<u8> {
     let tokens: Vec<Token> = pixels.iter().map(|&p| Token::Literal(p)).collect();
-    encode_tokens(&tokens, false, None)
+    // Literal-only stream emits no Copy tokens, so `image_width` is
+    // unused by the entropy stage; pass 1 as the trivial value.
+    encode_tokens(&tokens, false, None, 1)
 }
 
 /// Encode an ARGB image forcing the §3.5.3 / §3.8.2 subtract-green
@@ -1145,7 +1236,8 @@ pub fn encode_argb_literals_subtract_green(pixels: &[u32]) -> Vec<u8> {
     let mut sg_pixels = pixels.to_vec();
     apply_subtract_green(&mut sg_pixels);
     let tokens = tokenize_lz77(&sg_pixels);
-    encode_tokens(&tokens, true, None)
+    // Width-less test entry: pass 1 (the chooser falls back to scan-line).
+    encode_tokens(&tokens, true, None, 1)
 }
 
 /// Encode an ARGB image forcing a §5.2.3 color cache on (size
@@ -1156,7 +1248,8 @@ pub fn encode_argb_literals_subtract_green(pixels: &[u32]) -> Vec<u8> {
 /// path combinations.
 pub fn encode_argb_literals_color_cache(pixels: &[u32], cache_code_bits: u32) -> Vec<u8> {
     debug_assert!((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&cache_code_bits));
-    encode_literals_with_options(pixels, false, Some(cache_code_bits))
+    // Width-less test entry: pass 1 (the chooser falls back to scan-line).
+    encode_literals_with_options(pixels, false, Some(cache_code_bits), 1)
 }
 
 /// Shared entropy stage: from a §5.2.2 token stream, build the five prefix
@@ -1174,10 +1267,18 @@ pub fn encode_argb_literals_color_cache(pixels: &[u32], cache_code_bits: u32) ->
 /// caller-supplied `code_bits ∈ [1, 11]`. The token stream must already
 /// reflect the choice — `CacheRef` tokens are only meaningful when the
 /// cache is enabled.
+///
+/// `image_width` is the §3.4 image width the encoded stream describes;
+/// it feeds [`pixel_distance_to_distance_code`] for the §5.2.2 distance
+/// chooser so backward references whose scan-line distance equals
+/// `xi + yi*image_width` for some distance-map entry get the smaller
+/// distance code. Pass `1` to retain the round-119 scan-line-only
+/// behaviour (no map codes match at width 1 for typical distances).
 fn encode_tokens(
     tokens: &[Token],
     subtract_green: bool,
     color_cache_code_bits: Option<u32>,
+    image_width: u32,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
 
@@ -1216,7 +1317,7 @@ fn encode_tokens(
     // the §5.2.3 cache indices (`256 + 24 + index`). The distance
     // alphabet (40 codes) is exercised only when the matcher emitted at
     // least one copy.
-    let freqs = count_frequencies(tokens, color_cache_size);
+    let freqs = count_frequencies(tokens, color_cache_size, image_width);
     let green_code = WriteCode::from_freqs(&freqs.green);
     let red_code = WriteCode::from_freqs(&freqs.red);
     let blue_code = WriteCode::from_freqs(&freqs.blue);
@@ -1265,9 +1366,12 @@ fn encode_tokens(
             }
             Token::Copy { length, distance } => {
                 // §5.2.2: length via a GREEN length symbol (base 256), then
-                // distance via prefix code #5 (base 0).
+                // distance via prefix code #5 (base 0). The chooser must
+                // agree with `count_frequencies` so the prefix-code Huffman
+                // tree we built actually contains the prefix slot we look up.
                 write_lz77_value(&mut w, &green_code, 256, length as u32);
-                write_lz77_value(&mut w, &dist_code, 0, distance_to_code(distance));
+                let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                write_lz77_value(&mut w, &dist_code, 0, raw_code);
             }
         }
     }
@@ -1365,7 +1469,10 @@ fn validate_argb(pixels: &[u32], width: u32, height: u32) -> Result<(), EncodeEr
 /// `VP8L` chunk wraps — *not* a RIFF/WEBP file. Callers wanting the framed
 /// file use [`encode_webp_lossless`] / [`encode_vp8l_argb_with_metadata`].
 fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: bool) -> Vec<u8> {
-    let stream = encode_argb_literals(pixels);
+    // Production path: thread the actual image width so the §5.2.2
+    // distance-map chooser can swap row-style scan-line codes for
+    // small distance-map codes (round 130).
+    let stream = encode_argb_literals_with_width(pixels, width);
     let header = build_image_header(width, height, alpha_is_used);
     let mut payload = Vec::with_capacity(header.len() + stream.len());
     payload.extend_from_slice(&header);
@@ -1956,7 +2063,11 @@ mod tests {
         }
         let no_tx = {
             let tokens = tokenize_lz77(&pixels);
-            encode_tokens(&tokens, false, None)
+            // Width-less baseline (matches `encode_argb_literals_subtract_green`
+            // below, which also uses width=1) so the comparison isolates
+            // the subtract-green transform from the round-130 distance-map
+            // chooser.
+            encode_tokens(&tokens, false, None, 1)
         };
         let sg = encode_argb_literals_subtract_green(&pixels);
         eprintln!(
@@ -2001,10 +2112,12 @@ mod tests {
             pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
         }
         let chosen = encode_argb_literals(&pixels);
-        let no_tx = encode_literals_with_options(&pixels, false, None);
-        let sg = encode_literals_with_options(&pixels, true, None);
-        let cc = encode_literals_with_options(&pixels, false, Some(DEFAULT_COLOR_CACHE_BITS));
-        let sg_cc = encode_literals_with_options(&pixels, true, Some(DEFAULT_COLOR_CACHE_BITS));
+        // `encode_argb_literals` defaults to width=1 (no distance-map
+        // optimisation); match it for the per-option comparison.
+        let no_tx = encode_literals_with_options(&pixels, false, None, 1);
+        let sg = encode_literals_with_options(&pixels, true, None, 1);
+        let cc = encode_literals_with_options(&pixels, false, Some(DEFAULT_COLOR_CACHE_BITS), 1);
+        let sg_cc = encode_literals_with_options(&pixels, true, Some(DEFAULT_COLOR_CACHE_BITS), 1);
         let best = no_tx.len().min(sg.len()).min(cc.len()).min(sg_cc.len());
         assert_eq!(chosen.len(), best);
     }
@@ -2054,7 +2167,10 @@ mod tests {
         let chosen = encode_argb_literals(&pixels);
         let no_tx = {
             let tokens = tokenize_lz77(&pixels);
-            encode_tokens(&tokens, false, None)
+            // Match `encode_argb_literals`'s width-less form (width=1) so
+            // the chooser comparison stays apples-to-apples regardless of
+            // the round-130 distance-map optimisation.
+            encode_tokens(&tokens, false, None, 1)
         };
         assert!(
             chosen.len() <= no_tx.len(),
@@ -2271,8 +2387,11 @@ mod tests {
             state ^= state << 5;
             pixels.push(palette[(state as usize) % palette.len()]);
         }
-        let no_cache = encode_literals_with_options(&pixels, false, None);
-        let cache = encode_literals_with_options(&pixels, false, Some(DEFAULT_COLOR_CACHE_BITS));
+        // Width-less form (matches `encode_argb_literals_color_cache`,
+        // which also uses width=1) so the comparison isolates the
+        // color-cache effect from the round-130 distance-map chooser.
+        let no_cache = encode_literals_with_options(&pixels, false, None, 1);
+        let cache = encode_literals_with_options(&pixels, false, Some(DEFAULT_COLOR_CACHE_BITS), 1);
         eprintln!(
             "[round-121] 32x32 small-palette pseudo-random: no-cache={} B, color-cache={} B ({:.1}% reduction)",
             no_cache.len(),
@@ -2311,7 +2430,9 @@ mod tests {
             pixels.push(state | 0xff00_0000);
         }
         let chosen = encode_argb_literals(&pixels);
-        let no_cache_no_tx = encode_literals_with_options(&pixels, false, None);
+        // Match `encode_argb_literals`'s width=1 form so the comparison
+        // is apples-to-apples.
+        let no_cache_no_tx = encode_literals_with_options(&pixels, false, None, 1);
         assert!(
             chosen.len() <= no_cache_no_tx.len(),
             "chooser regressed on noise: {} B chosen vs {} B no-cache no-tx",
@@ -2348,5 +2469,359 @@ mod tests {
         assert!(header.color_cache.is_enabled());
         assert_eq!(header.color_cache.code_bits, DEFAULT_COLOR_CACHE_BITS);
         assert_eq!(header.color_cache.size(), 1 << DEFAULT_COLOR_CACHE_BITS);
+    }
+
+    // ---- round 130: §5.2.2 distance-map chooser ----
+
+    /// `pixel_distance_to_distance_code` reconstructs the spec's
+    /// `xi + yi * W` for the chosen code, identical to the decoder.
+    /// Across every distance-map entry at a fixed width, the chooser
+    /// must pick a code that round-trips through
+    /// `distance_code_to_pixel_distance` to the original distance.
+    #[test]
+    fn distance_chooser_reconstructs_each_distance_map_entry() {
+        use crate::vp8l_decode::{distance_code_to_pixel_distance, DISTANCE_MAP};
+        let width = 256u32;
+        for &(xi, yi) in DISTANCE_MAP.iter() {
+            let raw = xi + yi * width as i32;
+            let d = if raw < 1 { 1 } else { raw as usize };
+            let code = pixel_distance_to_distance_code(d, width);
+            assert_eq!(
+                distance_code_to_pixel_distance(code, width),
+                d,
+                "chooser code {code} for d={d} (xi={xi},yi={yi}) does not round-trip",
+            );
+        }
+    }
+
+    /// For a 256-wide image, pixel distance 256 (one row above) must be
+    /// represented by distance-map code 1 ((0, 1)), not the scan-line
+    /// code 376 (`256 + 120`). This is the headline round-130 win on
+    /// natural images.
+    #[test]
+    fn distance_chooser_picks_map_code_for_row_distance() {
+        let width = 256u32;
+        let code = pixel_distance_to_distance_code(width as usize, width);
+        assert_eq!(code, 1, "row distance must collapse to map code 1");
+        // And legacy scan-line code is the bigger alternative.
+        assert_eq!(distance_to_code(width as usize), width + 120);
+    }
+
+    /// A distance with no §5.2.2 map representation at the chosen width
+    /// falls back to the scan-line code `D + 120`. At width 256, a
+    /// distance of 1000 has no `(xi, yi)` entry that reconstructs it, so
+    /// the chooser emits `1000 + 120 = 1120`.
+    #[test]
+    fn distance_chooser_falls_back_to_scan_line_when_no_map_match() {
+        let width = 256u32;
+        let code = pixel_distance_to_distance_code(1000, width);
+        assert_eq!(code, 1000 + 120);
+    }
+
+    /// Width-1 (the no-spatial-structure form) admits no distance-map
+    /// entry whose `xi + yi*1` exceeds 8+7 = 15, so any distance >= 16
+    /// must use the scan-line form. The chooser must agree.
+    #[test]
+    fn distance_chooser_width_one_uses_scan_line_for_large_distances() {
+        for d in [16usize, 32, 64, 100, 500] {
+            assert_eq!(
+                pixel_distance_to_distance_code(d, 1),
+                (d as u32) + 120,
+                "width=1 distance {d} should not collapse",
+            );
+        }
+    }
+
+    /// On a row-correlated image (every scan-line copies the row above
+    /// verbatim), the round-130 width-aware encoder must produce a
+    /// strictly smaller stream than the round-119 scan-line-only form.
+    /// This is the headline round-130 size-reduction measurement.
+    #[test]
+    fn width_aware_distance_beats_scan_line_only_on_row_correlated_image() {
+        // 128x128 image whose every row is a fresh pseudo-random
+        // 128-pixel pattern repeated for the next scan-line. The LZ77
+        // matcher emits a single `Copy { length: ~MAX_MATCH, distance:
+        // 128 }` per row (and chains thereafter). At width 128, distance
+        // 128 = `(0, 1)` = distance-map code 1, far smaller than the
+        // scan-line code 248.
+        let w = 128u32;
+        let h = 128u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xC0DE_FACEu32;
+        for _ in 0..w {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push((state & 0x00ff_ffff) | 0xff00_0000);
+        }
+        for y in 1..h {
+            for x in 0..w {
+                pixels.push(pixels[(x + (y - 1) * w) as usize]);
+            }
+        }
+
+        let width_aware = encode_argb_literals_with_width(&pixels, w);
+        let scan_line_only = encode_argb_literals(&pixels); // width=1
+
+        eprintln!(
+            "[round-130] 128x128 row-correlated: scan-line-only={} B, width-aware={} B ({:.1}% reduction)",
+            scan_line_only.len(),
+            width_aware.len(),
+            100.0 * (scan_line_only.len() as f64 - width_aware.len() as f64)
+                / scan_line_only.len() as f64,
+        );
+        assert!(
+            width_aware.len() < scan_line_only.len(),
+            "width-aware stream ({} B) not smaller than scan-line-only ({} B)",
+            width_aware.len(),
+            scan_line_only.len(),
+        );
+
+        // Round trip is exact via the public entry point.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// A photo-like fixture (smooth luma gradient + per-pixel small
+    /// noise to fill the LZ77 hash chains) gets the round-130 chooser
+    /// to find numerous small `(xi, yi)` matches in the §5.2.2
+    /// distance-map neighbourhood. Compared to the width=1 scan-line
+    /// baseline, the width-aware path is strictly smaller.
+    #[test]
+    fn width_aware_distance_beats_scan_line_only_on_photo_like_image() {
+        let w = 64u32;
+        let h = 64u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        // Each row is a low-amplitude noise pattern around a luma ramp;
+        // adjacent rows share the same noise seed but with a tiny offset,
+        // so 2-D neighbour matches are abundant.
+        let mut state = 0x1234_5678u32;
+        for y in 0..h {
+            let luma = (y * 4) as u8;
+            for _x in 0..w {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let n = (state & 0x07) as i32 - 3; // [-3, 4)
+                let g = (luma as i32 + n).clamp(0, 255) as u32;
+                let r = g;
+                let b = g;
+                pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+            }
+        }
+        let width_aware = encode_argb_literals_with_width(&pixels, w);
+        let scan_line_only = encode_argb_literals(&pixels);
+        eprintln!(
+            "[round-130] 64x64 photo-like: scan-line-only={} B, width-aware={} B ({:.1}% reduction)",
+            scan_line_only.len(),
+            width_aware.len(),
+            100.0 * (scan_line_only.len() as f64 - width_aware.len() as f64)
+                / scan_line_only.len() as f64,
+        );
+        assert!(
+            width_aware.len() <= scan_line_only.len(),
+            "width-aware regressed: {} B vs scan-line-only {} B",
+            width_aware.len(),
+            scan_line_only.len(),
+        );
+
+        // Round trip stays exact.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// Round trip is exact across a spread of image widths. The chooser
+    /// must never emit a distance code that reconstructs to a different
+    /// pixel distance on the decode side.
+    #[test]
+    fn width_aware_round_trip_across_assorted_widths() {
+        for &(w, h) in &[
+            (1u32, 16u32),
+            (3u32, 16u32),
+            (16u32, 16u32),
+            (97u32, 13u32),
+            (200u32, 3u32),
+            (256u32, 8u32),
+        ] {
+            let mut pixels = Vec::with_capacity((w * h) as usize);
+            // A row-repeating pattern so the LZ77 matcher emits copies
+            // at row-multiple distances, exercising the chooser.
+            for y in 0..h {
+                for x in 0..w {
+                    let v = (x.wrapping_mul(31).wrapping_add(y)) & 0xff;
+                    pixels.push(0xff00_0000 | (v << 16) | (v << 8) | v);
+                }
+            }
+            let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+            let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+            let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+            assert_eq!(
+                img.pixels(),
+                pixels.as_slice(),
+                "round trip mismatch at {w}x{h}",
+            );
+        }
+    }
+
+    /// A 64x64 image whose every row is row 0 shifted by `(y % 4) - 1`
+    /// pixels — the resulting per-row matches are short (3-pixel-aligned
+    /// hashes mostly), at distances clustered near `width = 64`. The
+    /// matcher emits many small Copy tokens whose distances are 60–65
+    /// (= 64-4..64+1), all of which the round-130 chooser collapses to
+    /// distance-map codes 1, 3, 4 (prefix 0–2). With dozens of emissions
+    /// the chooser's per-token saving compounds against the scan-line
+    /// baseline (which would assign each to prefix-14 buckets).
+    #[test]
+    fn width_aware_distance_compounds_on_many_short_row_offset_matches() {
+        let w = 64u32;
+        let h = 64u32;
+        let mut row0 = Vec::with_capacity(w as usize);
+        let mut state = 0x1357_2468u32;
+        for _ in 0..w {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            row0.push((state & 0x00ff_ffff) | 0xff00_0000);
+        }
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        pixels.extend_from_slice(&row0);
+        for y in 1..h {
+            // Per-row 0..3 horizontal shift, ringing back into row0.
+            let shift = (y as usize) & 0x3;
+            for x in 0..(w as usize) {
+                pixels.push(row0[(x + shift) % (w as usize)]);
+            }
+        }
+        let width_aware = encode_argb_literals_with_width(&pixels, w);
+        let scan_line_only = encode_argb_literals(&pixels);
+        eprintln!(
+            "[round-130] 64x64 row-shifted: scan-line-only={} B, width-aware={} B ({:.1}% reduction)",
+            scan_line_only.len(),
+            width_aware.len(),
+            100.0 * (scan_line_only.len() as f64 - width_aware.len() as f64)
+                / scan_line_only.len() as f64,
+        );
+        assert!(
+            width_aware.len() < scan_line_only.len(),
+            "width-aware ({} B) not smaller than scan-line-only ({} B)",
+            width_aware.len(),
+            scan_line_only.len(),
+        );
+
+        // Round trip stays exact via the production path.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// A 256x256 row-repeating image (every scan-line a copy of row 1)
+    /// drives the round-130 chooser to swap the scan-line code `256+120
+    /// = 376` (prefix 16, 7 extra bits) for the map code 1 (prefix 0,
+    /// 0 extra bits) — the largest single-emission saving the chooser
+    /// can produce. The aggregate stream-size delta is the round-130
+    /// headline measurement on row-correlated content.
+    #[test]
+    fn width_aware_distance_headline_256x256_row_repeating() {
+        let w = 256u32;
+        let h = 256u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xABCD_1234u32;
+        for _ in 0..w {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push((state & 0x00ff_ffff) | 0xff00_0000);
+        }
+        for y in 1..h {
+            for x in 0..w {
+                pixels.push(pixels[(x + (y - 1) * w) as usize]);
+            }
+        }
+
+        let width_aware = encode_argb_literals_with_width(&pixels, w);
+        let scan_line_only = encode_argb_literals(&pixels);
+        eprintln!(
+            "[round-130] 256x256 row-repeating: scan-line-only={} B, width-aware={} B ({:.1}% reduction)",
+            scan_line_only.len(),
+            width_aware.len(),
+            100.0 * (scan_line_only.len() as f64 - width_aware.len() as f64)
+                / scan_line_only.len() as f64,
+        );
+        assert!(
+            width_aware.len() < scan_line_only.len(),
+            "width-aware stream ({} B) not smaller than scan-line-only ({} B)",
+            width_aware.len(),
+            scan_line_only.len(),
+        );
+
+        // Round trip stays exact via the production path.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// Re-encode an existing lossless fixture (decoded to ARGB) through
+    /// both the width=1 scan-line-only form and the round-130 width-aware
+    /// form, and confirm the width-aware variant is strictly smaller and
+    /// round-trips bit-exactly. This exercises the chooser on
+    /// non-synthetic distance distributions (the fixture's encoder
+    /// produced whatever natural-image-style matches it found).
+    #[test]
+    fn width_aware_re_encode_of_real_fixture_is_smaller() {
+        // 32x32 RGBA fixture committed in-tree (no external decode).
+        let bytes: &[u8] = include_bytes!("../tests/data/lossless-32x32-rgba.webp");
+        let decoded = crate::decode_lossless_image(bytes).unwrap().unwrap();
+        let w = decoded.width();
+        let h = decoded.height();
+        let pixels = decoded.pixels().to_vec();
+
+        let width_aware = encode_argb_literals_with_width(&pixels, w);
+        let scan_line_only = encode_argb_literals(&pixels);
+        eprintln!(
+            "[round-130] {}x{} re-encoded fixture: scan-line-only={} B, width-aware={} B ({:.1}% reduction)",
+            w,
+            h,
+            scan_line_only.len(),
+            width_aware.len(),
+            100.0 * (scan_line_only.len() as f64 - width_aware.len() as f64)
+                / scan_line_only.len() as f64,
+        );
+        assert!(
+            width_aware.len() <= scan_line_only.len(),
+            "width-aware regressed: {} B vs scan-line-only {} B",
+            width_aware.len(),
+            scan_line_only.len(),
+        );
+
+        // Round trip through the encoder + decoder is exact.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// The chooser must never inflate a distance: the chosen code's
+    /// prefix code is always less than or equal to the scan-line
+    /// alternative's prefix code, since the chooser picks the smaller
+    /// raw code and `value_to_prefix` is monotonic in the value.
+    #[test]
+    fn chooser_never_picks_larger_prefix_than_scan_line() {
+        let width = 320u32;
+        for d in 1..=(width as usize * 4) {
+            let chooser_code = pixel_distance_to_distance_code(d, width);
+            let scan_code = distance_to_code(d);
+            let (chooser_prefix, _, _) = value_to_prefix(chooser_code);
+            let (scan_prefix, _, _) = value_to_prefix(scan_code);
+            assert!(
+                chooser_prefix <= scan_prefix,
+                "d={d}: chooser code {chooser_code} (prefix {chooser_prefix}) > scan-line {scan_code} (prefix {scan_prefix})",
+            );
+        }
     }
 }

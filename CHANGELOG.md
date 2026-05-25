@@ -6,6 +6,41 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 130 (2026-05-25).** §5.2.2 **width-aware distance-code
+  chooser** for the VP8L lossless encoder. Each backward reference now
+  picks the smaller of the scan-line code (`D + 120`, the round-119
+  default) and any §5.2.2 distance-map code `c ∈ 1..=120` whose
+  `(xi, yi)` entry reconstructs to `D` for the image width — so a row-
+  distance match (D = W) on a 256-wide image collapses from scan-line
+  code 376 (prefix 16, 7 extra bits per emission) to map code 1
+  (prefix 0, 0 extra bits). The reconstruction in
+  `vp8l_decode::distance_code_to_pixel_distance` is identical for both
+  forms, so the round trip stays bit-exact. New public helper
+  `pixel_distance_to_distance_code(distance, image_width)`; new internal
+  `encode_argb_literals_with_width(pixels, image_width)` that threads
+  the actual image width into the chooser (wired by `encode_vp8l_payload`
+  → `encode_webp_lossless` / `encode_vp8l_argb` / animation encoders).
+  The legacy width-less `encode_argb_literals` is retained for test
+  callers that exercise the entropy stage without spatial structure;
+  it defaults to width = 1, which disables the chooser (no distance-map
+  entry reconstructs typical distances at a single-pixel-wide row).
+  Headline: a 256×256 row-repeating fixture shrinks from 972 B to 958 B
+  (~1.4 % reduction); a 128×128 row-correlated fixture from 522 B to
+  519 B (~0.6 %). Eight new tests cover chooser correctness
+  (`distance_chooser_reconstructs_each_distance_map_entry`,
+  `distance_chooser_picks_map_code_for_row_distance`,
+  `distance_chooser_falls_back_to_scan_line_when_no_map_match`,
+  `distance_chooser_width_one_uses_scan_line_for_large_distances`),
+  per-prefix non-regression (`chooser_never_picks_larger_prefix_than_scan_line`),
+  measured size-reduction
+  (`width_aware_distance_beats_scan_line_only_on_row_correlated_image`,
+  `width_aware_distance_compounds_on_many_short_row_offset_matches`,
+  `width_aware_distance_headline_256x256_row_repeating`,
+  `width_aware_distance_beats_scan_line_only_on_photo_like_image`,
+  `width_aware_re_encode_of_real_fixture_is_smaller`), and round-trip
+  bit-exactness across widths
+  (`width_aware_round_trip_across_assorted_widths`). 356 tests total.
+
 * **Clean-room round 127 (2026-05-25).** `AnimFrameMode::Auto` and
   `AnimFrameMode::Delta` are no longer `WebpError::Unsupported` — both
   now encode the caller's frames against the previous canvas using a
