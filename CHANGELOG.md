@@ -6,6 +6,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 137 (2026-05-26).** **Optimal length-limited Huffman
+  via Package-Merge.** The round-136 encoder built canonical Huffman from
+  histograms, then post-passed with a heuristic depth-limiter ("lengthen
+  the deepest leaf, shorten a short one to keep the Kraft sum at 1") when
+  the unconstrained tree depth exceeded the spec's 15-bit cap. On
+  cap-triggering histograms the heuristic is only *locally* optimal; the
+  globally-optimal length assignment under the depth cap is given by the
+  Package-Merge algorithm (Larmore–Hirschberg 1990) applied to the
+  coin-collector reformulation of length-limited Huffman. `build_code_lengths`
+  now invokes a from-scratch Package-Merge implementation when (and only
+  when) the unconstrained tree exceeds [`MAX_CODE_LENGTH`]; histograms whose
+  unconstrained tree already fits under the cap continue to use the
+  unconstrained build (which is itself optimal). The result is a
+  weakly-smaller bit cost ∑ freq[s]·len[s] on every input that triggers the
+  cap, and identical output on every input that does not — so the
+  round-trip stays bit-exact on every existing fixture (414/414 tests
+  green, including all seven lossless fixtures). Headline measurement on
+  a pathological Fibonacci(25) frequency vector (unconstrained tree depth
+  24, well past the 15-bit cap): **−759 bits (~95 bytes) vs the round-136
+  heuristic**, with both forms remaining complete (Kraft sum 1) and
+  cap-honouring. The earlier Fibonacci(20) case yields a smaller but real
+  −26-bit win. The heuristic limiter is retained as `#[cfg(test)]`-only
+  scaffolding so the comparison tests can demonstrate the strict-win
+  delta. Eight new inline tests cover: single-symbol / two-symbol
+  short-circuit, Kraft completeness over four histograms (uniform, mild
+  skew, ramp, Fibonacci), agreement with unconstrained Huffman when the
+  cap is not triggered, the strict-win pathological cases (Fibonacci(20)
+  and Fibonacci(25)), the `build_code_lengths` fallback dispatch, and a
+  bit-exact round trip through the round-104 prefix reader.
+
 * **Clean-room round 136 (2026-05-25).** §3.7.2.1.1 **simple code length
   code** emission for the VP8L lossless encoder. The encoder previously
   always wrote each of the five prefix codes' length tables with the

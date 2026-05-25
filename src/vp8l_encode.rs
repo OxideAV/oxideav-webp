@@ -251,11 +251,21 @@ impl BitWriter {
 /// input with exactly one used symbol.
 ///
 /// The algorithm is a textbook Huffman build over a min-heap of
-/// `(frequency, node)` pairs, followed by a length-limiting pass that caps
-/// any over-long code at [`MAX_CODE_LENGTH`] while re-balancing so the
-/// Kraft sum stays exactly 1. For the small alphabets and pixel counts this
-/// encoder targets, the cap is rarely hit; the pass is correctness
-/// insurance, not an optimization.
+/// `(frequency, node)` pairs. If the unconstrained tree depth exceeds
+/// [`MAX_CODE_LENGTH`], the result is **discarded** and recomputed with the
+/// Package-Merge algorithm (Larmore–Hirschberg 1990) at the depth cap. Unlike
+/// a heuristic "lengthen the deepest leaf, shorten a short one" post-pass,
+/// Package-Merge solves the length-limited Huffman problem **optimally**: it
+/// returns the depth-≤ L assignment that minimises the expected code length
+/// ∑ freq[i] · len[i]. The selection therefore can only equal or improve on
+/// the heuristic post-pass on every input that triggers the cap, and is
+/// identical to the heuristic on every input that does not (because the
+/// unconstrained Huffman tree is itself optimal when it already fits under
+/// L).
+///
+/// For the small alphabets and pixel counts this encoder targets, the cap is
+/// rarely hit, but when it is the optimal solution can be measurably smaller
+/// than the heuristic's — see [`package_merge_code_lengths`].
 pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     let n = freqs.len();
     let mut lengths = vec![0u8; n];
@@ -384,9 +394,193 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     }
 
     if max_len > MAX_CODE_LENGTH {
-        limit_code_lengths(&mut lengths, &used);
+        // Discard the unconstrained build and replace it with the optimal
+        // length-limited solution. Package-Merge returns the per-symbol
+        // length assignment of depth ≤ MAX_CODE_LENGTH that minimises
+        // ∑ freq[s] · len[s] — strictly the best the encoder can do under
+        // the spec's 15-bit cap.
+        let pm = package_merge_code_lengths(freqs, MAX_CODE_LENGTH);
+        lengths[..n].copy_from_slice(&pm[..n]);
     }
 
+    lengths
+}
+
+/// Optimal length-limited Huffman code-length assignment via the
+/// **Package-Merge algorithm** (Larmore–Hirschberg, "A Fast Algorithm for
+/// Optimal Length-Limited Huffman Codes", *J. ACM* 1990). For an alphabet
+/// of `freqs.len()` symbols with frequencies `freqs[s]`, returns a
+/// `Vec<u8>` of code lengths, one per symbol (0 = unused), such that:
+///
+/// * every used symbol's length is in `1..=max_len`,
+/// * the Kraft sum `∑ 2^-len[s]` over used symbols equals exactly 1
+///   (i.e. the resulting canonical Huffman code is *complete*), and
+/// * `∑ freq[s] · len[s]` is minimised over every length assignment
+///   satisfying the first two conditions.
+///
+/// ## Algorithm (textbook description)
+///
+/// Treat each used symbol as a "coin" of value `2^-i` for `i = 1..=max_len`.
+/// We need to select coins from `max_len` lists (one per `i`) totalling
+/// exactly `n-1` (in units of `2^-max_len`), minimising total coin
+/// frequency — this is the classic *coin-collector* reformulation of
+/// length-limited Huffman:
+///
+/// 1. Build the list at level `max_len` as `n` "items", one per used
+///    symbol, with `weight = freq[s]` and `leaves = {s}`.
+/// 2. For `level = max_len` down to `2`, repeat (a)–(c):
+///    (a) sort the current list by weight (stable on first-appearance);
+///    (b) take pairs `(items[0], items[1]), (items[2], items[3]), …` —
+///    drop any trailing unpaired item; each pair becomes a "package" with
+///    `weight = weight_a + weight_b` and leaf-multiset = union of the
+///    pair's leaves;
+///    (c) merge the packages into the next level (`level - 1`)'s leaf
+///    list (which is again `n` leaves with `weight = freq[s]`).
+/// 3. After processing, the level-1 list contains `n` original leaves plus
+///    some packages. Sort it by weight and pick the lowest-weight `2n - 2`
+///    items.
+/// 4. For each leaf `s`, count how many times it appears across the
+///    selected items (each leaf appears at most `max_len` times). That
+///    count is `len[s]`.
+///
+/// Steps 1–4 give an optimal length-limited Huffman code; the Kraft sum
+/// invariant follows from the coin-collector reformulation and the choice
+/// of `2n - 2` items.
+///
+/// ## Special cases
+///
+/// * 0 used symbols → all-zero result (caller emits the spec's
+///   single-symbol-0 form).
+/// * 1 used symbol → `len[s] = 1` (§3.7.2.1.2 single-leaf form).
+/// * `n` used symbols where `2^max_len < n` (the cap cannot describe a
+///   prefix-free code for `n` symbols) → returns whatever the algorithm
+///   yields; in practice the encoder only invokes this routine for
+///   alphabets with `n ≤ 280 < 2^15`, so the case never arises.
+///
+/// This routine is the optimal replacement for the round 136 heuristic
+/// length-limiter. On histograms where the depth cap does not bite, both
+/// the heuristic and Package-Merge return the same lengths as the
+/// unconstrained Huffman build, so this routine is invoked only via the
+/// fallback path in [`build_code_lengths`]. On histograms where it does
+/// bite, Package-Merge's lengths are weakly smaller (in the
+/// `∑ freq[s] · len[s]` sense) than the heuristic's on every input, and
+/// strictly smaller on inputs where the heuristic's local "lengthen the
+/// longest leaf" greedy is sub-optimal — see the `tests` module's
+/// `package_merge_beats_heuristic_on_pathological_histogram` case.
+pub fn package_merge_code_lengths(freqs: &[u32], max_len: usize) -> Vec<u8> {
+    let n = freqs.len();
+    let mut lengths = vec![0u8; n];
+
+    // Collect used symbols and short-circuit the 0- and 1-symbol cases.
+    let used: Vec<usize> = (0..n).filter(|&s| freqs[s] > 0).collect();
+    match used.len() {
+        0 => return lengths,
+        1 => {
+            lengths[used[0]] = 1;
+            return lengths;
+        }
+        _ => {}
+    }
+    debug_assert!(max_len >= 1);
+
+    // An `Item` is either a leaf (one symbol) or a package of two children.
+    // We track only the multiset of leaves it represents — that is the
+    // information needed to recover per-symbol lengths at the end. Storing
+    // a sorted, deduplicated `(symbol_index_in_used, count)` list would be
+    // cheaper, but a plain `Vec<usize>` of `used`-indices keeps the code
+    // simple and the alphabet sizes involved are small (n ≤ 280).
+    #[derive(Clone)]
+    struct Item {
+        weight: u64,
+        // Indices into `used` (so 0..used.len()), each occurrence counted.
+        leaves: Vec<u16>,
+    }
+
+    let u = used.len();
+    // Level `max_len`'s starting list: one item per used symbol.
+    let mut current: Vec<Item> = (0..u)
+        .map(|i| Item {
+            weight: freqs[used[i]] as u64,
+            leaves: vec![i as u16],
+        })
+        .collect();
+
+    // Stable sort by weight (ascending). `sort_by_key` is stable.
+    current.sort_by_key(|it| it.weight);
+
+    // Iterate from level = max_len down to level = 2. At each step we pair
+    // adjacent items into packages and merge those packages with the
+    // original `u` leaves at the next level.
+    for _ in 1..max_len {
+        // Pair up. A trailing unpaired item is dropped.
+        let pairs = current.len() / 2;
+        let mut packages: Vec<Item> = Vec::with_capacity(pairs);
+        for k in 0..pairs {
+            let a = &current[2 * k];
+            let b = &current[2 * k + 1];
+            let mut leaves = Vec::with_capacity(a.leaves.len() + b.leaves.len());
+            leaves.extend_from_slice(&a.leaves);
+            leaves.extend_from_slice(&b.leaves);
+            packages.push(Item {
+                weight: a.weight + b.weight,
+                leaves,
+            });
+        }
+        // Merge `packages` with a fresh leaf list. Both are sorted (the
+        // leaf list trivially by repeated stable sort, the package list by
+        // construction from a sorted source via pair-sums in ascending
+        // order). A straight merge keeps the combined list sorted in O(n).
+        let leaves_iter: Vec<Item> = (0..u)
+            .map(|i| Item {
+                weight: freqs[used[i]] as u64,
+                leaves: vec![i as u16],
+            })
+            .collect();
+        // We need leaves stably sorted by weight (matching the level-max
+        // initial sort). Reuse the same key.
+        let mut leaves_sorted = leaves_iter;
+        leaves_sorted.sort_by_key(|it| it.weight);
+
+        let mut merged: Vec<Item> = Vec::with_capacity(packages.len() + leaves_sorted.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < leaves_sorted.len() && j < packages.len() {
+            if leaves_sorted[i].weight <= packages[j].weight {
+                merged.push(leaves_sorted[i].clone());
+                i += 1;
+            } else {
+                merged.push(packages[j].clone());
+                j += 1;
+            }
+        }
+        while i < leaves_sorted.len() {
+            merged.push(leaves_sorted[i].clone());
+            i += 1;
+        }
+        while j < packages.len() {
+            merged.push(packages[j].clone());
+            j += 1;
+        }
+        current = merged;
+    }
+
+    // Pick the lowest-weight (2u - 2) items from the level-1 list. Per the
+    // coin-collector formulation that is exactly the number of selections
+    // needed for a complete code over `u` leaves.
+    let take = 2 * u - 2;
+    debug_assert!(current.len() >= take, "package-merge ran out of items");
+    let mut counts = vec![0u8; u];
+    for it in current.iter().take(take) {
+        for &li in &it.leaves {
+            counts[li as usize] += 1;
+        }
+    }
+
+    // counts[i] is the code length of used[i].
+    for (i, &c) in counts.iter().enumerate() {
+        debug_assert!(c >= 1, "every used symbol must be selected at least once");
+        debug_assert!(c as usize <= max_len, "package-merge length exceeded cap");
+        lengths[used[i]] = c;
+    }
     lengths
 }
 
@@ -394,12 +588,13 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
 /// exactly 1, using the standard "move a too-long leaf up and lengthen a
 /// short leaf to compensate" rebalancing pass.
 ///
-/// This is the approach a length-limited Huffman post-pass uses when a
-/// pathological frequency distribution would otherwise need codes longer
-/// than the format allows. It produces a *valid* (complete) code that is at
-/// most marginally sub-optimal; exactness of the round trip is unaffected
-/// because the decoder reconstructs pixels from whatever complete code the
-/// lengths describe.
+/// **Historical / comparison path only.** [`build_code_lengths`] no longer
+/// calls this routine — it falls back to [`package_merge_code_lengths`]
+/// when the depth cap is exceeded, which is provably optimal. This routine
+/// is retained so the `tests` module can demonstrate the byte delta
+/// between the round-136 heuristic and the round-137 optimal solution on
+/// histograms that trigger the cap.
+#[cfg(test)]
 fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
     // Clamp.
     for &s in used {
@@ -4998,6 +5193,298 @@ mod tests {
                 chooser_prefix <= scan_prefix,
                 "d={d}: chooser code {chooser_code} (prefix {chooser_prefix}) > scan-line {scan_code} (prefix {scan_prefix})",
             );
+        }
+    }
+
+    // ---- Package-Merge length-limited Huffman (round 137) ----
+
+    /// Helper: integer Kraft sum over denominator `2^max_len`. A complete
+    /// code has Kraft sum exactly `2^max_len`; a deficient code is less.
+    fn kraft_sum(lengths: &[u8], max_len: usize) -> i64 {
+        let mut k = 0i64;
+        for &l in lengths {
+            if l > 0 {
+                k += 1i64 << (max_len - l as usize);
+            }
+        }
+        k
+    }
+
+    /// Helper: total bit cost `∑ freq[s] · len[s]`.
+    fn weighted_length(freqs: &[u32], lengths: &[u8]) -> u64 {
+        freqs
+            .iter()
+            .zip(lengths.iter())
+            .map(|(&f, &l)| f as u64 * l as u64)
+            .sum()
+    }
+
+    /// Package-Merge produces the §3.7.2.1.2 single-leaf form for a
+    /// single-used-symbol input.
+    #[test]
+    fn package_merge_single_symbol_is_length_one() {
+        let mut freq = vec![0u32; 8];
+        freq[5] = 17;
+        let l = package_merge_code_lengths(&freq, MAX_CODE_LENGTH);
+        assert_eq!(l[5], 1);
+        assert_eq!(l.iter().filter(|&&v| v != 0).count(), 1);
+    }
+
+    /// Two used symbols both get length 1 — the only complete two-leaf
+    /// code.
+    #[test]
+    fn package_merge_two_symbols_length_one_each() {
+        let mut freq = vec![0u32; 4];
+        freq[1] = 7;
+        freq[2] = 3;
+        let l = package_merge_code_lengths(&freq, MAX_CODE_LENGTH);
+        assert_eq!(l[1], 1);
+        assert_eq!(l[2], 1);
+        assert_eq!(l[0], 0);
+        assert_eq!(l[3], 0);
+    }
+
+    /// Package-Merge's Kraft sum is exactly 1 on every input with at least
+    /// two used symbols, satisfying §3.7.2's completeness invariant.
+    #[test]
+    fn package_merge_kraft_sum_is_exactly_one() {
+        let cases: &[&[u32]] = &[
+            &[100, 1, 1, 1, 50, 25, 4, 2],
+            &[1, 1, 1, 1, 1, 1, 1, 1],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            // Fibonacci-like distribution, the textbook worst case for
+            // unconstrained Huffman tree depth.
+            &[
+                1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584,
+            ],
+        ];
+        for &freq in cases {
+            let l = package_merge_code_lengths(freq, MAX_CODE_LENGTH);
+            assert_eq!(
+                kraft_sum(&l, MAX_CODE_LENGTH),
+                1i64 << MAX_CODE_LENGTH,
+                "freq={freq:?} lengths={l:?}",
+            );
+            for (s, &len) in l.iter().enumerate() {
+                if freq[s] > 0 {
+                    assert!(len >= 1 && (len as usize) <= MAX_CODE_LENGTH);
+                } else {
+                    assert_eq!(len, 0);
+                }
+            }
+        }
+    }
+
+    /// On a histogram whose unconstrained Huffman tree fits under the
+    /// cap, Package-Merge returns the unconstrained build's lengths
+    /// (because the unconstrained build is already optimal).
+    #[test]
+    fn package_merge_matches_huffman_when_cap_not_triggered() {
+        // 8 symbols with a mild skew; max Huffman depth here is well
+        // below 15.
+        let freq = vec![40u32, 10, 5, 5, 1, 3, 2, 1];
+        let huff = build_code_lengths(&freq);
+        let pm = package_merge_code_lengths(&freq, MAX_CODE_LENGTH);
+        // Both must have the same weighted length (i.e. both optimal).
+        assert_eq!(weighted_length(&freq, &huff), weighted_length(&freq, &pm));
+        // Both must be complete codes.
+        assert_eq!(kraft_sum(&huff, MAX_CODE_LENGTH), 1i64 << MAX_CODE_LENGTH);
+        assert_eq!(kraft_sum(&pm, MAX_CODE_LENGTH), 1i64 << MAX_CODE_LENGTH);
+    }
+
+    /// A pathological histogram that forces the unconstrained Huffman tree
+    /// past the 15-bit cap. The classic recipe is a Fibonacci-ish weight
+    /// vector — the unconstrained tree is a maximally-skewed Vine, with
+    /// depth ≈ n. Pick n = 20 so the unconstrained max depth is 19 > 15.
+    fn pathological_freqs() -> Vec<u32> {
+        // 20 symbols; pure Fibonacci is the textbook worst case.
+        let mut f = vec![1u32, 1];
+        while f.len() < 20 {
+            let n = f.len();
+            f.push(f[n - 1] + f[n - 2]);
+        }
+        f
+    }
+
+    /// Package-Merge's bit cost on the pathological histogram is **at most
+    /// the heuristic post-pass's** bit cost, and **strictly less** when the
+    /// heuristic is sub-optimal. This is the round 137 win.
+    #[test]
+    fn package_merge_beats_heuristic_on_pathological_histogram() {
+        let freq = pathological_freqs();
+
+        // Unconstrained Huffman lengths (would exceed 15 here).
+        let unconstrained = unconstrained_huffman_for_test(&freq);
+        let max_unconstrained = *unconstrained.iter().max().unwrap();
+        assert!(
+            (max_unconstrained as usize) > MAX_CODE_LENGTH,
+            "test pre-condition: unconstrained depth must exceed cap (got {max_unconstrained})",
+        );
+
+        // Apply the round 136 heuristic post-pass to the unconstrained
+        // lengths.
+        let mut heuristic = unconstrained.clone();
+        let used: Vec<usize> = (0..freq.len()).filter(|&s| freq[s] > 0).collect();
+        limit_code_lengths(&mut heuristic, &used);
+        // Both must be complete.
+        assert_eq!(
+            kraft_sum(&heuristic, MAX_CODE_LENGTH),
+            1i64 << MAX_CODE_LENGTH,
+            "heuristic must remain complete",
+        );
+
+        let pm = package_merge_code_lengths(&freq, MAX_CODE_LENGTH);
+        assert_eq!(
+            kraft_sum(&pm, MAX_CODE_LENGTH),
+            1i64 << MAX_CODE_LENGTH,
+            "package-merge must be complete",
+        );
+
+        let wl_heuristic = weighted_length(&freq, &heuristic);
+        let wl_pm = weighted_length(&freq, &pm);
+        assert!(
+            wl_pm <= wl_heuristic,
+            "package-merge must be no worse than heuristic: pm={wl_pm} heuristic={wl_heuristic}",
+        );
+        // The headline claim of round 137: strictly smaller on a
+        // depth-cap-triggering pathological input.
+        assert!(
+            wl_pm < wl_heuristic,
+            "package-merge should strictly beat heuristic here: pm={wl_pm} heuristic={wl_heuristic}",
+        );
+    }
+
+    /// A deeper Fibonacci(25) histogram, where the unconstrained Huffman
+    /// tree depth is 24 (well past the 15-bit cap). On this input the
+    /// round-137 Package-Merge solution saves **759 bits (~95 bytes)** of
+    /// payload over the round-136 heuristic post-pass — a measurable
+    /// improvement on a depth-cap-triggered alphabet.
+    #[test]
+    fn package_merge_beats_heuristic_on_fib25() {
+        let mut freq = vec![1u32, 1];
+        while freq.len() < 25 {
+            let n = freq.len();
+            freq.push(freq[n - 1] + freq[n - 2]);
+        }
+        let unconstrained = unconstrained_huffman_for_test(&freq);
+        assert!((*unconstrained.iter().max().unwrap() as usize) > MAX_CODE_LENGTH);
+
+        let mut heuristic = unconstrained.clone();
+        let used: Vec<usize> = (0..freq.len()).filter(|&s| freq[s] > 0).collect();
+        limit_code_lengths(&mut heuristic, &used);
+        let pm = package_merge_code_lengths(&freq, MAX_CODE_LENGTH);
+
+        let wl_heuristic = weighted_length(&freq, &heuristic);
+        let wl_pm = weighted_length(&freq, &pm);
+        // The exact recorded delta at round-137 land; locked into the test
+        // so any regression in the Package-Merge implementation surfaces.
+        assert_eq!(
+            wl_heuristic - wl_pm,
+            759,
+            "Fibonacci(25) heuristic={wl_heuristic} pm={wl_pm}",
+        );
+        // Cap honoured on both.
+        assert!(heuristic.iter().all(|&l| (l as usize) <= MAX_CODE_LENGTH));
+        assert!(pm.iter().all(|&l| (l as usize) <= MAX_CODE_LENGTH));
+        // Both complete.
+        assert_eq!(
+            kraft_sum(&heuristic, MAX_CODE_LENGTH),
+            1i64 << MAX_CODE_LENGTH,
+        );
+        assert_eq!(kraft_sum(&pm, MAX_CODE_LENGTH), 1i64 << MAX_CODE_LENGTH);
+    }
+
+    /// Unconstrained Huffman build, copied from `build_code_lengths`
+    /// minus the depth-cap fallback. Used by the comparison test to
+    /// recover the pre-cap tree lengths.
+    fn unconstrained_huffman_for_test(freqs: &[u32]) -> Vec<u8> {
+        let n = freqs.len();
+        let mut lengths = vec![0u8; n];
+        let used: Vec<usize> = (0..n).filter(|&s| freqs[s] > 0).collect();
+        match used.len() {
+            0 => return lengths,
+            1 => {
+                lengths[used[0]] = 1;
+                return lengths;
+            }
+            _ => {}
+        }
+        // Naive O(n^2) repeated min-find for clarity in test code.
+        let mut parent: Vec<isize> = vec![-1; n];
+        let mut node_freq: Vec<u64> = (0..n).map(|s| freqs[s] as u64).collect();
+        let mut live: Vec<usize> = used.clone();
+        while live.len() > 1 {
+            // Find the two minimum-weight live nodes.
+            live.sort_by_key(|&x| node_freq[x]);
+            let a = live.remove(0);
+            let b = live.remove(0);
+            let new_node = node_freq.len();
+            node_freq.push(node_freq[a] + node_freq[b]);
+            parent.push(-1);
+            parent[a] = new_node as isize;
+            parent[b] = new_node as isize;
+            live.push(new_node);
+        }
+        for &s in &used {
+            let mut depth = 0usize;
+            let mut cur = s as isize;
+            while parent[cur as usize] != -1 {
+                cur = parent[cur as usize];
+                depth += 1;
+            }
+            lengths[s] = depth as u8;
+        }
+        lengths
+    }
+
+    /// `build_code_lengths` now invokes Package-Merge on the fallback
+    /// path: on the pathological histogram, its bit cost must equal
+    /// Package-Merge's (strictly better than the round 136 heuristic).
+    #[test]
+    fn build_code_lengths_uses_package_merge_on_overflow() {
+        let freq = pathological_freqs();
+        let lengths = build_code_lengths(&freq);
+
+        // Cap enforced.
+        let max = *lengths.iter().max().unwrap();
+        assert!(
+            (max as usize) <= MAX_CODE_LENGTH,
+            "depth cap honoured (got {max})",
+        );
+        // Complete.
+        assert_eq!(
+            kraft_sum(&lengths, MAX_CODE_LENGTH),
+            1i64 << MAX_CODE_LENGTH,
+        );
+
+        // Bit-exact match with package-merge.
+        let pm = package_merge_code_lengths(&freq, MAX_CODE_LENGTH);
+        assert_eq!(
+            weighted_length(&freq, &lengths),
+            weighted_length(&freq, &pm)
+        );
+    }
+
+    /// The cap-triggered code must still round-trip through the round-104
+    /// prefix reader — Package-Merge is bit-correct, not just numerically
+    /// better.
+    #[test]
+    fn package_merge_round_trips_through_prefix_reader() {
+        let freq = pathological_freqs();
+        let code = WriteCode::from_freqs(&freq);
+
+        let mut w = BitWriter::new();
+        code.write_code_lengths(&mut w);
+        // Emit one of each used symbol.
+        let used: Vec<usize> = (0..freq.len()).filter(|&s| freq[s] > 0).collect();
+        for &s in &used {
+            code.write_symbol(&mut w, s);
+        }
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        let decoded = PrefixCode::read(&mut r, freq.len()).unwrap();
+        for &s in &used {
+            assert_eq!(decoded.read_symbol(&mut r).unwrap() as usize, s);
         }
     }
 }

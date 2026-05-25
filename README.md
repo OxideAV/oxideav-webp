@@ -2,7 +2,41 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
-## Status — 2026-05-25 (clean-room round 136)
+## Status — 2026-05-26 (clean-room round 137)
+
+**Round 137 replaced the encoder's heuristic length-limited Huffman
+post-pass with a from-scratch *Package-Merge* (Larmore–Hirschberg 1990)
+implementation — the textbook *optimal* length-limited Huffman algorithm
+under the spec's §3.7.2 15-bit cap.** Round 136 built canonical Huffman
+from histograms and post-passed with a local "lengthen the deepest leaf,
+shorten a short one to keep the Kraft sum at 1" greedy. The greedy is
+correct (it always returns a complete depth-≤ 15 code), but only
+*locally* optimal: on histograms whose unconstrained Huffman tree
+exceeds the cap, a globally smaller ∑ freq[s]·len[s] is achievable.
+Package-Merge, applied to the coin-collector reformulation, returns that
+globally-optimal assignment. The encoder's
+[`build_code_lengths`](src/vp8l_encode.rs) now invokes Package-Merge on
+the fallback path whenever (and only when) the unconstrained tree
+exceeds [`MAX_CODE_LENGTH`]; histograms that already fit the cap keep
+the unconstrained build (itself optimal). Result: weakly-smaller bit
+cost on every cap-triggered input, identical output otherwise — so
+round-trip is bit-exact on every existing fixture (414/414 tests green,
+all seven lossless fixtures round-trip unchanged). The heuristic limiter
+is retained as `#[cfg(test)]`-only scaffolding so a comparison test can
+demonstrate the strict-win delta. Headline measurement on a pathological
+Fibonacci(25) frequency vector (unconstrained tree depth 24, well past
+the 15-bit cap): **−759 bits (~95 bytes) vs the round-136 heuristic**,
+with both forms remaining complete (Kraft sum 1) and cap-honouring; the
+shallower Fibonacci(20) case yields a smaller but real −26-bit win.
+Eight new inline tests cover single-symbol / two-symbol short-circuit,
+Kraft completeness over four histogram shapes (uniform, mild skew, ramp,
+Fibonacci), agreement with unconstrained Huffman when the cap is not
+triggered, the strict-win pathological cases (Fibonacci(20) and
+Fibonacci(25)), the `build_code_lengths` fallback dispatch, and a
+bit-exact round trip through the round-104 prefix reader. The natural
+test fixtures (predictor / cache / palette / color-decorrelated images)
+do not exercise the depth cap, so their byte counts are unchanged from
+round 136.
 
 **Round 136 added the VP8L §3.7.2.1.1 simple code length code to the
 encoder's prefix-code emission.** Each of the five prefix codes was
