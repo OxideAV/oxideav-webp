@@ -134,6 +134,18 @@
 //! square blocks; each block picks the prediction mode `0..=13` that
 //! minimises a residual-magnitude proxy (sum of per-channel
 //! `|residual|` folded onto `[-128, 127]`) over the block's pixels.
+//! As of round 159, the chooser also threads an
+//! **entropy-image-aware tie-break** through the per-block walk:
+//! when multiple modes tie on residual cost, the chooser prefers
+//! the mode chosen by the *previous neighbour* block (left-of in
+//! the current row, or top-of for the left-column blocks). The
+//! predictor sub-image is written as a §7.2 `entropy-coded-image`,
+//! so adjacent blocks carrying the same mode value reduce that
+//! sub-image's symbol entropy and the bytes the writer emits for
+//! it; this matches RFC 9649 §3.5's "transform data can be decided
+//! based on entropy minimization" note. The residuals themselves
+//! are unchanged on tie-equal swaps (the cost was already minimal),
+//! so decoded pixels stay bit-identical.
 //! The sub-resolution predictor image is written as a §7.2
 //! `predictor-image = 3BIT entropy-coded-image` and the per-pixel
 //! residuals are then handed to the standard
@@ -1679,6 +1691,13 @@ fn predictor_at(pixels: &[u32], width: usize, x: usize, y: usize, mode: u8) -> u
 ///
 /// On ties (multiple modes producing equal magnitude sums) the
 /// lowest mode wins, which makes the chooser deterministic.
+///
+/// This is the no-hint entry point — equivalent to calling
+/// [`pick_block_mode_with_hint`] with `prefer_mode = None`. The
+/// production caller [`build_predictor_image`] uses the
+/// hint-aware variant; the no-hint form is retained for the
+/// in-module tie-breaker tests.
+#[cfg(test)]
 fn pick_block_mode(
     pixels: &[u32],
     width: usize,
@@ -1687,6 +1706,82 @@ fn pick_block_mode(
     y0: usize,
     bw: usize,
     bh: usize,
+) -> u8 {
+    pick_block_mode_with_hint(pixels, width, height, x0, y0, bw, bh, None)
+}
+
+/// Compute the §4.1 residual-cost proxy for a single mode over
+/// the rectangular block `[x0, x0+bw) × [y0, y0+bh)`. Walks every
+/// in-bounds pixel without an early-out so the caller can use the
+/// result as an authoritative tie-break reference.
+///
+/// This is the same per-mode sum the main chooser computes inside
+/// [`pick_block_mode_with_hint`], factored out so the entropy-
+/// image-aware tie-breaker can evaluate the preferred neighbour
+/// mode exactly once and re-use the value to decide whether a
+/// post-walk swap is allowed.
+#[allow(clippy::too_many_arguments)]
+fn block_mode_cost(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mode: u8,
+) -> u64 {
+    let mut cost: u64 = 0;
+    for dy in 0..bh {
+        let y = y0 + dy;
+        if y >= height {
+            break;
+        }
+        for dx in 0..bw {
+            let x = x0 + dx;
+            if x >= width {
+                break;
+            }
+            let pred = predictor_at(pixels, width, x, y, mode);
+            let original = pixels[y * width + x];
+            let residual = predictor_subtract(original, pred);
+            cost += residual_magnitude(residual) as u64;
+        }
+    }
+    cost
+}
+
+/// Hint-aware variant of [`pick_block_mode`]: picks the §4.1 mode
+/// minimising the residual cost proxy, and on ties prefers
+/// `prefer_mode` over the otherwise-lowest tied mode.
+///
+/// `prefer_mode = Some(m)` directs the tie-break: when `m`'s cost
+/// equals the lowest cost found across all 14 modes, the chooser
+/// returns `m` instead of the lowest-indexed tied mode. When
+/// `prefer_mode = None` (or `prefer_mode = Some(m)` with `m`
+/// strictly worse than another mode), the lowest-tied-mode behaviour
+/// is preserved exactly.
+///
+/// Round 159: [`build_predictor_image`] passes the left neighbour
+/// block's chosen mode (or the top neighbour at the left edge of
+/// the predictor image) as the hint. The §3.5 RFC 9649 note
+/// "transform data can be decided based on entropy minimization"
+/// motivates this: residual-cost-equal modes encode different
+/// values into the predictor sub-image, and the sub-image is
+/// written as an `entropy-coded-image` (§7.2) so reducing its
+/// symbol entropy directly shrinks the output stream. The
+/// residuals themselves do not change (this is a strict tie-break),
+/// so decode round-trips are unaffected.
+#[allow(clippy::too_many_arguments)]
+fn pick_block_mode_with_hint(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    prefer_mode: Option<u8>,
 ) -> u8 {
     let mut best_mode: u8 = 0;
     let mut best_cost = u64::MAX;
@@ -1721,6 +1816,22 @@ fn pick_block_mode(
             best_mode = mode;
         }
     }
+    // Round 159 entropy-image-aware tie-breaker. If the caller
+    // supplied a preferred mode (typically the left or top neighbour
+    // block's chosen mode) and the preferred mode's full cost ties
+    // with `best_cost`, swap to the preferred mode so the predictor
+    // sub-image carries a longer run of identical mode values. The
+    // residual stream produced by the main image's forward transform
+    // is unchanged (the cost is equal), so decode round-trips are
+    // bit-identical.
+    if let Some(m) = prefer_mode {
+        if m != best_mode {
+            let cost = block_mode_cost(pixels, width, height, x0, y0, bw, bh, m);
+            if cost == best_cost {
+                best_mode = m;
+            }
+        }
+    }
     best_mode
 }
 
@@ -1734,6 +1845,19 @@ fn pick_block_mode(
 /// `transform_width = DIV_ROUND_UP(width, 1 << size_bits)` and
 /// `transform_height = DIV_ROUND_UP(height, 1 << size_bits)`, per
 /// §4.1.
+///
+/// Round 159: each block consults
+/// [`pick_block_mode_with_hint`] with the immediately-prior
+/// block's chosen mode as the preferred tie-break — left neighbour
+/// in the current row, or the top neighbour for blocks in the left
+/// column (no neighbour for the top-left block). This is a strict
+/// tie-break: when the preferred mode's residual cost equals the
+/// otherwise-lowest cost, the neighbour's value is chosen so the
+/// predictor sub-image carries longer runs of identical modes,
+/// dropping the sub-image's entropy and the bytes the
+/// `entropy-coded-image` writer emits for it. Residual values are
+/// unchanged on cost-equal swaps, so decoded pixels are
+/// bit-identical to the round-158 baseline.
 fn build_predictor_image(
     pixels: &[u32],
     width: u32,
@@ -1747,15 +1871,27 @@ fn build_predictor_image(
     let w = width as usize;
     let h = height as usize;
     let bsz = block as usize;
+    // Track the previous row's chosen modes so the left-column
+    // blocks can fall back to a top neighbour. Each slot is `None`
+    // while building the very first row.
+    let mut prev_row: Vec<Option<u8>> = vec![None; tw as usize];
     for by in 0..th as usize {
-        for bx in 0..tw as usize {
+        let mut left_mode: Option<u8> = None;
+        for (bx, top_slot) in prev_row.iter_mut().enumerate() {
             let x0 = bx * bsz;
             let y0 = by * bsz;
-            let mode = pick_block_mode(pixels, w, h, x0, y0, bsz, bsz);
+            // Preferred tie-break: left neighbour (current row) if
+            // present, else top neighbour (previous row). The
+            // top-left block (by == 0 && bx == 0) gets no hint and
+            // falls back to the lowest-tied-mode default.
+            let prefer = left_mode.or(*top_slot);
+            let mode = pick_block_mode_with_hint(pixels, w, h, x0, y0, bsz, bsz, prefer);
             // Pack mode into the green channel; opaque alpha and
             // zeroed red/blue keep the sub-image visually inert and
             // match the channel the decoder reads.
             img.push(0xff00_0000 | ((mode as u32) << 8));
+            left_mode = Some(mode);
+            *top_slot = Some(mode);
         }
     }
     (img, tw, th)
@@ -8588,5 +8724,550 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- round 159: §4.1 entropy-image-aware tie-break ----
+
+    /// `pick_block_mode_with_hint` accepts the preferred neighbour
+    /// mode when it ties with the otherwise-lowest mode at the same
+    /// minimal residual cost. The block is a solid-colour fill, so
+    /// modes 1..=13 all predict the left/top neighbour exactly →
+    /// every interior pixel has zero residual, and ties run across
+    /// every mode whose residual sum equals the lowest sum found.
+    /// Without a hint the chooser picks the lowest mode (mode 1 on a
+    /// non-black solid); with a hint of `Some(7)` it returns mode 7.
+    #[test]
+    fn round_159_pick_block_mode_with_hint_swaps_on_tie() {
+        let w = 8usize;
+        let h = 8usize;
+        let pixels = vec![0xff50_6070u32; w * h];
+
+        // No hint: the lowest tied mode wins (deterministic baseline).
+        let baseline = pick_block_mode_with_hint(&pixels, w, h, 0, 0, w, h, None);
+        // The exact value depends on the border rule for mode 0 vs
+        // the per-channel residual; what matters here is that the
+        // hint can swap to a different mode that ties at the same
+        // cost.
+        let baseline_cost = block_mode_cost(&pixels, w, h, 0, 0, w, h, baseline);
+
+        // Probe every mode 0..=13 to find one that ties baseline but
+        // is not equal to it.
+        let mut tied_other: Option<u8> = None;
+        for m in 0u8..=13 {
+            if m == baseline {
+                continue;
+            }
+            let c = block_mode_cost(&pixels, w, h, 0, 0, w, h, m);
+            if c == baseline_cost {
+                tied_other = Some(m);
+                break;
+            }
+        }
+        let other = tied_other
+            .expect("a solid-fill block has at least two modes tied at minimal residual cost");
+
+        // With hint == Some(other) and `other` strictly distinct
+        // from `baseline` but tied at the same cost, the chooser
+        // must return `other`.
+        let with_hint = pick_block_mode_with_hint(&pixels, w, h, 0, 0, w, h, Some(other));
+        assert_eq!(
+            with_hint, other,
+            "round-159 tie-break did not adopt the preferred mode: \
+             baseline={baseline}, other={other}, returned={with_hint}"
+        );
+    }
+
+    /// `pick_block_mode_with_hint` does NOT swap when the preferred
+    /// mode is strictly worse than the cost-minimal mode. A diagonal
+    /// 2-D ramp `pixels[y, x] = (x + 2y) & 0xff` makes the L-based
+    /// modes pay residual `1` per pixel while the T-based modes pay
+    /// residual `2` per pixel, so the chooser picks an L-based mode
+    /// uniquely. Probing every mode confirms which one is strictly
+    /// worse than the picked baseline; with that mode as the hint
+    /// the chooser must still return the baseline.
+    #[test]
+    fn round_159_pick_block_mode_with_hint_keeps_best_when_hint_worse() {
+        let w = 16usize;
+        let h = 16usize;
+        // 2-D ramp: L-based modes pay 1/pixel; T-based modes pay 2/pixel.
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| {
+                let x = (i % w) as u32;
+                let y = (i / w) as u32;
+                let v = (x + 2 * y) & 0xff;
+                0xff00_0000 | (v << 16) | (v << 8) | v
+            })
+            .collect();
+
+        let baseline = pick_block_mode_with_hint(&pixels, w, h, 0, 0, w, h, None);
+        let baseline_cost = block_mode_cost(&pixels, w, h, 0, 0, w, h, baseline);
+        // Find any mode whose cost is strictly worse than baseline.
+        let mut worse: Option<u8> = None;
+        for m in 0u8..=13 {
+            let c = block_mode_cost(&pixels, w, h, 0, 0, w, h, m);
+            if c > baseline_cost {
+                worse = Some(m);
+                break;
+            }
+        }
+        let worse = worse
+            .expect("test premise: the 2-D ramp should produce at least one strictly-worse mode");
+        let with_hint = pick_block_mode_with_hint(&pixels, w, h, 0, 0, w, h, Some(worse));
+        assert_eq!(
+            with_hint, baseline,
+            "round-159 tie-break must not adopt a strictly-worse hint \
+             (baseline={baseline}, worse-hint={worse})"
+        );
+    }
+
+    /// Local pre-round-159 copy of `build_predictor_image`. Mirrors
+    /// the round-158 behaviour exactly: every block calls the
+    /// hint-aware chooser with `prefer_mode = None`, so ties resolve
+    /// to the lowest mode regardless of any spatial coherence. Used
+    /// by the round-159 non-regression and strict-beat tests as the
+    /// before-after baseline.
+    fn pre_round_159_build_predictor_image(
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+        size_bits: u8,
+    ) -> (Vec<u32>, u32, u32) {
+        let block = 1u32 << size_bits;
+        let tw = predictor_div_round_up(width, block);
+        let th = predictor_div_round_up(height, block);
+        let mut img = Vec::with_capacity((tw * th) as usize);
+        let w = width as usize;
+        let h = height as usize;
+        let bsz = block as usize;
+        for by in 0..th as usize {
+            for bx in 0..tw as usize {
+                let x0 = bx * bsz;
+                let y0 = by * bsz;
+                let mode = pick_block_mode_with_hint(pixels, w, h, x0, y0, bsz, bsz, None);
+                img.push(0xff00_0000 | ((mode as u32) << 8));
+            }
+        }
+        (img, tw, th)
+    }
+
+    /// Round 159 structural correctness: the entropy-image-aware
+    /// tie-break is residual-cost-neutral, so for *every* block the
+    /// post-r159 chosen mode has identical residual cost to the
+    /// pre-r159 chosen mode (only the mode *value* may differ on
+    /// ties). The check is per-block: across a fixture matrix the
+    /// summed per-block residual cost must be exactly equal under
+    /// the two choosers.
+    #[test]
+    fn round_159_predictor_image_tie_break_is_cost_neutral() {
+        let shapes: &[(u32, u32, u8)] = &[
+            (32, 32, 4),
+            (48, 48, 4),
+            (64, 32, 4),
+            (32, 64, 4),
+            (24, 24, 3),
+        ];
+        for &(w, h, size_bits) in shapes {
+            // Two fixtures: smooth gradient (many ties on flat regions
+            // between modes 1/2/3 etc.) and palette-ish stripes
+            // (column-aligned ties between L-based modes).
+            let gradient: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    let y = (i as u32) / w;
+                    let g = (x + y) & 0x0F;
+                    0xFF00_0000 | (g << 16) | (g << 8) | g
+                })
+                .collect();
+            let stripes: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    match x % 4 {
+                        0 => 0xFFAA_5500,
+                        1 => 0xFF55_AA00,
+                        2 => 0xFF00_55AA,
+                        _ => 0xFF55_00AA,
+                    }
+                })
+                .collect();
+
+            for (name, pixels) in [("gradient", &gradient), ("stripes", &stripes)] {
+                let (pre_img, _, _) = pre_round_159_build_predictor_image(pixels, w, h, size_bits);
+                let (post_img, _, _) = build_predictor_image(pixels, w, h, size_bits);
+                assert_eq!(
+                    pre_img.len(),
+                    post_img.len(),
+                    "pre/post mode-image length differs on {name} {w}x{h} size_bits={size_bits}"
+                );
+                let block = 1u32 << size_bits;
+                let tw = predictor_div_round_up(w, block) as usize;
+                let bsz = block as usize;
+                let wu = w as usize;
+                let hu = h as usize;
+                for (idx, (pre_px, post_px)) in pre_img.iter().zip(post_img.iter()).enumerate() {
+                    let bx = idx % tw;
+                    let by = idx / tw;
+                    let x0 = bx * bsz;
+                    let y0 = by * bsz;
+                    let pre_mode = ((pre_px >> 8) & 0xff) as u8;
+                    let post_mode = ((post_px >> 8) & 0xff) as u8;
+                    let pre_cost = block_mode_cost(pixels, wu, hu, x0, y0, bsz, bsz, pre_mode);
+                    let post_cost = block_mode_cost(pixels, wu, hu, x0, y0, bsz, bsz, post_mode);
+                    assert_eq!(
+                        pre_cost, post_cost,
+                        "round-159 tie-break changed residual cost on {name} {w}x{h} \
+                         block=({bx},{by}): pre mode {pre_mode} cost {pre_cost}, \
+                         post mode {post_mode} cost {post_cost}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round 159 non-regression: across a fixture matrix the
+    /// post-r159 predictor-chooser stream must never be longer than
+    /// the pre-r159 stream. Since the tie-break is a strict subset
+    /// of the pre-r159 candidate space (the chosen mode is always a
+    /// cost-minimal mode under both choosers), the residual stream
+    /// is identical and only the predictor sub-image's entropy can
+    /// differ. The standalone chooser is invoked end-to-end through
+    /// the lossless decoder to confirm round-trips on every fixture.
+    #[test]
+    fn round_159_predictor_chooser_never_regresses() {
+        let shapes: &[(u32, u32)] = &[(16, 16), (24, 24), (32, 32), (48, 48), (32, 16), (24, 40)];
+        for &(w, h) in shapes {
+            let gradient: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    let y = (i as u32) / w;
+                    let g = (x + y) & 0x0F;
+                    0xFF00_0000 | (g << 16) | (g << 8) | g
+                })
+                .collect();
+            let stripes: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    match x % 4 {
+                        0 => 0xFFAA_5500,
+                        1 => 0xFF55_AA00,
+                        2 => 0xFF00_55AA,
+                        _ => 0xFF55_00AA,
+                    }
+                })
+                .collect();
+            let mut seed = 0xDEAD_BEEFu32;
+            let noise: Vec<u32> = (0..(w * h) as usize)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    0xFF00_0000 | (seed & 0x000F_0F0F)
+                })
+                .collect();
+
+            for (name, pixels) in [
+                ("gradient", &gradient),
+                ("stripes", &stripes),
+                ("low-noise", &noise),
+            ] {
+                // Encode under the production chooser (with r159 tie-break).
+                let post = encode_argb_with_predictor_chooser(pixels, w, h);
+                // Decode round-trip — strict invariant.
+                let header = build_image_header(w, h, true);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&post);
+                let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+                let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+                assert_eq!(
+                    img.pixels(),
+                    pixels.as_slice(),
+                    "round-159 round-trip mismatch on {name} {w}x{h}"
+                );
+                // Non-regression: the chooser's output with the
+                // r159 hint must be no larger than the chooser with
+                // the hint stubbed out. Since the hint is a strict
+                // tie-break (same residual cost), the residual
+                // stream is identical; only the predictor sub-image
+                // can change, and it changes in the entropy-
+                // reducing direction (so the writer emits fewer
+                // bytes for it).
+                let pre = encode_argb_with_predictor_chooser_no_r159_hint(pixels, w, h);
+                assert!(
+                    post.len() <= pre.len(),
+                    "round-159 chooser regressed on {name} {w}x{h}: \
+                     pre={} B post={} B",
+                    pre.len(),
+                    post.len(),
+                );
+            }
+        }
+    }
+
+    /// Round 159 structural strict-beat: across a sweep of
+    /// perturbation seeds, at least one fixture must reach a
+    /// strictly more-uniform predictor sub-image under the r159
+    /// hint-aware chooser than under the no-hint baseline — i.e.
+    /// the mode-image's distinct-mode count drops by at least 1.
+    /// The sweep verifies the entropy-image-aware tie-break
+    /// actually fires on realistic small fixtures and reports the
+    /// byte delta in the §4.1 predictor candidate's output for the
+    /// first such fixture.
+    ///
+    /// Operates on `encode_with_predictor` directly (vs the full
+    /// chooser) so the savings aren't masked by a competing
+    /// candidate winning the chooser.
+    #[test]
+    fn round_159_predictor_candidate_strictly_beats_no_hint_on_some_fixture() {
+        let w = 48u32;
+        let h = 48u32;
+        let size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+        let mut found_strict_image = false;
+        let mut found_strict_bytes = false;
+        let mut best_savings: i64 = 0;
+        let mut seed_winner: u32 = 0;
+        for seed_init in [
+            0xCAFE_BABEu32,
+            0xC0FFEE00,
+            0xDEAD_BEEF,
+            0xFACE_F00D,
+            0xFEED_F00D,
+            0x1234_5678,
+            0xABCD_1234,
+            0x90AB_CDEF,
+            0x5A5A_5A5A,
+            0xA5A5_A5A5,
+            0xBA5E_BA11,
+            0xB16B_00B5,
+        ] {
+            // Solid-fill canvas with a small perturbed region.
+            // Vary the perturbation extent so different fixtures
+            // trigger different mode-image patterns.
+            let solid = 0xff60_8050u32;
+            let mut pixels = vec![solid; (w * h) as usize];
+            let mut s = seed_init;
+            // 8×8 perturbation in the top-left so the right /
+            // bottom neighbours' left-/top-column reads stay
+            // mostly on solid pixels.
+            for y in 0..8u32 {
+                for x in 0..8u32 {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    let v = (s & 0x0007_0707) | 0xFF00_0000;
+                    pixels[(y * w + x) as usize] = v;
+                }
+            }
+            let (pre_img, _, _) = pre_round_159_build_predictor_image(&pixels, w, h, size_bits);
+            let (post_img, _, _) = build_predictor_image(&pixels, w, h, size_bits);
+            let pre_modes: Vec<u8> = pre_img.iter().map(|p| ((p >> 8) & 0xff) as u8).collect();
+            let post_modes: Vec<u8> = post_img.iter().map(|p| ((p >> 8) & 0xff) as u8).collect();
+            let pre_distinct: std::collections::BTreeSet<u8> = pre_modes.iter().copied().collect();
+            let post_distinct: std::collections::BTreeSet<u8> =
+                post_modes.iter().copied().collect();
+            if post_distinct.len() < pre_distinct.len() {
+                found_strict_image = true;
+                // Encode the predictor candidate under both
+                // variants and check the byte delta.
+                let post = encode_with_predictor(&pixels, w, h, size_bits, None, w);
+                let pre = encode_with_predictor_no_r159_hint(&pixels, w, h, size_bits, None, w);
+                let saved = pre.len() as i64 - post.len() as i64;
+                if saved > best_savings {
+                    best_savings = saved;
+                    seed_winner = seed_init;
+                }
+                if post.len() < pre.len() {
+                    found_strict_bytes = true;
+                    // Round-trip the post stream end-to-end.
+                    let header = build_image_header(w, h, true);
+                    let mut payload = header.to_vec();
+                    payload.extend_from_slice(&post);
+                    let framed =
+                        build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+                    let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+                    assert_eq!(
+                        img.pixels(),
+                        pixels.as_slice(),
+                        "round-159 strict-beat predictor candidate round-trip mismatch on \
+                         seed=0x{seed_init:08x}"
+                    );
+                    eprintln!(
+                        "[round-159] strict-beat predictor candidate: seed=0x{seed_init:08x}, \
+                         pre modes={pre_modes:?} post modes={post_modes:?} (distinct \
+                         pre={} post={}), pre={} B post={} B, saved={saved} B",
+                        pre_distinct.len(),
+                        post_distinct.len(),
+                        pre.len(),
+                        post.len(),
+                    );
+                }
+                // Non-regression always holds (residual cost is the
+                // same under the tie-break, so the encoded bytes
+                // can never increase).
+                assert!(
+                    post.len() <= pre.len(),
+                    "round-159 tie-break regressed on seed=0x{seed_init:08x}: \
+                     pre={} B post={} B",
+                    pre.len(),
+                    post.len(),
+                );
+            }
+        }
+        assert!(
+            found_strict_image,
+            "round-159 sweep did not produce a single strictly-more-uniform mode image \
+             — the hint propagation never fired across the fixture set"
+        );
+        assert!(
+            found_strict_bytes,
+            "round-159 sweep found a strict mode-image reduction but never a strict byte \
+             reduction; entropy savings stayed within the LSB packing slack \
+             (best_savings={best_savings} on seed=0x{seed_winner:08x})"
+        );
+    }
+
+    /// Local pre-round-159 copy of `encode_argb_with_predictor_chooser`
+    /// that forces every predictor-image build to use the no-hint
+    /// chooser. Used by `round_159_predictor_chooser_never_regresses`
+    /// as the before-after baseline. The chooser's other candidate
+    /// paths (no-tx, subtract-green, color-transform, color-indexing,
+    /// meta-prefix) are re-used verbatim — only the predictor
+    /// candidate is swapped for the no-hint variant.
+    fn encode_argb_with_predictor_chooser_no_r159_hint(
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let mut best = encode_argb_literals_with_width(pixels, width);
+
+        let pred_size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+        let ctx_size_bits = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let pred_block = 1u32 << pred_size_bits;
+        let ctx_block = 1u32 << ctx_size_bits;
+
+        if width >= pred_block && height >= pred_block {
+            let mut pred_single_block_size_bits: u8 = pred_size_bits;
+            while pred_single_block_size_bits < 9
+                && ((1u32 << pred_single_block_size_bits) < width
+                    || (1u32 << pred_single_block_size_bits) < height)
+            {
+                pred_single_block_size_bits += 1;
+            }
+            let try_pred_single_block = pred_single_block_size_bits != pred_size_bits;
+            let mut pred_candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
+                encode_with_predictor_no_r159_hint(
+                    pixels,
+                    width,
+                    height,
+                    pred_size_bits,
+                    cache_bits,
+                    width,
+                )
+            })];
+            if try_pred_single_block {
+                pred_candidates.push(select_best_cache_bits(|cache_bits| {
+                    encode_with_predictor_no_r159_hint(
+                        pixels,
+                        width,
+                        height,
+                        pred_single_block_size_bits,
+                        cache_bits,
+                        width,
+                    )
+                }));
+            }
+            for cand in pred_candidates {
+                if cand.len() < best.len() {
+                    best = cand;
+                }
+            }
+        }
+
+        if width >= ctx_block && height >= ctx_block {
+            let mut single_block_size_bits: u8 = ctx_size_bits;
+            while single_block_size_bits < 9
+                && ((1u32 << single_block_size_bits) < width
+                    || (1u32 << single_block_size_bits) < height)
+            {
+                single_block_size_bits += 1;
+            }
+            let try_single_block = single_block_size_bits != ctx_size_bits;
+            let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform(pixels, width, height, ctx_size_bits, cache_bits, width)
+            })];
+            if try_single_block {
+                candidates.push(select_best_cache_bits(|cache_bits| {
+                    encode_with_color_transform(
+                        pixels,
+                        width,
+                        height,
+                        single_block_size_bits,
+                        cache_bits,
+                        width,
+                    )
+                }));
+            }
+            for cand in candidates {
+                if cand.len() < best.len() {
+                    best = cand;
+                }
+            }
+        }
+
+        if collect_palette(pixels).is_some() {
+            let ci_best = select_best_cache_bits(|cache_bits| {
+                encode_with_color_indexing(pixels, width, height, cache_bits)
+                    .expect("palette feasibility already confirmed")
+            });
+            if ci_best.len() < best.len() {
+                best = ci_best;
+            }
+        }
+
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
+            if mp_best.len() < best.len() {
+                best = mp_best;
+            }
+        }
+
+        best
+    }
+
+    /// Local pre-round-159 copy of `encode_with_predictor` — same
+    /// shape, but builds the predictor sub-image via the no-hint
+    /// chooser (`pre_round_159_build_predictor_image`) so the
+    /// before-after comparison isolates exactly the round-159
+    /// tie-break change.
+    fn encode_with_predictor_no_r159_hint(
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+        size_bits: u8,
+        cache_code_bits: Option<u32>,
+        image_width: u32,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bit(true);
+        w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+        debug_assert!((2..=9).contains(&size_bits));
+        w.write_bits((size_bits - 2) as u32, 3);
+        let (predictor_image, tw, _th) =
+            pre_round_159_build_predictor_image(pixels, width, height, size_bits);
+        write_entropy_coded_image_literals(&mut w, &predictor_image);
+        w.write_bit(false);
+        let mut residuals = vec![0u32; pixels.len()];
+        apply_forward_predictor(
+            pixels,
+            &mut residuals,
+            width,
+            height,
+            &predictor_image,
+            tw,
+            size_bits,
+        );
+        let mut tokens = tokenize_lz77(&residuals);
+        if let Some(bits) = cache_code_bits {
+            tokens = cacheify_tokens(&tokens, &residuals, bits);
+        }
+        write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
+        w.into_bytes()
     }
 }

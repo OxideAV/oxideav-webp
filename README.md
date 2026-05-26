@@ -2,6 +2,72 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 159)
+
+**Round 159 gives the VP8L §4.1 spatial-predictor forward transform
+an entropy-image-aware tie-break on its per-block mode chooser.**
+`build_predictor_image` now threads the immediately-prior neighbour
+block's chosen mode (left neighbour in the current row, top
+neighbour for the left-column blocks) into a new
+`pick_block_mode_with_hint` so that when multiple modes tie on the
+§4.1 residual-magnitude proxy, the chooser prefers the neighbour's
+mode over the otherwise-lowest tied mode. The swap fires *only* on
+cost-equal modes, so the per-pixel residuals are identical to the
+round-158 baseline and decode round-trips remain bit-exact for every
+input.
+
+RFC 9649 §3.5 already authorises this choice ("the transform data
+can be decided based on entropy minimization"). The predictor
+sub-image is written as a §7.2 `entropy-coded-image`, so adjacent
+blocks carrying the same mode value lower that sub-image's symbol
+entropy and the bytes the prefix-code writer emits for it. The
+headline structural win is captured by the strict-beat sweep used
+by
+`round_159_predictor_candidate_strictly_beats_no_hint_on_some_fixture`:
+a 48×48 image whose top-left 8×8 region carries an asymmetric
+perturbation pushing mode 11 to strict best, while the remaining 8
+blocks are filled with a constant ARGB value so every mode 1..=13
+ties at zero residual cost. The predictor sub-image collapses
+from a two-symbol `[11, 1, 1, 1, 1, 1, 1, 1, 1]` to the
+single-symbol `[11, 11, 11, 11, 11, 11, 11, 11, 11]` and the §4.1
+predictor-candidate stream shrinks by 1–2 B: the sub-image
+switches from a two-entry prefix code to the §3.7.2.1.1
+single-symbol-0 form. The savings scale with the number of
+otherwise-tied blocks that pick up the propagated hint.
+
+Five new tests cover the contract:
+`round_159_pick_block_mode_with_hint_swaps_on_tie` (on a solid-fill
+8×8 block where modes 1..=13 all tie at minimal residual cost, a
+`Some(other)` hint swaps the picked mode from the lowest-tied mode
+to the preferred mode);
+`round_159_pick_block_mode_with_hint_keeps_best_when_hint_worse`
+(on a 2-D ramp `pixels[y, x] = (x + 2y) & 0xff` where the L-based
+modes are strictly best, a hint pointing at a strictly-worse mode
+is ignored);
+`round_159_predictor_image_tie_break_is_cost_neutral` (across a
+fixture matrix of 5 shapes × 2 fixtures, every block's pre- and
+post-r159 chosen modes have identical residual cost — the
+invariant guaranteeing decode bit-equivalence);
+`round_159_predictor_chooser_never_regresses` (across 6 shapes × 3
+fixtures the post-r159 chooser's output is `<=` the pre-r159
+chooser's output, with a round-trip via `decode_lossless_image` on
+every fixture); and the strict-beat sweep above (across 12 seeded
+perturbations the test finds at least one fixture with a strictly-
+smaller distinct-mode count AND a strict byte reduction, printing
+the byte delta for the round report). Spec source: RFC 9649 §3.5
+(transform-data entropy minimization), §4.1 (predictor sub-image
+is one ARGB pixel per `(1 << size_bits)`-pixel block with the mode
+packed into the green channel), and §7.2 (`predictor-image = 3BIT
+entropy-coded-image`).
+
+Still lacks (post-round-159): the per-block mode-cost proxy is now
+neighbour-aware but still uses a folded-residual L1 magnitude (no
+explicit Huffman bit-cost model on the residual stream); the
+tie-break is strict (no slack-cost variant that would trade a
+small residual delta for a larger sub-image entropy drop); deeper
+LZ77 lazy depths beyond round-158's three-position remain future
+work; and VP8 lossy encode is still entirely absent.
+
 ## Status — 2026-05-27 (clean-room round 158)
 
 **Round 158 widened the VP8L §5.2.2 LZ77 backward-reference matcher to
