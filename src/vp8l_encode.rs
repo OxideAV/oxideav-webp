@@ -17,7 +17,8 @@
 //!   redundant, as it can be modeled using the color transform, but since
 //!   there is no additional data here, the subtract green transform can
 //!   be coded using fewer bits"). The other three transforms (predictor
-//!   / color / color-indexing) are still pass-through.
+//!   / color / color-indexing) get their own forward passes in later
+//!   rounds.
 //! * **§5.2.1 / §5.2.3 color cache** — as of round 121 the encoder
 //!   evaluates a color cache alongside the no-cache path and emits
 //!   whichever is smaller. As of round 148 the chooser sweeps every
@@ -155,11 +156,32 @@
 //! zero, shrinking the per-channel Huffman codes and further reducing
 //! the chosen stream's size on top of the §4.1 predictor pass.
 //!
+//! ## §4.4 color-indexing transform encoder
+//!
+//! As of round 150 the encoder also evaluates the §4.4 color-indexing
+//! transform: an O(N) palette probe walks `pixels` and bails out
+//! early at >256 unique ARGB values; below that threshold a sorted
+//! palette is built (sorted ARGB-numerically so the §4.4
+//! subtraction-coded color-table deltas concentrate near zero), each
+//! pixel is replaced by its palette index, and indices are bundled
+//! into one byte per the §4.4 table (`width_bits = 3 / 2 / 1 / 0`
+//! for palettes of 1..=2 / 3..=4 / 5..=16 / 17..=256 entries —
+//! packing 8 / 4 / 2 / 1 indices into each green byte respectively).
+//! The bundled image is then handed to the standard
+//! `spatially-coded-image` writer at the subsampled `packed_width =
+//! DIV_ROUND_UP(width, 1 << width_bits)`. The color-indexing
+//! candidate uses the round-148 cache-bits sweep (§5.2.3
+//! `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline) and
+//! is cross-compared against every other candidate; the smallest
+//! stream wins. On palette-ish content (icons, line art, screen
+//! captures) the index-bundling drops the entropy stage's symbol
+//! count by 2..8×, more than paying for the small subtraction-coded
+//! palette-write overhead.
+//!
 //! ## What this module does NOT do
 //!
-//! * No §3.8.2 color-indexing encoding. Predictor (round 146) +
-//!   color transform (round 147) + subtract-green are wired; the
-//!   color-indexing transform is still pass-through.
+//! * No multi-meta-prefix (§6.2.2 entropy image). All candidates use
+//!   a single prefix-code group for the entire image.
 //! * No `oxideav-core` runtime dependency — this module compiles under
 //!   `--no-default-features`.
 
@@ -2107,6 +2129,225 @@ fn encode_with_color_transform(
     w.into_bytes()
 }
 
+// ---- §4.4 color-indexing transform encoder --------------------------
+
+/// §4.4 upper bound on the color-table size that triggers the
+/// color-indexing transform: the spec describes the inverse with an
+/// 8-bit on-wire `color_table_size = ReadBits(8) + 1`, so the legal
+/// range is `1..=256` unique ARGB colors.
+const MAX_PALETTE_SIZE: usize = 256;
+
+/// §4.4 `width_bits` from the color-table size, matching the decoder's
+/// [`crate::vp8l_transform`] threshold table exactly:
+///
+/// | `color_table_size` | `width_bits` | indices per packed byte |
+/// |--------------------|--------------|-------------------------|
+/// | `1..=2`            | `3`          | `8` (1 bit each)        |
+/// | `3..=4`            | `2`          | `4` (2 bits each)       |
+/// | `5..=16`           | `1`          | `2` (4 bits each)       |
+/// | `17..=256`         | `0`          | `1` (8 bits each)       |
+///
+/// The kept-local copy avoids a `pub(crate)` import dance with the
+/// decoder module, which marks its helper file-private.
+fn encoder_color_indexing_width_bits(color_table_size: usize) -> u8 {
+    if color_table_size <= 2 {
+        3
+    } else if color_table_size <= 4 {
+        2
+    } else if color_table_size <= 16 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Scan `pixels` for unique ARGB values and, if the count is below
+/// [`MAX_PALETTE_SIZE`], return a `(palette, index_of)` pair:
+///
+/// * `palette` — the unique ARGB values, sorted numerically. Sorting
+///   maximises the per-component delta correlation the §4.4
+///   subtraction-coded color table feeds to the entropy stage:
+///   adjacent palette entries share similar ARGB bits, so the deltas
+///   `palette[i] - palette[i-1]` (per-channel, mod 256) concentrate
+///   near zero — the histogram shape Huffman codes shrink best.
+///
+/// * `index_of` — a lookup map from ARGB pixel value to its position
+///   in `palette`, used by [`pack_indices_into_bundled_image`] to
+///   replace each pixel with its index.
+///
+/// Returns `None` as soon as the unique-color count exceeds
+/// [`MAX_PALETTE_SIZE`] (the §4.4 on-wire limit), so the early-exit
+/// cost on photo-like images is bounded.
+fn collect_palette(pixels: &[u32]) -> Option<(Vec<u32>, std::collections::HashMap<u32, u32>)> {
+    use std::collections::HashSet;
+    let mut set: HashSet<u32> = HashSet::new();
+    for &p in pixels {
+        set.insert(p);
+        if set.len() > MAX_PALETTE_SIZE {
+            return None;
+        }
+    }
+    let mut palette: Vec<u32> = set.into_iter().collect();
+    palette.sort_unstable();
+    let mut map: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::with_capacity(palette.len());
+    for (i, &c) in palette.iter().enumerate() {
+        map.insert(c, i as u32);
+    }
+    Some((palette, map))
+}
+
+/// §4.4 *subtraction-encode* a color table in place — the inverse of
+/// the decoder's [`crate::vp8l_transform::inverse_color_table`].
+///
+/// The decoder reconstructs `color_table[i] = color_table[i-1] +
+/// color_table[i]` (per-channel mod 256), so the encoder emits
+/// `color_table[i] - color_table[i-1]` (per-channel mod 256) for
+/// `i >= 1`, leaving `color_table[0]` unchanged. Deltas walk
+/// back-to-front so each cell still sees the original (pre-encoded)
+/// previous value at the moment of subtraction.
+fn forward_color_table(color_table: &mut [u32]) {
+    if color_table.len() < 2 {
+        return;
+    }
+    for i in (1..color_table.len()).rev() {
+        let cur = color_table[i];
+        let prev = color_table[i - 1];
+        let a = ((cur >> 24) & 0xff).wrapping_sub((prev >> 24) & 0xff) & 0xff;
+        let r = ((cur >> 16) & 0xff).wrapping_sub((prev >> 16) & 0xff) & 0xff;
+        let g = ((cur >> 8) & 0xff).wrapping_sub((prev >> 8) & 0xff) & 0xff;
+        let b = (cur & 0xff).wrapping_sub(prev & 0xff) & 0xff;
+        color_table[i] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+}
+
+/// §4.4 *forward* pixel bundling: replace each ARGB pixel by its
+/// palette `index`, packing 1/2/4/8 indices into one byte's-worth of
+/// green channel per the §4.4 LSB-first packing rule. Other channels
+/// are zeroed (alpha 0, red 0, blue 0) — the decoder reads only the
+/// green channel via `inverse_color_indexing`.
+///
+/// `width_bits` is the value [`encoder_color_indexing_width_bits`]
+/// returns for the palette size. `packed_width = DIV_ROUND_UP(width,
+/// 1 << width_bits)` — the new image width fed to the §3 image
+/// stream.
+///
+/// Returns the `packed_width * height` ARGB buffer the
+/// `spatially-coded-image` writer feeds to the entropy stage. The
+/// inverse `inverse_color_indexing` reconstructs the original
+/// `width * height` ARGB image when given this buffer and the
+/// (un-subtraction-encoded) palette.
+fn pack_indices_into_bundled_image(
+    pixels: &[u32],
+    index_of: &std::collections::HashMap<u32, u32>,
+    width: u32,
+    height: u32,
+    width_bits: u8,
+) -> (Vec<u32>, u32) {
+    let count = 1u32 << width_bits;
+    let bits_per_index = if width_bits == 0 { 8 } else { 8 / count };
+    let packed_width = width.div_ceil(count);
+    let pw = packed_width as usize;
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![0u32; pw * h];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = *index_of
+                .get(&pixels[y * w + x])
+                .expect("collect_palette covered every pixel");
+            let packed_x = x / count as usize;
+            let sub = x % count as usize;
+            let shift = sub * bits_per_index as usize;
+            let bits = (idx & ((1u32 << bits_per_index) - 1)) << shift;
+            out[y * pw + packed_x] |= bits << 8; // pack into the green channel.
+        }
+    }
+    (out, packed_width)
+}
+
+/// Encode `pixels` taking the §4.4 color-indexing transform path:
+/// build the unique-color palette, replace every pixel with its
+/// palette index (bundled per the §4.4 `width_bits` rule when the
+/// palette has ≤16 entries), then emit the bundled-width image via
+/// the standard `spatially-coded-image` shape — wrapped by an
+/// `optional-transform` whose first entry is the §4.4 color-indexing
+/// transform.
+///
+/// Wire format produced (§3.8.2 / §7.2 grammar):
+///
+/// ```text
+/// optional-transform =
+///   %b1                               -- transform present
+///   %b11                              -- type ColorIndexing = 3
+///   8BIT                              -- color_table_size - 1
+///   entropy-coded-image               -- the subtraction-encoded palette,
+///                                       written at width = color_table_size,
+///                                       height = 1
+///   %b0                               -- end of optional-transform list
+/// spatially-coded-image               -- packed indices at packed_width
+/// ```
+///
+/// Returns `None` when the palette size exceeds [`MAX_PALETTE_SIZE`]
+/// (the §4.4 on-wire limit), so the chooser can skip this candidate
+/// in O(N) on photo-like content. The chooser composes with
+/// `cache_code_bits`: when `Some(bits)` a §5.2.3 color cache of that
+/// size is built over the packed-index stream's literal tokens.
+fn encode_with_color_indexing(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    cache_code_bits: Option<u32>,
+) -> Option<Vec<u8>> {
+    let (palette, index_of) = collect_palette(pixels)?;
+    if palette.is_empty() {
+        return None;
+    }
+
+    let width_bits = encoder_color_indexing_width_bits(palette.len());
+    let (packed_image, packed_width) =
+        pack_indices_into_bundled_image(pixels, &index_of, width, height, width_bits);
+
+    let mut w = BitWriter::new();
+
+    // ---- §3.8.2 / §7.2 optional-transform: color-indexing-tx ----
+    // Header bit `%b1` (transform present).
+    w.write_bit(true);
+    // Transform type `ColorIndexing = 3` (2 bits, LSB-first → value 3
+    // matches the spec's `%b11` MSB-first ABNF when read through
+    // `ReadBits(2)`).
+    w.write_bits(crate::vp8l_stream::TransformType::ColorIndexing as u32, 2);
+    // 8-bit `color_table_size - 1` (decoder adds 1 back per §4.4).
+    debug_assert!((1..=MAX_PALETTE_SIZE).contains(&palette.len()));
+    w.write_bits((palette.len() - 1) as u32, 8);
+
+    // Color table = an entropy-coded-image at width = color_table_size,
+    // height = 1. The on-wire palette is subtraction-encoded; the
+    // decoder applies `inverse_color_table` to reverse it.
+    let mut subtraction_encoded = palette.clone();
+    forward_color_table(&mut subtraction_encoded);
+    write_entropy_coded_image_literals(&mut w, &subtraction_encoded);
+
+    // End of optional-transform list (`%b0`).
+    w.write_bit(false);
+
+    // ---- Spatially-coded-image at the *subsampled* width ------------
+    // After §4.4, `image_width` is `DIV_ROUND_UP(width, 1 <<
+    // width_bits)`; that is the width the entropy stage threads
+    // through the §5.2.2 distance-code chooser. Pixel values are the
+    // packed-green-channel bytes whose red/blue/alpha channels are
+    // identically zero, so the per-channel Huffman codes for those
+    // three channels collapse to a 1-symbol prefix code each (almost
+    // free header overhead).
+    let mut tokens = tokenize_lz77(&packed_image);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, &packed_image, bits);
+    }
+    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, packed_width);
+
+    Some(w.into_bytes())
+}
+
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
 /// §3.4 5-byte image-header), running the §5.2.2 LZ77 backward-reference
 /// matcher so repeated pixel runs compress.
@@ -2558,14 +2799,20 @@ fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: b
 
 /// Width × height-aware super-chooser: evaluates the four
 /// `(no-tx | subtract-green) × (no-cache | cache)` candidates plus
-/// two §4.1 spatial-predictor candidates and (as of round 147) two
-/// §3.5.2 / §4.2 color-transform candidates, each with and without
-/// the §5.2.3 color cache. Returns the smallest of the eight streams.
+/// two §4.1 spatial-predictor candidates, two §3.5.2 / §4.2
+/// color-transform candidates, and (as of round 150) one §4.4
+/// color-indexing candidate when the unique-color count fits in the
+/// §4.4 256-entry table, each with the round-148 §5.2.3
+/// `cache_code_bits ∈ [1..11]` sweep plus the disabled-cache
+/// baseline. Returns the smallest of the resulting streams.
 ///
-/// The transform-bearing candidates are only considered when both
-/// dimensions are at least `1 << size_bits` (otherwise the sub-
-/// resolution transform image collapses to a single block with no
-/// useful per-block resolution); for smaller images the existing
+/// The block-based transform-bearing candidates (§4.1 predictor,
+/// §4.2 color) are only considered when both dimensions are at least
+/// `1 << size_bits` (otherwise the sub-resolution transform image
+/// collapses to a single block with no useful per-block resolution).
+/// The §4.4 color-indexing candidate has no per-block size_bits and
+/// is gated solely on palette feasibility (≤ 256 unique colors);
+/// for smaller images or photo-like content the existing
 /// no-transform / subtract-green chooser remains the only path.
 fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
     let mut best = encode_argb_literals_with_width(pixels, width);
@@ -2635,6 +2882,25 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             if cand.len() < best.len() {
                 best = cand;
             }
+        }
+    }
+
+    // Round 150: §4.4 color-indexing transform candidate. Considered
+    // unconditionally (no per-block size_bits to sweep): a single
+    // O(N) palette probe decides feasibility, so the path is cheap
+    // to skip on photo-like content. On palette-ish images (icons,
+    // line art, screen captures) the bundled-index stream shrinks
+    // the §5 image data dramatically (a 4-color image packs 4 pixels
+    // per byte at width_bits=2, giving the entropy stage 1/4 the
+    // symbols to code), more than paying for the palette-write
+    // overhead.
+    if collect_palette(pixels).is_some() {
+        let ci_best = select_best_cache_bits(|cache_bits| {
+            encode_with_color_indexing(pixels, width, height, cache_bits)
+                .expect("palette feasibility already confirmed")
+        });
+        if ci_best.len() < best.len() {
+            best = ci_best;
         }
     }
 
@@ -5185,5 +5451,262 @@ mod tests {
             saw_non_default_enabled,
             "expected the round-148 sweep to pick a non-default code_bits on at least one payload"
         );
+    }
+
+    // ---- round 150: §4.4 color-indexing transform encoder ----
+
+    /// `encoder_color_indexing_width_bits` matches the §4.4 spec
+    /// thresholds: 1..=2 → 3, 3..=4 → 2, 5..=16 → 1, 17..=256 → 0.
+    #[test]
+    fn encoder_color_indexing_width_bits_matches_spec_table() {
+        assert_eq!(encoder_color_indexing_width_bits(1), 3);
+        assert_eq!(encoder_color_indexing_width_bits(2), 3);
+        assert_eq!(encoder_color_indexing_width_bits(3), 2);
+        assert_eq!(encoder_color_indexing_width_bits(4), 2);
+        assert_eq!(encoder_color_indexing_width_bits(5), 1);
+        assert_eq!(encoder_color_indexing_width_bits(16), 1);
+        assert_eq!(encoder_color_indexing_width_bits(17), 0);
+        assert_eq!(encoder_color_indexing_width_bits(256), 0);
+    }
+
+    /// `forward_color_table` is the bit-exact inverse of the decoder's
+    /// `inverse_color_table`: applying one after the other recovers
+    /// the original palette per-channel mod 256.
+    #[test]
+    fn forward_color_table_round_trips_with_decoder_inverse() {
+        let original: Vec<u32> = vec![
+            0xff00_0000,
+            0xff01_0203,
+            0xff80_4020,
+            0x7f12_3456,
+            0x0000_00ff,
+        ];
+        let mut encoded = original.clone();
+        forward_color_table(&mut encoded);
+        crate::vp8l_transform::inverse_color_table(&mut encoded);
+        assert_eq!(encoded, original);
+    }
+
+    /// `collect_palette` returns `None` for an image with > 256 unique
+    /// ARGB values, and `Some((palette, map))` otherwise. The palette
+    /// is sorted, no duplicates, and every pixel maps back via `map`.
+    #[test]
+    fn collect_palette_early_exits_above_256_unique_colors() {
+        // Easy under-threshold case: 4 unique colors.
+        let small = vec![0xff10_2030, 0xff40_5060, 0xff10_2030, 0xff70_8090];
+        let (p, m) = collect_palette(&small).expect("4-color palette fits");
+        assert_eq!(p.len(), 3); // 0xff10_2030 appears twice, so 3 uniques.
+                                // Sorted.
+        assert!(p.windows(2).all(|w| w[0] < w[1]));
+        // Round-trip every pixel through the map.
+        for px in &small {
+            let idx = m[px] as usize;
+            assert_eq!(p[idx], *px);
+        }
+
+        // Over-threshold: 257 distinct colors → None.
+        let big: Vec<u32> = (0..257u32).map(|i| 0xff00_0000 | i).collect();
+        assert!(collect_palette(&big).is_none());
+    }
+
+    /// End-to-end §4.4 color-indexing round trip through the decoder
+    /// across the four `width_bits` regimes: a 2-color image
+    /// (width_bits=3, 8-per-byte bundling), a 4-color image
+    /// (width_bits=2, 4-per-byte), a 16-color image (width_bits=1,
+    /// 2-per-byte), and a 64-color image (width_bits=0, 1-per-byte).
+    /// Each round trip must reproduce the exact input ARGB pixels.
+    #[test]
+    fn color_indexing_round_trip_across_all_width_bits_regimes() {
+        // Pseudo-random index pattern that visits every palette
+        // entry at least once over each test image.
+        let palette_64: Vec<u32> = (0..64u32)
+            .map(|i| 0xff00_0000 | (i << 18) | (i << 10) | (i << 2))
+            .collect();
+        let scenarios: [(u32, u32, &[u32]); 4] = [
+            // 2-color: width_bits = 3.
+            (32, 4, &[0xff00_0000, 0xffff_ffff]),
+            // 4-color: width_bits = 2.
+            (16, 4, &[0xff10_2030, 0xff40_5060, 0xff70_8090, 0xffa0_b0c0]),
+            // 16-color: width_bits = 1. Pick non-zero palettes that
+            // exercise the subtraction coding (varied deltas).
+            (
+                16,
+                4,
+                &[
+                    0xff00_0000,
+                    0xff10_2030,
+                    0xff20_4060,
+                    0xff30_6090,
+                    0xff40_80c0,
+                    0xff50_a0e0,
+                    0xff60_c0ff,
+                    0xff70_ff00,
+                    0xff80_8080,
+                    0xff90_9090,
+                    0xffa0_a0a0,
+                    0xffb0_b0b0,
+                    0xffc0_c0c0,
+                    0xffd0_d0d0,
+                    0xffe0_e0e0,
+                    0xfff0_f0f0,
+                ],
+            ),
+            // 64-color: width_bits = 0 (no bundling).
+            (16, 4, palette_64.as_slice()),
+        ];
+        for (w, h, palette) in scenarios {
+            let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+            let mut state: u32 = 0xC0FF_EE12;
+            for _ in 0..(w * h) {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                pixels.push(palette[(state as usize) % palette.len()]);
+            }
+            let stream = encode_with_color_indexing(&pixels, w, h, None)
+                .expect("palette fits below 256 unique");
+            // Build a complete VP8L chunk payload (5-byte header + stream)
+            // and decode it back through the decoder.
+            let header = build_image_header(w, h, false);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&stream);
+            let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                .expect("decode color-indexing round trip");
+            assert_eq!(
+                decoded.pixels(),
+                pixels.as_slice(),
+                "round-trip mismatch on {}-color palette ({}x{} image)",
+                palette.len(),
+                w,
+                h
+            );
+        }
+    }
+
+    /// Probe across palette-shaped synthetic payloads to find at
+    /// least one for which the round-150 super-chooser picks the
+    /// §4.4 color-indexing path and the chosen stream is materially
+    /// smaller than the round-149 baseline (no-tx / subtract-green /
+    /// predictor / color-transform).
+    ///
+    /// The §4.4 path doesn't dominate every palette image — the
+    /// §5.2.3 color cache + LZ77 already crunch a binary scan-line
+    /// random image to ~1 bit/pixel, which §4.4 bundling cannot beat
+    /// without spatial coherence to amortise the palette-table
+    /// header. The strong §4.4 case is a *binary* image whose packed
+    /// rows are exact LZ77 copies of preceding rows: at width_bits=3
+    /// (8 pixels per byte), an N-pixel-wide row collapses to N/8
+    /// bytes; row-to-row LZ77 matches in the bundled stream cover
+    /// the row's full N/8 bytes in one Copy token, vs N/3-ish
+    /// literal pixel tokens without bundling.
+    #[test]
+    fn round_150_color_indexing_beats_other_candidates_on_palette_image() {
+        // 64x32 binary image with row repetition: each row's binary
+        // pattern is the previous row XOR a fixed-period mask. The
+        // §4.4 bundled stream (width_bits=3 → 8 bytes wide) has 8
+        // packed bytes per row of distinct patterns the matcher
+        // chains; pixel-level LZ77 has 64 literal tokens per row to
+        // chain. The bundled path's Huffman code over the 8 packed
+        // bytes is tighter and the row-to-row Copy tokens have a
+        // smaller distance (8 vs 64), so the entropy stage shrinks
+        // them further.
+        let palette: [u32; 2] = [0xff00_0000, 0xffff_ffff];
+        let w = 64u32;
+        let h = 32u32;
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut row_pattern: u64 = 0xa5a5_a5a5_a5a5_a5a5;
+        for _y in 0..h {
+            for x in 0..w {
+                let bit = (row_pattern >> (x % 64)) & 1;
+                pixels.push(palette[bit as usize]);
+            }
+            // Rotate the row pattern by one bit each row so rows are
+            // similar (LZ77 finds long matches in the bundled
+            // stream) but not identical.
+            row_pattern = row_pattern.rotate_left(1);
+        }
+        // The chosen stream is what the chooser actually emits.
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        // Force the no-color-indexing baseline by sampling the chooser's
+        // pre-CI candidates. The §4.4 candidate must beat the baseline
+        // measurably (palette-coded images get 2..8× index bundling on
+        // top of the subtraction-coded palette).
+        let no_tx_baseline =
+            select_best_cache_bits(|bits| encode_literals_with_options(&pixels, false, bits, w));
+        let sg_baseline =
+            select_best_cache_bits(|bits| encode_literals_with_options(&pixels, true, bits, w));
+        let pred_baseline = select_best_cache_bits(|bits| {
+            encode_with_predictor(&pixels, w, h, DEFAULT_PREDICTOR_SIZE_BITS, bits, w)
+        });
+        let ctx_baseline = select_best_cache_bits(|bits| {
+            encode_with_color_transform(&pixels, w, h, DEFAULT_COLOR_TRANSFORM_SIZE_BITS, bits, w)
+        });
+        let baseline = no_tx_baseline
+            .len()
+            .min(sg_baseline.len())
+            .min(pred_baseline.len())
+            .min(ctx_baseline.len());
+        let ci_only = select_best_cache_bits(|bits| {
+            encode_with_color_indexing(&pixels, w, h, bits).expect("palette fits")
+        });
+        eprintln!(
+            "[round-150] 64x32 binary row-rotation: chosen={} B, baseline (no §4.4)={} B, ci_only={} B ({:.1}% reduction vs baseline)",
+            chosen.len(),
+            baseline,
+            ci_only.len(),
+            (1.0 - chosen.len() as f64 / baseline as f64) * 100.0
+        );
+        assert!(
+            chosen.len() < baseline,
+            "round-150 color-indexing must beat the round-149 baseline on a palette image: \
+             chosen={} B vs baseline={} B (ci_only={} B)",
+            chosen.len(),
+            baseline,
+            ci_only.len(),
+        );
+
+        // And the chosen stream must still round-trip through the
+        // top-level decoder when wrapped in a complete RIFF/WEBP file.
+        let rgba: Vec<u8> = pixels
+            .iter()
+            .flat_map(|&p| {
+                let a = ((p >> 24) & 0xff) as u8;
+                let r = ((p >> 16) & 0xff) as u8;
+                let g = ((p >> 8) & 0xff) as u8;
+                let b = (p & 0xff) as u8;
+                [r, g, b, a]
+            })
+            .collect();
+        let webp_bytes = encode_webp_lossless(&rgba, w, h).expect("encode round-150 webp");
+        let decoded = crate::decode_webp(&webp_bytes).expect("decode round-150 webp");
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].rgba.as_slice(), rgba.as_slice());
+    }
+
+    /// On photo-like noise (>256 unique colors), the §4.4 candidate
+    /// is unreachable (the O(N) palette probe returns `None`) and the
+    /// chooser silently keeps the best of the round-149 candidates.
+    /// This guarantees the round-150 path never regresses on
+    /// non-palette content.
+    #[test]
+    fn color_indexing_chooser_skips_photo_like_content() {
+        let w = 64u32;
+        let h = 64u32;
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        // 64x64 = 4096 unique values, well above the §4.4 256-entry
+        // threshold.
+        let mut state: u32 = 0xFEED_FACE;
+        for _ in 0..(w * h) {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            pixels.push(0xff00_0000 | (state & 0x00ff_ffff));
+        }
+        assert!(collect_palette(&pixels).is_none());
+        // The chooser must still return a valid stream that decodes
+        // exactly — the §4.4 path is just silently skipped.
+        let stream = encode_argb_with_predictor_chooser(&pixels, w, h);
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+            .expect("decode photo-like content");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
     }
 }

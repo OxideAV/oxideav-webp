@@ -2,6 +2,55 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 150)
+
+**Round 150 added the §4.4 color-indexing transform forward pass to the
+VP8L encoder.** The encoder now evaluates a new candidate alongside the
+round-149 super-chooser set: when an O(N) palette probe confirms the
+image has ≤ 256 unique ARGB values, `encode_with_color_indexing` builds
+a sorted palette (sorted ARGB-numerically so the §4.4 subtraction-coded
+color-table deltas concentrate near zero), replaces every pixel with
+its palette index, bundles indices into one byte per the §4.4 table
+(`width_bits = 3 / 2 / 1 / 0` for palettes of 1..=2 / 3..=4 / 5..=16 /
+17..=256 entries — packing 8 / 4 / 2 / 1 indices into each green byte
+respectively), and feeds the bundled-width image to the standard
+`spatially-coded-image` writer. The candidate uses the round-148
+`cache_code_bits ∈ [1..11]` sweep plus the disabled-cache baseline and
+is cross-compared against every other candidate; the smallest stream
+wins.
+
+Wire format (§3.8.2 / §7.2 grammar):
+
+```
+optional-transform =
+  %b1                  ; transform present
+  %b11                 ; type ColorIndexing = 3
+  8BIT                 ; color_table_size - 1
+  entropy-coded-image  ; subtraction-encoded palette (height = 1)
+  %b0                  ; end of optional-transform list
+spatially-coded-image  ; packed indices at packed_width
+```
+
+Headline measurement (encoder-stream byte count, identical pixel
+content, round-149 baseline vs round-150 color-indexing-aware chooser):
+
+| Fixture                              | round-149 baseline | round-150 chooser | Δ       |
+|--------------------------------------|--------------------:|-------------------:|--------:|
+| 64×32 binary row-rotation (2-color)  | 73 B               | 62 B              | -15.1 % |
+
+The §4.4 path doesn't dominate every palette image (the §5.2.3 color
+cache + LZ77 already crunch random binary content to ~1 bit/pixel), but
+it wins cleanly on palette-ish content with horizontal coherence — the
+bundling drops the entropy stage's symbol count by 2..8× and amortises
+the small palette-table overhead. Round-trips through
+[`decode_webp`](src/lib.rs) and `vp8l_transform::decode_lossless` remain
+bit-exact across all four `width_bits` regimes (2-color, 4-color,
+16-color, 64-color round-trips covered by the new
+`color_indexing_round_trip_across_all_width_bits_regimes` test).
+
+Still lacks: §6.2.2 multi-meta-prefix (entropy image) encoding, and VP8
+lossy encode.
+
 ## Status — 2026-05-26 (clean-room round 149)
 
 **Round 149 added the §3.7.2.1.1 simple code length code chooser to the
@@ -39,7 +88,8 @@ simple-form costs as well. Round-trips through
 both forms.
 
 Still lacks: §3.8.2 color-indexing encoding (predictor + color +
-subtract-green are wired), and VP8 lossy encode.
+subtract-green are wired; round 150 fills this gap), and VP8 lossy
+encode.
 
 ## Status — 2026-05-26 (clean-room round 148)
 

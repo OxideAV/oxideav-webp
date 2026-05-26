@@ -6,6 +6,47 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 150 (2026-05-26).** §4.4 color-indexing transform
+  forward pass for the VP8L lossless encoder. The encoder now evaluates
+  a new candidate alongside the round-149 super-chooser set: when an
+  O(N) palette probe (`collect_palette`) confirms the image has ≤ 256
+  unique ARGB values, `encode_with_color_indexing` builds a sorted
+  palette (sorted ARGB-numerically so the §4.4 subtraction-coded
+  color-table deltas concentrate near zero), replaces every pixel with
+  its palette index, bundles indices into one byte per the §4.4 table
+  (`width_bits = 3 / 2 / 1 / 0` for palettes of 1..=2 / 3..=4 / 5..=16
+  / 17..=256 entries — packing 8 / 4 / 2 / 1 indices into each green
+  byte respectively per the §4.4 LSB-first packing rule), and hands the
+  bundled image to the standard `spatially-coded-image` writer at the
+  subsampled `packed_width = DIV_ROUND_UP(width, 1 << width_bits)`. The
+  candidate uses the round-148 `cache_code_bits ∈ [1..11]` sweep plus
+  the disabled-cache baseline and is cross-compared against every other
+  candidate; the smallest stream wins. The §4.4 path doesn't dominate
+  every palette image (the §5.2.3 color cache + LZ77 already crunch
+  random binary content to ~1 bit/pixel), but it wins cleanly on
+  palette-ish content with horizontal coherence — the bundling drops
+  the entropy stage's symbol count by 2..8× and amortises the small
+  palette-table overhead. On a 64×32 binary row-rotation fixture the
+  round-150 chooser shrinks the encoded stream from 73 B (round-149
+  baseline) to 62 B (-15.1%). Five new tests:
+  `encoder_color_indexing_width_bits_matches_spec_table` (the §4.4
+  threshold table), `forward_color_table_round_trips_with_decoder_inverse`
+  (forward subtraction-encode + decoder inverse round-trip),
+  `collect_palette_early_exits_above_256_unique_colors` (the on-wire
+  256-entry limit), `color_indexing_round_trip_across_all_width_bits_regimes`
+  (end-to-end decode round-trips covering all four `width_bits` values
+  on 2/4/16/64-color palettes), and
+  `round_150_color_indexing_beats_other_candidates_on_palette_image`
+  (chooser-actually-picks-CI verification on the headline fixture),
+  plus `color_indexing_chooser_skips_photo_like_content` (non-regression
+  on photo-like content where the palette probe returns `None`). No
+  external implementation was consulted; spec source is the WebP
+  Lossless Bitstream specification §4.4 mirrored under
+  `docs/image/webp/` and RFC 9649 (the IETF WebP Image Format),
+  cross-checked against the existing decoder-side
+  `vp8l_transform::inverse_color_indexing` and `inverse_color_table`
+  (round 109).
+
 * **Clean-room round 149 (2026-05-26).** §3.7.2.1.1 *simple code length
   code* chooser for the VP8L lossless encoder. Previously every prefix
   code went through `write_normal_code_lengths` (§3.7.2.1.2 *normal code
