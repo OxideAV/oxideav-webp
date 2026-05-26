@@ -286,6 +286,14 @@ impl DeltaConfig {
 /// VP8L bitstreams are byte-exact-equal to the baseline encoder
 /// (equivalent to `Some(100)` in either slot). See
 /// [`crate::near_lossless`] for the quality scale and step table.
+///
+/// `default_lossy_quality` is the symmetric animation-wide fallback for
+/// the (still blocked on `oxideav-vp8` per-MB driver) VP8 lossy encode
+/// path. It is **no-op API surface today**: the lossless emission paths
+/// ignore it entirely and the field is wired only so callers can begin
+/// shaping their encoder configuration alongside the lossless knobs
+/// without code churn once the lossy path lands. See the module-level
+/// "Lossy quality" note for the resolution semantics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnimEncoderOptions<'a> {
     /// §2.7.1.1 `ANIM` loop count. `0` means "loop infinitely".
@@ -305,6 +313,22 @@ pub struct AnimEncoderOptions<'a> {
     /// identical to the baseline encoder, `0` is maximum RGB-channel
     /// quantization.
     pub default_near_lossless_quality: Option<u8>,
+    /// Animation-wide default **lossy** (VP8) quality used for every
+    /// frame whose own (future) per-frame lossy-quality field is `None`.
+    /// Resolution semantics mirror
+    /// [`AnimEncoderOptions::default_near_lossless_quality`]: per-frame
+    /// `Some(q)` always wins; per-frame `None` falls back to this
+    /// options-level default; both `None` is the lossless-only baseline.
+    ///
+    /// **API-shape stub today.** The VP8 lossy encode body is blocked
+    /// on the `oxideav-vp8` per-MB driver (workspace task #1041); the
+    /// existing `AnimFrameMode::Lossless` / `Delta` / `Auto` emission
+    /// paths are lossless-only and ignore this field. Storing it here
+    /// today lets callers wire their full encoder configuration without
+    /// code churn once the lossy path lands. The value uses the same
+    /// `[0..=100]` scale as the rest of this crate's encoder quality
+    /// knobs (`100` = highest quality, `0` = lowest).
+    pub default_lossy_quality: Option<u8>,
 }
 
 impl<'a> AnimEncoderOptions<'a> {
@@ -316,6 +340,22 @@ impl<'a> AnimEncoderOptions<'a> {
     /// [`AnimFrame::near_lossless_quality`].
     pub fn with_default_near_lossless_quality(mut self, quality: Option<u8>) -> Self {
         self.default_near_lossless_quality = quality;
+        self
+    }
+
+    /// Builder helper: set the animation-wide
+    /// [`AnimEncoderOptions::default_lossy_quality`] fallback in-place
+    /// and return `self`. Symmetric to
+    /// [`Self::with_default_near_lossless_quality`].
+    ///
+    /// **API-shape stub today.** Stored verbatim on the options struct
+    /// and ignored by the current lossless-only encoder; the value will
+    /// drive the per-MB quantiser ladder once the VP8 lossy encode body
+    /// is wired (workspace task #1041). Setting it today is harmless —
+    /// the current emission paths produce the same bytes regardless of
+    /// what is stored here.
+    pub fn with_default_lossy_quality(mut self, quality: Option<u8>) -> Self {
+        self.default_lossy_quality = quality;
         self
     }
 }
@@ -1121,6 +1161,64 @@ mod tests {
         assert_eq!(opts.default_near_lossless_quality, Some(60));
         let opts2 = AnimEncoderOptions::default().with_default_near_lossless_quality(None);
         assert_eq!(opts2.default_near_lossless_quality, None);
+    }
+
+    #[test]
+    fn anim_encoder_options_default_lossy_quality_default_is_none() {
+        let opts = AnimEncoderOptions::default();
+        assert_eq!(
+            opts.default_lossy_quality, None,
+            "default lossy fallback must be None (API-shape stub awaiting VP8 lossy encode)"
+        );
+    }
+
+    #[test]
+    fn with_default_lossy_quality_builder_round_trips_field() {
+        let opts = AnimEncoderOptions::default().with_default_lossy_quality(Some(75));
+        assert_eq!(opts.default_lossy_quality, Some(75));
+        let opts2 = AnimEncoderOptions::default().with_default_lossy_quality(None);
+        assert_eq!(opts2.default_lossy_quality, None);
+    }
+
+    #[test]
+    fn with_default_lossy_quality_is_independent_of_near_lossless_default() {
+        // Setting one must not perturb the other; this guards against a
+        // copy-paste swap on the builder body.
+        let opts = AnimEncoderOptions::default()
+            .with_default_near_lossless_quality(Some(60))
+            .with_default_lossy_quality(Some(80));
+        assert_eq!(opts.default_near_lossless_quality, Some(60));
+        assert_eq!(opts.default_lossy_quality, Some(80));
+
+        let opts2 = AnimEncoderOptions::default()
+            .with_default_lossy_quality(Some(80))
+            .with_default_near_lossless_quality(Some(60));
+        assert_eq!(opts2.default_near_lossless_quality, Some(60));
+        assert_eq!(opts2.default_lossy_quality, Some(80));
+    }
+
+    #[test]
+    fn with_default_lossy_quality_is_lossless_encode_no_op_today() {
+        // API-shape stub contract: the lossless emission paths must
+        // produce the same bytes regardless of what is stored in
+        // `default_lossy_quality`. Otherwise the field would not be a
+        // pure stub and consumers wiring it today would see a quiet
+        // bitstream change.
+        let f = AnimFrame::new(4, 4, solid_rgba(4, 4, [10, 20, 30, 255]), 80);
+        let baseline = build_animated_webp_with_options(
+            std::slice::from_ref(&f),
+            &AnimEncoderOptions::default(),
+        )
+        .expect("baseline");
+        for q in [Some(0u8), Some(50), Some(75), Some(100), Some(255), None] {
+            let opts = AnimEncoderOptions::default().with_default_lossy_quality(q);
+            let bytes = build_animated_webp_with_options(std::slice::from_ref(&f), &opts)
+                .expect("lossy default build");
+            assert_eq!(
+                bytes, baseline,
+                "default_lossy_quality = {q:?} must be a no-op on the current lossless encoder paths"
+            );
+        }
     }
 
     #[test]

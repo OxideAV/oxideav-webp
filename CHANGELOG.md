@@ -6,6 +6,42 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 143 (2026-05-26).** **Chainable
+  `AnimEncoderOptions::with_default_lossy_quality(Option<u8>) -> Self`
+  builder and matching `default_lossy_quality: Option<u8>` field,
+  symmetric to the round-141
+  `AnimEncoderOptions::with_default_near_lossless_quality` /
+  `default_near_lossless_quality` pair.** Lets callers configure their
+  full encoder shape (lossy + near-lossless animation-wide defaults)
+  through one chainable builder surface today, ahead of the VP8 lossy
+  encode body landing.
+
+  **API-shape stub.** The VP8 lossy encode path is blocked on the
+  `oxideav-vp8` per-MB driver (workspace task #1041); the existing
+  `AnimFrameMode::Lossless` / `Delta` / `Auto` emission paths are
+  lossless-only and ignore this field. The contract pinned by the new
+  tests: setting `default_lossy_quality` to any value (`Some(0)` …
+  `Some(255)` / `None`) produces output **byte-exact-equal** to the
+  baseline `None` bytes, on both the full-keyframe and dirty-rect
+  Delta paths, and does not perturb the round-141 near-lossless
+  default's existing behaviour when both knobs are set together.
+
+  Six new integration tests in
+  [`tests/published_anim_default_lossy_api.rs`](tests/published_anim_default_lossy_api.rs)
+  cover (a) field defaults to `None`, (b) builder round-trips
+  `Some(80)` / `None` and composes with `with_default_near_lossless_quality`
+  in either order, (c) the two defaults are stored in independent
+  fields (struct-literal + dual-builder equivalence), (d) lossy
+  default is byte-exact no-op on the Lossless keyframe path across
+  `Some(0)`/`50`/`75`/`100`/`255`/`None`, (e) byte-exact no-op on
+  the Delta dirty-rect path, (f) byte-exact no-op when overlaid on a
+  `default_near_lossless_quality = Some(60)` baseline. Four new inline
+  unit tests confirm the default, the builder round-trip, independence
+  from the near-lossless default (copy-paste-swap guard), and the
+  encoder no-op contract on a 4×4 fixture. Total: **495** tests green
+  (was 485: +10 from this round). Default and `--no-default-features`
+  builds both clippy + fmt clean.
+
 * **Clean-room round 142 (2026-05-26).** **Chainable
   `AnimFrame::with_blend(BlendingMethod)` and
   `AnimFrame::with_dispose(DisposalMethod)` builders for the §2.7.1.1

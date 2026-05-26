@@ -193,6 +193,7 @@ fn with_dispose_background_clears_sub_rect_to_anim_bg_between_frames() {
         metadata: WebpMetadata::default(),
         delta: DeltaConfig::default(),
         default_near_lossless_quality: None,
+        default_lossy_quality: None,
     };
 
     let file = build_animated_webp_with_options(&[f0, f1, f2], &opts).expect("build");
@@ -267,6 +268,7 @@ fn with_dispose_none_leaves_previous_sub_rect_intact_between_frames() {
         metadata: WebpMetadata::default(),
         delta: DeltaConfig::default(),
         default_near_lossless_quality: None,
+        default_lossy_quality: None,
     };
 
     let file = build_animated_webp_with_options(&[f0, f1, f2], &opts).expect("build");
@@ -332,6 +334,7 @@ fn dispose_background_and_alpha_blend_compose_through_encoder() {
         metadata: WebpMetadata::default(),
         delta: DeltaConfig::default(),
         default_near_lossless_quality: None,
+        default_lossy_quality: None,
     };
 
     let file = build_animated_webp_with_options(&[f0, f1, f2], &opts).expect("build");

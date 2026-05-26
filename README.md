@@ -2,6 +2,40 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 143)
+
+**Round 143 added the chainable
+`AnimEncoderOptions::with_default_lossy_quality(Option<u8>)` builder and
+the matching `default_lossy_quality: Option<u8>` field** on
+[`AnimEncoderOptions`](src/anim_encode.rs), symmetric to the round-141
+`with_default_near_lossless_quality` / `default_near_lossless_quality`
+pair. The new field lets callers shape their full encoder configuration
+(lossy + near-lossless animation-wide defaults) through one chainable
+builder surface today, ahead of the VP8 lossy encode body landing.
+
+**API-shape stub.** The VP8 lossy encode path is blocked on the
+`oxideav-vp8` per-MB driver (workspace task #1041); the existing
+`AnimFrameMode::Lossless` / `Delta` / `Auto` emission paths are
+lossless-only and ignore this field. The contract pinned by the new
+round-143 tests: setting `default_lossy_quality` to any value (`Some(0)`
+… `Some(255)` / `None`) produces output **byte-exact-equal** to the
+baseline `None` bytes, on both the full-keyframe and dirty-rect Delta
+paths, and does not perturb the round-141 near-lossless default's
+existing behaviour when both knobs are set together. Once the lossy
+emission body lands, the no-op contract here becomes the behavioural
+hook the lossy path consumes.
+
+What landed: one 11-line builder + one new field on
+[`AnimEncoderOptions`](src/anim_encode.rs), six new integration tests in
+[`tests/published_anim_default_lossy_api.rs`](tests/published_anim_default_lossy_api.rs)
+(field default, builder round-trip, dual-field independence, lossless
+keyframe no-op across six quality values, Delta dirty-rect no-op,
+near-lossless overlay no-op), and four new inline unit tests (default,
+builder round-trip, copy-paste-swap independence guard, and the
+encoder-no-op contract on a 4×4 fixture). Total: **495** tests green
+(was 485: +10 from this round). Default and `--no-default-features`
+builds both clippy + fmt clean.
+
 ## Status — 2026-05-26 (clean-room round 142)
 
 **Round 142 added chainable `AnimFrame::with_blend(BlendingMethod)` and
