@@ -6,6 +6,34 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 148 (2026-05-26).** §5.2.3 `color_cache_code_bits`
+  sweep for the VP8L lossless encoder. Previously the chooser locked
+  every cache-enabled candidate at `DEFAULT_COLOR_CACHE_BITS = 8`
+  (256-entry cache), giving the §5.2.3 trade-off only two effective
+  positions: disabled or 256 entries. The new `select_best_cache_bits`
+  helper sweeps the disabled-cache baseline plus every value in the
+  §5.2.3-allowed `[1..11]` range (2..=2048-entry caches) for each
+  base candidate — the no-tx and subtract-green literals candidates
+  in `encode_argb_literals_with_width`, the §4.1 predictor candidate
+  in `encode_argb_with_predictor_chooser`, and each color-transform
+  `size_bits` candidate (per-region + single-block) in the same
+  super-chooser. The sweep is non-monotonic: narrow caches win on
+  small-palette payloads (fewer wasted alphabet slots), wide caches
+  win on photo-like payloads (fewer hash collisions), and the
+  disabled-cache baseline wins on noise (no `%b1 4BIT` header tax,
+  no GREEN-alphabet growth from `280` to `280 + (1 << code_bits)`).
+  On a 32×32 16-color pseudo-random palette fixture, the round-148
+  sweep shrinks the encoded stream by a measurable fraction relative
+  to the hardcoded-8 chooser (see
+  `round_148_sweep_beats_hardcoded_8_on_small_palette` for the
+  reported byte counts). Five new tests: `select_best_cache_bits`
+  call-pattern coverage (12 candidates: `None` + `[1..=11]`),
+  minimum-stream selection, monotonic-non-regression versus the
+  hardcoded-8 chooser across three contrasting payloads, strict-beat
+  on a small-palette payload, and live decoder verification that the
+  chosen stream's `color_cache_code_bits` lands at a non-default
+  `[1..11]` value.
+
 * **Clean-room round 147 (2026-05-26).** §3.5.2 / §4.2 color-transform
   forward pass for the VP8L lossless encoder. The encoder now
   evaluates four new candidates alongside the existing six chooser

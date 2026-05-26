@@ -19,13 +19,17 @@
 //!   be coded using fewer bits"). The other three transforms (predictor
 //!   / color / color-indexing) are still pass-through.
 //! * **§5.2.1 / §5.2.3 color cache** — as of round 121 the encoder
-//!   evaluates a `color_cache_code_bits = 8` (256-entry) color cache
-//!   alongside the no-cache path and emits whichever is smaller. When
-//!   enabled, the §3.8.3 `color-cache-info` field becomes `%b1 8` (1-bit
-//!   flag + 4-bit `code_bits`), the GREEN alphabet grows to
-//!   `256 + 24 + 256 = 536` symbols, and each repeat of a previously-
-//!   inserted ARGB literal is emitted as a §5.2.3 color-cache code
-//!   `256 + 24 + index` instead of four separate ARGB-channel literals.
+//!   evaluates a color cache alongside the no-cache path and emits
+//!   whichever is smaller. As of round 148 the chooser sweeps every
+//!   §5.2.3 `cache_code_bits ∈ [1..11]` per the spec's allowed range
+//!   (2..=2048-entry caches) and picks the smallest stream, rather
+//!   than the round-121 fixed 256-entry choice. When the cache is
+//!   enabled, the §3.8.3 `color-cache-info` field becomes
+//!   `%b1 code_bits` (1-bit flag + 4-bit `code_bits`), the GREEN
+//!   alphabet grows to `256 + 24 + (1 << code_bits)` symbols, and
+//!   each repeat of a previously-inserted ARGB literal is emitted as
+//!   a §5.2.3 color-cache code `256 + 24 + index` instead of four
+//!   separate ARGB-channel literals.
 //!   Cache state is maintained per §5.2.3: every emitted pixel — literal
 //!   *and* every pixel covered by a §5.2.2 backward-reference copy — is
 //!   re-inserted at its hashed slot
@@ -116,14 +120,14 @@
 //! The sub-resolution predictor image is written as a §7.2
 //! `predictor-image = 3BIT entropy-coded-image` and the per-pixel
 //! residuals are then handed to the standard
-//! `spatially-coded-image` writer. Two predictor candidates are
-//! evaluated (no §5.2.3 cache and the default §5.2.3 cache) and
-//! cross-compared against the four existing
-//! `(no-tx | subtract-green) × (no-cache | cache)` candidates; the
-//! smallest stream wins. On smooth gradients with strong spatial
-//! correlation, the predictor path's per-pixel residual entropy is
-//! much lower than the raw pixels' entropy, more than paying for the
-//! predictor-image overhead.
+//! `spatially-coded-image` writer. The predictor candidate uses the
+//! round-148 cache-bits sweep (§5.2.3 `cache_code_bits ∈ [1..11]`
+//! plus the disabled-cache baseline) and is cross-compared against
+//! the no-tx / subtract-green candidates; the smallest stream wins.
+//! On smooth gradients with strong spatial correlation, the
+//! predictor path's per-pixel residual entropy is much lower than
+//! the raw pixels' entropy, more than paying for the predictor-image
+//! overhead.
 //!
 //! ## §3.5.2 / §4.2 color-transform forward pass
 //!
@@ -142,13 +146,14 @@
 //! `color-image = 3BIT entropy-coded-image` (re-using
 //! `write_entropy_coded_image_literals`) and the per-pixel residuals
 //! are then handed to the standard `spatially-coded-image` writer.
-//! Two color-transform candidates are evaluated (no §5.2.3 cache and
-//! the default §5.2.3 cache) and cross-compared against the six
-//! existing chooser candidates; the smallest stream wins. On natural
-//! images with red/green and blue/green correlation, the
-//! color-transform path concentrates the red/blue residuals near zero,
-//! shrinking the per-channel Huffman codes and further reducing the
-//! chosen stream's size on top of the §4.1 predictor pass.
+//! Each color-transform `size_bits` candidate uses the round-148
+//! cache-bits sweep (§5.2.3 `cache_code_bits ∈ [1..11]` plus the
+//! disabled-cache baseline) and is cross-compared against the no-tx,
+//! subtract-green, and §4.1 predictor candidates; the smallest stream
+//! wins. On natural images with red/green and blue/green correlation,
+//! the color-transform path concentrates the red/blue residuals near
+//! zero, shrinking the per-channel Huffman codes and further reducing
+//! the chosen stream's size on top of the §4.1 predictor pass.
 //!
 //! ## What this module does NOT do
 //!
@@ -898,13 +903,17 @@ pub const COLOR_CACHE_BITS_MIN: u32 = 1;
 /// See [`COLOR_CACHE_BITS_MIN`].
 pub const COLOR_CACHE_BITS_MAX: u32 = 11;
 
-/// The default `color_cache_code_bits` the chooser evaluates when
-/// deciding whether to enable §5.2.3 color caching. Eight bits gives a
-/// 256-entry cache — the spec doesn't mandate a specific size, but 8 is
-/// the sweet spot for the kind of payloads this first-pass encoder
-/// targets (saves the 4-bit `code_bits` field a slot in the middle of
-/// the allowed range; 256 entries is large enough that the hash
-/// collisions are negligible on most natural images).
+/// The default `color_cache_code_bits` the chooser evaluates when a
+/// caller asks for a single representative cache size (e.g. test
+/// fixtures, the `encode_argb_literals_color_cache` direct entry).
+/// Eight bits gives a 256-entry cache — a middle-of-range value that
+/// works reasonably well across the §5.2.3 `[1..11]` range.
+///
+/// The production chooser ([`encode_argb_literals_with_width`] and
+/// [`encode_argb_with_predictor_chooser`]) no longer uses this single
+/// value: as of round 148 it sweeps every `cache_code_bits ∈ [1..11]`
+/// per the §5.2.3 range and emits the smallest stream. See
+/// [`select_best_cache_bits`].
 pub const DEFAULT_COLOR_CACHE_BITS: u32 = 8;
 
 /// §5.2.3 color-cache helper used by the encoder. Mirrors the decoder's
@@ -2003,14 +2012,65 @@ pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
 /// the entropy stage without spatial structure.
 pub fn encode_argb_literals_with_width(pixels: &[u32], image_width: u32) -> Vec<u8> {
     debug_assert!(image_width >= 1);
-    let mut best = encode_literals_with_options(pixels, false, None, image_width);
+    // For each `(subtract_green)` choice, evaluate the no-cache
+    // baseline plus every §5.2.3 `cache_code_bits ∈ [1..11]` and keep
+    // the smallest stream per the round-148 sweep. The §5.2.3 cache
+    // size is `1 << code_bits` (2..=2048 entries), so different
+    // payloads peak at different sizes: small-palette images favour
+    // narrow caches (less header overhead for the same hit-rate);
+    // large-palette photo-like images favour wider caches (fewer hash
+    // collisions). Sweeping is the only way to pick the best per
+    // payload without an analytical model.
+    let mut best = select_best_cache_bits(|cache_bits| {
+        encode_literals_with_options(pixels, false, cache_bits, image_width)
+    });
+    let sg_best = select_best_cache_bits(|cache_bits| {
+        encode_literals_with_options(pixels, true, cache_bits, image_width)
+    });
+    if sg_best.len() < best.len() {
+        best = sg_best;
+    }
+    best
+}
 
-    let candidates = [
-        encode_literals_with_options(pixels, true, None, image_width),
-        encode_literals_with_options(pixels, false, Some(DEFAULT_COLOR_CACHE_BITS), image_width),
-        encode_literals_with_options(pixels, true, Some(DEFAULT_COLOR_CACHE_BITS), image_width),
-    ];
-    for cand in candidates {
+/// Sweep §5.2.3 `cache_code_bits ∈ [1..11]` plus the disabled-cache
+/// (`None`) baseline for an encoder candidate, returning the smallest
+/// stream the closure produced.
+///
+/// `build_with_cache` takes the candidate `cache_code_bits` (`None`
+/// = disable, `Some(bits)` = enable with the given size) and returns
+/// the encoded bytes for that choice. The function calls
+/// `build_with_cache` 12 times: once with `None` and once per value
+/// in [`COLOR_CACHE_BITS_MIN`]..=[`COLOR_CACHE_BITS_MAX`], i.e. the
+/// full §5.2.3 `[1..11]` range a compliant decoder accepts.
+///
+/// The §5.2.3 cache size is `1 << code_bits`, so the optimum varies
+/// per payload:
+///
+/// * **Disabled** wins on uncorrelated noise (every "hit" is a hash
+///   collision; the §3.8.3 `color-cache-info` `%b1 4BIT` header costs
+///   five bits the no-cache path doesn't pay; the GREEN alphabet
+///   stays at `256 + 24 = 280` symbols rather than growing to
+///   `256 + 24 + cache_size`).
+/// * **Narrow caches** (`code_bits` 1..4 → 2..16 entries) win on
+///   payloads with a tiny effective palette where a 256-entry cache
+///   wastes alphabet width on slots that never see a hit.
+/// * **Wide caches** (`code_bits` 9..11 → 512..2048 entries) win on
+///   photo-like images with hundreds of distinct colors where hash
+///   collisions in a 256-entry cache prevent a hit.
+///
+/// Note that the §3.7.2 prefix code's alphabet length is exactly
+/// `256 + 24 + (1 << code_bits)`, so a wider cache also widens every
+/// emitted code-length-table entry; the trade-off between hit rate
+/// and alphabet overhead is non-monotonic, which is why the chooser
+/// sweeps the full range instead of using a single heuristic value.
+fn select_best_cache_bits<F>(mut build_with_cache: F) -> Vec<u8>
+where
+    F: FnMut(Option<u32>) -> Vec<u8>,
+{
+    let mut best = build_with_cache(None);
+    for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
+        let cand = build_with_cache(Some(bits));
         if cand.len() < best.len() {
             best = cand;
         }
@@ -2391,21 +2451,14 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     let ctx_block = 1u32 << ctx_size_bits;
 
     if width >= pred_block && height >= pred_block {
-        let candidates = [
-            encode_with_predictor(pixels, width, height, pred_size_bits, None, width),
-            encode_with_predictor(
-                pixels,
-                width,
-                height,
-                pred_size_bits,
-                Some(DEFAULT_COLOR_CACHE_BITS),
-                width,
-            ),
-        ];
-        for cand in candidates {
-            if cand.len() < best.len() {
-                best = cand;
-            }
+        // Round 148: sweep §5.2.3 `cache_code_bits ∈ [1..11]` plus the
+        // disabled-cache baseline for the §4.1 predictor candidate
+        // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
+        let pred_best = select_best_cache_bits(|cache_bits| {
+            encode_with_predictor(pixels, width, height, pred_size_bits, cache_bits, width)
+        });
+        if pred_best.len() < best.len() {
+            best = pred_best;
         }
     }
 
@@ -2429,34 +2482,23 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // Deduplicate when the per-region and single-block size_bits
         // collapse onto the same value (small images).
         let try_single_block = single_block_size_bits != ctx_size_bits;
-        let mut candidates: Vec<Vec<u8>> = vec![
-            encode_with_color_transform(pixels, width, height, ctx_size_bits, None, width),
-            encode_with_color_transform(
-                pixels,
-                width,
-                height,
-                ctx_size_bits,
-                Some(DEFAULT_COLOR_CACHE_BITS),
-                width,
-            ),
-        ];
+        // Round 148: per `size_bits`, sweep §5.2.3
+        // `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline
+        // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
+        let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
+            encode_with_color_transform(pixels, width, height, ctx_size_bits, cache_bits, width)
+        })];
         if try_single_block {
-            candidates.push(encode_with_color_transform(
-                pixels,
-                width,
-                height,
-                single_block_size_bits,
-                None,
-                width,
-            ));
-            candidates.push(encode_with_color_transform(
-                pixels,
-                width,
-                height,
-                single_block_size_bits,
-                Some(DEFAULT_COLOR_CACHE_BITS),
-                width,
-            ));
+            candidates.push(select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform(
+                    pixels,
+                    width,
+                    height,
+                    single_block_size_bits,
+                    cache_bits,
+                    width,
+                )
+            }));
         }
         for cand in candidates {
             if cand.len() < best.len() {
@@ -4452,5 +4494,292 @@ mod tests {
             }
         }
         best
+    }
+
+    // ---- round 148: §5.2.3 color-cache code-bits sweep ----
+
+    /// Local copy of the pre-round-148 chooser for
+    /// [`encode_argb_literals_with_width`]: hardcoded to the round-121
+    /// `DEFAULT_COLOR_CACHE_BITS = 8` cache size for the two
+    /// `(no-tx | subtract-green) × cache` candidates. Used by the
+    /// round-148 regression tests to confirm that sweeping the full
+    /// §5.2.3 `[1..11]` `cache_code_bits` range never produces a
+    /// larger stream than the hardcoded-8 chooser.
+    fn pre_round_148_literals_chooser(pixels: &[u32], image_width: u32) -> Vec<u8> {
+        debug_assert!(image_width >= 1);
+        let mut best = encode_literals_with_options(pixels, false, None, image_width);
+        let candidates = [
+            encode_literals_with_options(pixels, true, None, image_width),
+            encode_literals_with_options(
+                pixels,
+                false,
+                Some(DEFAULT_COLOR_CACHE_BITS),
+                image_width,
+            ),
+            encode_literals_with_options(pixels, true, Some(DEFAULT_COLOR_CACHE_BITS), image_width),
+        ];
+        for cand in candidates {
+            if cand.len() < best.len() {
+                best = cand;
+            }
+        }
+        best
+    }
+
+    /// `select_best_cache_bits` evaluates the disabled-cache baseline
+    /// plus all eleven §5.2.3 sizes (`code_bits ∈ [1..11]`), i.e. it
+    /// calls the closure exactly twelve times and returns whichever
+    /// stream is the shortest.
+    #[test]
+    fn select_best_cache_bits_explores_full_spec_range() {
+        let mut calls: Vec<Option<u32>> = Vec::new();
+        let _ = select_best_cache_bits(|bits| {
+            calls.push(bits);
+            // Return a stream whose length encodes the cache-bits
+            // choice so we can verify the chooser inspects every
+            // candidate (smallest is `Some(7)` here).
+            let len = match bits {
+                None => 100,
+                Some(b) => 200 - (b as usize) * 10 + (7 - b as i32).unsigned_abs() as usize,
+            };
+            vec![0u8; len]
+        });
+        // 12 calls: None + 11 cache sizes.
+        assert_eq!(calls.len(), 12, "expected 12 candidates");
+        assert_eq!(calls[0], None);
+        for (i, bits) in (COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).enumerate() {
+            assert_eq!(calls[i + 1], Some(bits));
+        }
+    }
+
+    /// `select_best_cache_bits` returns the smallest stream produced.
+    #[test]
+    fn select_best_cache_bits_returns_minimum() {
+        // Crafted: cache_code_bits = 5 produces a 50-byte stream; all
+        // others are larger. The sweep must return the 50-byte stream.
+        let chosen = select_best_cache_bits(|bits| match bits {
+            None => vec![0u8; 200],
+            Some(5) => vec![0u8; 50],
+            Some(b) => vec![0u8; 200 - (b as usize)],
+        });
+        assert_eq!(chosen.len(), 50);
+    }
+
+    /// On every payload, the round-148 chooser produces a stream at
+    /// most as large as the round-121-style hardcoded-8 chooser: the
+    /// `cache_code_bits = 8` candidate is always among the sweep's
+    /// twelve candidates, so the sweep can only improve.
+    #[test]
+    fn round_148_sweep_never_regresses_versus_hardcoded_8() {
+        // Three contrasting payloads:
+        // (a) small palette favouring narrow caches;
+        // (b) wide palette favouring wide caches;
+        // (c) random noise favouring disabled cache.
+        let palette4: Vec<u32> = {
+            let palette = [0xff10_2030u32, 0xff40_5060, 0xff70_8090, 0xffa0_b0c0];
+            let mut state = 0x1357_9bdfu32;
+            (0..(8 * 8))
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    palette[(state as usize) % palette.len()]
+                })
+                .collect()
+        };
+        let mut wide_palette: Vec<u32> = Vec::with_capacity(32 * 32);
+        let mut wstate = 0xabad_1deau32;
+        for _ in 0..(32 * 32) {
+            wstate ^= wstate << 13;
+            wstate ^= wstate >> 17;
+            wstate ^= wstate << 5;
+            // 1024-color palette (10-bit truncation), opaque alpha.
+            wide_palette.push(0xff00_0000 | (wstate & 0x3fff_3fff));
+        }
+        let noise: Vec<u32> = {
+            let mut state = 0xc0de_d00du32;
+            (0..(16 * 16))
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state | 0xff00_0000
+                })
+                .collect()
+        };
+
+        for (label, pixels, width) in [
+            ("small-palette 8x8", palette4, 8u32),
+            ("wide-palette 32x32", wide_palette, 32u32),
+            ("noise 16x16", noise, 16u32),
+        ] {
+            let pre = pre_round_148_literals_chooser(&pixels, width);
+            let post = encode_argb_literals_with_width(&pixels, width);
+            eprintln!(
+                "[round-148] {label}: pre={} B, post-sweep={} B",
+                pre.len(),
+                post.len(),
+            );
+            assert!(
+                post.len() <= pre.len(),
+                "round-148 sweep regressed on {label}: post {} B vs pre {} B",
+                post.len(),
+                pre.len(),
+            );
+        }
+    }
+
+    /// On a 32×32 image whose pixels are drawn from a 16-color
+    /// palette in a pseudo-random pattern, the round-148 sweep picks
+    /// a `cache_code_bits` value that produces a *strictly smaller*
+    /// stream than the hardcoded `DEFAULT_COLOR_CACHE_BITS = 8`
+    /// choice — the four-bit difference in alphabet width pays for
+    /// itself when the effective palette is only 16 colors.
+    #[test]
+    fn round_148_sweep_beats_hardcoded_8_on_small_palette() {
+        let w = 32u32;
+        let h = 32u32;
+        let palette: Vec<u32> = (0..16u32)
+            .map(|i| 0xff00_0000 | (i * 0x0011_2233))
+            .collect();
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xfeed_face_u32;
+        for _ in 0..(w * h) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            pixels.push(palette[(state as usize) % palette.len()]);
+        }
+        let pre = pre_round_148_literals_chooser(&pixels, w);
+        let post = encode_argb_literals_with_width(&pixels, w);
+        eprintln!(
+            "[round-148] small-palette 32x32: hardcoded-8={} B, sweep={} B ({:.1}% reduction)",
+            pre.len(),
+            post.len(),
+            100.0 * (pre.len() as f64 - post.len() as f64) / pre.len() as f64,
+        );
+        assert!(
+            post.len() < pre.len(),
+            "expected sweep to beat hardcoded-8 on 16-color palette: post {} B vs pre {} B",
+            post.len(),
+            pre.len(),
+        );
+
+        // Round trip through the full encoder/decoder chain is exact.
+        let bare = encode_vp8l_argb(&pixels, w, h).unwrap();
+        let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// Verify the round-148 sweep can pick a non-default
+    /// `cache_code_bits` value: on at least one of several
+    /// payloads, the sweep chooses a `code_bits` value that differs
+    /// from the round-121 hardcoded default of `8` — proving the
+    /// chooser is exercising the full §5.2.3 `[1..11]` range rather
+    /// than locking to the historical fixed value.
+    ///
+    /// The sweep is allowed to disable the cache or pick `8` on any
+    /// individual payload (the chooser only commits to the smallest
+    /// stream); the assertion is that at least one of the surveyed
+    /// payloads landed on a non-default enabled cache.
+    #[test]
+    fn round_148_sweep_picks_non_default_cache_bits_on_some_payload() {
+        use crate::meta_prefix::{ImageRole, MetaPrefixHeader};
+        use crate::vp8l_stream::BitReader;
+
+        // Three payloads with varying palette / size / repetition
+        // structure. Each is run through `encode_literals_with_options`
+        // via the round-148 sweep (no §3.8.2 transform header in front,
+        // so the chosen stream's first bit is the optional-transform
+        // terminator `%b0` followed directly by the §3.8.3
+        // `color-cache-info`).
+        let mut payloads: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+
+        // 32x32 4-color pseudo-random palette.
+        {
+            let w = 32u32;
+            let h = 32u32;
+            let palette = [0xff10_2030u32, 0xff40_5060, 0xff70_8090, 0xffa0_b0c0];
+            let mut pixels = Vec::with_capacity((w * h) as usize);
+            let mut state = 0x1357_9bdfu32;
+            for _ in 0..(w * h) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                pixels.push(palette[(state as usize) % palette.len()]);
+            }
+            payloads.push((w, h, pixels));
+        }
+
+        // 64x64 32-color pseudo-random palette.
+        {
+            let w = 64u32;
+            let h = 64u32;
+            let palette: Vec<u32> = (0..32u32)
+                .map(|i| 0xff00_0000 | (i * 0x0008_4210))
+                .collect();
+            let mut pixels = Vec::with_capacity((w * h) as usize);
+            let mut state = 0xdead_beefu32;
+            for _ in 0..(w * h) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                pixels.push(palette[(state as usize) % palette.len()]);
+            }
+            payloads.push((w, h, pixels));
+        }
+
+        // 64x64 256-color pseudo-random palette.
+        {
+            let w = 64u32;
+            let h = 64u32;
+            let palette: Vec<u32> = (0..256u32)
+                .map(|i| 0xff00_0000 | (i * 0x0001_0101))
+                .collect();
+            let mut pixels = Vec::with_capacity((w * h) as usize);
+            let mut state = 0xc0ff_eeefu32;
+            for _ in 0..(w * h) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                pixels.push(palette[(state as usize) % palette.len()]);
+            }
+            payloads.push((w, h, pixels));
+        }
+
+        let mut saw_non_default_enabled = false;
+        for (w, h, pixels) in &payloads {
+            let chosen = select_best_cache_bits(|cache_bits| {
+                encode_literals_with_options(pixels, false, cache_bits, *w)
+            });
+            let mut r = BitReader::new(&chosen);
+            assert!(!r.read_bit().unwrap());
+            let header = MetaPrefixHeader::read(&mut r, ImageRole::Argb, *w, *h).unwrap();
+            if header.color_cache.is_enabled() {
+                assert!(
+                    (COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX)
+                        .contains(&header.color_cache.code_bits),
+                    "chosen code_bits {} outside §5.2.3 [{COLOR_CACHE_BITS_MIN}..{COLOR_CACHE_BITS_MAX}]",
+                    header.color_cache.code_bits,
+                );
+                eprintln!(
+                    "[round-148] {}x{} palette payload: sweep enabled cache with code_bits={}",
+                    w, h, header.color_cache.code_bits
+                );
+                if header.color_cache.code_bits != DEFAULT_COLOR_CACHE_BITS {
+                    saw_non_default_enabled = true;
+                }
+            } else {
+                eprintln!(
+                    "[round-148] {}x{} palette payload: sweep disabled cache",
+                    w, h
+                );
+            }
+        }
+        assert!(
+            saw_non_default_enabled,
+            "expected the round-148 sweep to pick a non-default code_bits on at least one payload"
+        );
     }
 }

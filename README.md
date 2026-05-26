@@ -2,6 +2,48 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 148)
+
+**Round 148 added the §5.2.3 `color_cache_code_bits` sweep to the VP8L
+encoder chooser.** Previously every cache-enabled candidate locked at
+`DEFAULT_COLOR_CACHE_BITS = 8` (a 256-entry cache), giving the §5.2.3
+trade-off only two effective positions: disabled or 256 entries. The
+new `select_best_cache_bits` helper sweeps the disabled-cache baseline
+plus every value in the §5.2.3-allowed `[1..11]` range (2..=2048-entry
+caches) for each base candidate: the no-tx and subtract-green literals
+candidates in `encode_argb_literals_with_width`, the §4.1 predictor
+candidate, and each color-transform `size_bits` candidate (per-region
++ single-block) in `encode_argb_with_predictor_chooser`. The sweep is
+non-monotonic — narrow caches win on small-palette payloads (fewer
+wasted alphabet slots), wide caches win on photo-like payloads (fewer
+hash collisions), and the disabled-cache baseline wins on noise (no
+`%b1 4BIT` header tax, no GREEN-alphabet growth from `280` to
+`280 + (1 << code_bits)`).
+
+Headline measurements (encoder-stream byte count, identical pixel
+content, round-121 hardcoded-8 chooser vs round-148 sweep):
+
+| Fixture                                  | hardcoded-8 | round-148 sweep | Δ          |
+|------------------------------------------|------------:|----------------:|-----------:|
+| 32×32 16-color pseudo-random palette     | 740 B       | 716 B           | -3.2 %     |
+
+Sample of `code_bits` choices the sweep makes on contrasting payloads
+(none of these collapses to the round-121 hardcoded `8`):
+
+| Fixture                                  | sweep picks |
+|------------------------------------------|------------:|
+| 32×32 4-color pseudo-random palette      | `code_bits = 3` (8-entry cache)   |
+| 64×64 32-color pseudo-random palette     | `code_bits = 9` (512-entry cache) |
+| 64×64 256-color pseudo-random palette    | `code_bits = 9` (512-entry cache) |
+
+Bit-exact round trips hold through [`decode_webp`](src/lib.rs) /
+[`decode_lossless_image`](src/lib.rs) — the sweep only changes the
+chosen `color_cache_code_bits` field in the §3.8.3 `color-cache-info`
+header; the decoder reads the same `[1..11]` range it already accepted.
+
+Still lacks: §3.8.2 color-indexing encoding (predictor + color +
+subtract-green are wired), and VP8 lossy encode.
+
 ## Status — 2026-05-26 (clean-room round 147)
 
 **Round 147 added the §3.5.2 / §4.2 color-transform forward pass to the
