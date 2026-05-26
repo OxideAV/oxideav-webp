@@ -6,6 +6,55 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 141 (2026-05-26).** **Animation-wide near-lossless
+  default in `AnimEncoderOptions`.** The new
+  `AnimEncoderOptions::default_near_lossless_quality: Option<u8>` field
+  lets callers set the VP8L near-lossless preprocessing knob **once for
+  the whole animation** instead of repeating it on every
+  [`AnimFrame::near_lossless_quality`]. Resolution order at encode time:
+  per-frame `Some(q)` always wins; per-frame `None` falls back to the
+  options-level default; both `None` is the pre-round-140 baseline
+  (no quantization, byte-exact-equal to the baseline encoder, identical
+  to `Some(100)` in either slot). A builder helper
+  `AnimEncoderOptions::with_default_near_lossless_quality(Option<u8>) -> Self`
+  matches the rest of the chainable options surface.
+
+  The default is threaded through to *both* the full-keyframe
+  ([`AnimFrameMode::Lossless`]) and dirty-rect
+  ([`AnimFrameMode::Delta`] / [`AnimFrameMode::Auto`]) emission paths
+  via a single `effective_quality = frame.q.or(opts.default_q)`
+  resolution in `build_animated_webp_with_options`'s per-frame loop, so
+  the round-140 per-frame-knob behaviour and the round-141
+  options-default behaviour share the exact same downstream quantization
+  call and produce bit-identical per-frame ANMFs given the same
+  effective quality.
+
+  **Measured deltas (3-frame 64×64 noisy fixture, deterministic
+  xorshift32 seeds 0/1/2):** baseline (default `None`) 37,364 B (ANMFs
+  ~12,432 each). Options default `Some(60)` with no per-frame
+  overrides: 28,180 B (**−24.58 %** overall), each ANMF ~9,368 B
+  (**−24.66 %** / **−24.58 %** / **−24.63 %**) — byte-for-byte
+  equivalent to the round-140 per-frame `Some(60)` output. Mixed
+  (default `Some(60)`, frame 1 overridden to `Some(100)`): 31,236 B
+  (**−16.40 %** overall); frames 0 and 2 shrink to 9,368 B each
+  (default applied), frame 1 stays at 12,432 B exactly (override wins,
+  matches baseline ANMF byte-for-byte). The per-frame chunk sizes are
+  cross-checked against the corresponding "all `Some(60)`" and "all
+  `Some(100)`" files inside the test.
+
+  Seven new integration tests in
+  [`tests/published_anim_default_near_lossless_api.rs`](tests/published_anim_default_near_lossless_api.rs)
+  cover (a) default-only equals per-frame-only byte-for-byte, (b)
+  default `None` equals the convenience baseline, (c) default `Some(255)`
+  clamps to the baseline no-op, (d) per-frame `Some(q)` overrides the
+  default in either direction, (e) decoder round-trip recovers
+  `near_lossless::quantize(src, q)` exactly when the default supplies
+  the quality, and (f) the default flows through to the Delta
+  dirty-rect path the same way the per-frame knob does. Two new inline
+  unit tests confirm the new field defaults to `None` and the
+  `with_default_near_lossless_quality` builder round-trips. Default +
+  `--no-default-features` builds clippy + fmt clean.
+
 * **Clean-room round 140 (2026-05-26).** **Per-frame near-lossless
   preprocessing in the animated-WebP encoder.** The round-139 still-image
   `near_lossless::apply` preprocessor is now wired into the

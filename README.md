@@ -2,6 +2,55 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 141)
+
+**Round 141 hoisted the round-140 per-frame near-lossless knob to an
+animation-wide default** on
+[`AnimEncoderOptions`](src/anim_encode.rs). A new optional
+[`AnimEncoderOptions::default_near_lossless_quality: Option<u8>`](src/anim_encode.rs)
+field — paired with the chainable
+[`with_default_near_lossless_quality(Option<u8>)`](src/anim_encode.rs)
+builder — lets callers set the VP8L near-lossless preprocessing quality
+**once for the whole animation** instead of repeating it on every
+[`AnimFrame`]. Resolution order at encode time: a per-frame
+`Some(q)` always wins; a per-frame `None` falls back to the
+options-level default; both `None` is the baseline (no quantization,
+byte-exact-equal to the pre-round-140 output, equivalent to `Some(100)`
+in either slot). The default is threaded through to *both* the
+full-keyframe ([`AnimFrameMode::Lossless`]) and dirty-rect
+([`AnimFrameMode::Delta`] / [`AnimFrameMode::Auto`]) emission paths via
+a single `effective_quality = frame.q.or(opts.default_q)` resolution in
+`build_animated_webp_with_options`'s per-frame loop, so the round-140
+per-frame-knob behaviour and the round-141 options-default behaviour
+share the exact same downstream quantization call and produce
+bit-identical per-frame ANMFs given the same effective quality.
+
+**Measured deltas** (3-frame 64×64 deterministic xorshift32-noise
+fixture, seeds 0/1/2): the round-140 baseline (no near-lossless) is
+**37,364 B** (ANMFs ~12,432 each). Round-141 options default
+`Some(60)` with no per-frame overrides: **28,180 B (−24.58 %)** with
+per-frame ANMFs of 9,368 / 9,376 / 9,368 — **byte-for-byte equivalent
+to the round-140 per-frame `Some(60)` file**. Mixed (default `Some(60)`,
+frame 1 overridden to `Some(100)`): **31,236 B (−16.40 %)**; frames 0
+and 2 each shrink to 9,368 B (default applied, −24.66 % / −24.63 %),
+frame 1 stays at exactly 12,432 B (override wins, matches baseline
+ANMF byte-for-byte).
+
+Seven new integration tests in
+[`tests/published_anim_default_near_lossless_api.rs`](tests/published_anim_default_near_lossless_api.rs)
+cover (a) default-only equals per-frame-only byte-for-byte, (b) default
+`None` equals the convenience baseline, (c) default `Some(255)` clamps
+to the baseline no-op, (d) per-frame `Some(q)` overrides the default in
+either direction (including the central "mixed sequence" case that
+checks per-frame ANMF sizes against the all-60 / all-100 reference
+files), (e) decoder round-trip recovers `near_lossless::quantize(src, q)`
+exactly when the default supplies the quality, and (f) the default
+flows through to the Delta dirty-rect path the same way the per-frame
+knob does. Two new inline unit tests confirm the new field defaults to
+`None` and the `with_default_near_lossless_quality` builder
+round-trips. Total: **473** tests green (was 464: +9 from this round).
+Default + `--no-default-features` builds clippy + fmt clean.
+
 ## Status — 2026-05-26 (clean-room round 140)
 
 **Round 140 wired the round-139 VP8L *near-lossless* preprocessing pass

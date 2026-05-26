@@ -101,6 +101,7 @@ fn build_animated_webp_with_options_carries_loop_bg_and_metadata() {
             xmp: Some(&xmp),
         },
         delta: DeltaConfig::default(),
+        default_near_lossless_quality: None,
     };
 
     let file = build_animated_webp_with_options(&frames, &opts).expect("build with options");

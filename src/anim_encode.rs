@@ -231,6 +231,15 @@ impl DeltaConfig {
 /// `background_rgba` is the `ANIM` background colour as `[R, G, B, A]`. The
 /// borrowed [`WebpMetadata`] carries optional ICC / Exif / XMP payloads to
 /// embed in the §2.7 chunk order. `delta` tunes the (blocked) delta path.
+///
+/// `default_near_lossless_quality` is the animation-wide fallback for the
+/// VP8L near-lossless preprocessing knob. It is consulted **only** when a
+/// frame's own [`AnimFrame::near_lossless_quality`] is `None`; a per-frame
+/// `Some(q)` always overrides the default. When both are absent — the
+/// pre-round-140 baseline — no quantization is applied and the per-frame
+/// VP8L bitstreams are byte-exact-equal to the baseline encoder
+/// (equivalent to `Some(100)` in either slot). See
+/// [`crate::near_lossless`] for the quality scale and step table.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnimEncoderOptions<'a> {
     /// §2.7.1.1 `ANIM` loop count. `0` means "loop infinitely".
@@ -241,6 +250,28 @@ pub struct AnimEncoderOptions<'a> {
     pub metadata: WebpMetadata<'a>,
     /// Tuning for the (blocked) inter-frame delta path.
     pub delta: DeltaConfig,
+    /// Animation-wide default near-lossless quality used for every frame
+    /// whose own [`AnimFrame::near_lossless_quality`] is `None`. A
+    /// per-frame `Some(q)` always wins. `None` (the default) preserves
+    /// the pre-round-140 baseline behaviour — no quantization is applied.
+    /// The value uses the same `[0..=100]` scale documented in
+    /// [`crate::near_lossless`]: `100` (or any value ≥ 100) is a no-op
+    /// identical to the baseline encoder, `0` is maximum RGB-channel
+    /// quantization.
+    pub default_near_lossless_quality: Option<u8>,
+}
+
+impl<'a> AnimEncoderOptions<'a> {
+    /// Builder helper: set the animation-wide
+    /// [`AnimEncoderOptions::default_near_lossless_quality`] fallback
+    /// in-place and return `self`. `None` preserves the baseline (no
+    /// quantization); `Some(q)` applies the same `[0..=100]` knob to
+    /// every frame that did not set its own per-frame
+    /// [`AnimFrame::near_lossless_quality`].
+    pub fn with_default_near_lossless_quality(mut self, quality: Option<u8>) -> Self {
+        self.default_near_lossless_quality = quality;
+        self
+    }
 }
 
 /// Build an animated `.webp` from `frames`, defaulting all encoder options
@@ -358,8 +389,23 @@ pub fn build_animated_webp_with_options(
         if let Some((px, py, pw, ph, DisposalMethod::Background)) = prev_disposal {
             fill_canvas_rect_in_place(&mut prev_canvas, canvas_width, px, py, pw, ph, bg_rgba);
         }
-        let anmf_payload =
-            build_anmf_payload_with_prev(f, canvas_width, canvas_height, &prev_canvas, idx == 0)?;
+        // Resolve the effective near-lossless quality for this frame:
+        // a per-frame `Some(q)` always wins; a per-frame `None` falls back
+        // to the animation-wide
+        // [`AnimEncoderOptions::default_near_lossless_quality`]; when both
+        // are `None` the result is `None` (no quantization, baseline
+        // bitstream).
+        let effective_quality = f
+            .near_lossless_quality
+            .or(opts.default_near_lossless_quality);
+        let anmf_payload = build_anmf_payload_with_prev(
+            f,
+            canvas_width,
+            canvas_height,
+            &prev_canvas,
+            idx == 0,
+            effective_quality,
+        )?;
         push(fourcc::ANMF, &anmf_payload)?;
         // Update the canvas tracker with this frame's drawn pixels
         // (matching the decoder's blend method).
@@ -612,18 +658,27 @@ fn build_anim_payload(opts: &AnimEncoderOptions<'_>) -> Vec<u8> {
 ///
 /// For [`AnimFrameMode::Auto`], both candidates are encoded and the
 /// smaller VP8L bitstream wins.
+///
+/// `effective_quality` is the already-resolved near-lossless preprocessing
+/// knob for this frame: the per-frame
+/// [`AnimFrame::near_lossless_quality`] when set, else the animation-wide
+/// [`AnimEncoderOptions::default_near_lossless_quality`] fallback, else
+/// `None`. `None` and `Some(q ≥ 100)` are no-ops at the per-pixel level.
 fn build_anmf_payload_with_prev(
     f: &AnimFrame,
     canvas_w: u32,
     canvas_h: u32,
     prev: &[u8],
     is_first_frame: bool,
+    effective_quality: Option<u8>,
 ) -> Result<Vec<u8>, WebpError> {
     match f.mode {
-        AnimFrameMode::Lossless => emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels),
+        AnimFrameMode::Lossless => {
+            emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, effective_quality)
+        }
         AnimFrameMode::Delta => {
             if is_first_frame {
-                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)
+                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, effective_quality)
             } else {
                 let rect =
                     dirty_rect_canvas_coords(f, canvas_w, canvas_h, prev).unwrap_or(DirtyRect {
@@ -639,13 +694,14 @@ fn build_anmf_payload_with_prev(
                         h: 2.min(f.height),
                     });
                 let sub_rgba = extract_subrect_from_frame(f, rect);
-                emit_dirty_anmf(f, rect, &sub_rgba)
+                emit_dirty_anmf(f, rect, &sub_rgba, effective_quality)
             }
         }
         AnimFrameMode::Auto => {
             // Always evaluate the full-frame candidate (and use it for the
             // first frame regardless).
-            let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)?;
+            let full =
+                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, effective_quality)?;
             if is_first_frame {
                 return Ok(full);
             }
@@ -659,7 +715,7 @@ fn build_anmf_payload_with_prev(
                     h: 2.min(f.height),
                 };
                 let sub_rgba = extract_subrect_from_frame(f, degen_rect);
-                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba)?;
+                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba, effective_quality)?;
                 return Ok(if delta.len() < full.len() {
                     delta
                 } else {
@@ -672,7 +728,7 @@ fn build_anmf_payload_with_prev(
                 return Ok(full);
             }
             let sub_rgba = extract_subrect_from_frame(f, rect);
-            let delta = emit_dirty_anmf(f, rect, &sub_rgba)?;
+            let delta = emit_dirty_anmf(f, rect, &sub_rgba, effective_quality)?;
             Ok(if delta.len() < full.len() {
                 delta
             } else {
@@ -686,6 +742,12 @@ fn build_anmf_payload_with_prev(
 /// the §2.7.1.1 Figure 9 16-byte ANMF header at `(x, y, w, h)` with the
 /// caller's blend/dispose/duration. Used by both the full-keyframe and
 /// dirty-rect emission paths.
+///
+/// `effective_quality` is the already-resolved near-lossless preprocessing
+/// knob the caller decided on (per-frame override, else the
+/// animation-wide [`AnimEncoderOptions::default_near_lossless_quality`]
+/// fallback, else `None`). `None` / `Some(q ≥ 100)` is the baseline.
+#[allow(clippy::too_many_arguments)]
 fn emit_full_anmf(
     f: &AnimFrame,
     x: u32,
@@ -693,12 +755,15 @@ fn emit_full_anmf(
     w: u32,
     h: u32,
     pixels: &[u8],
+    effective_quality: Option<u8>,
 ) -> Result<Vec<u8>, WebpError> {
     let mut argb = rgba_to_argb(pixels);
     let has_alpha = pixels.chunks_exact(4).any(|px| px[3] != 0xff);
-    // Per-frame near-lossless preprocessing — no-op when the knob is
-    // `None` (default) or `Some(q)` with `q ≥ 100`. See `AnimFrame::near_lossless_quality`.
-    apply_near_lossless_if_requested(&mut argb, f.near_lossless_quality);
+    // Near-lossless preprocessing — no-op when the resolved knob is
+    // `None` (default) or `Some(q)` with `q ≥ 100`. See
+    // `AnimFrame::near_lossless_quality` and
+    // `AnimEncoderOptions::default_near_lossless_quality`.
+    apply_near_lossless_if_requested(&mut argb, effective_quality);
     let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, w, h, has_alpha)
         .map_err(Error::from)
         .map_err(WebpError::from)?;
@@ -720,15 +785,21 @@ fn emit_full_anmf(
 /// compositor reconstructs the caller's full-canvas frame bit-exactly.
 /// The caller's `dispose` is overridden to `None` regardless of what they
 /// passed — preserving it would corrupt the next frame's reference state.
-fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Vec<u8>, WebpError> {
+///
+/// `effective_quality` is the already-resolved near-lossless preprocessing
+/// knob for this frame; applied identically to the dirty-rect sub-frame
+/// so a [`AnimFrameMode::Delta`] / [`AnimFrameMode::Auto`] frame with the
+/// knob set quantizes the changed sub-rectangle the same way a full
+/// keyframe would.
+fn emit_dirty_anmf(
+    f: &AnimFrame,
+    rect: DirtyRect,
+    sub_rgba: &[u8],
+    effective_quality: Option<u8>,
+) -> Result<Vec<u8>, WebpError> {
     let mut argb = rgba_to_argb(sub_rgba);
     let has_alpha = sub_rgba.chunks_exact(4).any(|px| px[3] != 0xff);
-    // Per-frame near-lossless preprocessing — applied identically to the
-    // dirty-rect sub-frame so an `AnimFrameMode::Delta` / `::Auto` frame
-    // with the knob set quantizes the *changed* sub-rectangle in the
-    // same way a full keyframe would. No-op when the knob is `None`
-    // (default) or `Some(q)` with `q ≥ 100`.
-    apply_near_lossless_if_requested(&mut argb, f.near_lossless_quality);
+    apply_near_lossless_if_requested(&mut argb, effective_quality);
     let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, rect.w, rect.h, has_alpha)
         .map_err(Error::from)
         .map_err(WebpError::from)?;
@@ -987,5 +1058,22 @@ mod tests {
         assert_eq!(cfg.max_components, 3);
         assert_eq!(cfg.auto_inner_threshold_bytes, Some(512));
         assert_eq!(cfg.msssim_downsample_kernel, DownsampleKernel::Gaussian);
+    }
+
+    #[test]
+    fn anim_encoder_options_default_near_lossless_quality_default_is_none() {
+        let opts = AnimEncoderOptions::default();
+        assert_eq!(
+            opts.default_near_lossless_quality, None,
+            "default fallback must be None for byte-exact baseline"
+        );
+    }
+
+    #[test]
+    fn with_default_near_lossless_quality_builder_round_trips_field() {
+        let opts = AnimEncoderOptions::default().with_default_near_lossless_quality(Some(60));
+        assert_eq!(opts.default_near_lossless_quality, Some(60));
+        let opts2 = AnimEncoderOptions::default().with_default_near_lossless_quality(None);
+        assert_eq!(opts2.default_near_lossless_quality, None);
     }
 }
