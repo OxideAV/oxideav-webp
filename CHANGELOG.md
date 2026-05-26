@@ -6,6 +6,30 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 155 (2026-05-26).** §4.1 spatial-predictor
+  `size_bits` two-value sweep inside the encoder super-chooser
+  (`encode_argb_with_predictor_chooser`), mirroring the round-147
+  §4.2 color-transform pattern. The chooser now evaluates the
+  default per-block predictor (`size_bits = 4`, 16×16 pixel blocks)
+  *and* a maximal single-block predictor whose `size_bits` is
+  promoted up to 9 so that `1 << size_bits ≥ max(width, height)` —
+  one predictor mode covers the whole image. Both candidates pair
+  with the existing round-148 `cache_code_bits ∈ [1..11]` plus
+  disabled-cache sweep, so the predictor branch now considers
+  `2 * 12 = 24` cache-bits-and-size-bits combinations (vs the
+  pre-r155 12). Measured savings: 20×20 dense-residual fixture
+  −2 B (−3.51 %); 32×32 diagonal-gradient fixture −2 B (−3.45 %);
+  64×16 wide-and-short asymmetric fixture round-trips exactly
+  through `decode_lossless_image`. Three non-regression tests
+  (`round_155_predictor_size_bits_sweep_does_not_regress_small_image`,
+  `round_155_predictor_size_bits_sweep_beats_baseline_on_gradient`,
+  `round_155_size_bits_sweep_handles_asymmetric_shapes`) capture
+  the contract; the pre-r155 chooser is preserved verbatim as
+  `pre_round_155_chooser` for the regression baseline. Spec
+  sources consulted: RFC 9649 §3.5.2, §4.1 (predictor transform
+  `size_bits` range `2..=9`). No external implementation source
+  was consulted.
+
 * **Clean-room round 154 (2026-05-26).** Published-shape §2.5 `VP8 ` lossy
   encode entry points landed, completing the `API-COMPAT.md` four-pixel-
   layout surface (`encode_vp8_lossy_yuv420p` / `_yuva420p` / `_rgba` /

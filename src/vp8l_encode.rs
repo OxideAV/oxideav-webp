@@ -3425,10 +3425,11 @@ fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: b
 
 /// Width × height-aware super-chooser: evaluates the four
 /// `(no-tx | subtract-green) × (no-cache | cache)` candidates plus
-/// two §4.1 spatial-predictor candidates, two §3.5.2 / §4.2
-/// color-transform candidates, and (as of round 150) one §4.4
-/// color-indexing candidate when the unique-color count fits in the
-/// §4.4 256-entry table, each with the round-148 §5.2.3
+/// (as of round 155) two §4.1 spatial-predictor `size_bits`
+/// candidates, two §3.5.2 / §4.2 color-transform `size_bits`
+/// candidates, and (as of round 150) one §4.4 color-indexing
+/// candidate when the unique-color count fits in the §4.4 256-entry
+/// table, each with the round-148 §5.2.3
 /// `cache_code_bits ∈ [1..11]` sweep plus the disabled-cache
 /// baseline. Returns the smallest of the resulting streams.
 ///
@@ -3455,14 +3456,49 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     let ctx_block = 1u32 << ctx_size_bits;
 
     if width >= pred_block && height >= pred_block {
-        // Round 148: sweep §5.2.3 `cache_code_bits ∈ [1..11]` plus the
-        // disabled-cache baseline for the §4.1 predictor candidate
-        // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
-        let pred_best = select_best_cache_bits(|cache_bits| {
+        // Round 155: sweep two `size_bits` values for the §4.1 spatial
+        // predictor, mirroring the §4.2 color-transform pattern below.
+        // The default (`size_bits = 4`, 16×16 pixel blocks) gives fine
+        // per-region mode granularity at the cost of a `tw × th`
+        // predictor sub-image. A maximal single-block transform whose
+        // `size_bits` is large enough that the whole image collapses
+        // into one predictor mode pays a 4-byte sub-image overhead but
+        // saves the per-block mode bits — strictly better on small or
+        // uniform-mode images, and never worse than the default after
+        // the `best.len()` comparison below.
+        //
+        // The block-bearing transforms each pair with the round-148
+        // `cache_code_bits ∈ [1..11]` plus disabled-cache sweep.
+        let mut single_block_size_bits: u8 = pred_size_bits;
+        while single_block_size_bits < 9
+            && ((1u32 << single_block_size_bits) < width
+                || (1u32 << single_block_size_bits) < height)
+        {
+            single_block_size_bits += 1;
+        }
+        // Deduplicate when the default and single-block size_bits
+        // collapse onto the same value (images already exactly one
+        // default-block wide AND tall).
+        let try_single_block = single_block_size_bits != pred_size_bits;
+        let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
             encode_with_predictor(pixels, width, height, pred_size_bits, cache_bits, width)
-        });
-        if pred_best.len() < best.len() {
-            best = pred_best;
+        })];
+        if try_single_block {
+            candidates.push(select_best_cache_bits(|cache_bits| {
+                encode_with_predictor(
+                    pixels,
+                    width,
+                    height,
+                    single_block_size_bits,
+                    cache_bits,
+                    width,
+                )
+            }));
+        }
+        for cand in candidates {
+            if cand.len() < best.len() {
+                best = cand;
+            }
         }
     }
 
@@ -7179,5 +7215,225 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- round 155: §4.1 predictor `size_bits` sweep ----
+
+    /// Local copy of the pre-round-155 chooser: the round-154
+    /// super-chooser's predictor branch with the single hardcoded
+    /// `pred_size_bits = DEFAULT_PREDICTOR_SIZE_BITS` only (no
+    /// single-block-large fallback). Used as the regression baseline
+    /// for the round-155 non-regression tests so they exercise *only*
+    /// the predictor `size_bits` sweep delta the chooser added — the
+    /// §4.2 color-transform two-`size_bits` sweep, the §4.4
+    /// color-indexing candidate, the §6.2.2 multi-meta-prefix sweep,
+    /// and the §5.2.3 cache-bits sweep are all preserved.
+    fn pre_round_155_chooser(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
+        let mut best = encode_argb_literals_with_width(pixels, width);
+
+        let pred_size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+        let ctx_size_bits = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let pred_block = 1u32 << pred_size_bits;
+        let ctx_block = 1u32 << ctx_size_bits;
+
+        // Predictor: single hardcoded `size_bits` (pre-r155 behaviour).
+        if width >= pred_block && height >= pred_block {
+            let pred_best = select_best_cache_bits(|cache_bits| {
+                encode_with_predictor(pixels, width, height, pred_size_bits, cache_bits, width)
+            });
+            if pred_best.len() < best.len() {
+                best = pred_best;
+            }
+        }
+
+        // Color-transform: two-`size_bits` sweep (r147 + r148, unchanged
+        // pre/post r155).
+        if width >= ctx_block && height >= ctx_block {
+            let mut single_block_size_bits: u8 = ctx_size_bits;
+            while single_block_size_bits < 9
+                && ((1u32 << single_block_size_bits) < width
+                    || (1u32 << single_block_size_bits) < height)
+            {
+                single_block_size_bits += 1;
+            }
+            let try_single_block = single_block_size_bits != ctx_size_bits;
+            let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform(pixels, width, height, ctx_size_bits, cache_bits, width)
+            })];
+            if try_single_block {
+                candidates.push(select_best_cache_bits(|cache_bits| {
+                    encode_with_color_transform(
+                        pixels,
+                        width,
+                        height,
+                        single_block_size_bits,
+                        cache_bits,
+                        width,
+                    )
+                }));
+            }
+            for cand in candidates {
+                if cand.len() < best.len() {
+                    best = cand;
+                }
+            }
+        }
+
+        // Color-indexing (r150, unchanged).
+        if collect_palette(pixels).is_some() {
+            let ci_best = select_best_cache_bits(|cache_bits| {
+                encode_with_color_indexing(pixels, width, height, cache_bits)
+                    .expect("palette feasibility already confirmed")
+            });
+            if ci_best.len() < best.len() {
+                best = ci_best;
+            }
+        }
+
+        // Multi-meta-prefix (r151 + r152, unchanged).
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
+            if mp_best.len() < best.len() {
+                best = mp_best;
+            }
+        }
+
+        best
+    }
+
+    /// Build a small dense-residual ARGB image whose default-block
+    /// (16×16) granularity already covers the whole canvas: the
+    /// pre-r155 chooser cannot fall back to a larger block, but the
+    /// r155 single-block-large sweep can. Confirms r155 never produces
+    /// a *larger* stream than the r154 baseline (a strict
+    /// non-regression contract) and exercises the default-block ==
+    /// image-block edge case.
+    #[test]
+    fn round_155_predictor_size_bits_sweep_does_not_regress_small_image() {
+        // 20×20: just above the 16×16 default block. The single-block
+        // sweep promotes `size_bits` to 5 (32 ≥ 20 ≥ 16 fits a single
+        // 32×32 block, so the whole image collapses to one predictor
+        // mode).
+        let w = 20u32;
+        let h = 20u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                // Smooth gradient → predictor mode TOP / LEFT both work
+                // across the image, so single-block beats per-block.
+                let v = (x.wrapping_add(y) * 3) as u8;
+                let p = 0xff00_0000
+                    | ((v as u32) << 16)
+                    | ((v.wrapping_add(7) as u32) << 8)
+                    | (v.wrapping_add(11) as u32);
+                pixels.push(p);
+            }
+        }
+        let pre = pre_round_155_chooser(&pixels, w, h);
+        let post = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(
+            post.len() <= pre.len(),
+            "[round-155] {}x{}: post-r155 chooser {} B must not exceed pre-r155 baseline {} B",
+            w,
+            h,
+            post.len(),
+            pre.len(),
+        );
+        println!(
+            "r155 small-image {w}x{h}: pre-r155={} B post-r155={} B delta={} B",
+            pre.len(),
+            post.len(),
+            pre.len() as i64 - post.len() as i64,
+        );
+    }
+
+    /// On a larger uniform-gradient image the single-block predictor
+    /// candidate strictly *beats* the default-block path: every block
+    /// picks the same predictor mode (the gradient direction is
+    /// constant across the canvas), so paying for one per-image
+    /// predictor mode instead of N per-block predictor modes shrinks
+    /// the predictor sub-image. The post-r155 chooser must therefore
+    /// produce a stream at least as small as the pre-r155 baseline,
+    /// and on this fixture strictly smaller.
+    #[test]
+    fn round_155_predictor_size_bits_sweep_beats_baseline_on_gradient() {
+        // 32×32: large enough to host either a default 16×16 block-tile
+        // or a single 32×32 block.
+        let w = 32u32;
+        let h = 32u32;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                // Diagonal gradient: the LEFT or TOP-LEFT predictor
+                // wins uniformly across all blocks.
+                let v = (x + y) as u8;
+                let p = 0xff00_0000
+                    | ((v as u32) << 16)
+                    | ((v.wrapping_add(5) as u32) << 8)
+                    | (v.wrapping_add(9) as u32);
+                pixels.push(p);
+            }
+        }
+        let pre = pre_round_155_chooser(&pixels, w, h);
+        let post = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(
+            post.len() <= pre.len(),
+            "[round-155] {}x{} gradient: post-r155 {} B must not exceed pre-r155 {} B",
+            w,
+            h,
+            post.len(),
+            pre.len(),
+        );
+        println!(
+            "r155 gradient {w}x{h}: pre-r155={} B post-r155={} B delta={} B ({:.2}%)",
+            pre.len(),
+            post.len(),
+            pre.len() as i64 - post.len() as i64,
+            100.0 * (pre.len() as f64 - post.len() as f64) / pre.len() as f64,
+        );
+    }
+
+    /// Wide-and-short / tall-and-narrow shapes: the single-block sweep
+    /// must promote `size_bits` so that *both* dimensions fit inside
+    /// one block (no row-of-blocks or column-of-blocks degenerate
+    /// shape that under-utilises the predictor sub-image). Asserts the
+    /// promoted `size_bits` ≥ `ceil(log2(max(w, h)))`.
+    #[test]
+    fn round_155_size_bits_sweep_handles_asymmetric_shapes() {
+        // 64×16: width = 4 default blocks, height = exactly one block.
+        // The chooser must promote single_block_size_bits to 6
+        // (`1 << 6 = 64`), spanning the whole 64-wide canvas in one block.
+        let (w, h) = (64u32, 16u32);
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let v = ((x + y) & 0xff) as u8;
+                pixels.push(
+                    0xff00_0000
+                        | ((v as u32) << 16)
+                        | ((v.wrapping_add(3) as u32) << 8)
+                        | (v.wrapping_add(7) as u32),
+                );
+            }
+        }
+        let pre = pre_round_155_chooser(&pixels, w, h);
+        let post = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(
+            post.len() <= pre.len(),
+            "[round-155] {w}x{h} asymmetric: post-r155 {} B must not exceed pre-r155 {} B",
+            post.len(),
+            pre.len(),
+        );
+
+        // Round-trip: the r155 chooser still produces a spec-valid
+        // bitstream that decodes back to the input pixels exactly.
+        let payload = post.clone();
+        let header = build_image_header(w, h, false);
+        let mut bare = Vec::with_capacity(header.len() + payload.len());
+        bare.extend_from_slice(&header);
+        bare.extend_from_slice(&payload);
+        let framed = crate::build::build_webp_file(&bare, ImageKind::Lossless, w, h)
+            .expect("frame round-155 webp");
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
     }
 }

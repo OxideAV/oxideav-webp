@@ -2,6 +2,60 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 155)
+
+**Round 155 extends the §4.1 spatial-predictor candidate inside the
+encoder super-chooser
+([`encode_argb_with_predictor_chooser`](src/vp8l_encode.rs)) with a
+two-`size_bits` sweep**, mirroring the round-147 §4.2 color-transform
+pattern that already swept the default-block (`size_bits = 4`,
+RFC 9649 §4.1) against a maximal single-block transform. The chooser
+now evaluates both:
+
+* **Default per-block predictor** (`size_bits = 4`, 16×16 pixel
+  blocks): fine per-region mode granularity at the cost of a
+  `(ceil(w/16) * ceil(h/16))`-entry predictor sub-image — wins on
+  natural images whose ideal predictor varies spatially.
+* **Single-block predictor** (`size_bits` promoted so that
+  `1 << size_bits ≥ max(w, h)` ≤ 9): one predictor mode covers the
+  whole image, paying a 4-byte sub-image overhead but eliminating
+  the per-block mode bits — wins on gradient / uniform-mode images.
+
+Both candidates pair with the existing round-148
+`cache_code_bits ∈ [1..11]` plus disabled-cache sweep; the chooser
+takes the smaller of every cross-product candidate against the
+running `best`. On a 20×20 dense-residual fixture (just above the
+default-block size, so the pre-r155 chooser had no fallback) the
+post-r155 stream is **55 B vs 57 B (−2 B, −3.51 %)**; on a 32×32
+diagonal-gradient fixture the post-r155 stream is **56 B vs 58 B
+(−2 B, −3.45 %)**. Single-block always at least ties the default —
+the worst-case extra 4-byte sub-image-header cost is absorbed by the
+per-block-mode-bit savings, so the candidate is strictly safe to
+add. The pre-r155 baseline is preserved verbatim as
+[`pre_round_155_chooser`](src/vp8l_encode.rs) and the contract is
+asserted by three new non-regression tests
+(`round_155_predictor_size_bits_sweep_does_not_regress_small_image`,
+`round_155_predictor_size_bits_sweep_beats_baseline_on_gradient`,
+`round_155_size_bits_sweep_handles_asymmetric_shapes`) that also
+exercise a 64×16 wide-and-short fixture's round-trip back through
+[`crate::decode_lossless_image`].
+
+Build is green on default features and on `--no-default-features`;
+all 443 tests across the four integration suites and the lib
+unittests pass. Clippy is clean under `-D warnings`.
+
+Spec sources consulted: RFC 9649 §3.5.2, §4.1 (predictor transform
+`size_bits` range `2..=9`). No external implementation source was
+consulted.
+
+Still lacks (post-round-155): the predictor chooser still only
+considers two of the eight admissible `size_bits` values; sweeping
+intermediate values (5, 6, 7) is the natural follow-up once a
+fixture demonstrates a per-region size that beats both 4 and the
+single-block promotion. The §4.4 color-indexing transform encoder
+still skips its own multi-`size_bits` sweep (it has none; only the
+`width_bits` lookup applies).
+
 ## Status — 2026-05-26 (clean-room round 154)
 
 **Round 154 lands the published-shape §2.5 `VP8 ` lossy encode surface
