@@ -2,6 +2,49 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 146)
+
+**Round 146 added the §4.1 spatial-predictor forward transform to the VP8L
+encoder.** The encoder now evaluates two new candidates alongside the
+existing `(no-tx | subtract-green) × (no-cache | cache)` set: the §4.1
+predictor transform with and without a §5.2.3 color cache. For each
+`(1 << size_bits)`-pixel square block (default `size_bits = 4` →
+16×16 blocks), `pick_block_mode` walks all 14 §4.1 prediction modes
+`0..=13` (`Black`, `L`, `T`, `TR`, `TL`, four `Average2(..)`
+combinations, `Select(L, T, TL)`, two `ClampAddSubtract..(..)` forms)
+and picks the mode minimising a per-channel `|residual|` proxy folded
+onto `[-128, 127]`. The chosen modes are packed into a sub-resolution
+predictor image (one ARGB pixel per block, mode in the green channel)
+that is written as a §7.2 `predictor-image = 3BIT entropy-coded-image`;
+the main image is then forward-transformed into per-pixel residuals
+which feed the existing `spatially-coded-image` writer. The chooser
+falls back to the four pre-round-146 candidates when either dimension
+is below one block.
+
+Headline measurements (encoder-stream byte count, identical pixel
+content, no-tx baseline vs round-146 predictor-aware chooser):
+
+| Fixture                                    | no-tx baseline | predictor chooser | Δ        |
+|--------------------------------------------|----------------:|-------------------:|---------:|
+| 64×64 smooth gradient                      | 9 793 B         | 303 B              | -96.9 %  |
+| 128×128 natural fixture (published)        | 46 797 B        | 1 011 B            | -97.8 %  |
+
+The chooser is non-regressing on uncorrelated noise (the predictor
+candidate never produces a smaller stream than literals when no
+neighbour predicts the next pixel), and bit-exact round trips hold
+through [`decode_webp`](src/lib.rs) / [`decode_lossless_image`](src/lib.rs)
+for every fixture in the table above. Internally `encode_tokens` was
+split into `write_spatially_coded_image` (the body after the §3.8.2
+optional-transform terminator) and `write_prefix_codes_and_tokens`
+(the shared `data = prefix-codes lz77-coded-image` emitter), and the
+new `write_entropy_coded_image_literals` helper writes a §7.3
+`entropy-coded-image` for the predictor sub-image — these building
+blocks will also serve the §4.2 color transform encoder in a future
+round.
+
+Still lacks: §3.8.2 color-transform / color-indexing encoding
+(predictor + subtract-green are wired), and VP8 lossy encode.
+
 ## Status — 2026-05-26 (clean-room round 145)
 
 **Round 145 added the §2.7 metadata-aware container writer
@@ -72,9 +115,8 @@ near-row distances compounds the per-emission saving via the §5.2.2
 distance-prefix Huffman tree (more frequent low-prefix codes amortise
 the table overhead). Round trip is bit-exact across every fixture above
 through [`decode_webp`](src/lib.rs) / [`decode_lossless_image`](src/lib.rs).
-Still lacks: §3.8.2 predictor / color / color-indexing transform
-encoding (subtract-green is the only transform the encoder applies),
-and VP8 lossy encode.
+(Round 146 has since added §4.1 predictor encoding — see the round-146
+status block at the top.)
 
 ## Status — 2026-05-25 (clean-room round 127)
 

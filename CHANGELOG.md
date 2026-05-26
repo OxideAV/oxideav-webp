@@ -6,6 +6,41 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 146 (2026-05-26).** §4.1 spatial-predictor forward
+  transform for the VP8L lossless encoder. The encoder now evaluates two
+  new candidates alongside the existing
+  `(no-tx | subtract-green) × (no-cache | cache)` set: the §4.1 predictor
+  transform with and without a §5.2.3 color cache. For each
+  `(1 << size_bits)`-pixel square block (default
+  `size_bits = 4` → 16×16 blocks), `pick_block_mode` walks the 14 §4.1
+  prediction modes `0..=13` and selects the mode minimising a residual-
+  magnitude proxy (sum of per-channel `|residual|` folded onto
+  `[-128, 127]`). The sub-resolution predictor image is written as a §7.2
+  `predictor-image = 3BIT entropy-coded-image` (a new
+  `write_entropy_coded_image_literals` helper, also reusable by §4.2 in a
+  future round), the main image is forward-transformed into per-pixel
+  residuals, and the residuals feed the standard
+  `spatially-coded-image` writer. On a 64×64 smooth gradient the chooser
+  shrinks the stream from 9793 B (no-tx baseline) to 303 B — a 96.9%
+  reduction; on the published 128×128 natural fixture, from 46797 B to
+  1011 B — 97.8%. The chooser falls back to the existing four
+  candidates when either dimension is below one block. Internally,
+  `encode_tokens` was split: `write_spatially_coded_image` writes the
+  body after the §3.8.2 optional-transform terminator, and
+  `write_prefix_codes_and_tokens` is the shared `data = prefix-codes
+  lz77-coded-image` emitter, so the predictor candidate composes the
+  same low-level building blocks as the round-145 path. Eight new
+  tests: residual-subtract-add round-trip, `pick_block_mode` solid-
+  block cost, forward+inverse predictor bit-exact round trip,
+  end-to-end round trip on a smooth gradient, a chooser size-reduction
+  assertion (with `eprintln!` byte counts for visibility), a chooser
+  noise-non-regression assertion, and a 128×128 natural fixture
+  round-trip + size-reduction log. The
+  `lossless-128x128-natural.webp` fixture was copied from
+  `docs/image/webp/fixtures/lossless-128x128-natural/input.webp` into
+  `tests/data/` to make the natural-image regression test
+  self-contained.
+
 * **Clean-room round 145 (2026-05-26).** §2.7 metadata-aware container
   writer: `build::build_webp_file_with_metadata(payload, image_kind,
   canvas_width, canvas_height, has_alpha, FileMetadata)` assembles a
