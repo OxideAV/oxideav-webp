@@ -6,6 +6,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 154 (2026-05-26).** Published-shape §2.5 `VP8 ` lossy
+  encode entry points landed, completing the `API-COMPAT.md` four-pixel-
+  layout surface (`encode_vp8_lossy_yuv420p` / `_yuva420p` / `_rgba` /
+  `_rgb24`) plus the `CODEC_ID_VP8` registry-ID constant. All four route
+  through the `oxideav-vp8` sibling crate's `encode_keyframe` driver and
+  wrap the emitted VP8 bitstream into a complete `.webp` file: simple
+  layout (`RIFF` + `VP8 `) when no alpha plane is present and the
+  `WebpMetadata` is empty; extended layout (`RIFF` + `VP8X` + `ICCP?` +
+  `ALPH?` + `VP8 ` + `EXIF?` + `XMP ?`) otherwise. The `ALPH` chunk is
+  emitted in §2.7.1.2 method-0 (raw, no filter) form (one `0x00` info
+  byte followed by `width * height` raw alpha bytes), interoperable with
+  the existing `decode_alpha_plane` round-trip. RGB/RGBA inputs are
+  converted to a tightly-packed I420 source via the full-range
+  ITU-R BT.601 forward matrix — the inverse of the §2.5 decode path's
+  YCbCr→RGB conversion — with 2×2 box-averaged chroma. The
+  published-shape `quality: f32` knob in `0..=100.0` (default 75.0)
+  maps to RFC 6386 §9.6's `y_ac_qi: u8` in `0..=127` via the linear
+  inversion `qi = round(127 * (1 - q / 100))`, so `quality = 75` lands
+  on the `KeyframeParams::default()` `y_ac_qi = 32`. The RGBA path
+  auto-promotes to the extended `ALPH`-bearing layout iff any pixel's
+  alpha is non-opaque; the Rgb24 path is always treated as opaque per
+  the published 0.1.5 contract. Nine standalone integration tests
+  (`tests/published_vp8_lossy_encode_api.rs`) plus ten in-module unit
+  tests cover the layout-promotion rules, the alpha plane round-trip,
+  the simple/extended decision, the I420 chroma down-sample arithmetic,
+  the NaN/clamp behaviour on `quality`, and the dimension-mismatch
+  refusals. Spec sources consulted: RFC 9649 (WebP container) §2.5,
+  §2.7, §2.7.1.2 mirrored under `docs/image/webp/`; RFC 6386 (VP8)
+  §9.1, §9.2, §9.6; ITU-R BT.601 (full-range forward matrix). No
+  external implementation source was consulted.
+
 * **Clean-room round 152 (2026-05-26).** Histogram-distance per-region
   clusterer for the §6.2.2 multi-meta-prefix encoder, replacing the
   round-151 mean-green bucketiser. The new

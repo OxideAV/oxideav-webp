@@ -2,6 +2,65 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 154)
+
+**Round 154 lands the published-shape §2.5 `VP8 ` lossy encode surface
+from `API-COMPAT.md`.** Four entry points
+([`encode_vp8_lossy_yuv420p`](src/vp8_encode.rs),
+[`encode_vp8_lossy_yuva420p`](src/vp8_encode.rs),
+[`encode_vp8_lossy_rgba`](src/vp8_encode.rs),
+[`encode_vp8_lossy_rgb24`](src/vp8_encode.rs)) plus the registry
+[`CODEC_ID_VP8`](src/lib.rs) constant. All four route through the
+`oxideav-vp8` sibling crate's `encode_keyframe` driver (single-keyframe
+RD intra mode pick) and wrap the emitted VP8 bitstream into a complete
+`.webp` file via the existing §2.7 chunk builders:
+
+* **Simple layout** (`RIFF` + `VP8 `) when no alpha plane is supplied
+  and the supplied `WebpMetadata` is empty.
+* **Extended layout** (`RIFF` + `VP8X` + `ICCP?` + `ALPH?` + `VP8 ` +
+  `EXIF?` + `XMP ?`) when metadata is present or alpha is non-opaque.
+  The `VP8X` flag byte declares exactly the features present (`L` for
+  alpha, `I` for ICC, `E` for Exif, `X` for XMP).
+
+The §2.7.1.2 `ALPH` chunk is emitted in method-0 (raw, no filter) form
+— one `0x00` info byte followed by `width * height` raw alpha bytes —
+which the existing `decode_alpha_plane` reader round-trips byte-for-
+byte. RGB/RGBA inputs are converted to a tightly-packed I420 source
+via the full-range ITU-R BT.601 forward matrix (the inverse of the
+§2.5 decode path's YCbCr→RGB conversion, so encode + decode share a
+single colourspace model), with 2×2 box-averaged chroma at the chroma-
+plane boundary.
+
+The published-shape `quality: f32` knob in `0..=100.0` (default 75.0,
+higher = better) maps to RFC 6386 §9.6's `y_ac_qi: u8` in `0..=127`
+via the linear inversion `qi = round(127 * (1 - q / 100))`, so
+`quality = 75` lands on `KeyframeParams::default()` `y_ac_qi = 32`.
+NaN inputs fall back to the default; out-of-range values clamp into
+the table.
+
+Nine standalone integration tests
+([`tests/published_vp8_lossy_encode_api.rs`](tests/published_vp8_lossy_encode_api.rs))
+plus ten in-module unit tests cover layout promotion (simple →
+extended on alpha / metadata), the §2.7.1.2 `ALPH` round trip, the
+I420 chroma down-sample arithmetic on grey content, the
+`quality_to_qindex` mapping at the bounds and default, the
+dimension-mismatch refusals, and the published `CODEC_ID_VP8` /
+`CODEC_ID_VP8L` constants. Build is green on default features and on
+`--no-default-features` (the standalone surface ships these without
+`oxideav-core`).
+
+Spec sources consulted: RFC 9649 (WebP container) §2.5, §2.7,
+§2.7.1.2; RFC 6386 (VP8) §9.1, §9.2, §9.6; ITU-R BT.601 (full-range
+forward matrix). No external implementation source was consulted.
+
+Still lacks (post-round-154): all four entry points pick the
+`KeyframeParams::default()` loop-filter level (0 = whole-frame skip)
+and 1-partition layout; tuning these against quality / fixture-size
+trade-offs is the natural follow-up. VP8 lossy *animation* (ANMF + VP8
+sub-chunks) remains gated on a multi-frame encode driver; the
+`build_animated_webp` `Auto` / `Delta` paths still return
+`WebpError::Unsupported` for non-VP8L modes pending that work.
+
 ## Status — 2026-05-26 (clean-room round 152)
 
 **Round 152 swapped the round-151 mean-green bucketiser inside the

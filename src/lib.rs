@@ -140,6 +140,7 @@ pub mod meta_prefix;
 pub mod registry;
 pub mod vp8_chunk;
 pub mod vp8_decode;
+pub mod vp8_encode;
 pub mod vp8l_chunk;
 pub mod vp8l_decode;
 pub mod vp8l_encode;
@@ -1434,9 +1435,30 @@ pub use anim_encode::{
     AnimFrameMode, DeltaConfig, DownsampleKernel,
 };
 
+// ─────────────────────── Published-shape VP8 lossy encode API ───────────────────────
+//
+// The published-0.1.5 lossy-encode public names, layered over the `oxideav-vp8`
+// sibling crate's `encode_keyframe`. Four entry points, accepting the four
+// pixel layouts API-COMPAT.md names: I420 (planar `yuv420p`), I420 + alpha
+// (`yuva420p`), interleaved RGBA, and interleaved RGB24. All accept a libwebp-
+// style `quality: f32` in `0..=100.0` (default 75.0) and the same
+// `WebpMetadata` borrowed-form the VP8L `_with_metadata` path consumes.
+// See `API-COMPAT.md` + `vp8_encode` module docs.
+
+#[doc(inline)]
+pub use vp8_encode::{
+    encode_vp8_lossy_rgb24, encode_vp8_lossy_rgba, encode_vp8_lossy_yuv420p,
+    encode_vp8_lossy_yuva420p, DEFAULT_QUALITY,
+};
+
 /// Stable codec identifier the VP8L lossless encoder registers under in the
 /// codec registry — the published `"webp_vp8l"` name.
 pub const CODEC_ID_VP8L: &str = "webp_vp8l";
+
+/// Stable codec identifier the VP8 lossy encoder registers under in the
+/// codec registry — the published `"webp_vp8"` name. Symmetric with
+/// [`CODEC_ID_VP8L`] for the lossless path.
+pub const CODEC_ID_VP8: &str = "webp_vp8";
 
 /// Repack a scan-line-order ARGB pixel buffer (`(a<<24)|(r<<16)|(g<<8)|b`)
 /// into interleaved 8-bit `[R, G, B, A]` bytes — the
