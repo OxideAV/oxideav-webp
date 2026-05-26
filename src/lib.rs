@@ -1440,8 +1440,8 @@ pub use anim_encode::{
 // The published-0.1.5 lossy-encode public names, layered over the `oxideav-vp8`
 // sibling crate's `encode_keyframe`. Four entry points, accepting the four
 // pixel layouts API-COMPAT.md names: I420 (planar `yuv420p`), I420 + alpha
-// (`yuva420p`), interleaved RGBA, and interleaved RGB24. All accept a libwebp-
-// style `quality: f32` in `0..=100.0` (default 75.0) and the same
+// (`yuva420p`), interleaved RGBA, and interleaved RGB24. All accept a
+// published-shape `quality: f32` in `0..=100.0` (default 75.0) and the same
 // `WebpMetadata` borrowed-form the VP8L `_with_metadata` path consumes.
 // See `API-COMPAT.md` + `vp8_encode` module docs.
 
