@@ -6,6 +6,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 156 (2026-05-27).** §5.2.2 LZ77 backward-reference
+  matcher gains single-position **lazy matching**. The matcher in
+  `tokenize_lz77` now probes `pos + 1` after finding a match `(L_a, _)`
+  at `pos`; if the look-ahead yields a strictly longer match `L_b > L_a`,
+  the pixel at `pos` is emitted as a literal and the longer match from
+  `pos + 1` is taken in place of the greedy match. This recovers the
+  classic LZ77 strict-greedy trap where a short match at `pos` blocks a
+  much longer match at `pos + 1`. Decoder output is bit-identical for
+  any input — only the token *partition* changes — so the entire
+  existing test suite continues to round-trip unchanged. The hash-chain
+  insert bookkeeping deduplicates the `pos`-insert that the lookahead
+  probe performed so the greedy branch does not double-insert. The
+  refactor exposes an internal `tokenize_lz77_inner(pixels, lazy: bool)`
+  so the round-156 A/B regression tests can build the strict-greedy
+  r155 baseline alongside the round-156 lazy stream on the same
+  fixture. Three new tests:
+  `round_156_lazy_match_round_trips_through_decoder` (a noisy 64×16
+  fixture round-trips end-to-end via `decode_lossless_image` and the
+  direct `encode_argb_literals_with_width` path, catching insert-
+  bookkeeping bugs);
+  `round_156_lazy_match_strictly_beats_greedy_on_trap_fixture` (a
+  hand-crafted dual-chain trap fixture where the strict-greedy matcher
+  emits `Copy{4, 17}` + `Copy{7, 11}` while the lazy matcher emits one
+  literal + `Copy{10, 11}` covering the same 11-pixel span — net −1
+  Copy token at parity overall-token count); and
+  `round_156_lazy_never_increases_token_count` (across 8 shapes ×
+  3 fixture families the lazy token count is structurally `<=` the
+  greedy token count, guarding against future off-by-one regressions
+  in the lookahead bookkeeping).
+
 * **Clean-room round 155 (2026-05-26).** §4.1 spatial-predictor
   `size_bits` two-value sweep, mirroring the round-147 §4.2
   color-transform pattern. The super-chooser

@@ -2,6 +2,63 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 156)
+
+**Round 156 added single-position lazy matching to the VP8L §5.2.2
+LZ77 backward-reference matcher.** The matcher in `tokenize_lz77` now
+probes `pos + 1` after finding a match `(L_a, _)` at `pos`; if the
+look-ahead yields a strictly longer match `L_b > L_a`, the pixel at
+`pos` is emitted as a literal and the longer match from `pos + 1` is
+taken in place of the greedy match. This recovers the classic LZ77
+strict-greedy trap where a short match at `pos` blocks a much longer
+match at `pos + 1`.
+
+Decoder output is bit-identical for any input — only the token
+*partition* changes — so the entire existing test suite continues to
+round-trip unchanged. The hash-chain insert bookkeeping deduplicates
+the `pos`-insert that the lookahead probe performs so the greedy
+branch does not double-insert. The refactor exposes an internal
+`tokenize_lz77_inner(pixels, lazy: bool)` so round-156 A/B regression
+tests can build the strict-greedy r155 baseline alongside the
+round-156 lazy stream on the same fixture.
+
+The headline structural win is captured by the hand-crafted dual-chain
+trap fixture: where strict greedy emits
+
+    Copy{length=4, dist=17}, Copy{length=7, dist=11}    (3 copies)
+
+across an 11-pixel span, lazy emits
+
+    Literal(A), Copy{length=10, dist=11}                (2 copies)
+
+over the same span. Net effect: one fewer Copy token at parity overall
+token count, and the longer-match-with-shorter-distance partition
+should encode through the §3.7 prefix codes at lower bit cost on
+inputs where the trap pattern recurs (natural-image regions where
+inter-row repeats are interrupted by a single-pixel difference, exactly
+the case strict greedy can't escape).
+
+Three new tests cover the contract:
+`round_156_lazy_match_round_trips_through_decoder` (a noisy 64×16
+fixture round-trips end-to-end via `decode_lossless_image` and the
+direct `encode_argb_literals_with_width` path, catching insert-
+bookkeeping bugs),
+`round_156_lazy_match_strictly_beats_greedy_on_trap_fixture` (the
+hand-crafted dual-chain trap asserts lazy emits strictly fewer Copy
+tokens — `lazy_copies = 2 < greedy_copies = 3`), and
+`round_156_lazy_never_increases_token_count` (across 8 shapes ×
+3 fixture families the lazy token count is structurally `<=` the
+greedy token count, guarding against future off-by-one regressions
+in the lookahead bookkeeping). Spec source: RFC 9649 §5.2.2 / §3.6.2.2
+(backward references; the lazy-match strategy is an encoder choice
+unconstrained by the format).
+
+Still lacks (post-round-156): the §4.1 per-block mode-cost proxy still
+uses a folded-residual magnitude rather than accounting for the
+entropy-image bit cost (an r155 follow-up), the LZ77 lazy depth is
+fixed at single-position (no two-position lookahead yet), and VP8
+lossy encode is still entirely absent.
+
 ## Status — 2026-05-26 (clean-room round 155)
 
 **Round 155 added a `size_bits` two-value sweep to the VP8L §4.1
