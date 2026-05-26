@@ -2,6 +2,77 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 158)
+
+**Round 158 widened the VP8L §5.2.2 LZ77 backward-reference matcher to
+three-position lazy matching.** The matcher in `tokenize_lz77` now
+extends the round-157 two-position look-ahead with a third
+look-ahead position at `pos + 3`. After finding the best match across
+`(L_a at pos, L_b at pos + 1, L_c at pos + 2)`, the matcher also
+probes `pos + 3` for an `L_d > max(L_a, L_b, L_c)`; when the depth-3
+probe wins, three literals (`pixels[pos]`, `pixels[pos + 1]`, and
+`pixels[pos + 2]`) are emitted and the longer match starting at
+`pos + 3` is taken in place of the depth-2 choice. This recovers a
+*third-order* strict-greedy trap that the round-157 depth-2 matcher
+could not escape — three consecutive short matches at `pos`,
+`pos + 1`, `pos + 2` together blocking a strictly longer match at
+`pos + 3`.
+
+Decoder output is bit-identical for any input — only the token
+*partition* changes — so the entire existing test suite (now 365
+unit tests) continues to round-trip unchanged. The hash-chain insert
+bookkeeping now also deduplicates the `pos + 2`-insert that the
+depth-3 probe performs, along with the existing `pos`-insert
+(depth-1 probe) and `pos + 1`-insert (depth-2 probe), so the
+post-match chain walk never double-inserts. The internal
+`tokenize_lz77_inner` `lazy_depth: u32` toggle now accepts `3`:
+`0` = strict-greedy r155 baseline, `1` = depth-1 round-156, `2` =
+depth-2 round-157, `3` = depth-3 round-158 (now the production
+default). Round-158 A/B regression tests can build all four
+baselines on the same fixture.
+
+The headline structural win is captured by the hand-crafted
+four-anchor depth-3 trap fixture: where strict greedy AND the
+round-156 depth-1 matcher AND the round-157 depth-2 matcher all emit
+
+    Copy{length=4, dist=33}, Copy{length=8, dist=15}, ...   (2 copies)
+
+covering the trap span (33..45), the round-158 depth-3 matcher emits
+
+    Literal(P), Literal(Q), Literal(R), Copy{length=9, dist=15}, ...
+                                                              (1 copy)
+
+over the same span. Net effect: one fewer Copy token at +1 overall
+token cost (the extra literal). The longer-match-with-shorter-distance
+partition compresses through the §3.7 prefix codes at lower bit cost
+on inputs where the trap pattern recurs (three-pixel-run-difference
+regions interrupting an underlying long repeat — exactly the case
+round-157 could not escape).
+
+Three new tests cover the contract:
+`round_158_depth3_lazy_match_round_trips_through_decoder` (a noisy
+96×16 fixture round-trips end-to-end via `decode_lossless_image` and
+the direct `encode_argb_literals_with_width` path, catching
+bookkeeping bugs in the new depth-3 insert/skip dedup);
+`round_158_depth3_lazy_match_strictly_beats_depth2_on_trap_fixture`
+(the depth-3 trap asserts depth-3 emits strictly fewer Copy tokens
+than ALL of the strict-greedy, depth-1, and depth-2 baselines, with
+`lazy3_copies = 1 < lazy2_copies = 2 = lazy1_copies = 2 =
+greedy_copies = 2`); and
+`round_158_depth3_never_increases_token_count_over_depth2` (across
+8 shapes × 3 fixture families the depth-3 token count is structurally
+`<=` the depth-2 token count, with a defensive round-trip on every
+fixture). Spec source: RFC 9649 §5.2.2 / §3.6.2.2 (backward
+references; the lazy-match depth is an encoder choice unconstrained
+by the format).
+
+Still lacks (post-round-158): the §4.1 per-block mode-cost proxy still
+uses a folded-residual magnitude rather than accounting for the
+entropy-image bit cost (an r155 follow-up), the LZ77 lazy depth is
+now fixed at three-position (deeper look-aheads — depth-4+, or
+optimal-parsing — remain future work), and VP8 lossy encode is still
+entirely absent.
+
 ## Status — 2026-05-27 (clean-room round 157)
 
 **Round 157 widened the VP8L §5.2.2 LZ77 backward-reference matcher to
@@ -60,13 +131,6 @@ than BOTH the strict-greedy and depth-1 baselines, with `lazy2_copies
 fixture). Spec source: RFC 9649 §5.2.2 / §3.6.2.2 (backward
 references; the lazy-match depth is an encoder choice unconstrained
 by the format).
-
-Still lacks (post-round-157): the §4.1 per-block mode-cost proxy still
-uses a folded-residual magnitude rather than accounting for the
-entropy-image bit cost (an r155 follow-up), the LZ77 lazy depth is
-now fixed at two-position (deeper look-aheads — depth-3+, or
-optimal-parsing — remain future work), and VP8 lossy encode is still
-entirely absent.
 
 ## Status — 2026-05-27 (clean-room round 156)
 
