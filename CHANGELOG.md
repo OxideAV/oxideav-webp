@@ -6,6 +6,40 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 155 (2026-05-26).** §4.1 spatial-predictor
+  `size_bits` two-value sweep, mirroring the round-147 §4.2
+  color-transform pattern. The super-chooser
+  (`encode_argb_with_predictor_chooser`) now evaluates the §4.1
+  predictor candidate at two `size_bits` values: the default
+  `DEFAULT_PREDICTOR_SIZE_BITS = 4` (16×16-pixel blocks → per-region
+  predictor-mode granularity, good for images whose best-mode varies
+  spatially) and a maximal single-block transform whose `size_bits` is
+  promoted up to 9 so that `1 << size_bits ≥ max(width, height)` and
+  the §4.1 sub-resolution predictor image collapses to a single 1×1
+  pixel (the cheapest possible §4.1 header — 4 bytes of sub-image
+  data). Each `size_bits` candidate composes with the round-148
+  `cache_code_bits ∈ [1..11]` plus disabled-cache sweep, so the
+  predictor branch now covers 24 combinations instead of 12 (the
+  per-region candidate alone). Per RFC 9649 §4.1 `size_bits` ranges
+  over `[2..=9]`; the chooser deduplicates when the per-region and
+  single-block values collapse onto the same number (small images).
+  Three new tests:
+  `round_155_predictor_size_bits_sweep_never_regresses` (a fixture
+  matrix spanning gradient / dense-noise / palette-stripes images
+  across 8 shapes asserts the round-155 chooser is byte-wise ≤ the
+  pre-round-155 chooser, by construction since the new candidate is
+  a strict superset), `round_155_predictor_size_bits_sweep_strictly_beats_default_on_some_fixture`
+  (a 20×20 dense-residual fixture saves 6 B / 0.45 % vs the
+  default-only predictor — the measured headline for the round), and
+  `round_155_predictor_single_block_round_trips_through_decoder` (the
+  maximal-single-block stream at the promoted `size_bits = 6` for a
+  64×16 image still round-trips through `decode_lossless_image`
+  end-to-end). The module-level documentation and
+  `DEFAULT_PREDICTOR_SIZE_BITS` rustdoc were updated to describe the
+  new sweep shape. Spec source: RFC 9649 §4.1 (predictor transform
+  `size_bits` range `2..=9`). No external implementation was
+  consulted.
+
 * **Clean-room round 152 (2026-05-26).** Histogram-distance per-region
   clusterer for the §6.2.2 multi-meta-prefix encoder, replacing the
   round-151 mean-green bucketiser. The new

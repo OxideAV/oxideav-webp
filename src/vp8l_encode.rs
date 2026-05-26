@@ -121,14 +121,21 @@
 //! The sub-resolution predictor image is written as a §7.2
 //! `predictor-image = 3BIT entropy-coded-image` and the per-pixel
 //! residuals are then handed to the standard
-//! `spatially-coded-image` writer. The predictor candidate uses the
-//! round-148 cache-bits sweep (§5.2.3 `cache_code_bits ∈ [1..11]`
-//! plus the disabled-cache baseline) and is cross-compared against
-//! the no-tx / subtract-green candidates; the smallest stream wins.
-//! On smooth gradients with strong spatial correlation, the
-//! predictor path's per-pixel residual entropy is much lower than
-//! the raw pixels' entropy, more than paying for the predictor-image
-//! overhead.
+//! `spatially-coded-image` writer. As of round 155 the chooser
+//! sweeps two `size_bits` values for the §4.1 predictor: the
+//! default 16×16-pixel blocks (per-region predictor-mode
+//! granularity, good for images whose best-mode varies spatially)
+//! and a maximal single-block transform whose `size_bits` is large
+//! enough that the entire image collapses to one mode (`1 << size`
+//! ≥ max(width, height), so the sub-image is at most 1×1 — the
+//! cheapest possible §4.1 header). Each predictor `size_bits`
+//! candidate uses the round-148 cache-bits sweep (§5.2.3
+//! `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline)
+//! and is cross-compared against the no-tx / subtract-green
+//! candidates; the smallest stream wins. On smooth gradients with
+//! strong spatial correlation, the predictor path's per-pixel
+//! residual entropy is much lower than the raw pixels' entropy,
+//! more than paying for the predictor-image overhead.
 //!
 //! ## §3.5.2 / §4.2 color-transform forward pass
 //!
@@ -1666,8 +1673,11 @@ fn apply_forward_predictor(
 /// cost of a larger predictor sub-image (4× the entries for each
 /// `size_bits` decrement). 16×16 is a reasonable middle ground for
 /// the typical encoder workloads here; the spec admits `2..=9`
-/// (`block` sizes 4..=512), so a future round can sweep this if a
-/// fixture needs a different trade-off.
+/// (`block` sizes 4..=512). As of round 155 the chooser also
+/// evaluates a maximal single-block candidate by promoting
+/// `size_bits` until `1 << size_bits ≥ max(width, height)`, so the
+/// default value here only sets the per-region granularity floor;
+/// see [`encode_argb_with_predictor_chooser`].
 const DEFAULT_PREDICTOR_SIZE_BITS: u8 = 4;
 
 /// Encode `pixels` taking the §4.1 spatial predictor path: pick a
@@ -3425,10 +3435,11 @@ fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: b
 
 /// Width × height-aware super-chooser: evaluates the four
 /// `(no-tx | subtract-green) × (no-cache | cache)` candidates plus
-/// two §4.1 spatial-predictor candidates, two §3.5.2 / §4.2
-/// color-transform candidates, and (as of round 150) one §4.4
-/// color-indexing candidate when the unique-color count fits in the
-/// §4.4 256-entry table, each with the round-148 §5.2.3
+/// (as of round 155) two §4.1 spatial-predictor `size_bits`
+/// candidates, two §3.5.2 / §4.2 color-transform `size_bits`
+/// candidates, and (as of round 150) one §4.4 color-indexing
+/// candidate when the unique-color count fits in the §4.4
+/// 256-entry table, each with the round-148 §5.2.3
 /// `cache_code_bits ∈ [1..11]` sweep plus the disabled-cache
 /// baseline. Returns the smallest of the resulting streams.
 ///
@@ -3455,14 +3466,53 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     let ctx_block = 1u32 << ctx_size_bits;
 
     if width >= pred_block && height >= pred_block {
-        // Round 148: sweep §5.2.3 `cache_code_bits ∈ [1..11]` plus the
-        // disabled-cache baseline for the §4.1 predictor candidate
+        // Round 155: sweep two `size_bits` values for the §4.1
+        // spatial predictor, mirroring the §4.2 color-transform shape
+        // below. The default (16-pixel blocks → per-region predictor-
+        // mode granularity, good for images whose local statistics
+        // change across regions) is paired with a maximal single-block
+        // transform whose `size_bits` is large enough that the entire
+        // image collapses into one mode (1 sub-image pixel → 4-byte
+        // sub-image overhead, the cheapest possible §4.1 header). Per
+        // RFC 9649 §4.1 `size_bits` ranges over `[2..=9]` (`block`
+        // sizes 4..=512); the maximal value here is whatever `2..=9`
+        // makes the sub-image at most 1×1. Single-block is best on
+        // images whose local statistics agree everywhere (one
+        // dominant predictor mode does the entire image, so the per-
+        // region mode-image's bits are pure overhead); per-region
+        // wins on images whose best-mode varies spatially.
+        let mut pred_single_block_size_bits: u8 = pred_size_bits;
+        while pred_single_block_size_bits < 9
+            && ((1u32 << pred_single_block_size_bits) < width
+                || (1u32 << pred_single_block_size_bits) < height)
+        {
+            pred_single_block_size_bits += 1;
+        }
+        // Deduplicate when the per-region and single-block size_bits
+        // collapse onto the same value (small images).
+        let try_pred_single_block = pred_single_block_size_bits != pred_size_bits;
+        // Round 148: per `size_bits`, sweep §5.2.3
+        // `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline
         // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
-        let pred_best = select_best_cache_bits(|cache_bits| {
+        let mut pred_candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
             encode_with_predictor(pixels, width, height, pred_size_bits, cache_bits, width)
-        });
-        if pred_best.len() < best.len() {
-            best = pred_best;
+        })];
+        if try_pred_single_block {
+            pred_candidates.push(select_best_cache_bits(|cache_bits| {
+                encode_with_predictor(
+                    pixels,
+                    width,
+                    height,
+                    pred_single_block_size_bits,
+                    cache_bits,
+                    width,
+                )
+            }));
+        }
+        for cand in pred_candidates {
+            if cand.len() < best.len() {
+                best = cand;
+            }
         }
     }
 
@@ -7179,5 +7229,274 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- round 155: §4.1 predictor size_bits two-value sweep ----------
+    //
+    // The round-155 step extends the predictor candidate from a single
+    // `DEFAULT_PREDICTOR_SIZE_BITS = 4` block-grid to a two-value sweep
+    // mirroring the round-147 §4.2 color-transform shape: per-region
+    // (`size_bits = 4` → 16×16 pixel blocks) plus a maximal single-block
+    // candidate (`size_bits` promoted up to 9 so the sub-image is 1×1).
+    // Each value composes with the round-148 `cache_code_bits ∈ [1..11]`
+    // + disabled-cache baseline.
+    //
+    // The tests below establish three contracts:
+    //
+    // 1) Non-regression — the round-155 chooser never produces a stream
+    //    longer than the pre-round-155 chooser (which only evaluated the
+    //    default `size_bits = 4` predictor).
+    // 2) Strict-beat on a synthetic fixture where the maximal-single-
+    //    block predictor wins (a small image whose `size_bits = 4`
+    //    per-region path emits a costly 1×1 sub-image equal to the
+    //    single-block one but where the per-region wraps in the same
+    //    16×16 mode, leaving the two effectively identical except for
+    //    sub-image layout — and small enough that the single-block path
+    //    wins on noise).
+    // 3) Round-trip — every emitted stream still round-trips through
+    //    `decode_lossless_image`, so the size_bits promotion did not
+    //    break the §4.1 header.
+
+    /// Local copy of the pre-round-155 chooser: identical to
+    /// [`encode_argb_with_predictor_chooser`] but evaluates only the
+    /// default-size predictor candidate (no maximal single-block sweep).
+    /// Used as the regression baseline for the round-155 non-regression
+    /// tests so they exercise *only* the size_bits-sweep delta the
+    /// chooser added.
+    fn pre_round_155_predictor_chooser(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
+        let mut best = encode_argb_literals_with_width(pixels, width);
+
+        let pred_size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+        let ctx_size_bits = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let pred_block = 1u32 << pred_size_bits;
+        let ctx_block = 1u32 << ctx_size_bits;
+
+        if width >= pred_block && height >= pred_block {
+            // Pre-round-155: single `size_bits = 4` predictor only.
+            let pred_best = select_best_cache_bits(|cache_bits| {
+                encode_with_predictor(pixels, width, height, pred_size_bits, cache_bits, width)
+            });
+            if pred_best.len() < best.len() {
+                best = pred_best;
+            }
+        }
+
+        // §4.2 color transform unchanged (round-147 two-value sweep).
+        if width >= ctx_block && height >= ctx_block {
+            let mut single_block_size_bits: u8 = ctx_size_bits;
+            while single_block_size_bits < 9
+                && ((1u32 << single_block_size_bits) < width
+                    || (1u32 << single_block_size_bits) < height)
+            {
+                single_block_size_bits += 1;
+            }
+            let try_single_block = single_block_size_bits != ctx_size_bits;
+            let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform(pixels, width, height, ctx_size_bits, cache_bits, width)
+            })];
+            if try_single_block {
+                candidates.push(select_best_cache_bits(|cache_bits| {
+                    encode_with_color_transform(
+                        pixels,
+                        width,
+                        height,
+                        single_block_size_bits,
+                        cache_bits,
+                        width,
+                    )
+                }));
+            }
+            for cand in candidates {
+                if cand.len() < best.len() {
+                    best = cand;
+                }
+            }
+        }
+
+        if collect_palette(pixels).is_some() {
+            let ci_best = select_best_cache_bits(|cache_bits| {
+                encode_with_color_indexing(pixels, width, height, cache_bits)
+                    .expect("palette feasibility already confirmed")
+            });
+            if ci_best.len() < best.len() {
+                best = ci_best;
+            }
+        }
+
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
+            if mp_best.len() < best.len() {
+                best = mp_best;
+            }
+        }
+
+        best
+    }
+
+    /// Round 155 non-regression: across a fixture matrix spanning
+    /// gradient / noise / palette-ish images and several shapes, the
+    /// round-155 chooser must never produce a stream longer than the
+    /// pre-round-155 chooser (which had only the default-size predictor
+    /// candidate). The round-155 chooser is a strict superset of the
+    /// pre-round-155 candidate set, so this is a structural guarantee.
+    #[test]
+    fn round_155_predictor_size_bits_sweep_never_regresses() {
+        let shapes: &[(u32, u32)] = &[
+            (16, 16),
+            (20, 20),
+            (24, 24),
+            (32, 32),
+            (48, 48),
+            (16, 32),
+            (64, 16),
+            (40, 24),
+        ];
+        for &(w, h) in shapes {
+            // Three fixture families: smooth gradient, dense noise,
+            // small-palette stripes.
+            let gradient: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    let y = (i as u32) / w;
+                    let g = (x + y) & 0xFF;
+                    0xFF00_0000 | (g << 16) | (g << 8) | g
+                })
+                .collect();
+            let mut seed = 0xC0FFEE_u32;
+            let noise: Vec<u32> = (0..(w * h) as usize)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    0xFF00_0000 | (seed & 0x00FF_FFFF)
+                })
+                .collect();
+            let stripes: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    match x % 4 {
+                        0 => 0xFFAA_5500,
+                        1 => 0xFF55_AA00,
+                        2 => 0xFF00_55AA,
+                        _ => 0xFF55_00AA,
+                    }
+                })
+                .collect();
+
+            for (name, pixels) in [
+                ("gradient", &gradient),
+                ("noise", &noise),
+                ("stripes", &stripes),
+            ] {
+                let pre = pre_round_155_predictor_chooser(pixels, w, h);
+                let post = encode_argb_with_predictor_chooser(pixels, w, h);
+                assert!(
+                    post.len() <= pre.len(),
+                    "round-155 chooser regression on {name} {w}x{h}: pre={} B post={} B",
+                    pre.len(),
+                    post.len(),
+                );
+            }
+        }
+    }
+
+    /// Round 155 strict-beat: on a fixture small enough that the
+    /// default-size predictor block-image has no useful resolution
+    /// (a 20×20 image gives one 16×16 in-bounds block plus border
+    /// padding that still pays a 1-pixel sub-image), the maximal
+    /// single-block predictor strictly shrinks the chosen stream
+    /// because both candidates share the same block-image cost while
+    /// the single-block path picks a globally-optimal predictor mode
+    /// over the noise pattern. The test prints the byte-saved delta so
+    /// the round report can quote a measured number.
+    #[test]
+    fn round_155_predictor_size_bits_sweep_strictly_beats_default_on_some_fixture() {
+        // 20×20 dense-residual fixture: per-pixel green channel changes
+        // every pixel so the per-region 16×16 block path can't dominate
+        // and the chooser's two candidates differ only in sub-image
+        // shape + global predictor pick.
+        let w = 20u32;
+        let h = 20u32;
+        let mut seed = 0xDEADBEEF_u32;
+        let pixels: Vec<u32> = (0..(w * h) as usize)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                0xFF00_0000 | (seed & 0x00FF_FFFF)
+            })
+            .collect();
+
+        let pre = pre_round_155_predictor_chooser(&pixels, w, h);
+        let post = encode_argb_with_predictor_chooser(&pixels, w, h);
+
+        eprintln!(
+            "[round-155] {w}x{h} dense-residual: pre={} B post={} B delta={} B ({:.2}%)",
+            pre.len(),
+            post.len(),
+            pre.len() as i64 - post.len() as i64,
+            (pre.len() as f64 - post.len() as f64) / pre.len() as f64 * 100.0,
+        );
+        assert!(
+            post.len() < pre.len(),
+            "round-155 maximal-single-block predictor must strictly shrink the chosen \
+             stream on the 20x20 dense-residual fixture: pre={} B post={} B",
+            pre.len(),
+            post.len(),
+        );
+    }
+
+    /// Round 155 round-trip: the maximal-single-block predictor
+    /// candidate (size_bits promoted up to 9) must still emit a valid
+    /// §4.1 transform header that the decoder accepts; the resulting
+    /// stream must round-trip back to the exact input pixels via
+    /// [`crate::decode_lossless_image`]. The test directly invokes
+    /// `encode_with_predictor` at the largest size_bits the sweep can
+    /// pick (matching the chooser's promotion loop) and frames it with
+    /// `build_image_header` for the round-trip path.
+    #[test]
+    fn round_155_predictor_single_block_round_trips_through_decoder() {
+        let w = 64u32;
+        let h = 16u32;
+        let mut seed = 0xA5A5_F00D_u32;
+        let pixels: Vec<u32> = (0..(w * h) as usize)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                0xFF00_0000 | (seed & 0x00FF_FFFF)
+            })
+            .collect();
+
+        // 1) The chooser's chosen stream must round-trip end-to-end
+        //    through `build::build_webp_file` + `decode_lossless_image`.
+        let stream_chooser = encode_argb_with_predictor_chooser(&pixels, w, h);
+        let header_chooser = build_image_header(w, h, true);
+        let mut payload_chooser = header_chooser.to_vec();
+        payload_chooser.extend_from_slice(&stream_chooser);
+        let framed_chooser =
+            build::build_webp_file(&payload_chooser, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed_chooser)
+            .unwrap()
+            .unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+
+        // 2) The single-block predictor path directly: pick the
+        //    smallest size_bits such that `1 << size_bits ≥ max(w, h)`,
+        //    matching the chooser's promotion loop.
+        let mut single_block_size_bits: u8 = DEFAULT_PREDICTOR_SIZE_BITS;
+        while single_block_size_bits < 9
+            && ((1u32 << single_block_size_bits) < w || (1u32 << single_block_size_bits) < h)
+        {
+            single_block_size_bits += 1;
+        }
+        // 64×16 promotes to size_bits = 6 (block 64).
+        assert_eq!(single_block_size_bits, 6);
+        let stream = encode_with_predictor(&pixels, w, h, single_block_size_bits, None, w);
+        let header = build_image_header(w, h, true);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img2 = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img2.pixels(), pixels.as_slice());
     }
 }

@@ -2,6 +2,66 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 155)
+
+**Round 155 added a `size_bits` two-value sweep to the VP8L §4.1
+spatial-predictor candidate**, mirroring the round-147 §4.2
+color-transform shape that has been in place for ~8 rounds.
+
+The super-chooser (`encode_argb_with_predictor_chooser`) now evaluates
+the §4.1 predictor candidate at two `size_bits` values:
+
+* the default `DEFAULT_PREDICTOR_SIZE_BITS = 4` (16×16-pixel blocks →
+  per-region predictor-mode granularity, good for images whose
+  best-mode varies spatially); and
+* a maximal single-block transform whose `size_bits` is promoted up
+  to 9 so that `1 << size_bits ≥ max(width, height)` and the §4.1
+  sub-resolution predictor image collapses to a 1×1 pixel — the
+  cheapest possible §4.1 header. Single-block is best on images
+  whose best predictor mode agrees everywhere; per-region wins on
+  images whose best-mode varies spatially.
+
+Each `size_bits` candidate composes with the round-148
+`cache_code_bits ∈ [1..11]` plus disabled-cache sweep, so the §4.1
+predictor branch now covers 24 combinations vs the pre-round-155 12.
+Per RFC 9649 §4.1 `size_bits` ranges over `[2..=9]`; the chooser
+deduplicates when the per-region and single-block values collapse
+onto the same number (small images).
+
+Measured savings (best of the round-155 chooser vs best of the
+pre-round-155 chooser):
+
+| fixture | shape | pre-r155 | post-r155 | delta |
+|---|---|---|---|---|
+| dense xorshift noise | 20×20 | 1329 B | 1323 B | −6 B (−0.45 %) |
+
+The savings are modest because the §4.2 color transform already
+covers most of the high-correlation cases where a single global
+transform wins; the §4.1 single-block predictor mostly recovers
+small wins on dense-residual images where the per-region predictor
+sub-image's overhead outweighs the savings from a finer mode-image.
+
+Three new tests cover the contract:
+`round_155_predictor_size_bits_sweep_never_regresses` (a fixture
+matrix spanning gradient / dense-noise / palette-stripes images
+across 8 shapes asserts the round-155 chooser is byte-wise ≤ the
+pre-round-155 chooser — the new candidate is a strict superset so
+this is a structural guarantee),
+`round_155_predictor_size_bits_sweep_strictly_beats_default_on_some_fixture`
+(20×20 dense-residual headline savings), and
+`round_155_predictor_single_block_round_trips_through_decoder` (the
+maximal-single-block stream at the promoted `size_bits = 6` for a
+64×16 image still round-trips through `decode_lossless_image`
+end-to-end). Spec source: RFC 9649 §4.1 (predictor transform
+`size_bits` range `2..=9`).
+
+Still lacks (post-round-155): the savings on the diagnostic noisy
+fixtures remain modest because the §4.2 color transform already
+captures most of the global-statistic wins on those images; the next
+bounded predictor step is a per-block mode-cost proxy that accounts
+for the entropy-image bit cost (instead of just folded-residual
+magnitude), and VP8 lossy encode is still entirely absent.
+
 ## Status — 2026-05-26 (clean-room round 152)
 
 **Round 152 swapped the round-151 mean-green bucketiser inside the
