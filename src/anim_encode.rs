@@ -163,6 +163,52 @@ impl AnimFrame {
         self.near_lossless_quality = quality;
         self
     }
+
+    /// Builder helper: set the §2.7.1.1 `B` (blending) bit on this frame
+    /// and return `self`.
+    ///
+    /// * [`BlendingMethod::Overwrite`] (§2.7.1.1 `B = 1`) — the
+    ///   [`AnimFrame::new`] default — copies the frame's sub-rect pixels
+    ///   over the previous canvas byte-for-byte, ignoring the source's
+    ///   alpha. Use this when the frame is a full opaque keyframe.
+    /// * [`BlendingMethod::AlphaBlend`] (§2.7.1.1 `B = 0`) runs the
+    ///   per-pixel formula `blend.A = src.A + dst.A * (1 - src.A / 255)`
+    ///   then `blend.RGB = (src.RGB * src.A + dst.RGB * dst.A * (1 -
+    ///   src.A / 255)) / blend.A` (8-bit integer approximation, sRGB
+    ///   space). Translucent pixels (`src.A < 255`) preserve the
+    ///   previous canvas underneath; fully-opaque pixels still overwrite.
+    ///
+    /// The chosen method is emitted into the §2.7.1.1 Figure 9 info byte
+    /// of the ANMF header and consumed by [`crate::decode_webp`]'s
+    /// canvas compositor. Round-trip is bit-exact regardless of which
+    /// method is chosen, given equivalent source pixels.
+    pub fn with_blend(mut self, blend: BlendingMethod) -> Self {
+        self.blend = blend;
+        self
+    }
+
+    /// Builder helper: set the §2.7.1.1 `D` (disposal) bit on this frame
+    /// and return `self`.
+    ///
+    /// * [`DisposalMethod::None`] (§2.7.1.1 `D = 0`) — the
+    ///   [`AnimFrame::new`] default — leaves this frame's sub-rect on
+    ///   the canvas after display, so the next frame composites over
+    ///   the result.
+    /// * [`DisposalMethod::Background`] (§2.7.1.1 `D = 1`) clears this
+    ///   frame's sub-rect to the §2.7.1.1 ANIM background colour
+    ///   *before* the next frame's blending step. The encoder mirrors
+    ///   that behaviour in its internal canvas tracker so the
+    ///   dirty-rect diff used by [`AnimFrameMode::Auto`] /
+    ///   [`AnimFrameMode::Delta`] is computed against the post-dispose
+    ///   canvas — the same reference state the decoder sees.
+    ///
+    /// The chosen method is emitted into the §2.7.1.1 Figure 9 info byte
+    /// of the ANMF header. Round-trip is bit-exact through
+    /// [`crate::decode_webp`] for both methods.
+    pub fn with_dispose(mut self, dispose: DisposalMethod) -> Self {
+        self.dispose = dispose;
+        self
+    }
 }
 
 /// Multi-scale SSIM downsample kernel selector for the (blocked) delta path.
@@ -1075,5 +1121,110 @@ mod tests {
         assert_eq!(opts.default_near_lossless_quality, Some(60));
         let opts2 = AnimEncoderOptions::default().with_default_near_lossless_quality(None);
         assert_eq!(opts2.default_near_lossless_quality, None);
+    }
+
+    #[test]
+    fn anim_frame_new_defaults_blend_and_dispose_to_overwrite_and_none() {
+        let f = AnimFrame::new(4, 4, solid_rgba(4, 4, [0, 0, 0, 255]), 50);
+        assert_eq!(
+            f.blend,
+            BlendingMethod::Overwrite,
+            "new() blend default must be Overwrite (§2.7.1.1 B = 1)"
+        );
+        assert_eq!(
+            f.dispose,
+            DisposalMethod::None,
+            "new() dispose default must be None (§2.7.1.1 D = 0)"
+        );
+    }
+
+    #[test]
+    fn with_blend_builder_round_trips_both_methods() {
+        let base = AnimFrame::new(4, 4, solid_rgba(4, 4, [1, 2, 3, 255]), 50);
+        let alpha = base.clone().with_blend(BlendingMethod::AlphaBlend);
+        assert_eq!(alpha.blend, BlendingMethod::AlphaBlend);
+        let over = base.with_blend(BlendingMethod::Overwrite);
+        assert_eq!(over.blend, BlendingMethod::Overwrite);
+    }
+
+    #[test]
+    fn with_dispose_builder_round_trips_both_methods() {
+        let base = AnimFrame::new(4, 4, solid_rgba(4, 4, [1, 2, 3, 255]), 50);
+        let bg = base.clone().with_dispose(DisposalMethod::Background);
+        assert_eq!(bg.dispose, DisposalMethod::Background);
+        let none = base.with_dispose(DisposalMethod::None);
+        assert_eq!(none.dispose, DisposalMethod::None);
+    }
+
+    #[test]
+    fn with_blend_and_with_dispose_chain_with_other_builders() {
+        // The chainable forms compose with the existing
+        // `with_near_lossless_quality` builder and don't disturb its
+        // independent field.
+        let f = AnimFrame::new(4, 4, solid_rgba(4, 4, [9, 9, 9, 255]), 25)
+            .with_blend(BlendingMethod::AlphaBlend)
+            .with_dispose(DisposalMethod::Background)
+            .with_near_lossless_quality(Some(60));
+        assert_eq!(f.blend, BlendingMethod::AlphaBlend);
+        assert_eq!(f.dispose, DisposalMethod::Background);
+        assert_eq!(f.near_lossless_quality, Some(60));
+        assert_eq!(f.duration, 25);
+        assert_eq!(f.width, 4);
+        assert_eq!(f.height, 4);
+    }
+
+    #[test]
+    fn with_blend_emits_correct_info_byte_in_anmf_header() {
+        // Build a one-frame animation per builder method and re-parse
+        // the ANMF header to confirm the §2.7.1.1 Figure 9 info byte
+        // carries the requested `B` bit.
+        for (blend, expected_b) in [
+            (BlendingMethod::Overwrite, 1u8),
+            (BlendingMethod::AlphaBlend, 0u8),
+        ] {
+            let f = AnimFrame::new(4, 4, solid_rgba(4, 4, [10, 20, 30, 255]), 80).with_blend(blend);
+            let file = build_animated_webp(&[f]).expect("build");
+            let c = crate::container::parse(&file).expect("container");
+            let anmf = c
+                .first_chunk_with_fourcc(fourcc::ANMF)
+                .expect("ANMF present");
+            let header = crate::anmf::AnmfHeader::parse(anmf.payload(&file)).expect("ANMF parse");
+            assert_eq!(
+                header.blend, blend,
+                "blend round-trips through the ANMF info byte"
+            );
+            // Sanity: the §2.7.1.1 Figure 9 info byte's B bit equals
+            // the expected value (bit 1).
+            assert_eq!(
+                (header.info_byte >> 1) & 1,
+                expected_b,
+                "info byte B bit = {expected_b}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_dispose_emits_correct_info_byte_in_anmf_header() {
+        // Build a one-frame animation per builder method and re-parse
+        // the ANMF header to confirm the §2.7.1.1 Figure 9 info byte
+        // carries the requested `D` bit.
+        for (dispose, expected_d) in [
+            (DisposalMethod::None, 0u8),
+            (DisposalMethod::Background, 1u8),
+        ] {
+            let f =
+                AnimFrame::new(4, 4, solid_rgba(4, 4, [10, 20, 30, 255]), 80).with_dispose(dispose);
+            let file = build_animated_webp(&[f]).expect("build");
+            let c = crate::container::parse(&file).expect("container");
+            let anmf = c
+                .first_chunk_with_fourcc(fourcc::ANMF)
+                .expect("ANMF present");
+            let header = crate::anmf::AnmfHeader::parse(anmf.payload(&file)).expect("ANMF parse");
+            assert_eq!(
+                header.dispose, dispose,
+                "dispose round-trips through the ANMF info byte"
+            );
+            assert_eq!(header.info_byte & 1, expected_d, "info byte D bit");
+        }
     }
 }

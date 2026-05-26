@@ -2,6 +2,58 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 142)
+
+**Round 142 added chainable `AnimFrame::with_blend(BlendingMethod)` and
+`AnimFrame::with_dispose(DisposalMethod)` builders for the per-frame
+§2.7.1.1 `B` and `D` info-byte bits**, and pinned the end-to-end
+round-trip semantics of both with six new integration tests. The
+underlying `blend: BlendingMethod` and `dispose: DisposalMethod` fields
+were already public on [`AnimFrame`](src/anim_encode.rs) since round
+118, but the published-0.1.5 surface only exposed the literal-
+construction path; the new
+[`with_blend`](src/anim_encode.rs) / [`with_dispose`](src/anim_encode.rs)
+helpers complete the chainable-builder pattern alongside
+`with_near_lossless_quality` (r140) and the
+`AnimFrame::new(…)` constructor. Both helpers consume the receiver and
+return `Self`, so they compose with each other and with the existing
+builders in any order.
+
+**Three round-142 guarantees** are pinned by integration tests in
+[`tests/published_anim_blend_dispose_api.rs`](tests/published_anim_blend_dispose_api.rs):
+(a) the chosen `B` / `D` bit round-trips byte-exactly through the §2.7.1.1
+Figure 9 ANMF info byte — the encoder emits the bit a reader can
+re-parse via [`crate::anmf::AnmfHeader::parse`] (inline tests). (b) The
+§2.7.1.1 **alpha-blending formula** `blend.A = src.A + dst.A * (1 −
+src.A / 255)`, `blend.RGB = (src.RGB * src.A + dst.RGB * dst.A * (1 −
+src.A / 255)) / blend.A` (8-bit integer approximation, sRGB space)
+applies bit-exactly on a 2×2 translucent (`src.A = 128`) sub-frame over
+an opaque keyframe: red `(255, 0, 0, 255)` under blue `(0, 0, 255,
+128)` blends to **`(127, 0, 128, 255)`** — the precise spec-formula
+value. The opaque (`src.A = 255`) case still decodes to the source
+verbatim, since the formula short-circuits to overwrite at full alpha.
+(c) The §2.7.1.1 **disposal rule** "before rendering each frame, the
+previous frame's Disposal method is applied" clears a
+`DisposalMethod::Background` frame's sub-rect to the ANIM background
+colour before the next frame is composited — a 2×2 GREEN frame with
+dispose=Background between an 8×8 RED keyframe and a 2×2 BLUE frame
+produces a third-frame snapshot whose `(2..4, 2..4)` rect is the ANIM
+bg `(10, 20, 30, 255)`, not GREEN. The mirror case with
+`DisposalMethod::None` leaves GREEN on the canvas under the next
+frame. The integrated case where AlphaBlend + Background dispose
+compose on the same frame produces the blended pixels in the f1
+snapshot and the bg-cleared rect in the f2 snapshot.
+
+What landed: two 22-line builders on
+[`AnimFrame`](src/anim_encode.rs), six new integration tests, and six
+new inline unit tests (the `new()` defaults for blend/dispose, the
+builder round-trip for each method, a chaining test against the other
+builders, and the info-byte emission for each method). No new public
+fields; no behavioural change to existing encoder output (the
+literal-construction path was already wired). Total: **485** tests
+green (was 473: +12 from this round). Default and
+`--no-default-features` builds both clippy + fmt clean.
+
 ## Status — 2026-05-26 (clean-room round 141)
 
 **Round 141 hoisted the round-140 per-frame near-lossless knob to an

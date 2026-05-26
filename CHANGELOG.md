@@ -6,6 +6,42 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 142 (2026-05-26).** **Chainable
+  `AnimFrame::with_blend(BlendingMethod)` and
+  `AnimFrame::with_dispose(DisposalMethod)` builders for the §2.7.1.1
+  `B` (blending) and `D` (disposal) info-byte bits.** The underlying
+  fields were already public on `AnimFrame` since round 118, but the
+  published-0.1.5 surface only exposed the literal-construction path;
+  the new helpers complete the chainable-builder pattern alongside
+  `with_near_lossless_quality` (r140) and the `AnimFrame::new(…)`
+  constructor. Both helpers consume the receiver and return `Self`, so
+  they compose with each other and with the existing builders in any
+  order. No new public fields; no behavioural change to existing
+  encoder output (the literal-construction path was already wired).
+
+  Six new integration tests in
+  [`tests/published_anim_blend_dispose_api.rs`](tests/published_anim_blend_dispose_api.rs)
+  pin the end-to-end semantics through `decode_webp`'s §2.7.1.1
+  compositor: (a) opaque-source alpha-blend short-circuits to byte-
+  exact round-trip; (b) a 2×2 translucent (alpha=128) BLUE sub-frame
+  over an 8×8 opaque RED keyframe blends to the spec-formula bit-
+  exact `(127, 0, 128, 255)`; (c) the same setup with Overwrite blits
+  the translucent source verbatim into the canvas; (d) a 2×2 GREEN
+  frame with dispose=Background between RED keyframe and 2×2 BLUE
+  frame produces a third-frame snapshot whose `(2..4, 2..4)` rect is
+  the ANIM bg, not GREEN; (e) the mirror case with dispose=None leaves
+  GREEN on the canvas under the next frame; (f) the integrated case
+  where AlphaBlend + Background dispose compose on the same frame
+  produces the blended pixels in the f1 snapshot and the bg-cleared
+  rect in the f2 snapshot.
+
+  Six new inline unit tests confirm the `new()` blend/dispose
+  defaults (`Overwrite` / `None`), the per-method builder round-trip
+  for each, the chaining behaviour against `with_near_lossless_quality`,
+  and the §2.7.1.1 Figure 9 info-byte emission for each `B` and `D`
+  bit. Total: **485** tests green (was 473: +12 from this round).
+  Default and `--no-default-features` builds both clippy + fmt clean.
+
 * **Clean-room round 141 (2026-05-26).** **Animation-wide near-lossless
   default in `AnimEncoderOptions`.** The new
   `AnimEncoderOptions::default_near_lossless_quality: Option<u8>` field
