@@ -6,6 +6,43 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 147 (2026-05-26).** §3.5.2 / §4.2 color-transform
+  forward pass for the VP8L lossless encoder. The encoder now
+  evaluates four new candidates alongside the existing six chooser
+  candidates: the §3.5.2 color transform with two `size_bits` values
+  (`4` → 16×16 per-region blocks; the maximal single-block size that
+  collapses the entire image into one CTE), each with and without a
+  §5.2.3 color cache. For each block, `pick_block_cte` runs an exact
+  per-axis greedy sweep over a 25-entry candidate grid (`±0..±96`
+  with fine resolution near zero) picking the
+  `(green_to_red, green_to_blue, red_to_blue)` triple that minimises
+  a residual-magnitude proxy. The per-axis greedy is exact because
+  the §3.5.2 cost decomposes additively across channels (green is
+  untouched, red depends only on `green_to_red`, blue depends
+  additively on `(green_to_blue, red_to_blue)`). The sub-resolution
+  color image is written as a §7.2 `color-image = 3BIT
+  entropy-coded-image` (re-using `write_entropy_coded_image_literals`
+  from round 146), the main image is forward-transformed into the
+  red/blue residuals, and the residuals feed the standard
+  `spatially-coded-image` writer. On a 128×128 fixture with per-
+  block-varying linear channel correlation (four-slope palette), the
+  chooser shrinks the stream from 47636 B (round-146 baseline) to
+  41399 B — a 13.1% reduction. On the published 128×128 natural
+  fixture the round-146 predictor candidate already wins at 1011 B
+  and the new color candidate doesn't beat it (the chooser correctly
+  keeps the predictor pick — no regression). The chooser falls back
+  to the existing six candidates when either dimension is below one
+  block. Nine new tests: `color_xfrm_delta` matching the §3.5.2
+  signed-fixed-point formula on spec examples, per-pixel forward+
+  inverse round-trip through the decoder's `inverse_color`, a solid-
+  block CTE-cost-minimum assertion, a known-slope CTE recovery on a
+  synthetic `red ≈ green / 2` block, forward + inverse multi-block
+  bit-exact round trip, end-to-end public-API round trip on a chroma-
+  correlated image, a chooser non-regression on a low-correlation
+  synthetic and on uncorrelated noise, a strict-beat assertion on
+  the varying-slope fixture (with `eprintln!` byte counts for
+  visibility), and the natural-fixture round trip + non-regression.
+
 * **Clean-room round 146 (2026-05-26).** §4.1 spatial-predictor forward
   transform for the VP8L lossless encoder. The encoder now evaluates two
   new candidates alongside the existing

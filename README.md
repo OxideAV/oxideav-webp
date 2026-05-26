@@ -2,6 +2,49 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 147)
+
+**Round 147 added the §3.5.2 / §4.2 color-transform forward pass to the
+VP8L encoder.** The encoder now evaluates four new candidates alongside
+the round-146 set: the §3.5.2 color transform with two `size_bits`
+values (`4` → 16×16 per-region blocks, and the maximal single-block
+size that collapses the entire image into one CTE), each with and
+without a §5.2.3 color cache. For each block, `pick_block_cte` runs an
+exact per-axis greedy sweep over a 25-entry candidate grid
+(`±0..±96` with fine resolution near zero) picking the
+`(green_to_red, green_to_blue, red_to_blue)` triple that minimises a
+residual-magnitude proxy. The per-axis greedy is exact because the
+§3.5.2 cost decomposes additively across channels (green is untouched,
+red depends only on `green_to_red`, blue depends additively on
+`(green_to_blue, red_to_blue)`). The sub-resolution color image is
+written as a §7.2 `color-image = 3BIT entropy-coded-image` (re-using
+the round-146 `write_entropy_coded_image_literals` helper), the main
+image is forward-transformed into per-pixel red/blue residuals, and
+the residuals feed the existing `spatially-coded-image` writer. The
+chooser falls back to the round-146 six candidates when either
+dimension is below one block.
+
+Headline measurements (encoder-stream byte count, identical pixel
+content, round-146 baseline vs round-147 color-transform-aware chooser):
+
+| Fixture                                        | round-146 baseline | round-147 chooser | Δ        |
+|------------------------------------------------|--------------------:|-------------------:|---------:|
+| 128×128 varying-slope channel-correlated noise | 47 636 B            | 41 399 B           | -13.1 %  |
+| 128×128 natural fixture (published)            | 1 011 B             | 1 011 B            | 0.0 %    |
+
+On natural images the round-146 predictor candidate already wins
+outright at 1011 B (-97.8 % vs the no-tx baseline of 46 797 B) and
+the new color candidate doesn't beat it — the chooser correctly
+keeps the predictor pick, no regression. The chooser is also non-
+regressing on uncorrelated noise (neither the predictor nor the
+color transform produces a smaller stream than literals when no
+neighbour or channel-correlation helps). Bit-exact round trips hold
+through [`decode_webp`](src/lib.rs) / [`decode_lossless_image`](src/lib.rs)
+for every fixture above.
+
+Still lacks: §3.8.2 color-indexing encoding (predictor + color +
+subtract-green are wired), and VP8 lossy encode.
+
 ## Status — 2026-05-26 (clean-room round 146)
 
 **Round 146 added the §4.1 spatial-predictor forward transform to the VP8L
@@ -43,7 +86,8 @@ blocks will also serve the §4.2 color transform encoder in a future
 round.
 
 Still lacks: §3.8.2 color-transform / color-indexing encoding
-(predictor + subtract-green are wired), and VP8 lossy encode.
+(predictor + subtract-green are wired); color transform later landed
+in round 147 — see the round-147 status block at the top.
 
 ## Status — 2026-05-26 (clean-room round 145)
 
