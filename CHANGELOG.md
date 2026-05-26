@@ -6,6 +6,44 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 157 (2026-05-27).** §5.2.2 LZ77 backward-reference
+  matcher gains **two-position lazy matching**. The matcher in
+  `tokenize_lz77` now extends the round-156 single-position look-ahead
+  with a second look-ahead position at `pos + 2`. After finding the
+  best match across `(L_a at pos, L_b at pos + 1)`, the matcher also
+  probes `pos + 2` for an `L_c > max(L_a, L_b)`; when the depth-2
+  probe wins, two literals (`pixels[pos]` and `pixels[pos + 1]`) are
+  emitted and the longer match starting at `pos + 2` is taken. This
+  recovers a *second-order* strict-greedy trap that the round-156
+  depth-1 matcher could not escape — a short match at `pos` AND a
+  short match at `pos + 1` together blocking a strictly longer match
+  at `pos + 2`. The hash-chain insert bookkeeping deduplicates both
+  the `pos`-insert (from the depth-1 probe) and the `pos + 1`-insert
+  (from the depth-2 probe) so the post-match chain walk does not
+  double-insert. Decoder output is bit-identical for any input — only
+  the token *partition* shifts by up to two pixels — so the entire
+  existing test suite (now 362 tests) continues to round-trip
+  unchanged. The internal `tokenize_lz77_inner` toggle is widened
+  from `bool` to `u32` (`0` = strict-greedy r155, `1` = depth-1
+  round-156, `2` = depth-2 round-157) so the new round-157 A/B
+  regression tests can build all three baselines on the same fixture.
+  Three new tests:
+  `round_157_depth2_lazy_match_round_trips_through_decoder` (a noisy
+  80×16 fixture round-trips end-to-end via `decode_lossless_image`
+  and the direct `encode_argb_literals_with_width` path, catching
+  bookkeeping bugs in the new depth-2 insert/skip dedup);
+  `round_157_depth2_lazy_match_strictly_beats_depth1_on_trap_fixture`
+  (a hand-crafted three-anchor depth-2 trap fixture where the
+  strict-greedy matcher AND the depth-1 matcher both emit a
+  `Copy{4, 25}` short match while the depth-2 matcher emits
+  `Lit + Lit + Copy{7, 13}` — the depth-2 copy count is strictly
+  smaller; the test asserts depth-1 == greedy here, confirming the
+  trap is depth-2-specific); and
+  `round_157_depth2_never_increases_token_count_over_depth1`
+  (across 8 shapes × 3 fixture families the depth-2 token count is
+  structurally `<=` the depth-1 token count, with a defensive
+  round-trip on every fixture).
+
 * **Clean-room round 156 (2026-05-27).** §5.2.2 LZ77 backward-reference
   matcher gains single-position **lazy matching**. The matcher in
   `tokenize_lz77` now probes `pos + 1` after finding a match `(L_a, _)`

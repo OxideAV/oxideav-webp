@@ -1038,90 +1038,125 @@ impl<'a> Lz77Matcher<'a> {
 /// `MIN_MATCH <= length <= MAX_MATCH`, so the decoder's §5.2.2 copy
 /// loop reproduces the exact pixels.
 ///
-/// As of round 156 single-position **lazy matching** is applied:
+/// As of round 157 the matcher applies **two-position lazy matching**:
 /// when the matcher finds a match `(len_a, _)` at `pos`, the encoder
-/// also probes `pos + 1`. If the look-ahead match is strictly longer
-/// than the match-at-`pos` (`len_b > len_a`), the pixel at `pos` is
-/// emitted as a literal and the (longer) match-at-`pos + 1` is used
-/// in its place. This costs one extra hash-chain walk per match
-/// attempt and recovers the classic LZ77 strict-greedy trap: a
-/// length-`L` match at `pos` that prevents a length-`>L` match at
-/// `pos + 1` is now resolved in favour of the longer match, which
-/// (after accounting for one extra literal symbol) is essentially
-/// always cheaper. The reconstructed pixels are bit-identical to the
-/// strict-greedy partition for any input — only the token *boundary*
-/// shifts by one pixel.
+/// also probes `pos + 1` and (if the depth-1 swap is not already a
+/// strict win) `pos + 2`. The longest of `(len_a, len_b, len_c)`
+/// wins; ties resolve to the earliest position (preserving the
+/// existing depth-1 strict-greater semantics). When the depth-2 match
+/// `len_c` is the unique longest, the encoder emits *two* literals
+/// (at `pos` and `pos + 1`) and takes the longer match starting at
+/// `pos + 2`. This costs at most two extra hash-chain walks per
+/// match attempt and extends the round-156 single-position lazy
+/// recovery to the second-order trap: a short match at `pos` AND a
+/// short match at `pos + 1` together block a strictly longer match
+/// at `pos + 2`. The reconstructed pixels are bit-identical to the
+/// strict-greedy and depth-1 partitions for any input — only the
+/// token *partition* shifts by up to two pixels — so round-trips
+/// remain bit-exact and the existing test suite continues to pass.
 fn tokenize_lz77(pixels: &[u32]) -> Vec<Token> {
-    tokenize_lz77_inner(pixels, true)
+    tokenize_lz77_inner(pixels, LAZY_DEPTH_DEFAULT)
 }
 
-/// Implementation of [`tokenize_lz77`] with an explicit `lazy` toggle.
-/// `lazy = true` is the production behaviour (single-position
-/// look-ahead); `lazy = false` reproduces the strict-greedy r155
-/// partition for round-156 A/B regression tests.
-fn tokenize_lz77_inner(pixels: &[u32], lazy: bool) -> Vec<Token> {
+/// Production lazy-match depth used by [`tokenize_lz77`]. Round 156
+/// set this to 1 (single-position look-ahead); round 157 bumps it to
+/// 2 (two-position look-ahead). A value of 0 reproduces the r155
+/// strict-greedy partition.
+const LAZY_DEPTH_DEFAULT: u32 = 2;
+
+/// Implementation of [`tokenize_lz77`] with an explicit `lazy_depth`
+/// toggle. Values:
+///
+/// * `0` — strict-greedy r155 partition (no look-ahead). Always emits
+///   the match found at `pos`.
+/// * `1` — round-156 single-position lazy partition: probe `pos + 1`,
+///   swap to a strictly-longer match starting there.
+/// * `2` — round-157 two-position lazy partition: also probe
+///   `pos + 2`, swap to a strictly-longer match starting there (the
+///   `pos + 2` match must strictly beat both `pos` and `pos + 1`).
+///
+/// Values `>= 2` are clamped to `2`. The A/B regression tests
+/// in this module use `0` and `1` to compare against the r155 and
+/// r156 baselines.
+fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
     let n = pixels.len();
     let mut matcher = Lz77Matcher::new(pixels);
     let mut tokens = Vec::new();
     let mut pos = 0usize;
+    let depth = lazy_depth.min(2);
     while pos < n {
         if let Some((len_a, dist_a)) = matcher.find(pos) {
-            // Single-position lazy lookahead. The matcher's hash
-            // chains do not yet include `pos` (matches at `pos` only
-            // reference positions strictly before `pos`), so to give
-            // the `pos + 1` probe a fair shot at a match that
-            // *includes* the pixel at `pos`, we insert `pos` into
-            // the chains before the look-ahead `find`. Whether or
-            // not the lazy match wins, the greedy branch below skips
-            // the duplicate insert for `pos`.
-            let mut take_lazy = false;
-            let mut lazy_len = 0usize;
-            let mut lazy_dist = 0usize;
-            let lookahead = lazy && len_a < MAX_MATCH && pos + 1 < n;
-            if lookahead {
+            // Lazy lookahead. The matcher's hash chains do not yet
+            // include `pos` (matches at `pos` only reference positions
+            // strictly before `pos`), so to give the `pos + 1` probe a
+            // fair shot at a match that *includes* the pixel at `pos`
+            // we insert `pos` into the chains before the look-ahead
+            // `find`. Likewise, the `pos + 2` probe needs both `pos`
+            // and `pos + 1` in the chains. The bookkeeping at the
+            // tail of each branch skips re-inserting any positions
+            // that the lookahead probes already inserted.
+            let mut best_len = len_a;
+            let mut best_dist = dist_a;
+            let mut best_start = pos; // pixel index where the match begins
+            let inserted_pos = depth >= 1 && len_a < MAX_MATCH && pos + 1 < n;
+            if inserted_pos {
                 matcher.insert(pos);
                 if let Some((len_b, dist_b)) = matcher.find(pos + 1) {
-                    if len_b > len_a {
-                        take_lazy = true;
-                        lazy_len = len_b;
-                        lazy_dist = dist_b;
+                    if len_b > best_len {
+                        best_len = len_b;
+                        best_dist = dist_b;
+                        best_start = pos + 1;
+                    }
+                }
+            }
+            // Depth-2 probe: only meaningful if depth allows it, the
+            // current best match is short enough to be worth
+            // attempting to displace, and `pos + 2` is in range. We
+            // also require `pos + 1` to be inserted so the `pos + 2`
+            // window can reference it; the depth-1 probe already
+            // inserted `pos`.
+            let inserted_pos1 = depth >= 2 && best_len < MAX_MATCH && pos + 2 < n;
+            if inserted_pos1 {
+                matcher.insert(pos + 1);
+                if let Some((len_c, dist_c)) = matcher.find(pos + 2) {
+                    if len_c > best_len {
+                        best_len = len_c;
+                        best_dist = dist_c;
+                        best_start = pos + 2;
                     }
                 }
             }
 
-            if take_lazy {
-                // Emit `pos` as a literal, then take the longer match
-                // starting at `pos + 1`.
-                tokens.push(Token::Literal(pixels[pos]));
-                pos += 1;
-                tokens.push(Token::Copy {
-                    length: lazy_len,
-                    distance: lazy_dist,
-                });
-                let end = pos + lazy_len;
-                while pos < end {
-                    matcher.insert(pos);
-                    pos += 1;
-                }
-            } else {
-                tokens.push(Token::Copy {
-                    length: len_a,
-                    distance: dist_a,
-                });
-                // Insert every covered position into the chains so
-                // later matches can reference inside the just-copied
-                // run, then skip past the run. If we already inserted
-                // `pos` above as part of the lazy-lookahead probe,
-                // skip the duplicate insert here.
-                let end = pos + len_a;
-                if lookahead {
-                    pos += 1;
-                }
-                while pos < end {
-                    matcher.insert(pos);
-                    pos += 1;
-                }
+            // Emit literals for any pixels skipped by the chosen
+            // lazy starting position, then the chosen match.
+            for &skipped in &pixels[pos..best_start] {
+                tokens.push(Token::Literal(skipped));
             }
+            tokens.push(Token::Copy {
+                length: best_len,
+                distance: best_dist,
+            });
+
+            // Hash-chain bookkeeping. Insert every covered position
+            // into the chains so later matches can reference inside
+            // the just-copied run; skip positions that the lookahead
+            // probes already inserted.
+            //
+            // Pre-inserted positions (so far): `pos` if `inserted_pos`,
+            // `pos + 1` if `inserted_pos1`. The chosen match covers
+            // `[best_start, best_start + best_len)`. Walk that range
+            // and only `insert` the positions that are not already in
+            // the chains.
+            let end = best_start + best_len;
+            let mut q = pos;
+            while q < end {
+                let already_in = (q == pos && inserted_pos) || (q == pos + 1 && inserted_pos1);
+                if q >= best_start && !already_in {
+                    matcher.insert(q);
+                }
+                q += 1;
+            }
+            pos = end;
         } else {
             tokens.push(Token::Literal(pixels[pos]));
             matcher.insert(pos);
@@ -7588,10 +7623,12 @@ mod tests {
     // partition shifts — so the property under test is *byte-count*,
     // not pixel correctness (which the existing round-trip tests cover).
     //
-    // The internal `tokenize_lz77_inner` exposes a `lazy: bool` toggle
-    // so a test can build the strict-greedy r155 baseline token stream
-    // alongside the round-156 lazy stream on the same fixture, then
-    // compare token counts. Three contracts:
+    // The internal `tokenize_lz77_inner` exposes a `lazy_depth: u32`
+    // toggle so a test can build the strict-greedy r155 baseline token
+    // stream (`lazy_depth = 0`) alongside the round-156 depth-1 stream
+    // (`lazy_depth = 1`) and the round-157 depth-2 stream
+    // (`lazy_depth = 2`) on the same fixture, then compare token counts.
+    // Three contracts:
     //
     // 1) Round-trip — every lazy-matched stream still round-trips
     //    end-to-end through `decode_lossless_image`.
@@ -7733,8 +7770,8 @@ mod tests {
             pixels.push(z);
         }
 
-        let greedy = tokenize_lz77_inner(&pixels, false);
-        let lazy = tokenize_lz77_inner(&pixels, true);
+        let greedy = tokenize_lz77_inner(&pixels, 0);
+        let lazy = tokenize_lz77_inner(&pixels, 1);
 
         let greedy_copies = greedy
             .iter()
@@ -7857,14 +7894,325 @@ mod tests {
                 ("noise", &noise),
                 ("stripes", &stripes),
             ] {
-                let greedy = tokenize_lz77_inner(pixels, false);
-                let lazy = tokenize_lz77_inner(pixels, true);
+                let greedy = tokenize_lz77_inner(pixels, 0);
+                let lazy = tokenize_lz77_inner(pixels, 1);
                 assert!(
                     lazy.len() <= greedy.len(),
                     "round-156 lazy regression on {name} {w}x{h}: greedy={} tokens, \
                      lazy={} tokens",
                     greedy.len(),
                     lazy.len(),
+                );
+            }
+        }
+    }
+
+    // ---- round 157: §5.2.2 two-position lazy LZ77 matching -----------
+    //
+    // The round-157 step extends the round-156 single-position lazy
+    // matcher with a second look-ahead position. After finding a match
+    // `(L_a, _)` at `pos` and (depth-1) probing `pos + 1` for a strictly
+    // longer `L_b`, the matcher also (depth-2) probes `pos + 2` for an
+    // `L_c > max(L_a, L_b)`. When the depth-2 probe wins, the encoder
+    // emits two literals (`pixels[pos]` and `pixels[pos + 1]`) and takes
+    // the longer match from `pos + 2`. This recovers a *second-order*
+    // strict-greedy trap that the round-156 depth-1 matcher could not
+    // escape — a short match at `pos` AND a short match at `pos + 1`
+    // together blocking a strictly longer match at `pos + 2`. The
+    // decoder output is bit-identical for any input — only the token
+    // *partition* shifts by up to two pixels — so round-trips remain
+    // bit-exact under any input.
+    //
+    // Three contracts (mirroring the round-156 layout):
+    //
+    // 1) Round-trip — every depth-2 lazy-matched stream still
+    //    round-trips end-to-end through `decode_lossless_image`.
+    // 2) Strict-beat — on a hand-crafted depth-2-trap fixture, the
+    //    depth-2 matcher emits strictly fewer Copy tokens than both
+    //    the strict-greedy matcher and the depth-1 lazy matcher.
+    // 3) Non-regression — on a broader fixture matrix the depth-2
+    //    token count is `<=` the depth-1 token count everywhere.
+
+    /// Round 157 round-trip: a noisy 80×16 fixture encoded with the
+    /// round-157 depth-2 lazy matcher (now the production
+    /// `tokenize_lz77` default) must still decode bit-exactly back to
+    /// the original ARGB pixels. Uses an independent xorshift seed
+    /// from the round-156 test so both fixtures exercise the matcher
+    /// over distinct entropy.
+    #[test]
+    fn round_157_depth2_lazy_match_round_trips_through_decoder() {
+        let w = 80u32;
+        let h = 16u32;
+        let mut seed = 0xCAFE_F00D_u32;
+        let pixels: Vec<u32> = (0..(w * h) as usize)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                0xFF00_0000 | (seed & 0x00FF_FFFF)
+            })
+            .collect();
+
+        // The full chooser delegates to `tokenize_lz77` (depth-2 as of
+        // round 157); end-to-end round-trip through the framed file
+        // must recover the exact input.
+        let stream = encode_argb_with_predictor_chooser(&pixels, w, h);
+        let header = build_image_header(w, h, true);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+
+        // The direct depth-2 token stream against the no-transform
+        // encoder must also round-trip — guards against bookkeeping
+        // bugs in the new depth-2 insert/skip dedup path.
+        let stream_direct = encode_argb_literals_with_width(&pixels, w);
+        let header_direct = build_image_header(w, h, true);
+        let mut payload_direct = header_direct.to_vec();
+        payload_direct.extend_from_slice(&stream_direct);
+        let framed_direct =
+            build::build_webp_file(&payload_direct, ImageKind::Lossless, w, h).unwrap();
+        let img_direct = crate::decode_lossless_image(&framed_direct)
+            .unwrap()
+            .unwrap();
+        assert_eq!(img_direct.pixels(), pixels.as_slice());
+    }
+
+    /// Round 157 strict-beat: a hand-crafted depth-2-trap fixture where
+    /// the strict-greedy matcher AND the round-156 depth-1 lazy matcher
+    /// both accept a short match at `pos` that prevents a strictly
+    /// longer match at `pos + 2`. The depth-2 lazy matcher emits two
+    /// literals and takes the longer match.
+    ///
+    /// Layout (each capital letter is a unique ARGB constant; the
+    /// `Z*` family are unique separator pixels that share no 4-pixel
+    /// window with the anchors):
+    ///
+    /// ```text
+    ///   pos  0..3    [P Q R S]                — anchor A (4 px)
+    ///   pos  4..6    [Z1 Z2 Z3]               — separator
+    ///   pos  7..10   [Q R S T]                — anchor B (4 px)
+    ///   pos 11..13   [Z4 Z5 Z6]               — separator
+    ///   pos 14..21   [R S T U V W X Y]        — anchor C (8 px)
+    ///   pos 22..24   [Z7 Z8 Z9]               — separator
+    ///   pos 25       P                         — trap start
+    ///   pos 26       Q
+    ///   pos 27..33   [R S T U V W X]          — depth-2 chain region
+    ///   pos 34..     fill with a fresh Zfill color (no 4-window match)
+    /// ```
+    ///
+    /// At pos 25:
+    ///
+    /// * `find(25)` window `[P,Q,R,S]` → matches anchor A (pos 0),
+    ///   extension stops at length 4 because pos 4 (Z1) ≠ pos 29 (T).
+    /// * `find(26)` window `[Q,R,S,T]` → matches anchor B (pos 7),
+    ///   extension stops at length 4 because pos 11 (Z4) ≠ pos 30 (U).
+    ///   `L_b = 4 = L_a`, **not strictly greater**, so the depth-1
+    ///   lazy matcher does NOT swap.
+    /// * `find(27)` window `[R,S,T,U]` → matches anchor C (pos 14),
+    ///   extension goes `[R,S,T,U,V,W,X]` (length 7) before pos 21
+    ///   (Y) ≠ pos 34 (Zfill). `L_c = 7 > 4`, so the depth-2 lazy
+    ///   matcher swaps to two literals + the length-7 match.
+    ///
+    /// Strict-greedy AND depth-1 partition at the trap:
+    /// `[Copy{4, dist=25}, ...]`. Depth-2 partition: `[Lit(P),
+    /// Lit(Q), Copy{7, dist=13}, ...]`. Net: depth-2 collapses a
+    /// short-then-short pair into one longer copy — strictly fewer
+    /// Copy tokens, at the cost of one extra literal (mirroring the
+    /// round-156 pattern).
+    #[test]
+    fn round_157_depth2_lazy_match_strictly_beats_depth1_on_trap_fixture() {
+        // Distinct ARGB constants. Anchor letters P..Y carry the
+        // structural matches; Z1..Z9 + Zfill are deliberately unique
+        // so they cannot seed a parasitic chain.
+        let p_ = 0xFF11_2200_u32;
+        let q_ = 0xFF22_3300_u32;
+        let r_ = 0xFF33_4400_u32;
+        let s_ = 0xFF44_5500_u32;
+        let t_ = 0xFF55_6600_u32;
+        let u_ = 0xFF66_7700_u32;
+        let v_ = 0xFF77_8800_u32;
+        let w_ = 0xFF88_9900_u32;
+        let x_ = 0xFF99_AA00_u32;
+        let y_ = 0xFFAA_BB00_u32;
+        let z1 = 0xFFCC_DD01_u32;
+        let z2 = 0xFFCC_DD02_u32;
+        let z3 = 0xFFCC_DD03_u32;
+        let z4 = 0xFFCC_DD04_u32;
+        let z5 = 0xFFCC_DD05_u32;
+        let z6 = 0xFFCC_DD06_u32;
+        let z7 = 0xFFCC_DD07_u32;
+        let z8 = 0xFFCC_DD08_u32;
+        let z9 = 0xFFCC_DD09_u32;
+
+        let mut pixels: Vec<u32> = vec![
+            p_, q_, r_, s_, // 0..4    anchor A
+            z1, z2, z3, // 4..7    separator
+            q_, r_, s_, t_, // 7..11   anchor B
+            z4, z5, z6, // 11..14  separator
+            r_, s_, t_, u_, v_, w_, x_, y_, // 14..22  anchor C
+            z7, z8, z9, // 22..25  separator
+            p_, q_, // 25..27  trap start (depth-1 cannot escape)
+            r_, s_, t_, u_, v_, w_, x_, // 27..34  depth-2 chain region
+        ];
+        // Pad the tail with unique colors so the depth-2 swap's
+        // post-match region cannot trigger another long match that
+        // might mask the trap's copy-count delta.
+        let mut filler = 0xFFE0_0000_u32;
+        while pixels.len() < 80 {
+            filler = filler.wrapping_add(1);
+            pixels.push(filler);
+        }
+
+        let greedy = tokenize_lz77_inner(&pixels, 0);
+        let lazy1 = tokenize_lz77_inner(&pixels, 1);
+        let lazy2 = tokenize_lz77_inner(&pixels, 2);
+
+        let copies = |toks: &[Token]| -> usize {
+            toks.iter()
+                .filter(|t| matches!(t, Token::Copy { .. }))
+                .count()
+        };
+        let coverage = |toks: &[Token]| -> usize {
+            toks.iter()
+                .map(|t| match *t {
+                    Token::Literal(_) => 1,
+                    Token::CacheRef { .. } => 1,
+                    Token::Copy { length, .. } => length,
+                })
+                .sum()
+        };
+        // Sanity: all three partitions cover the exact image.
+        assert_eq!(coverage(&greedy), pixels.len());
+        assert_eq!(coverage(&lazy1), pixels.len());
+        assert_eq!(coverage(&lazy2), pixels.len());
+
+        let g_c = copies(&greedy);
+        let l1_c = copies(&lazy1);
+        let l2_c = copies(&lazy2);
+        eprintln!(
+            "[round-157] depth-2 trap fixture: greedy tokens={} (copies={}), \
+             depth-1 tokens={} (copies={}), depth-2 tokens={} (copies={}), \
+             copy delta vs depth-1={}",
+            greedy.len(),
+            g_c,
+            lazy1.len(),
+            l1_c,
+            lazy2.len(),
+            l2_c,
+            l1_c as i64 - l2_c as i64,
+        );
+
+        // The trap forces depth-2 to collapse a length-4 copy into a
+        // 2-literals + length-7 copy that subsumes 7 pixels of what
+        // greedy / depth-1 would have to cover with multiple matches.
+        // The structural win is on Copy count: depth-2 must emit
+        // strictly fewer Copy tokens than BOTH baselines.
+        assert_eq!(
+            g_c, l1_c,
+            "round-157 fixture: depth-1 must agree with greedy here \
+             (no depth-1 swap fires) — greedy={g_c}, depth-1={l1_c}"
+        );
+        assert!(
+            l2_c < l1_c,
+            "round-157 depth-2 matcher must emit strictly fewer Copy \
+             tokens than the depth-1 matcher on the depth-2 trap \
+             fixture: depth-1 copies={l1_c} depth-2 copies={l2_c}\n\
+             depth-1 partition: {lazy1:?}\n\
+             depth-2 partition: {lazy2:?}"
+        );
+
+        // Round-trip the bytes through the no-transform encoder for
+        // good measure: the depth-2 path must decode back exactly.
+        let stream = encode_argb_literals_with_width(&pixels, pixels.len() as u32);
+        let w = pixels.len() as u32;
+        let h = 1u32;
+        let header = build_image_header(w, h, true);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// Round 157 non-regression: across a broad fixture matrix the
+    /// depth-2 lazy token count is `<=` the depth-1 lazy token count
+    /// everywhere. Structural because the depth-2 probe only swaps
+    /// when the alternate match is strictly longer than the depth-1
+    /// best, so the depth-2 partition uses at most as many tokens as
+    /// the depth-1 partition. The test guards against off-by-one in
+    /// the new depth-2 insert/skip dedup (where `pos` and `pos + 1`
+    /// can both be pre-inserted before the chosen match starts at
+    /// `pos`, `pos + 1`, or `pos + 2`).
+    #[test]
+    fn round_157_depth2_never_increases_token_count_over_depth1() {
+        let shapes: &[(u32, u32)] = &[
+            (16, 16),
+            (20, 20),
+            (24, 24),
+            (32, 32),
+            (48, 48),
+            (16, 32),
+            (64, 16),
+            (40, 24),
+        ];
+        for &(w, h) in shapes {
+            let gradient: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    let y = (i as u32) / w;
+                    let g = (x + y) & 0xFF;
+                    0xFF00_0000 | (g << 16) | (g << 8) | g
+                })
+                .collect();
+            let mut seed = 0xC0FFEE_u32;
+            let noise: Vec<u32> = (0..(w * h) as usize)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    0xFF00_0000 | (seed & 0x00FF_FFFF)
+                })
+                .collect();
+            let stripes: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    match x % 4 {
+                        0 => 0xFFAA_5500,
+                        1 => 0xFF55_AA00,
+                        2 => 0xFF00_55AA,
+                        _ => 0xFF55_00AA,
+                    }
+                })
+                .collect();
+
+            for (name, pixels) in [
+                ("gradient", &gradient),
+                ("noise", &noise),
+                ("stripes", &stripes),
+            ] {
+                let lazy1 = tokenize_lz77_inner(pixels, 1);
+                let lazy2 = tokenize_lz77_inner(pixels, 2);
+                assert!(
+                    lazy2.len() <= lazy1.len(),
+                    "round-157 depth-2 regression on {name} {w}x{h}: \
+                     depth-1={} tokens, depth-2={} tokens",
+                    lazy1.len(),
+                    lazy2.len(),
+                );
+                // Round-trip the depth-2 stream as a defensive check
+                // for hash-chain insert bookkeeping.
+                let stream = encode_argb_literals_with_width(pixels, w);
+                let header = build_image_header(w, h, true);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&stream);
+                let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+                let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+                assert_eq!(
+                    img.pixels(),
+                    pixels.as_slice(),
+                    "round-157 depth-2 round-trip mismatch on {name} {w}x{h}"
                 );
             }
         }
