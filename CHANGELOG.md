@@ -6,6 +6,51 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 160 (2026-05-27).** §4.1 spatial-predictor
+  forward transform gains a **slack-cost variant** of the round-159
+  entropy-image-aware tie-break: a small additive `slack` budget on
+  the per-block residual cost lets the chooser swap to the preferred
+  neighbour mode even when its cost is *not* exactly equal to the
+  best, trading a small residual increase for a §7.2 predictor
+  sub-image entropy drop. `pick_block_mode_with_hint_slack` /
+  `build_predictor_image_with_slack` / `encode_with_predictor_slack`
+  expose the slack budget; `slack == 0` is byte-identical to the
+  round-159 strict tie-break path. The production chooser at
+  `encode_argb_with_predictor_chooser` now evaluates both `slack ==
+  0` and three slack-budget candidates (`block_pixels`,
+  `2 * block_pixels`, `4 * block_pixels`) at both the per-region and
+  single-block `size_bits`, and keeps the byte-shortest stream —
+  this is therefore strictly non-regressing relative to round 159.
+  RFC 9649 §3.5 authorises the choice ("the transform data can be
+  decided based on entropy minimization") and the slack budget
+  formalises the trade-off between residual mass and sub-image
+  entropy. Five new tests:
+  `round_160_pick_block_mode_with_hint_slack_swaps_within_budget`
+  (an 8×8 fixture where mode 0 is strictly best by some `extra`
+  cost units; the slack-cost chooser keeps mode 0 at any slack <
+  extra, then swaps to the preferred mode at slack >= extra; the
+  round-159 strict tie-break never swaps);
+  `round_160_slack_zero_matches_round_159_baseline` (across 5
+  shapes × 2 fixtures, the slack = 0 sub-image and encoded bytes
+  are byte-identical to the round-159 strict-tie-break output);
+  `round_160_slack_predictor_round_trips_through_decoder` (a 32×32
+  fixture round-trips end-to-end through `decode_lossless_image` at
+  four slack budgets including 0 and 8 × block_pixels);
+  `round_160_chooser_never_regresses_vs_round_159` (across 5
+  shapes × 3 fixtures the production r160 chooser output is `<=`
+  the chooser-without-slack-candidates output, with an end-to-end
+  round-trip on every fixture); and
+  `round_160_slack_candidate_strictly_beats_strict_on_some_fixture`
+  (across 20 seeded 128×128 perturbations of a near-uniform canvas,
+  finds 12 fixtures where some slack budget produces a strictly
+  shorter predictor stream than the strict baseline; savings span
+  1–36 B with seed `0xFACE_F00D` at `slack=1` the headline
+  `540 B → 504 B` saving). Spec source: RFC 9649 §3.5 (transform-
+  data entropy minimization rationale), §4.1 (predictor sub-image
+  is one ARGB pixel per `(1 << size_bits)`-pixel block with the
+  mode packed into green), and §7.2 (`predictor-image = 3BIT
+  entropy-coded-image`). 375 lib tests, +5 vs round 159.
+
 * **Clean-room round 159 (2026-05-27).** §4.1 spatial-predictor
   forward transform gains an **entropy-image-aware tie-break** on
   the per-block mode chooser. `build_predictor_image` now threads

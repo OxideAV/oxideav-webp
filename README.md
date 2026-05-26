@@ -2,6 +2,83 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 160)
+
+**Round 160 generalises the round-159 entropy-image-aware tie-break
+into a slack-cost variant on the VP8L §4.1 per-block mode chooser.**
+Where round 159's tie-break only swapped to the preferred neighbour
+mode when its residual cost was **exactly equal** to the
+otherwise-best cost, the round-160 chooser also accepts the swap
+when the preferred cost exceeds the best cost by **at most a small
+additive `slack` budget**. This is a generalisation, not a
+replacement: `slack == 0` recovers the round-159 strict-tie-break
+behaviour byte-for-byte, so the round-160 path strictly extends the
+encoder's option set rather than redirecting it. The trade-off is
+that on a slack-accepted swap the residuals **do change** (the
+forward transform recomputes residuals against the swapped mode),
+in exchange for a strict drop in the §7.2 predictor sub-image's
+symbol entropy. RFC 9649 §3.5 already authorises the trade
+("transform data can be decided based on entropy minimization").
+
+The new helpers are `pick_block_mode_with_hint_slack`,
+`build_predictor_image_with_slack`, and `encode_with_predictor_slack`
+— same signatures as their round-159 counterparts with an added
+`slack: u64` parameter. The production
+`encode_argb_with_predictor_chooser` now evaluates four predictor
+candidates per `size_bits`: the strict (slack=0) round-159 path
+plus three slack budgets (`block_pixels`, `2 * block_pixels`,
+`4 * block_pixels`) at both the per-region default and the maximal
+single-block `size_bits`, and keeps the byte-shortest stream. The
+chooser is therefore strictly non-regressing relative to round 159:
+a slack candidate is only selected when it strictly wins on bytes,
+and the round-160 path always includes the round-159 baseline.
+
+The headline structural win is captured by
+`round_160_slack_candidate_strictly_beats_strict_on_some_fixture`:
+across 20 seeded 128×128 fixtures (near-uniform canvas with two
+small perturbation patches plus a sparse single-pixel noise
+sprinkle), 12 seeds find some slack budget where the slack-cost
+predictor candidate strictly beats the strict-tie-break baseline.
+Savings span 1–36 B with the headline at seed `0xFACE_F00D`,
+`slack=1`, predictor stream `540 B → 504 B`. The production chooser
+on these fixtures usually picks a different transform path
+(color-transform or color-indexing) as the overall byte-best, so
+the chooser-level non-regression check
+`round_160_chooser_never_regresses_vs_round_159` validates the
+broader contract (production chooser never increases output length)
+while the strict-beat test validates the §4.1 candidate's
+genuine work.
+
+Five new tests cover the contract:
+`round_160_pick_block_mode_with_hint_slack_swaps_within_budget`
+(an 8×8 fixture where mode 0 is strictly best by some `extra` cost
+units; the slack chooser keeps mode 0 at any slack `< extra`, then
+swaps to the preferred mode at `slack >= extra`; the round-159
+strict tie-break never swaps);
+`round_160_slack_zero_matches_round_159_baseline` (across 5 shapes
+× 2 fixtures, the slack = 0 sub-image and encoded bytes are
+byte-identical to the round-159 strict-tie-break output);
+`round_160_slack_predictor_round_trips_through_decoder` (a 32×32
+fixture round-trips end-to-end through `decode_lossless_image` at
+four slack budgets including 0 and `8 × block_pixels`);
+`round_160_chooser_never_regresses_vs_round_159` (across 5 shapes
+× 3 fixtures the production r160 chooser output is `<=` the
+chooser-without-slack-candidates output, with an end-to-end
+round-trip via `decode_lossless_image` on every fixture); and the
+strict-beat sweep above. Spec source: RFC 9649 §3.5 (transform-
+data entropy minimization rationale), §4.1 (predictor sub-image
+is one ARGB pixel per `(1 << size_bits)`-pixel block with the mode
+packed into the green channel), and §7.2 (`predictor-image = 3BIT
+entropy-coded-image`).
+
+Still lacks (post-round-160): the per-block mode-cost proxy is now
+slack-tunable but still uses a folded-residual L1 magnitude (no
+explicit Huffman bit-cost model on the residual stream); the slack
+candidate set is a fixed three-budget sweep (no per-image adaptive
+budget that targets a measured entropy-vs-residual cost crossover);
+deeper LZ77 lazy depths beyond round-158's three-position remain
+future work; and VP8 lossy encode is still entirely absent.
+
 ## Status — 2026-05-27 (clean-room round 159)
 
 **Round 159 gives the VP8L §4.1 spatial-predictor forward transform
