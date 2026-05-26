@@ -4,6 +4,51 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-webp/compare/v0.1.5...v0.1.6) - 2026-05-26
+
+### Other
+
+- drop decorative attribution from round-154 module banner
+- round 154 — published §2.5 VP8 lossy encode entry points
+- round 152 — histogram-distance per-region clusterer
+- round 151 — §6.2.2 multi-meta-prefix encoder
+- round 150 — §4.4 color-indexing forward pass
+- round 149 — §3.7.2.1.1 simple code length code chooser
+- round 148 — §5.2.3 color_cache_code_bits sweep
+- round 147 — §3.5.2 / §4.2 color-transform forward pass
+- round 146 — §4.1 spatial-predictor forward transform
+- round 145 — §2.7 metadata-aware container writer
+- round 130 — §5.2.2 width-aware distance-code chooser
+- round 127: Auto/Delta lossless dirty-rect animation modes + canvas compositing
+- wire lossy decode against published DecodeError (not unpublished Vp8Error)
+- §2.5 VP8 (lossy) decode via oxideav-vp8 (round 124)
+- §5.2.1 / §5.2.3 color-cache writer (round 121)
+- §3.5.3 / §3.8.2 subtract-green forward transform (round 120)
+- §5.2.2 LZ77 backward-reference matching (round 119)
+- Round 118: restore published-0.1.5 animation-encode API (VP8L path)
+- round 117 — restore published VP8L lossless-encode public names
+- restore published-0.1.5 decode API shape (WebpImage/WebpFrame/WebpError)
+- add API-COMPAT.md — public API shape the rebuild must reproduce
+- round 115 — first VP8L lossless encoder (literal-only round trip)
+- register oxideav_core::Decoder into RuntimeContext (round 112)
+- wire top-level decode_webp to RGBA for VP8L (round 111)
+- decode the §2.7.1.2 ALPH alpha-channel bitstream (round 110)
+- round 109 — VP8L §4 inverse-transform passes (lossless decode complete)
+- round 108 — VP8L §6.2.2 entropy-image multi-group ARGB decode
+- round 107 — VP8L §5.2 LZ77 + §5.2.3 color-cache per-pixel ARGB decode loop
+- round 106 — VP8L §5.2.3 + §6.2.2 + §6.2 meta-prefix header reader
+- round 104 — VP8L §6.2.1 prefix-code reader + canonical decoder
+- clean-room round 99 — VP8L bit-reader + §4 transform-list reader
+- round 7: typed §2.6 `VP8L` chunk routing handle
+- round 6: typed §2.5 `VP8 ` chunk routing handle
+- round 5: RIFF/WEBP container builders (§2.3 / §2.4 / §2.7.1)
+- round 4: ANMF §2.7.1.1 typed per-frame header parse
+- round 3: ALPH §2.7.1.2 + ANIM §2.7.1.1 typed field parse
+- round 2: VP8X §2.7.1 typed field parse (flags + canvas dims)
+- in-crate copies of fixture inputs for standalone CI checkout
+- round 1: RIFF/WEBP container walker per RFC 9649 §2.3–§2.7
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Clean-room round 154 (2026-05-26).** Published-shape §2.5 `VP8 ` lossy
