@@ -6,6 +6,41 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 149 (2026-05-26).** §3.7.2.1.1 *simple code length
+  code* chooser for the VP8L lossless encoder. Previously every prefix
+  code went through `write_normal_code_lengths` (§3.7.2.1.2 *normal code
+  length code*), which always pays the 1-flag + 4-`num_code_lengths` +
+  3-bit-per-CLC + 1-`max_symbol`-gate header tax (≥ 18 bits, ≥ 58 bits
+  when more than one length value is present). The new chooser in
+  `WriteCode::write_code_lengths` recognises the simple form's two
+  qualifying shapes (1 or 2 used symbols, each at length 1, in `[0..255]`),
+  computes the exact bit-cost of both forms (`simple_form_bits` and
+  `normal_form_bits`), and emits whichever is cheaper. The simple form
+  costs as little as 4 bits (1 symbol with value in `[0..1]`), making it a
+  dramatic win on the bulk of single-leaf prefix codes that arise
+  naturally in WebP streams: the empty distance code on images with no
+  LZ77 matches, the per-channel literal codes on solid blocks, and the
+  alpha code on opaque images. Measured deltas on synthetic fixtures:
+  1×1 opaque drops from 174 B (round 148) to 32 B (-81.6%); 32×32 solid
+  gray drops from 174 B to 68 B (-60.9%); 16×16 four-band gradient
+  drops from 328 B to 80 B (-75.6%); 8×8 two-alpha-value drops from
+  178 B to 76 B (-57.3%). The chooser also propagates through the
+  super-chooser's 12 candidate streams (no-tx, subtract-green,
+  predictor, color-transform × cache sweep), so the candidate-cheapest
+  pick now reflects the smaller-tax simple-form costs as well. Eight
+  new tests: `simple_form_rejects_tables_outside_3_7_2_1_1_constraints`,
+  `simple_form_accepts_one_or_two_length_one_symbols`,
+  `simple_form_bits_matches_written_layout`,
+  `chooser_prefers_simple_form_for_empty_distance_code`,
+  `chooser_round_trips_through_decoder_on_both_branches`,
+  `round_149_simple_form_shrinks_1x1_lossless_baseline`,
+  `round_149_simple_form_shrinks_synthetic_fixtures`, and
+  `round_149_two_symbol_simple_form_round_trips`. No external
+  implementation was consulted; spec source is the WebP Lossless
+  Bitstream specification §3.7.2.1.1 mirrored under `docs/image/webp/`,
+  cross-checked against the existing decoder-side reader in
+  `vp8l_prefix::read_simple_code_lengths` (round 104).
+
 * **Clean-room round 148 (2026-05-26).** §5.2.3 `color_cache_code_bits`
   sweep for the VP8L lossless encoder. Previously the chooser locked
   every cache-enabled candidate at `DEFAULT_COLOR_CACHE_BITS = 8`

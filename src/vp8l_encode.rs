@@ -642,11 +642,142 @@ impl WriteCode {
         }
     }
 
-    /// Write this code's per-symbol lengths to `w` using the §3.7.2.1.2
-    /// *normal code length code* (the general form that can represent any
-    /// length table, including the single-leaf one).
+    /// Write this code's per-symbol lengths to `w`, picking the cheaper
+    /// of the two §3.7.2.1 forms.
+    ///
+    /// The §3.7.2.1.1 *simple code length code* can only represent length
+    /// tables with 1 or 2 symbols at length 1 (every other symbol
+    /// implicitly absent). When that constraint holds, `write_code_lengths`
+    /// computes the precise bit-cost of both forms and picks the smaller.
+    /// Otherwise it falls back to the §3.7.2.1.2 *normal code length code*.
     fn write_code_lengths(&self, w: &mut BitWriter) {
+        if let Some(simple) = self.as_simple_form() {
+            // Two trivial cases the simple form can carry — compare
+            // bit-costs and pick the cheaper.
+            let simple_bits = simple_form_bits(&simple);
+            let normal_bits = normal_form_bits(&self.lengths);
+            if simple_bits <= normal_bits {
+                write_simple_code_lengths(w, &simple);
+                return;
+            }
+        }
         write_normal_code_lengths(w, &self.lengths);
+    }
+
+    /// If this code's length table is encodable with the §3.7.2.1.1 simple
+    /// form (1 or 2 symbols at length 1, all others 0), return the symbol
+    /// list `[symbol0]` or `[symbol0, symbol1]`. Otherwise return `None`.
+    fn as_simple_form(&self) -> Option<Vec<usize>> {
+        let used: Vec<(usize, u8)> = self
+            .lengths
+            .iter()
+            .enumerate()
+            .filter_map(|(s, &l)| if l != 0 { Some((s, l)) } else { None })
+            .collect();
+        // Simple form requires 1 or 2 used symbols, each at length 1.
+        // §3.7.2.1.1: "code length 1. All other prefix code lengths are
+        // implicitly zeros."
+        if used.is_empty() || used.len() > 2 {
+            return None;
+        }
+        if used.iter().any(|&(_, l)| l != 1) {
+            return None;
+        }
+        // §3.7.2.1.1 first symbol is coded with 1 or 8 bits, so it must
+        // fit in [0..255]; second symbol always 8 bits, [0..255]. Anything
+        // beyond 255 can only be sent via the normal form.
+        if used.iter().any(|&(s, _)| s > 255) {
+            return None;
+        }
+        Some(used.iter().map(|&(s, _)| s).collect())
+    }
+}
+
+/// Precise bit-cost of the §3.7.2.1.1 *simple code length code* for the
+/// given symbol list (1 or 2 entries, each in `[0..255]`).
+///
+/// Layout per §3.7.2.1.1:
+/// * 1 flag bit (`1` = simple)
+/// * 1 bit `num_symbols - 1`
+/// * 1 bit `is_first_8bits` (chooses 1-bit vs 8-bit width for symbol0)
+/// * `1 + 7 * is_first_8bits` bits for `symbol0`
+/// * if `num_symbols == 2`: 8 bits for `symbol1`
+fn simple_form_bits(symbols: &[usize]) -> usize {
+    debug_assert!(symbols.len() == 1 || symbols.len() == 2);
+    let is_first_8bits = symbols[0] > 1;
+    // Per spec: the second symbol, when present, is always 8 bits.
+    let s0_width = if is_first_8bits { 8 } else { 1 };
+    let s1_width = if symbols.len() == 2 { 8 } else { 0 };
+    // 1 (flag) + 1 (num_symbols-1) + 1 (is_first_8bits) + s0 + s1.
+    3 + s0_width + s1_width
+}
+
+/// Precise bit-cost of [`write_normal_code_lengths`] for `lengths`.
+///
+/// Mirrors `write_normal_code_lengths` exactly so the chooser is
+/// self-consistent: any change in normal-form layout there must reflect
+/// here.
+fn normal_form_bits(lengths: &[u8]) -> usize {
+    // CLC frequencies are the histogram of length values 0..=15 in the
+    // literal length table.
+    let mut clc_freq = [0u32; NUM_CODE_LENGTH_CODES];
+    for &l in lengths {
+        clc_freq[l as usize] += 1;
+    }
+    let clc_lengths = build_code_lengths(&clc_freq);
+
+    // Locate the highest-ordered CLC symbol that has a non-zero length.
+    let mut max_order_used = 0usize;
+    for (order_idx, &pos) in CODE_LENGTH_CODE_ORDER.iter().enumerate() {
+        if clc_lengths[pos] != 0 {
+            max_order_used = order_idx;
+        }
+    }
+    let num_code_lengths = (max_order_used + 1).max(4);
+
+    // §3.7.2.1.2 header tax: 1 flag + 4 num_code_lengths + 3*num_code_lengths
+    // CLC lengths + 1 max_symbol gate.
+    let mut bits = 1 + 4 + 3 * num_code_lengths + 1;
+
+    // Per-symbol body: when the CLC collapses to a single non-zero
+    // length (single-leaf CLC), the decoder consumes 0 bits per symbol
+    // and the writer emits nothing. Otherwise emit the canonical code for
+    // each literal length value.
+    let used_clc: Vec<usize> = (0..NUM_CODE_LENGTH_CODES)
+        .filter(|&s| clc_freq[s] > 0)
+        .collect();
+    if used_clc.len() > 1 {
+        for &l in lengths {
+            bits += clc_lengths[l as usize] as usize;
+        }
+    }
+    bits
+}
+
+/// Write a per-symbol length table with the §3.7.2.1.1 *simple code
+/// length code*.
+///
+/// Only valid for `symbols.len()` in `[1, 2]`, each symbol in `[0..255]`,
+/// each implicitly at code length 1. The caller is responsible for
+/// checking applicability via [`WriteCode::as_simple_form`].
+fn write_simple_code_lengths(w: &mut BitWriter, symbols: &[usize]) {
+    debug_assert!(symbols.len() == 1 || symbols.len() == 2);
+    debug_assert!(symbols.iter().all(|&s| s <= 255));
+
+    // §3.7.2.1.1 flag: 1 selects the simple form.
+    w.write_bit(true);
+    // num_symbols = ReadBits(1) + 1, so write `num_symbols - 1`.
+    w.write_bits((symbols.len() as u32) - 1, 1);
+    // §3.7.2.1.1: "is_first_8bits ... range [0..1] or [0..255]". Choose
+    // the 1-bit form when symbol0 fits in [0..1], else the 8-bit form.
+    let is_first_8bits = symbols[0] > 1;
+    w.write_bits(if is_first_8bits { 1 } else { 0 }, 1);
+    let s0_width = if is_first_8bits { 8 } else { 1 };
+    w.write_bits(symbols[0] as u32, s0_width);
+    if symbols.len() == 2 {
+        // §3.7.2.1.1: "The second symbol, if present, is always assumed
+        // to be in the range [0..255] and coded using 8 bits."
+        w.write_bits(symbols[1] as u32, 8);
     }
 }
 
@@ -2637,6 +2768,279 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let decoded = PrefixCode::read(&mut r, 40).unwrap();
         assert_eq!(decoded.single_symbol(), Some(0));
+    }
+
+    // ---- §3.7.2.1.1 simple code length code chooser ----
+
+    /// `WriteCode::as_simple_form` rejects any table that the simple form
+    /// cannot represent verbatim: length > 1, symbol > 255, more than two
+    /// used symbols, all-zeros table.
+    #[test]
+    fn simple_form_rejects_tables_outside_3_7_2_1_1_constraints() {
+        // Three symbols → too many for simple form.
+        let mut freq = vec![0u32; 8];
+        freq[0] = 1;
+        freq[1] = 1;
+        freq[2] = 1;
+        let three_sym = WriteCode::from_freqs(&freq);
+        assert!(three_sym.as_simple_form().is_none());
+
+        // All-zero / empty alphabet → as_simple_form returns None
+        // (encoder handles the empty case via `WriteCode::empty`).
+        let lengths_empty = vec![0u8; 16];
+        let codes_empty = canonical_codes(&lengths_empty);
+        let empty_code = WriteCode {
+            lengths: lengths_empty,
+            codes: codes_empty,
+            single: None,
+        };
+        assert!(empty_code.as_simple_form().is_none());
+
+        // Symbol > 255 → simple form's 8-bit symbol field can't carry it.
+        let mut freq_big = vec![0u32; 300];
+        freq_big[280] = 1;
+        let beyond_255 = WriteCode::from_freqs(&freq_big);
+        assert!(beyond_255.as_simple_form().is_none());
+
+        // Length > 1 → cannot be the simple form (every present symbol
+        // must be at length 1).
+        let mixed_lengths = vec![0u8, 2, 2, 1];
+        let mixed_codes = canonical_codes(&mixed_lengths);
+        let mixed = WriteCode {
+            lengths: mixed_lengths,
+            codes: mixed_codes,
+            single: None,
+        };
+        assert!(mixed.as_simple_form().is_none());
+    }
+
+    /// `WriteCode::as_simple_form` accepts the two qualifying shapes
+    /// (1 used symbol or 2 used symbols, each at length 1).
+    #[test]
+    fn simple_form_accepts_one_or_two_length_one_symbols() {
+        let mut freq1 = vec![0u32; 16];
+        freq1[7] = 1;
+        let one = WriteCode::from_freqs(&freq1);
+        assert_eq!(one.as_simple_form(), Some(vec![7]));
+
+        let mut freq2 = vec![0u32; 16];
+        freq2[3] = 4;
+        freq2[12] = 4;
+        let two = WriteCode::from_freqs(&freq2);
+        assert_eq!(two.as_simple_form(), Some(vec![3, 12]));
+    }
+
+    /// §3.7.2.1.1 exact bit-cost layout: 1 flag + 1 num + 1 width + s0 + s1.
+    /// `simple_form_bits` must match the bytes [`write_simple_code_lengths`]
+    /// actually emits.
+    #[test]
+    fn simple_form_bits_matches_written_layout() {
+        // 1 symbol, symbol0 in [0..1] → is_first_8bits = 0 → 1-bit symbol.
+        // Total = 1 + 1 + 1 + 1 = 4 bits.
+        assert_eq!(simple_form_bits(&[1]), 4);
+        // 1 symbol, symbol0 = 7 (> 1) → is_first_8bits = 1 → 8-bit symbol.
+        // Total = 1 + 1 + 1 + 8 = 11 bits.
+        assert_eq!(simple_form_bits(&[7]), 11);
+        // 2 symbols, symbol0 = 0 (fits in 1 bit), symbol1 = 50.
+        // Total = 1 + 1 + 1 + 1 + 8 = 12 bits.
+        assert_eq!(simple_form_bits(&[0, 50]), 12);
+        // 2 symbols, symbol0 = 200 (> 1) → 8 bits; symbol1 = 100 → 8 bits.
+        // Total = 1 + 1 + 1 + 8 + 8 = 19 bits.
+        assert_eq!(simple_form_bits(&[200, 100]), 19);
+
+        // Round-trip the byte count against an actual writer.
+        let mut w = BitWriter::new();
+        write_simple_code_lengths(&mut w, &[200, 100]);
+        // 19 bits → 3 bytes (24 bits, padded). Confirm the writer's
+        // bit-position is exactly 19.
+        let pos_bits = w.bit_position();
+        assert_eq!(pos_bits, 19);
+    }
+
+    /// The chooser switches to the simple form for a 1-symbol distance
+    /// code (saves ~14 bits over the normal-form single-leaf path).
+    #[test]
+    fn chooser_prefers_simple_form_for_empty_distance_code() {
+        let code = WriteCode::empty(40);
+        // Confirm normal form would have been more expensive than simple.
+        let normal_bits = normal_form_bits(&code.lengths);
+        let simple = code.as_simple_form().expect("empty(40) is simple-form");
+        let simple_bits = simple_form_bits(&simple);
+        assert!(
+            simple_bits < normal_bits,
+            "expected simple form (= {simple_bits} bits) to beat normal form (= {normal_bits} bits) for empty distance code"
+        );
+
+        // Now drive write_code_lengths and confirm the leading flag bit is
+        // 1 (the simple-form selector per §3.7.2.1).
+        let mut w = BitWriter::new();
+        code.write_code_lengths(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert!(
+            r.read_bit().expect("flag bit"),
+            "chooser must select simple form (flag bit = 1) for the empty distance code"
+        );
+    }
+
+    /// `write_code_lengths` round-trips through the decoder for both
+    /// branches of the chooser: a 1-symbol code (simple form) and a
+    /// 4-symbol code (normal form).
+    #[test]
+    fn chooser_round_trips_through_decoder_on_both_branches() {
+        // ---- 1-symbol path: simple form ----
+        let mut freq = vec![0u32; 16];
+        freq[9] = 7;
+        let code1 = WriteCode::from_freqs(&freq);
+        let mut w1 = BitWriter::new();
+        code1.write_code_lengths(&mut w1);
+        let bytes1 = w1.into_bytes();
+        let mut r1 = BitReader::new(&bytes1);
+        let decoded1 = PrefixCode::read(&mut r1, 16).expect("decode simple form");
+        assert_eq!(
+            decoded1.single_symbol(),
+            Some(9),
+            "decoder must recover the single-leaf symbol from the simple form"
+        );
+
+        // ---- 4-symbol path: normal form ----
+        let freq4 = vec![10u32, 4, 2, 1, 0, 0, 0, 0];
+        let code4 = WriteCode::from_freqs(&freq4);
+        let mut w4 = BitWriter::new();
+        code4.write_code_lengths(&mut w4);
+        // Emit a representative symbol sequence and round-trip it.
+        let seq = [0usize, 1, 2, 3, 0, 0, 1, 2];
+        for &s in &seq {
+            code4.write_symbol(&mut w4, s);
+        }
+        let bytes4 = w4.into_bytes();
+        let mut r4 = BitReader::new(&bytes4);
+        let decoded4 = PrefixCode::read(&mut r4, 8).expect("decode normal form");
+        for &s in &seq {
+            assert_eq!(
+                decoded4.read_symbol(&mut r4).expect("symbol") as usize,
+                s,
+                "round-trip mismatch on normal-form code"
+            );
+        }
+    }
+
+    /// On a 1×1 opaque image the encoder produces 5 prefix codes
+    /// (G/R/B/A + distance) and every one of them is the single-leaf
+    /// case (one length-1 symbol, all others zero). Before round 149 the
+    /// chooser had only the normal-form path, paying ≥ 58 bits per code
+    /// to send the length table even though the per-symbol body
+    /// collapses to zero. The simple-form path costs at most 11 bits
+    /// (1-symbol header + 8-bit value), so the round-149 chooser flips
+    /// all five codes and shrinks the encoded file by a large fraction
+    /// on this baseline fixture.
+    #[test]
+    fn round_149_simple_form_shrinks_1x1_lossless_baseline() {
+        let rgba = [0x12, 0x34, 0x56, 0xff];
+        let file = encode_webp_lossless(&rgba, 1, 1).unwrap();
+        eprintln!("round-149 1x1 lossless byte count: {}", file.len());
+
+        // Round-trip confirms the chosen stream still decodes.
+        let decoded = crate::decode_webp(&file).unwrap();
+        assert_eq!(decoded.frames[0].rgba, rgba);
+
+        // Round-148 baseline for this fixture was 174 bytes (5 prefix
+        // codes × ≥ 58 bits each, plus container envelope). Round 149
+        // lands at 32 bytes — a >80% reduction. Assert a conservative
+        // strict-beat below the round-148 size.
+        assert!(
+            file.len() <= 48,
+            "expected round-149 simple-form chooser to bring the 1×1 baseline well under the round-148 174-byte size; got {}",
+            file.len()
+        );
+    }
+
+    /// Same chooser-shrink check on a 16×16 gradient. The chooser
+    /// trade-off here applies to many of the candidate streams the
+    /// super-chooser races: each pays substantially less header tax on
+    /// its prefix codes when the alphabet collapses to one or two
+    /// length-1 symbols (single-pixel column, alpha-uniform images,
+    /// solid-color blocks, the bulk of small synthetic fixtures).
+    #[test]
+    fn round_149_simple_form_shrinks_synthetic_fixtures() {
+        // 32×32 solid gray — every channel emits one literal value
+        // repeated 1024 times. Each of the 4 literal prefix codes is a
+        // single-leaf code → all four flip to the simple form.
+        let mut solid = Vec::new();
+        for _ in 0..1024 {
+            solid.extend_from_slice(&[0x80, 0x80, 0x80, 0xff]);
+        }
+        let file_solid = encode_webp_lossless(&solid, 32, 32).unwrap();
+        eprintln!("round-149 32×32 solid: {}", file_solid.len());
+        assert!(
+            file_solid.len() <= 100,
+            "round-149 32×32 solid should land far below the round-148 174-byte size; got {}",
+            file_solid.len()
+        );
+
+        // 8×8 with 2 alpha values, single literal triple — RGB codes
+        // single-leaf (one value each), alpha code two-symbol (0x80 and
+        // 0xff). Two-symbol case may pick simple or normal depending on
+        // the cost — the chooser picks whichever is cheaper.
+        let mut alpha = Vec::new();
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let a = if (x + y) % 2 == 0 { 0xff } else { 0x80 };
+                alpha.extend_from_slice(&[0x44, 0x88, 0xcc, a]);
+            }
+        }
+        let file_alpha = encode_webp_lossless(&alpha, 8, 8).unwrap();
+        eprintln!("round-149 8×8 alpha: {}", file_alpha.len());
+        assert!(
+            file_alpha.len() <= 110,
+            "round-149 8×8 alpha should land below the round-148 178-byte size; got {}",
+            file_alpha.len()
+        );
+
+        // Every chosen stream still decodes byte-exact.
+        let decoded_solid = crate::decode_webp(&file_solid).unwrap();
+        assert_eq!(decoded_solid.frames[0].rgba, solid);
+        let decoded_alpha = crate::decode_webp(&file_alpha).unwrap();
+        assert_eq!(decoded_alpha.frames[0].rgba, alpha);
+    }
+
+    /// Two-symbol simple-form path: when the alphabet has exactly two
+    /// length-1 symbols, the chooser may pick simple (≤19 bits) or
+    /// normal (≥18 bits) — whichever is cheaper. The chooser picks the
+    /// minimum, and the chosen stream still decodes.
+    #[test]
+    fn round_149_two_symbol_simple_form_round_trips() {
+        // Manually drive the chooser with a 2-symbol length-1 code.
+        let mut freq = vec![0u32; 16];
+        freq[2] = 5;
+        freq[11] = 5;
+        let code = WriteCode::from_freqs(&freq);
+        assert_eq!(code.as_simple_form(), Some(vec![2, 11]));
+
+        // Confirm bit-costs are within ±1 bit of each other (the
+        // chooser's interesting regime). Either choice round-trips.
+        let normal_bits = normal_form_bits(&code.lengths);
+        let simple_bits = simple_form_bits(&[2, 11]);
+        eprintln!(
+            "2-symbol code: simple={} bits, normal={} bits",
+            simple_bits, normal_bits
+        );
+
+        // Drive write_code_lengths through the chooser + decode.
+        let mut w = BitWriter::new();
+        code.write_code_lengths(&mut w);
+        // Emit a few symbols to confirm the round-trip works.
+        for _ in 0..3 {
+            code.write_symbol(&mut w, 2);
+            code.write_symbol(&mut w, 11);
+        }
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        let decoded = PrefixCode::read(&mut r, 16).expect("decode chooser output");
+        for _ in 0..3 {
+            assert_eq!(decoded.read_symbol(&mut r).unwrap() as usize, 2);
+            assert_eq!(decoded.read_symbol(&mut r).unwrap() as usize, 11);
+        }
     }
 
     // ---- image-header ----

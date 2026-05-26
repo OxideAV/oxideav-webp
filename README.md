@@ -2,6 +2,45 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 149)
+
+**Round 149 added the §3.7.2.1.1 simple code length code chooser to the
+VP8L encoder.** Previously every prefix code went through
+`write_normal_code_lengths` (§3.7.2.1.2 *normal code length code*) — the
+general form that always pays the 1-flag + 4-`num_code_lengths` +
+3-bit-per-CLC + 1-`max_symbol`-gate header tax (≥ 18 bits, ≥ 58 bits
+when the literal length table has more than one length value). The new
+chooser in `WriteCode::write_code_lengths` recognises the simple form's
+two qualifying shapes (1 or 2 used symbols, each at length 1, in
+`[0..255]`), computes the exact bit-cost of both forms
+(`simple_form_bits` and `normal_form_bits`), and emits whichever is
+cheaper. The simple form costs as little as 4 bits (1 symbol with value
+in `[0..1]`), making it a dramatic win on the bulk of single-leaf
+prefix codes that arise naturally in WebP streams: the empty distance
+code on images with no LZ77 matches, the per-channel literal codes on
+solid blocks, and the alpha code on opaque images.
+
+Headline measurements (encoded file byte count, identical pixel
+content, round-148 chooser vs round-149 chooser):
+
+| Fixture                                  | round 148 | round 149 | Δ          |
+|------------------------------------------|----------:|----------:|-----------:|
+| 1×1 opaque                               | 174 B     | 32 B      | -81.6 %    |
+| 32×32 solid gray                         | 174 B     | 68 B      | -60.9 %    |
+| 16×16 four-band gradient                 | 328 B     | 80 B      | -75.6 %    |
+| 8×8 two-alpha-value                      | 178 B     | 76 B      | -57.3 %    |
+
+The chooser also propagates through the super-chooser's 12 candidate
+streams (no-tx, subtract-green, predictor, color-transform × cache
+sweep), so the candidate-cheapest pick now reflects the smaller-tax
+simple-form costs as well. Round-trips through
+[`decode_webp`](src/lib.rs) remain bit-exact — the decoder's
+`vp8l_prefix::read_simple_code_lengths` (round 104) already handles
+both forms.
+
+Still lacks: §3.8.2 color-indexing encoding (predictor + color +
+subtract-green are wired), and VP8 lossy encode.
+
 ## Status — 2026-05-26 (clean-room round 148)
 
 **Round 148 added the §5.2.3 `color_cache_code_bits` sweep to the VP8L
