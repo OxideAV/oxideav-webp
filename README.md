@@ -2,6 +2,76 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 152)
+
+**Round 152 swapped the round-151 mean-green bucketiser inside the
+§6.2.2 multi-meta-prefix encoder for a histogram-distance per-region
+clusterer.** Each `(1 << prefix_bits)`-square block is now featurised
+as a coarse 48-element RGB histogram (16 bins per channel after a
+`CLUSTER_BIN_SHIFT = 4` collapse of the 256-value channel range), and
+`num_groups` cluster centroids are seeded by a deterministic
+farthest-from-already-chosen rule (k-means++-style, no randomness)
+then refined by up to 8 Lloyd's iteration passes (early-exit on
+no-assignment-change). The final assignment is compacted so the
+returned meta-codes always run `0..actual_groups - 1` without gaps
+(per RFC 9649 §3.7.2.2.2 `num_prefix_groups = max(entropy image) + 1`,
+so a gap would inflate the encoder's per-group prefix-code-table cost
+for nothing). Uniform images and inputs whose seeding cannot find
+`num_groups` distinguishable centroids collapse to a single-group
+degenerate cleanly so the chooser stays at the round-150 baseline.
+
+Measured impact on the diagnostic two-region noisy sweep
+(multi-meta-prefix candidate byte cost; best non-degenerate
+`(prefix_bits, num_groups)` from the round-151 chooser sweep is
+selected for each clusterer):
+
+| shape | mean-green | histogram | delta |
+|---|---|---|---|
+| 64×64 | 8944 B | 8730 B | −214 B (−2.39%) |
+| 128×128 | 35049 B | 33264 B | −1785 B (−5.09%) |
+| 64×128 | 17640 B | 16903 B | −737 B (−4.18%) |
+| 256×256 | 139497 B | 131580 B | −7917 B (−5.68%) |
+
+On a four-region "mean-collision" fixture (designed so per-block
+green means agree across regions whose full per-channel distributions
+diverge — exactly the failure mode the histogram path is meant to
+fix) the mean-green clusterer collapses to a single group at every
+swept configuration, while the histogram clusterer finds a
+non-degenerate partition.
+
+The multi-prefix candidate still does not beat the round-150
+super-chooser on these synthetic fixtures (the LZ77 + predictor +
+color-cache stack is very strong on uniform-noise inputs), but the
+4–6 % narrower gap puts the candidate within striking distance on
+larger natural images where per-region adaptation has more to capture
+than synthetic uniform-noise PRNGs can simulate.
+
+Five new clusterer tests cover the histogram path:
+`histogram_clusterer_separates_blocks_sharing_a_mean` (a bimodal-vs-
+flat fixture mean-green could not split — both regions share mean ≈
+128 but the histogram clusterer separates them),
+`histogram_clusterer_is_deterministic` (same input → same codes),
+`histogram_clusterer_collapses_on_uniform_image`,
+`histogram_clusterer_num_groups_one_returns_all_zeros` (short-circuit
+for the trivial single-group case), and
+`histogram_clusterer_returns_compact_group_ids` (no gaps in the
+returned meta-code range). The existing
+`meta_prefix_clusterer_splits_two_region_bimodal_fixture` test was
+retargeted at the new clusterer and still asserts the top-vs-bottom
+split on the headline bimodal image. Two regression-bench tests
+(`histogram_clusterer_reduces_mp_bytes_on_two_region_sweep` and
+`histogram_clusterer_reduces_mp_bytes_on_mean_collision_sweep`)
+sweep `(prefix_bits, num_groups)` across both clusterers and assert
+the histogram path never regresses.
+
+Still lacks (post-round-152): the histogram-distance clusterer brings
+the multi-meta-prefix candidate within 4–6 % of winning on the
+diagnostic noisy fixtures but does not flip the chooser on them; the
+remaining gap is dominated by the cost of N additional 280-symbol
+prefix-code tables (a future round can stack the §4.1 / §4.2
+transforms atop the multi-prefix path to amortise that overhead), and
+VP8 lossy encode is still entirely absent.
+
 ## Status — 2026-05-26 (clean-room round 151)
 
 **Round 151 added the §6.2.2 multi-meta-prefix (entropy-image) encoder

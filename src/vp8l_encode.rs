@@ -2377,22 +2377,189 @@ const META_PREFIX_BITS_SWEEP: [u8; 4] = [4, 5, 6, 7];
 /// justify separate codes).
 const MAX_META_GROUPS: u32 = 4;
 
-/// Cluster the per-block mean-green values into `num_groups` clusters
-/// and return one meta-prefix code per block in scan-line order. The
-/// clustering is a simple sort-then-equal-width bucketing on the
-/// (block_index → mean_green) map: blocks whose green statistic falls
-/// in the lowest `1/num_groups` of the value range get group 0, the
-/// next `1/num_groups` get group 1, and so on. The simple bucketing is
-/// deterministic and depends only on the input pixels, so the encoder
-/// emits the same entropy image for the same input.
+// ---- §6.2.2 histogram-distance block clusterer -------------------------
+//
+// Spec context (RFC 9649 §3.7.2.2 / WebP Lossless §6.2.2): the §5.2 LZ77
+// + prefix-code-group decoder selects one of `num_prefix_groups` groups
+// per pixel block. The encoder gets to choose how to *partition* the
+// image's blocks into groups — the spec only constrains the on-wire
+// representation (an `entropy-coded-image` whose green+red channels
+// carry the per-block meta-prefix code).
+//
+// The right partition collects blocks whose alphabet-symbol histograms
+// (green, red, blue, alpha + LZ77 length / distance) match closely, so
+// each group's shared §6.2 prefix code can compact those symbols
+// efficiently. A direct symbol-histogram clusterer would have to
+// pre-tokenise to see which symbols each block produces, which puts a
+// hard constraint on the matcher (`tokenize_lz77` runs *after* the
+// clusterer here). We use a pixel-domain proxy instead: a coarse
+// per-channel RGB histogram. Blocks whose pixel-value distributions
+// agree at bin resolution will, in expectation, produce closely-matched
+// literal-symbol frequencies, which is exactly what drives §6.2's
+// per-group code cost.
+
+/// Bin shift collapsing the 256-value channel range into a coarser
+/// histogram for clustering. `BIN_SHIFT = 4` → 16 bins per channel.
 ///
-/// The mean-green statistic is a stand-in for the per-block symbol
-/// histogram: blocks whose green distribution falls in similar ranges
-/// also tend to share similar literal-symbol histograms (because the
-/// green channel is the dominant symbol stream in `prefix-code group
-/// #1`), so blocks in the same bucket build a more efficient shared
-/// Huffman code than the union of all blocks would.
-fn cluster_blocks_by_mean_green(
+/// The smaller the shift the finer the discrimination but the more
+/// per-block memory + per-iteration arithmetic; 4 keeps the per-block
+/// feature vector at 48 `u32` slots (16 × 3 channels) which is small
+/// enough to scan repeatedly in Lloyd's iteration but large enough to
+/// distinguish meaningfully different per-region distributions on
+/// natural-image inputs.
+const CLUSTER_BIN_SHIFT: u32 = 4;
+/// Number of histogram bins per channel after [`CLUSTER_BIN_SHIFT`]:
+/// `256 >> CLUSTER_BIN_SHIFT`.
+const CLUSTER_BINS_PER_CHANNEL: usize = 256 >> CLUSTER_BIN_SHIFT;
+/// Channels included in the feature vector. We histogram red / green /
+/// blue; alpha is omitted because most lossless WebP payloads carry an
+/// opaque alpha and a uniform-`0xff` alpha bin contributes no signal.
+const CLUSTER_NUM_CHANNELS: usize = 3;
+/// Length of one block's feature vector: `bins-per-channel × channels`.
+const CLUSTER_FEATURE_DIM: usize = CLUSTER_BINS_PER_CHANNEL * CLUSTER_NUM_CHANNELS;
+
+/// Maximum Lloyd's-algorithm iteration count. On the diagnostic
+/// fixtures the assignment settles in 2–3 passes; the cap bounds the
+/// chooser's wall-time on pathological inputs (the outer chooser will
+/// often discard this candidate anyway).
+const CLUSTER_MAX_ITERATIONS: u32 = 8;
+
+/// Build the per-block coarse RGB histogram feature vectors.
+///
+/// The feature layout per block is three contiguous channel chunks:
+/// red bins, then green bins, then blue bins, each of length
+/// [`CLUSTER_BINS_PER_CHANNEL`]. Counts are left raw (not normalised)
+/// because all blocks of the same `block_side` see the same pixel
+/// count, so L1 distance between any two block vectors is directly
+/// comparable. Boundary blocks (where `block_side` doesn't divide
+/// `width` / `height` evenly) have smaller pixel counts, so their
+/// vector magnitudes are correspondingly smaller — the L1 metric
+/// stays meaningful because both sides of every comparison are
+/// pulled from the same fixed-size bin grid.
+fn histogram_block_features(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    prefix_bits: u8,
+) -> (Vec<u32>, usize) {
+    let block_side = 1u32 << prefix_bits;
+    let blocks_wide = width.div_ceil(block_side) as usize;
+    let blocks_high = height.div_ceil(block_side) as usize;
+    let block_count = blocks_wide * blocks_high;
+    let mut features = vec![0u32; block_count * CLUSTER_FEATURE_DIM];
+
+    let row_stride = width as usize;
+    let bs = block_side as usize;
+    for y in 0..height as usize {
+        let block_row = y / bs;
+        for x in 0..width as usize {
+            let block_col = x / bs;
+            let block_index = block_row * blocks_wide + block_col;
+            let pixel = pixels[y * row_stride + x];
+            let r_bin = (((pixel >> 16) & 0xff) >> CLUSTER_BIN_SHIFT) as usize;
+            let g_bin = (((pixel >> 8) & 0xff) >> CLUSTER_BIN_SHIFT) as usize;
+            let b_bin = ((pixel & 0xff) >> CLUSTER_BIN_SHIFT) as usize;
+            let base = block_index * CLUSTER_FEATURE_DIM;
+            features[base + r_bin] += 1;
+            features[base + CLUSTER_BINS_PER_CHANNEL + g_bin] += 1;
+            features[base + 2 * CLUSTER_BINS_PER_CHANNEL + b_bin] += 1;
+        }
+    }
+    (features, block_count)
+}
+
+/// L1 (sum-of-absolute-differences) distance between two
+/// `CLUSTER_FEATURE_DIM`-length count vectors. Symmetric and integer-
+/// valued; zero iff every bin matches exactly.
+fn histogram_l1(a: &[u32], b: &[u32]) -> u64 {
+    debug_assert_eq!(a.len(), CLUSTER_FEATURE_DIM);
+    debug_assert_eq!(b.len(), CLUSTER_FEATURE_DIM);
+    let mut sum: u64 = 0;
+    for i in 0..CLUSTER_FEATURE_DIM {
+        let ai = a[i];
+        let bi = b[i];
+        sum += ai.abs_diff(bi) as u64;
+    }
+    sum
+}
+
+/// Deterministic centroid seeding by farthest-from-already-chosen rule
+/// (a k-means++-style maximum-minimum-distance variant with no
+/// randomness so identical inputs always produce identical seeds).
+///
+/// Starts with block 0 as the first centroid, then repeatedly picks
+/// the block whose minimum L1 distance to the already-chosen set is
+/// the largest. Returns the chosen block indices. If at some step no
+/// remaining block has positive distance to every chosen centroid
+/// (i.e. it duplicates one already in the set), the seeding stops
+/// early — the caller treats a list shorter than `num_groups` as a
+/// signal that the input cannot be split that finely.
+fn seed_cluster_centroids(features: &[u32], block_count: usize, num_groups: u32) -> Vec<usize> {
+    let target = num_groups as usize;
+    debug_assert!(target >= 1 && target <= block_count);
+    let mut picks: Vec<usize> = Vec::with_capacity(target);
+    picks.push(0);
+    while picks.len() < target {
+        let mut champion_block = 0usize;
+        let mut champion_min_dist: u64 = 0;
+        for cand in 0..block_count {
+            if picks.contains(&cand) {
+                continue;
+            }
+            let cand_vec = &features[cand * CLUSTER_FEATURE_DIM..(cand + 1) * CLUSTER_FEATURE_DIM];
+            let mut nearest: u64 = u64::MAX;
+            for &p in &picks {
+                let pick_vec = &features[p * CLUSTER_FEATURE_DIM..(p + 1) * CLUSTER_FEATURE_DIM];
+                let d = histogram_l1(cand_vec, pick_vec);
+                if d < nearest {
+                    nearest = d;
+                }
+            }
+            if nearest > champion_min_dist {
+                champion_min_dist = nearest;
+                champion_block = cand;
+            }
+        }
+        if champion_min_dist == 0 {
+            // No more distinguishable centroids remain.
+            break;
+        }
+        picks.push(champion_block);
+    }
+    picks
+}
+
+/// Partition the image's `prefix_bits`-aligned blocks into at most
+/// `num_groups` clusters by coarse-RGB-histogram L1 distance, returning
+/// one meta-prefix code per block in scan-line order.
+///
+/// The returned codes are always *compact*: they form the contiguous
+/// range `0..actual_groups - 1` with no gaps. Per RFC 9649 §3.7.2.2.2
+/// the entropy image's `num_prefix_groups` is derived as
+/// `max(entropy image) + 1`, so a gap (an empty group sitting between
+/// used ones) would force the encoder to emit an unused prefix-code
+/// group and pay its code-length-table cost for no benefit.
+///
+/// Returns `vec![0; block_count]` (a single-group degenerate) when:
+///
+/// * `num_groups == 1` (caller asked for one group),
+/// * `block_count <= 1` (the entropy image holds at most one block, so
+///   there is no partition to make),
+/// * seeding cannot find `≥ 2` distinguishable centroids (e.g. all
+///   blocks have identical histograms), or
+/// * Lloyd's iteration converges to a single non-empty cluster after
+///   the compaction pass.
+///
+/// The caller's chooser uses the degenerate path as a signal to fall
+/// through to the single-group baseline rather than paying the
+/// multi-group meta-prefix header overhead.
+///
+/// **Determinism.** Two calls with the same `(pixels, width, height,
+/// prefix_bits, num_groups)` always produce the same `Vec<u16>` — the
+/// seeding rule, the Lloyd loop's tie-break (lowest-index centroid
+/// wins on equal-distance), and the compaction pass are all
+/// deterministic.
+fn cluster_blocks_by_histogram_distance(
     pixels: &[u32],
     width: u32,
     height: u32,
@@ -2400,60 +2567,98 @@ fn cluster_blocks_by_mean_green(
     num_groups: u32,
 ) -> Vec<u16> {
     debug_assert!(num_groups >= 1);
-    let block_side = 1u32 << prefix_bits;
-    let pw = width.div_ceil(block_side);
-    let ph = height.div_ceil(block_side);
-    let num_blocks = (pw * ph) as usize;
-
-    // Compute per-block mean green.
-    let mut block_mean: Vec<f64> = vec![0.0; num_blocks];
-    let mut block_count: Vec<u32> = vec![0; num_blocks];
-    let w = width as usize;
-    let pw_u = pw as usize;
-    for y in 0..height as usize {
-        let by = y / block_side as usize;
-        for x in 0..width as usize {
-            let bx = x / block_side as usize;
-            let b = by * pw_u + bx;
-            let g = ((pixels[y * w + x] >> 8) & 0xff) as f64;
-            block_mean[b] += g;
-            block_count[b] += 1;
-        }
-    }
-    for b in 0..num_blocks {
-        if block_count[b] > 0 {
-            block_mean[b] /= block_count[b] as f64;
-        }
+    let (features, block_count) = histogram_block_features(pixels, width, height, prefix_bits);
+    if num_groups == 1 || block_count <= 1 {
+        return vec![0u16; block_count];
     }
 
-    if num_groups == 1 {
-        return vec![0u16; num_blocks];
+    let seeds = seed_cluster_centroids(&features, block_count, num_groups);
+    if seeds.len() < 2 {
+        return vec![0u16; block_count];
+    }
+    let cluster_k = seeds.len();
+
+    // Centroids are stored as running sums of assigned-block feature
+    // vectors so the update step amortises the per-bin sum across all
+    // assigned blocks in O(block_count × feat_dim). The per-cluster
+    // assignment count divides the sum on demand to materialise the
+    // average for the L1 step.
+    let mut centroid_sums: Vec<u64> = vec![0u64; cluster_k * CLUSTER_FEATURE_DIM];
+    let mut centroid_counts: Vec<u64> = vec![1u64; cluster_k];
+    for (slot, &block_idx) in seeds.iter().enumerate() {
+        let src = &features[block_idx * CLUSTER_FEATURE_DIM..(block_idx + 1) * CLUSTER_FEATURE_DIM];
+        for (i, &v) in src.iter().enumerate() {
+            centroid_sums[slot * CLUSTER_FEATURE_DIM + i] = v as u64;
+        }
     }
 
-    // Equal-width bucketing on the observed `[min, max]` range.
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &m in &block_mean {
-        if m < lo {
-            lo = m;
-        }
-        if m > hi {
-            hi = m;
-        }
-    }
-    if hi <= lo {
-        // All blocks identical → degenerate to a single group.
-        return vec![0u16; num_blocks];
-    }
-    let span = hi - lo;
-    let step = span / num_groups as f64;
+    let mut assignment: Vec<u16> = vec![0u16; block_count];
+    let mut centroid_view: Vec<u32> = vec![0u32; CLUSTER_FEATURE_DIM];
 
-    let mut codes: Vec<u16> = Vec::with_capacity(num_blocks);
-    for &m in &block_mean {
-        let bucket = (((m - lo) / step).floor() as i64).clamp(0, num_groups as i64 - 1);
-        codes.push(bucket as u16);
+    for _pass in 0..CLUSTER_MAX_ITERATIONS {
+        // Assignment step: reassign each block to the nearest centroid.
+        let mut any_change = false;
+        for b in 0..block_count {
+            let block_vec = &features[b * CLUSTER_FEATURE_DIM..(b + 1) * CLUSTER_FEATURE_DIM];
+            let mut best_group: u16 = 0;
+            let mut best_dist: u64 = u64::MAX;
+            for ci in 0..cluster_k {
+                let divisor = centroid_counts[ci].max(1);
+                for i in 0..CLUSTER_FEATURE_DIM {
+                    let raw = centroid_sums[ci * CLUSTER_FEATURE_DIM + i];
+                    centroid_view[i] = (raw / divisor) as u32;
+                }
+                let d = histogram_l1(block_vec, &centroid_view);
+                if d < best_dist {
+                    best_dist = d;
+                    best_group = ci as u16;
+                }
+            }
+            if assignment[b] != best_group {
+                assignment[b] = best_group;
+                any_change = true;
+            }
+        }
+        if !any_change {
+            break;
+        }
+
+        // Update step: rebuild centroid sums + counts from the new
+        // assignment.
+        for slot in centroid_sums.iter_mut() {
+            *slot = 0;
+        }
+        for slot in centroid_counts.iter_mut() {
+            *slot = 0;
+        }
+        for b in 0..block_count {
+            let ci = assignment[b] as usize;
+            let block_vec = &features[b * CLUSTER_FEATURE_DIM..(b + 1) * CLUSTER_FEATURE_DIM];
+            let base = ci * CLUSTER_FEATURE_DIM;
+            for (i, &v) in block_vec.iter().enumerate() {
+                centroid_sums[base + i] += v as u64;
+            }
+            centroid_counts[ci] += 1;
+        }
     }
-    codes
+
+    // Compaction: map the (possibly sparse) assigned group IDs onto
+    // the contiguous range `0..used - 1`. First-seen-in-scan-order
+    // wins, so the output is deterministic.
+    let mut remap: Vec<i32> = vec![-1; cluster_k];
+    let mut next_id: u16 = 0;
+    for slot in assignment.iter_mut() {
+        let group = *slot as usize;
+        if remap[group] < 0 {
+            remap[group] = next_id as i32;
+            next_id += 1;
+        }
+        *slot = remap[group] as u16;
+    }
+    if next_id < 2 {
+        return vec![0u16; block_count];
+    }
+    assignment
 }
 
 /// §6.2.2 per-pixel group selector backed by a flat block-index map.
@@ -2611,8 +2816,10 @@ fn build_group_codes(
 /// Try encoding `pixels` with the §6.2.2 multi-meta-prefix path:
 ///
 /// 1. Cluster the image's `prefix_bits`-aligned blocks into `num_groups`
-///    groups (currently by mean green; see
-///    [`cluster_blocks_by_mean_green`]).
+///    groups by coarse-RGB-histogram L1 distance (see
+///    [`cluster_blocks_by_histogram_distance`]). Blocks whose pixel-
+///    value distributions agree at bin resolution end up in the same
+///    group and share a single five-code prefix-code group.
 /// 2. Tokenise the image via the standard §5.2.2 LZ77 matcher
 ///    (`tokenize_lz77`), optionally cacheifying with `cache_code_bits`.
 /// 3. Split tokens into per-group buckets, build per-group prefix codes,
@@ -2651,7 +2858,8 @@ fn encode_with_meta_prefix(
         return None;
     }
 
-    let codes = cluster_blocks_by_mean_green(pixels, width, height, prefix_bits, num_groups);
+    let codes =
+        cluster_blocks_by_histogram_distance(pixels, width, height, prefix_bits, num_groups);
     let index = EncoderMetaIndex {
         prefix_bits,
         block_width: pw,
@@ -6259,10 +6467,10 @@ mod tests {
         pixels
     }
 
-    /// The encoder's mean-green clusterer must produce a non-degenerate
-    /// (≥ 2-group) split on the headline two-region bimodal fixture, and
-    /// the resulting meta-codes must reflect the visible top-vs-bottom
-    /// statistic separation.
+    /// The histogram-distance clusterer must produce a non-degenerate
+    /// (≥ 2-group) split on the headline two-region bimodal fixture
+    /// (top and bottom halves use disjoint per-channel ranges), and
+    /// the resulting meta-codes must reflect the top-vs-bottom split.
     #[test]
     fn meta_prefix_clusterer_splits_two_region_bimodal_fixture() {
         let w = 64u32;
@@ -6272,7 +6480,7 @@ mod tests {
         // horizontal midpoint sits on the block-row-2/3 boundary, so
         // clustering should put rows 0..2 in one group and rows 2..4 in
         // the other.
-        let codes = cluster_blocks_by_mean_green(&pixels, w, h, 4, 2);
+        let codes = cluster_blocks_by_histogram_distance(&pixels, w, h, 4, 2);
         assert_eq!(codes.len(), 16);
         // Top two block-rows should agree; bottom two should agree;
         // the two halves must differ from each other.
@@ -6287,6 +6495,107 @@ mod tests {
         }
         for c in &codes[8..16] {
             assert_eq!(*c, bot, "bottom-half blocks must share a group");
+        }
+    }
+
+    /// The histogram-distance clusterer must separate two regions
+    /// whose per-block *mean green* coincides but whose per-block
+    /// green *distribution* diverges — the failure mode of the
+    /// round-151 mean-statistic bucketiser. Top half: bimodal green
+    /// alternating 16/240 (mean ≈ 128). Bottom half: flat green at
+    /// 128 (also mean ≈ 128).
+    #[test]
+    fn histogram_clusterer_separates_blocks_sharing_a_mean() {
+        let w = 32u32;
+        let h = 32u32;
+        let w_us = w as usize;
+        let h_us = h as usize;
+        let mut pixels: Vec<u32> = Vec::with_capacity(w_us * h_us);
+        for y in 0..h_us {
+            for x in 0..w_us {
+                let g = if y < h_us / 2 {
+                    if (x ^ y) & 1 == 0 {
+                        16u32
+                    } else {
+                        240u32
+                    }
+                } else {
+                    128u32
+                };
+                pixels.push(0xff00_0000 | (g << 8));
+            }
+        }
+        // prefix_bits = 4 → 16-pixel blocks → 2x2 entropy image. The
+        // top row of two blocks should differ from the bottom row.
+        let codes = cluster_blocks_by_histogram_distance(&pixels, w, h, 4, 2);
+        assert_eq!(codes.len(), 4);
+        let top_left = codes[0];
+        let bot_left = codes[2];
+        assert_ne!(
+            top_left, bot_left,
+            "bimodal-vs-flat green regions must split into distinct groups",
+        );
+    }
+
+    /// Clustering must be a pure function of its inputs: two calls
+    /// with the same arguments produce the same `Vec<u16>`. Encoder
+    /// reproducibility depends on this.
+    #[test]
+    fn histogram_clusterer_is_deterministic() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = two_region_noisy_image(w, h);
+        let first = cluster_blocks_by_histogram_distance(&pixels, w, h, 4, 3);
+        let second = cluster_blocks_by_histogram_distance(&pixels, w, h, 4, 3);
+        assert_eq!(first, second);
+    }
+
+    /// A uniform image (every pixel the same value) has no per-block
+    /// histogram divergence, so the clusterer must collapse to a
+    /// single group. The encoder relies on this `actual_groups < 2`
+    /// signal to skip the multi-group path cleanly.
+    #[test]
+    fn histogram_clusterer_collapses_on_uniform_image() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = vec![0xff80_8080u32; (w * h) as usize];
+        let codes = cluster_blocks_by_histogram_distance(&pixels, w, h, 4, 4);
+        assert_eq!(codes.len(), 16);
+        for c in &codes {
+            assert_eq!(*c, 0, "uniform image must collapse to one group");
+        }
+    }
+
+    /// `num_groups = 1` must short-circuit straight to an all-zeros
+    /// map (the caller asked for one group; running Lloyd's iteration
+    /// would only waste cycles confirming the trivial answer).
+    #[test]
+    fn histogram_clusterer_num_groups_one_returns_all_zeros() {
+        let w = 32u32;
+        let h = 32u32;
+        let pixels = two_region_noisy_image(w, h);
+        let codes = cluster_blocks_by_histogram_distance(&pixels, w, h, 4, 1);
+        assert!(codes.iter().all(|&c| c == 0));
+    }
+
+    /// The returned meta-codes must form the *compact* contiguous
+    /// range `0..max + 1` with no gaps. Per RFC 9649 §3.7.2.2.2,
+    /// `num_prefix_groups = max(entropy image) + 1`, so an unused
+    /// group sitting between used ones would inflate the encoder's
+    /// per-group prefix-code-table cost without ever being read.
+    #[test]
+    fn histogram_clusterer_returns_compact_group_ids() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = two_region_noisy_image(w, h);
+        let codes = cluster_blocks_by_histogram_distance(&pixels, w, h, 4, 4);
+        let max_code = codes.iter().copied().max().unwrap_or(0) as usize;
+        let mut seen = vec![false; max_code + 1];
+        for &c in &codes {
+            seen[c as usize] = true;
+        }
+        for (i, &s) in seen.iter().enumerate() {
+            assert!(s, "gap at group id {i} — compaction failed");
         }
     }
 
@@ -6552,5 +6861,323 @@ mod tests {
             baseline.len(),
             mp.len(),
         );
+    }
+
+    // ---- Round-152 measurement harness -----------------------------
+    //
+    // Reproduces the round-151 mean-green clusterer locally so the test
+    // can measure the multi-meta-prefix candidate's byte cost with both
+    // partitioners and confirm the histogram path is strictly smaller
+    // on the diagnostic two-region noisy fixture. The mean-green
+    // implementation here is a verbatim copy of the round-151 helper
+    // that lived in this file before this round; it's `#[cfg(test)]`-
+    // only and never reachable from the encoder.
+    fn cluster_blocks_by_mean_green_for_bench(
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+        prefix_bits: u8,
+        num_groups: u32,
+    ) -> Vec<u16> {
+        let block_side = 1u32 << prefix_bits;
+        let pw = width.div_ceil(block_side);
+        let ph = height.div_ceil(block_side);
+        let num_blocks = (pw * ph) as usize;
+        let mut block_mean: Vec<f64> = vec![0.0; num_blocks];
+        let mut block_count: Vec<u32> = vec![0; num_blocks];
+        let row = width as usize;
+        let pw_u = pw as usize;
+        for y in 0..height as usize {
+            let by = y / block_side as usize;
+            for x in 0..width as usize {
+                let bx = x / block_side as usize;
+                let b = by * pw_u + bx;
+                let g = ((pixels[y * row + x] >> 8) & 0xff) as f64;
+                block_mean[b] += g;
+                block_count[b] += 1;
+            }
+        }
+        for b in 0..num_blocks {
+            if block_count[b] > 0 {
+                block_mean[b] /= block_count[b] as f64;
+            }
+        }
+        if num_groups == 1 {
+            return vec![0u16; num_blocks];
+        }
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &m in &block_mean {
+            if m < lo {
+                lo = m;
+            }
+            if m > hi {
+                hi = m;
+            }
+        }
+        if hi <= lo {
+            return vec![0u16; num_blocks];
+        }
+        let span = hi - lo;
+        let step = span / num_groups as f64;
+        let mut codes = Vec::with_capacity(num_blocks);
+        for &m in &block_mean {
+            let bucket = (((m - lo) / step).floor() as i64).clamp(0, num_groups as i64 - 1);
+            codes.push(bucket as u16);
+        }
+        codes
+    }
+
+    /// Body-shared bencher: encode `pixels` via the multi-meta-prefix
+    /// candidate using either the mean-green or histogram-distance
+    /// clusterer, returning the encoded byte count. Drives
+    /// `encode_with_meta_prefix` directly by overriding the cluster
+    /// step's output through a tiny shim.
+    fn measure_mp_bytes_at(
+        pixels: &[u32],
+        w: u32,
+        h: u32,
+        prefix_bits: u8,
+        num_groups: u32,
+        use_histogram: bool,
+    ) -> Option<usize> {
+        let block_side = 1u32 << prefix_bits;
+        let pw = w.div_ceil(block_side);
+        let ph = h.div_ceil(block_side);
+        if (pw * ph) < num_groups {
+            return None;
+        }
+        let codes = if use_histogram {
+            cluster_blocks_by_histogram_distance(pixels, w, h, prefix_bits, num_groups)
+        } else {
+            cluster_blocks_by_mean_green_for_bench(pixels, w, h, prefix_bits, num_groups)
+        };
+        // Reach into encode_with_meta_prefix's internals by reusing
+        // its emitter parts: build the EncoderMetaIndex from `codes`
+        // and run the same writer path. Easier: call the encoder
+        // directly when `use_histogram` is true (it uses the new
+        // clusterer); the mean-green branch needs a manual emit.
+        // Since the two paths share every step except the codes
+        // vector, the round-trip is much cleaner if we just call
+        // `encode_with_meta_prefix` for the histogram branch and a
+        // tiny re-emit for the mean-green branch that mirrors the
+        // same writer steps.
+        //
+        // For a measurement test it's enough to compare the two byte
+        // counts at the same `(prefix_bits, num_groups)`, which is
+        // exactly what the chooser ablation needs. We achieve that by
+        // letting `encode_with_meta_prefix` drive the histogram path
+        // and replaying the same steps inline for the mean-green
+        // path.
+        if use_histogram {
+            return encode_with_meta_prefix(pixels, w, h, prefix_bits, num_groups, None, w)
+                .map(|v| v.len());
+        }
+        // Mean-green inline emission (same shape as
+        // encode_with_meta_prefix).
+        let index = EncoderMetaIndex {
+            prefix_bits,
+            block_width: pw,
+            codes,
+        };
+        let actual_groups = index.num_groups();
+        if actual_groups < 2 {
+            return None;
+        }
+        let tokens = tokenize_lz77(pixels);
+        let buckets = split_tokens_by_group(&tokens, &index, w, actual_groups);
+        let group_codes = build_group_codes(&buckets, 0, w);
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bits((prefix_bits - 2) as u32, 3);
+        let entropy_image = index.entropy_image_argb();
+        write_entropy_coded_image_literals(&mut bw, &entropy_image);
+        for group in &group_codes {
+            for code in group.iter() {
+                code.write_code_lengths(&mut bw);
+            }
+        }
+        let mut pos = 0usize;
+        let w_pixels = w as usize;
+        for &tok in &tokens {
+            let x = (pos % w_pixels) as u32;
+            let y = (pos / w_pixels) as u32;
+            let g = index.group_for(x, y) as usize;
+            let codes = &group_codes[g];
+            let green_code = &codes[0];
+            let red_code = &codes[1];
+            let blue_code = &codes[2];
+            let alpha_code = &codes[3];
+            let dist_code = &codes[4];
+            match tok {
+                Token::Literal(p) => {
+                    let a = ((p >> 24) & 0xff) as usize;
+                    let r = ((p >> 16) & 0xff) as usize;
+                    let g_ch = ((p >> 8) & 0xff) as usize;
+                    let b = (p & 0xff) as usize;
+                    green_code.write_symbol(&mut bw, g_ch);
+                    red_code.write_symbol(&mut bw, r);
+                    blue_code.write_symbol(&mut bw, b);
+                    alpha_code.write_symbol(&mut bw, a);
+                    pos += 1;
+                }
+                Token::CacheRef { .. } => unreachable!("no cache in measurement"),
+                Token::Copy { length, distance } => {
+                    write_lz77_value(&mut bw, green_code, 256, length as u32);
+                    let raw_code = pixel_distance_to_distance_code(distance, w);
+                    write_lz77_value(&mut bw, dist_code, 0, raw_code);
+                    pos += length;
+                }
+            }
+        }
+        Some(bw.into_bytes().len())
+    }
+
+    /// A four-region fixture where the top-left quadrant has the same
+    /// per-channel mean as the bottom-right but a very different
+    /// per-channel distribution, and the top-right has the same mean
+    /// as the bottom-left also with a divergent distribution. The
+    /// mean-green clusterer at `num_groups = 2` can only find one
+    /// axis of separation and folds two distinct distributions onto
+    /// the same group; the histogram clusterer separates by full
+    /// distribution and finds the right partition.
+    fn four_region_mean_collision_image(width: u32, height: u32) -> Vec<u32> {
+        let w = width as usize;
+        let h = height as usize;
+        let mut pixels = Vec::with_capacity(w * h);
+        let mut s: u32 = 0x12345678;
+        for y in 0..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                let top = y < h / 2;
+                let left = x < w / 2;
+                // Pick (g, r) pairs whose means match across the
+                // top-left vs bottom-right and top-right vs bottom-left
+                // diagonals but whose distributions are very different.
+                let (g, r, b) = match (top, left) {
+                    (true, true) => {
+                        // top-left: g bimodal {16, 240} mean ≈ 128
+                        let gv = if (s & 1) == 0 { 16 } else { 240 };
+                        let rv = (s >> 8) & 0x3f;
+                        let bv = (s >> 16) & 0x3f;
+                        (gv, rv, bv)
+                    }
+                    (true, false) => {
+                        // top-right: g flat 128
+                        let gv = 128u32;
+                        let rv = ((s >> 8) & 0x3f).wrapping_add(192);
+                        let bv = (s >> 16) & 0x3f;
+                        (gv, rv, bv)
+                    }
+                    (false, true) => {
+                        // bottom-left: g bimodal but {64, 192} mean ≈ 128
+                        let gv = if (s & 1) == 0 { 64 } else { 192 };
+                        let rv = (s >> 8) & 0x3f;
+                        let bv = ((s >> 16) & 0x3f).wrapping_add(192);
+                        (gv, rv, bv)
+                    }
+                    (false, false) => {
+                        // bottom-right: g flat 128 too
+                        let gv = 128u32;
+                        let rv = ((s >> 8) & 0x3f).wrapping_add(192);
+                        let bv = ((s >> 16) & 0x3f).wrapping_add(192);
+                        (gv, rv, bv)
+                    }
+                };
+                pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+            }
+        }
+        pixels
+    }
+
+    /// For a given fixture, sweep every `(prefix_bits, num_groups)`
+    /// the round-151 chooser searches and return the smallest
+    /// non-degenerate multi-meta-prefix byte cost under the named
+    /// clusterer. Returns `None` if every combination collapsed.
+    fn best_mp_bytes_over_sweep(
+        pixels: &[u32],
+        w: u32,
+        h: u32,
+        use_histogram: bool,
+    ) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+            for num_groups in 2u32..=MAX_META_GROUPS {
+                if let Some(bytes) =
+                    measure_mp_bytes_at(pixels, w, h, prefix_bits, num_groups, use_histogram)
+                {
+                    best = Some(match best {
+                        Some(b) => b.min(bytes),
+                        None => bytes,
+                    });
+                }
+            }
+        }
+        best
+    }
+
+    /// Confirm the round-152 histogram-distance clusterer beats (or at
+    /// worst ties) the round-151 mean-green bucketiser on the
+    /// diagnostic two-region noisy sweep. Prints byte counts (run with
+    /// `--nocapture`).
+    #[test]
+    fn histogram_clusterer_reduces_mp_bytes_on_two_region_sweep() {
+        let shapes: &[(u32, u32)] = &[(64, 64), (128, 128), (64, 128), (256, 256)];
+        for &(w, h) in shapes {
+            let pixels = two_region_noisy_image(w, h);
+            let mg = best_mp_bytes_over_sweep(&pixels, w, h, false)
+                .expect("mean-green path must produce a candidate");
+            let hi = best_mp_bytes_over_sweep(&pixels, w, h, true)
+                .expect("histogram path must produce a candidate");
+            assert!(
+                hi <= mg,
+                "{w}x{h}: histogram path produced {hi} B, mean-green produced {mg} B \
+                 — histogram path must not regress on the two-region sweep",
+            );
+            println!(
+                "r152 measurement {w}x{h}: mean-green={mg} B histogram={hi} B \
+                 delta={} B ({:.2}%)",
+                mg as i64 - hi as i64,
+                100.0 * (mg as f64 - hi as f64) / mg as f64,
+            );
+        }
+    }
+
+    /// Confirm the histogram clusterer is *strictly* better than
+    /// mean-green on the four-region mean-collision fixture, where
+    /// blocks sharing a green mean diverge in distribution. Prints
+    /// byte counts (run with `--nocapture`).
+    #[test]
+    fn histogram_clusterer_reduces_mp_bytes_on_mean_collision_sweep() {
+        let shapes: &[(u32, u32)] = &[(64, 64), (128, 128), (64, 128), (256, 256)];
+        for &(w, h) in shapes {
+            let pixels = four_region_mean_collision_image(w, h);
+            let mg_opt = best_mp_bytes_over_sweep(&pixels, w, h, false);
+            let hi = best_mp_bytes_over_sweep(&pixels, w, h, true)
+                .expect("histogram path must produce a candidate");
+            match mg_opt {
+                Some(mg) => {
+                    assert!(
+                        hi < mg,
+                        "{w}x{h}: histogram path produced {hi} B, mean-green produced {mg} B \
+                         — histogram path must strictly improve on mean-collision fixture",
+                    );
+                    println!(
+                        "r152 mean-collision {w}x{h}: mean-green={mg} B histogram={hi} B \
+                         delta={} B ({:.2}%)",
+                        mg as i64 - hi as i64,
+                        100.0 * (mg as f64 - hi as f64) / mg as f64,
+                    );
+                }
+                None => {
+                    println!(
+                        "r152 mean-collision {w}x{h}: mean-green collapsed (no candidate); \
+                         histogram={hi} B",
+                    );
+                }
+            }
+        }
     }
 }

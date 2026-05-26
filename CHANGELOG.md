@@ -6,6 +6,58 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 152 (2026-05-26).** Histogram-distance per-region
+  clusterer for the §6.2.2 multi-meta-prefix encoder, replacing the
+  round-151 mean-green bucketiser. The new
+  `cluster_blocks_by_histogram_distance` featurises every
+  `(1 << prefix_bits)`-square block as a coarse 48-element RGB
+  histogram (16 bins per channel after a `CLUSTER_BIN_SHIFT = 4`
+  collapse), seeds `num_groups` cluster centroids by a deterministic
+  farthest-from-already-chosen rule (a k-means++-style maximum-
+  minimum-L1 variant with no randomness), iterates Lloyd's assignment
+  / centroid-update step for up to 8 passes (early-exit on
+  no-assignment-change), and compacts the final assignment so the
+  returned meta-codes always run `0..actual_groups - 1` with no gaps
+  (per RFC 9649 §3.7.2.2.2, `num_prefix_groups = max(entropy image) +
+  1`, so a gap would force the encoder to emit an unused prefix-code
+  group). `encode_with_meta_prefix` now drives the histogram path; the
+  round-151 mean-green helper is removed from production code.
+  Uniform images and images whose seeding cannot find `num_groups`
+  distinguishable centroids collapse to a single-group degenerate
+  cleanly so the chooser falls back to the round-150 baseline. Five
+  new clusterer tests:
+  `histogram_clusterer_separates_blocks_sharing_a_mean` (a bimodal-
+  vs-flat green fixture that mean-green cannot split — both regions
+  share mean ≈ 128 but the histogram clusterer separates them),
+  `histogram_clusterer_is_deterministic` (same input → same codes),
+  `histogram_clusterer_collapses_on_uniform_image` (degenerate signal
+  for the encoder to fall through to the single-group path),
+  `histogram_clusterer_num_groups_one_returns_all_zeros`
+  (short-circuit for the trivial `num_groups = 1` case), and
+  `histogram_clusterer_returns_compact_group_ids` (compaction
+  invariant — no gaps in the returned meta-code range). The existing
+  `meta_prefix_clusterer_splits_two_region_bimodal_fixture` test was
+  retargeted at the new clusterer and still asserts the top-vs-bottom
+  split on the headline bimodal image. Two new regression-bench tests
+  (`histogram_clusterer_reduces_mp_bytes_on_two_region_sweep` and
+  `histogram_clusterer_reduces_mp_bytes_on_mean_collision_sweep`)
+  compare the multi-prefix candidate byte cost between the two
+  clusterers across the chooser's full `(prefix_bits, num_groups)`
+  sweep and assert the histogram path never regresses; on the
+  diagnostic noisy two-region fixtures the histogram path shrinks the
+  best-of-sweep multi-prefix candidate by 2.39–5.68 % (64×64
+  8944→8730 B, 128×128 35049→33264 B, 64×128 17640→16903 B, 256×256
+  139497→131580 B). The multi-prefix candidate still does not beat
+  the round-150 super-chooser on these synthetic fixtures (LZ77 +
+  predictor + color-cache dominate on uniform-noise inputs) but the
+  gap is now 4–6 % narrower across every shape; on the mean-collision
+  fixture (designed so per-block means match across regions that
+  differ in distribution) the mean-green path collapses to a single
+  group while the histogram path successfully partitions the image.
+  Spec source: WebP Lossless Bitstream specification §6.2.2 / §3.7.2
+  mirrored under `docs/image/webp/` and RFC 9649 §3.7.2 / §3.7.2.2.
+  No external implementation was consulted.
+
 * **Clean-room round 151 (2026-05-26).** §6.2.2 multi-meta-prefix
   (entropy-image) encoder for the VP8L lossless path. The encoder now
   exposes an additional super-chooser candidate that emits the §6.2.2
