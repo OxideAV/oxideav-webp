@@ -2,6 +2,61 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 151)
+
+**Round 151 added the §6.2.2 multi-meta-prefix (entropy-image) encoder
+to the VP8L encoder.** The encoder now exposes a new super-chooser
+candidate that emits the §6.2.2 *multi-prefix-code-group* shape:
+meta-prefix bit `%b1`, 3-bit `prefix_bits - 2`, an entropy-coded
+sub-resolution image carrying one meta-prefix code per
+`(1 << prefix_bits)`-square block, `N` prefix-code groups (5 prefix
+codes each), and the LZ77 token stream emitted with each token's
+symbols under the prefix-code group selected by its start pixel's
+block. `encode_with_meta_prefix` takes `prefix_bits`, `num_groups`,
+and `cache_code_bits`; `sweep_meta_prefix_candidate` sweeps
+`prefix_bits ∈ {4, 5, 6, 7}` (16/32/64/128-pixel blocks) ×
+`num_groups ∈ [2..4]` × the round-148 `cache_code_bits ∈ [1..11]`
+plus disabled-cache baseline and keeps the smallest non-degenerate
+stream.
+
+Wire format (§3.8.3 / §7.3 grammar, ARGB role):
+
+```
+spatially-coded-image =
+  color-cache-info     ; %b0 or (%b1 4BIT)
+  meta-prefix          ; %b1 entropy-image  (this candidate)
+  data
+meta-prefix-multi =
+  %b1                  ; multi-group flag
+  3BIT                 ; prefix_bits - 2 (in [0..7] → prefix_bits in [2..9])
+  entropy-coded-image  ; sub-resolution entropy image (red+green = meta-code)
+data =
+  prefix-codes         ; num_prefix_groups × 5 prefix codes
+  lz77-coded-image     ; per-token group selected by start pixel's block
+```
+
+Round-trip integrity covered across `prefix_bits ∈ {4, 5, 6, 7}` × 2/3/4
+groups by the new `meta_prefix_*_round_trip_through_decoder` test set
+(every combination decodes back to the exact input pixels via
+`vp8l_transform::decode_lossless` and the top-level `decode_webp`).
+The clusterer (`cluster_blocks_by_mean_green`) bucketises blocks by
+mean-green value into equal-width groups; uniform images and images
+too small for the requested block count return `None` so the chooser
+stays at the single-group baseline. On the synthetic two-region
+fixtures the multi-meta-prefix candidate stays larger than the
+single-group baseline (the cost of N additional 280-symbol prefix-code
+tables — typically thousands of bytes each — dominates the per-region
+savings on small to mid-size images), so the chooser correctly keeps
+the round-150 pick; the candidate's value is structural — the
+round-151 encoder is now spec-conformant for any future per-region
+clustering improvement to plug into without changing the on-wire
+serialiser.
+
+Still lacks: smarter per-region clustering (the round-151 mean-green
+bucketer is a stand-in; a histogram-distance partitioner would shrink
+the per-group code overhead enough to flip the chooser on natural
+images), and VP8 lossy encode.
+
 ## Status — 2026-05-26 (clean-room round 150)
 
 **Round 150 added the §4.4 color-indexing transform forward pass to the
@@ -48,8 +103,9 @@ bit-exact across all four `width_bits` regimes (2-color, 4-color,
 16-color, 64-color round-trips covered by the new
 `color_indexing_round_trip_across_all_width_bits_regimes` test).
 
-Still lacks: §6.2.2 multi-meta-prefix (entropy image) encoding, and VP8
-lossy encode.
+Still lacks: §6.2.2 multi-meta-prefix (entropy image) encoding (round
+151 lands the encoder; per-region clustering refinement remains), and
+VP8 lossy encode.
 
 ## Status — 2026-05-26 (clean-room round 149)
 

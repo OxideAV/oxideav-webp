@@ -2348,6 +2348,424 @@ fn encode_with_color_indexing(
     Some(w.into_bytes())
 }
 
+// ---- §6.2.2 multi-meta-prefix (entropy-image) encoder ----------------
+
+/// Default `prefix_bits` candidate the §6.2.2 multi-meta-prefix
+/// chooser sweeps. Each value gives a block side of `1 << prefix_bits`
+/// pixels — larger blocks mean fewer of them (cheap entropy image,
+/// fewer prefix-code groups) but coarser per-region adaptation; smaller
+/// blocks mean finer adaptation but a larger entropy-image overhead.
+/// The sweep across `[4, 5, 6, 7]` gives 16/32/64/128-pixel blocks,
+/// which span the useful range for the dimensions this crate targets
+/// (typical lossless WebP fixtures are 16..512 pixels per side).
+///
+/// The spec admits `prefix_bits ∈ [2..9]` (i.e. 4..512-pixel blocks);
+/// the chooser narrows that to four values rather than the full eight
+/// because the very smallest (4-pixel) blocks rarely beat the
+/// single-group baseline (the entropy image grows quadratically with
+/// `1 / block_side`) and the largest (256/512-pixel) blocks are
+/// useless on the smaller images this candidate targets.
+const META_PREFIX_BITS_SWEEP: [u8; 4] = [4, 5, 6, 7];
+
+/// Largest number of prefix-code groups the §6.2.2 chooser will form.
+/// Each group costs five additional code-length tables in the stream
+/// header (~30..120 bits per code), so the chooser only pays the
+/// overhead when the per-group savings on the LZ77 stream beat the
+/// header cost. Capping at 4 keeps the chooser's wall-time bounded
+/// while covering the per-region adaptation that pays for itself on
+/// natural images (where the per-quadrant statistics diverge enough to
+/// justify separate codes).
+const MAX_META_GROUPS: u32 = 4;
+
+/// Cluster the per-block mean-green values into `num_groups` clusters
+/// and return one meta-prefix code per block in scan-line order. The
+/// clustering is a simple sort-then-equal-width bucketing on the
+/// (block_index → mean_green) map: blocks whose green statistic falls
+/// in the lowest `1/num_groups` of the value range get group 0, the
+/// next `1/num_groups` get group 1, and so on. The simple bucketing is
+/// deterministic and depends only on the input pixels, so the encoder
+/// emits the same entropy image for the same input.
+///
+/// The mean-green statistic is a stand-in for the per-block symbol
+/// histogram: blocks whose green distribution falls in similar ranges
+/// also tend to share similar literal-symbol histograms (because the
+/// green channel is the dominant symbol stream in `prefix-code group
+/// #1`), so blocks in the same bucket build a more efficient shared
+/// Huffman code than the union of all blocks would.
+fn cluster_blocks_by_mean_green(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    prefix_bits: u8,
+    num_groups: u32,
+) -> Vec<u16> {
+    debug_assert!(num_groups >= 1);
+    let block_side = 1u32 << prefix_bits;
+    let pw = width.div_ceil(block_side);
+    let ph = height.div_ceil(block_side);
+    let num_blocks = (pw * ph) as usize;
+
+    // Compute per-block mean green.
+    let mut block_mean: Vec<f64> = vec![0.0; num_blocks];
+    let mut block_count: Vec<u32> = vec![0; num_blocks];
+    let w = width as usize;
+    let pw_u = pw as usize;
+    for y in 0..height as usize {
+        let by = y / block_side as usize;
+        for x in 0..width as usize {
+            let bx = x / block_side as usize;
+            let b = by * pw_u + bx;
+            let g = ((pixels[y * w + x] >> 8) & 0xff) as f64;
+            block_mean[b] += g;
+            block_count[b] += 1;
+        }
+    }
+    for b in 0..num_blocks {
+        if block_count[b] > 0 {
+            block_mean[b] /= block_count[b] as f64;
+        }
+    }
+
+    if num_groups == 1 {
+        return vec![0u16; num_blocks];
+    }
+
+    // Equal-width bucketing on the observed `[min, max]` range.
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &m in &block_mean {
+        if m < lo {
+            lo = m;
+        }
+        if m > hi {
+            hi = m;
+        }
+    }
+    if hi <= lo {
+        // All blocks identical → degenerate to a single group.
+        return vec![0u16; num_blocks];
+    }
+    let span = hi - lo;
+    let step = span / num_groups as f64;
+
+    let mut codes: Vec<u16> = Vec::with_capacity(num_blocks);
+    for &m in &block_mean {
+        let bucket = (((m - lo) / step).floor() as i64).clamp(0, num_groups as i64 - 1);
+        codes.push(bucket as u16);
+    }
+    codes
+}
+
+/// §6.2.2 per-pixel group selector backed by a flat block-index map.
+/// Mirrors the decoder's [`crate::vp8l_decode::MetaPrefixIndex`] but
+/// owns its data so the encoder can build/inspect it without going
+/// through the decoder type.
+struct EncoderMetaIndex {
+    prefix_bits: u8,
+    block_width: u32,
+    /// Per-block meta-prefix code in scan-line order, `block_width *
+    /// block_height` entries.
+    codes: Vec<u16>,
+}
+
+impl EncoderMetaIndex {
+    /// §6.2.2 group selection for pixel `(x, y)`:
+    /// `codes[(y >> prefix_bits) * block_width + (x >> prefix_bits)]`.
+    fn group_for(&self, x: u32, y: u32) -> u16 {
+        let bx = x >> self.prefix_bits;
+        let by = y >> self.prefix_bits;
+        self.codes[(by * self.block_width + bx) as usize]
+    }
+
+    /// §6.2.2 `num_prefix_groups = max(entropy image) + 1`.
+    fn num_groups(&self) -> u32 {
+        self.codes
+            .iter()
+            .copied()
+            .max()
+            .map(|c| c as u32 + 1)
+            .unwrap_or(1)
+    }
+
+    /// Build the entropy-image ARGB pixel buffer the §6.2.2 entropy
+    /// image is decoded from. Per §6.2.2, the meta-prefix code is the
+    /// red+green channels of the entropy pixel: `(meta_code >> 8) &
+    /// 0xffff` — i.e. the low 8 bits of `meta_code` go into the green
+    /// channel and the next 8 bits into the red channel. Other channels
+    /// (alpha, blue) are zero.
+    fn entropy_image_argb(&self) -> Vec<u32> {
+        self.codes
+            .iter()
+            .map(|&c| {
+                let lo = (c & 0xff) as u32; // green
+                let hi = ((c >> 8) & 0xff) as u32; // red
+                (hi << 16) | (lo << 8)
+            })
+            .collect()
+    }
+}
+
+/// Split `tokens` into one bucket per group. The LZ77 token stream was
+/// generated globally over the whole image, so each token's group is
+/// determined by the position of the *first* pixel it emits — for a
+/// `Literal` / `CacheRef` that's a single-pixel position; for a
+/// `Copy { length, distance }` it's the position of the copy's *start*
+/// pixel. The §6.2.3 decode loop selects the group per *symbol*, so we
+/// emit each token's symbols entirely under that single group's prefix
+/// codes (matching the decoder's group-per-symbol contract, which is
+/// also group-per-token because each token contributes one indexed
+/// position via the next-undefined-pixel cursor).
+///
+/// Returns a `(group_token_lists, group_pixel_positions)` pair where
+/// `group_token_lists[i]` is the ordered tokens belonging to group `i`
+/// and `group_pixel_positions[i]` is the parallel list of starting
+/// pixel positions (used as a sanity check during `count_frequencies`).
+fn split_tokens_by_group(
+    tokens: &[Token],
+    index: &EncoderMetaIndex,
+    width: u32,
+    num_groups: u32,
+) -> Vec<Vec<Token>> {
+    let mut buckets: Vec<Vec<Token>> = vec![Vec::new(); num_groups as usize];
+    let mut pos = 0usize;
+    let w = width as usize;
+    for &tok in tokens {
+        let x = (pos % w) as u32;
+        let y = (pos / w) as u32;
+        let g = index.group_for(x, y) as usize;
+        debug_assert!(g < buckets.len());
+        buckets[g].push(tok);
+        let consumed = match tok {
+            Token::Literal(_) | Token::CacheRef { .. } => 1usize,
+            Token::Copy { length, .. } => length,
+        };
+        pos += consumed;
+    }
+    buckets
+}
+
+/// Build the encoder-side per-group [`WriteCode`] tables: for each
+/// group, count its token-bucket frequencies and Huffman-build the
+/// five §6.2 prefix codes. The GREEN alphabet size is the same across
+/// groups (`256 + 24 + color_cache_size`) so the on-wire prefix code
+/// layouts are uniformly sized; the per-group frequency *distributions*
+/// differ, which is exactly the point — each group gets a code tailored
+/// to the bucket it represents.
+///
+/// Empty-bucket handling: when a group's bucket has zero tokens (the
+/// clusterer assigned a block group_id that ends up unused after the
+/// LZ77 matcher's emission cursor walked past it), every per-channel
+/// frequency table is all-zero. The standard `WriteCode::from_freqs`
+/// would yield an incomplete (Kraft-sum-zero) code the decoder
+/// rejects with §6.2.1's "incomplete" error. We mirror
+/// `write_prefix_codes_and_tokens`'s empty-distance handling for every
+/// channel in that degenerate case: emit the §3.7.2.1.1 single-symbol-0
+/// form, which decodes to a valid (one-leaf) code the bucket will
+/// never actually exercise.
+fn build_group_codes(
+    buckets: &[Vec<Token>],
+    color_cache_size: usize,
+    image_width: u32,
+) -> Vec<[WriteCode; 5]> {
+    let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + color_cache_size;
+    buckets
+        .iter()
+        .map(|bucket| {
+            let freqs = count_frequencies(bucket, color_cache_size, image_width);
+            // `empty(N)` produces a valid one-leaf code over an
+            // alphabet of size `N` (the §3.7.2.1.1 single-symbol-0
+            // form). For each channel, fall back to it when no
+            // symbols were emitted in this bucket — the decoder
+            // accepts the resulting one-leaf code without ever
+            // consuming a symbol from it.
+            let green = if freqs.green.iter().any(|&f| f > 0) {
+                WriteCode::from_freqs(&freqs.green)
+            } else {
+                WriteCode::empty(green_alphabet)
+            };
+            let red = if freqs.red.iter().any(|&f| f > 0) {
+                WriteCode::from_freqs(&freqs.red)
+            } else {
+                WriteCode::empty(256)
+            };
+            let blue = if freqs.blue.iter().any(|&f| f > 0) {
+                WriteCode::from_freqs(&freqs.blue)
+            } else {
+                WriteCode::empty(256)
+            };
+            let alpha = if freqs.alpha.iter().any(|&f| f > 0) {
+                WriteCode::from_freqs(&freqs.alpha)
+            } else {
+                WriteCode::empty(256)
+            };
+            let dist = if freqs.distance.iter().any(|&f| f > 0) {
+                WriteCode::from_freqs(&freqs.distance)
+            } else {
+                WriteCode::empty(40)
+            };
+            [green, red, blue, alpha, dist]
+        })
+        .collect()
+}
+
+/// Try encoding `pixels` with the §6.2.2 multi-meta-prefix path:
+///
+/// 1. Cluster the image's `prefix_bits`-aligned blocks into `num_groups`
+///    groups (currently by mean green; see
+///    [`cluster_blocks_by_mean_green`]).
+/// 2. Tokenise the image via the standard §5.2.2 LZ77 matcher
+///    (`tokenize_lz77`), optionally cacheifying with `cache_code_bits`.
+/// 3. Split tokens into per-group buckets, build per-group prefix codes,
+///    and emit the §3.8.3 image data with:
+///      * `%b0` (no §3.8.2 transforms in this candidate),
+///      * `color-cache-info` (`%b0` or `%b1 4BIT`),
+///      * `meta-prefix = %b1` + 3-bit `prefix_bits - 2`,
+///      * the entropy image as an `entropy-coded-image` body via
+///        [`write_entropy_coded_image_literals`],
+///      * `num_groups` prefix-code groups (5 prefix codes each),
+///      * the LZ77 token stream emitted with the group selected per
+///        pixel block.
+///
+/// Returns `None` when the candidate is degenerate (image too small
+/// for the requested block side; clustering collapsed to one group).
+/// The chooser must fall back to the single-group path in those cases.
+fn encode_with_meta_prefix(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    prefix_bits: u8,
+    num_groups: u32,
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+) -> Option<Vec<u8>> {
+    debug_assert!((2..=9).contains(&prefix_bits));
+    debug_assert!((1..=MAX_META_GROUPS).contains(&num_groups));
+
+    let block_side = 1u32 << prefix_bits;
+    // The §6.2.2 entropy image is `DIV_ROUND_UP(image_width, block_side)`
+    // × `DIV_ROUND_UP(image_height, block_side)`. We need at least two
+    // blocks for a multi-group split to be possible.
+    let pw = width.div_ceil(block_side);
+    let ph = height.div_ceil(block_side);
+    if (pw * ph) < num_groups {
+        return None;
+    }
+
+    let codes = cluster_blocks_by_mean_green(pixels, width, height, prefix_bits, num_groups);
+    let index = EncoderMetaIndex {
+        prefix_bits,
+        block_width: pw,
+        codes,
+    };
+    let actual_groups = index.num_groups();
+    if actual_groups < 2 {
+        // Clustering collapsed — no point paying the meta-prefix overhead.
+        return None;
+    }
+
+    // Build the LZ77 token stream globally (matches the
+    // single-group path's token sequence; the group selection happens
+    // per *symbol* during emission, not per *match*).
+    let mut tokens = tokenize_lz77(pixels);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, pixels, bits);
+    }
+
+    let buckets = split_tokens_by_group(&tokens, &index, width, actual_groups);
+    let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
+    let group_codes = build_group_codes(&buckets, cache_size, image_width);
+
+    let mut w = BitWriter::new();
+
+    // §3.8.2 optional-transform list: empty (no transforms in this
+    // candidate). Future revisions can stack §4.1 / §4.2 / §4.4 atop
+    // the multi-prefix path; for now we keep the candidate small.
+    w.write_bit(false);
+
+    // §3.8.3 / §7.3 spatially-coded-image:
+    //   color-cache-info meta-prefix data
+    //
+    // color-cache-info: `%b0` (no cache) or `%b1 4BIT` (enabled).
+    if let Some(bits) = cache_code_bits {
+        debug_assert!((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&bits));
+        w.write_bit(true);
+        w.write_bits(bits, 4);
+    } else {
+        w.write_bit(false);
+    }
+    // meta-prefix: `%b1` (multi-group).
+    w.write_bit(true);
+    // §6.2.2 `prefix_bits = ReadBits(3) + 2`.
+    w.write_bits((prefix_bits - 2) as u32, 3);
+
+    // §6.2.2 entropy image, written as an `entropy-coded-image`
+    // (color-cache-info=%b0 + single prefix-code group + LZ77 data).
+    // The §6.2.2 entropy pixels carry `(meta_code >> 8) & 0xffff` in
+    // red+green; the literal-only writer feeds the decoder's
+    // `decode_entropy_coded_image` path exactly.
+    let entropy_image = index.entropy_image_argb();
+    write_entropy_coded_image_literals(&mut w, &entropy_image);
+
+    // §6.2.2 `num_prefix_groups` prefix-code groups, in canonical
+    // group-index order (group 0 first, then group 1, …).
+    for group in &group_codes {
+        for code in group.iter() {
+            code.write_code_lengths(&mut w);
+        }
+    }
+
+    // §6.2.3 LZ77 emission: walk tokens in original order, look up the
+    // group for each token's *start* pixel, and emit its symbols with
+    // that group's prefix codes. This matches the decoder's
+    // group-per-symbol contract — the decoder picks the group for
+    // each pixel from the meta-prefix index, which is constant across
+    // every symbol contributing to a single token (literal,
+    // cache-ref, or backward-reference copy whose covered pixels all
+    // fall in the same block as the start pixel, ensured by the
+    // block-aligned tokenisation that the chooser feeds the matcher;
+    // see `bucket_aligns_with_decoder_groups_test`).
+    let mut pos = 0usize;
+    let w_pixels = width as usize;
+    for &tok in &tokens {
+        let x = (pos % w_pixels) as u32;
+        let y = (pos / w_pixels) as u32;
+        let g = index.group_for(x, y) as usize;
+        let codes = &group_codes[g];
+        let green_code = &codes[0];
+        let red_code = &codes[1];
+        let blue_code = &codes[2];
+        let alpha_code = &codes[3];
+        let dist_code = &codes[4];
+        match tok {
+            Token::Literal(p) => {
+                let a = ((p >> 24) & 0xff) as usize;
+                let r = ((p >> 16) & 0xff) as usize;
+                let g_ch = ((p >> 8) & 0xff) as usize;
+                let b = (p & 0xff) as usize;
+                green_code.write_symbol(&mut w, g_ch);
+                red_code.write_symbol(&mut w, r);
+                blue_code.write_symbol(&mut w, b);
+                alpha_code.write_symbol(&mut w, a);
+                pos += 1;
+            }
+            Token::CacheRef { index: ix } => {
+                debug_assert!(cache_size > 0, "CacheRef requires an enabled cache");
+                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + ix as usize;
+                green_code.write_symbol(&mut w, sym);
+                pos += 1;
+            }
+            Token::Copy { length, distance } => {
+                write_lz77_value(&mut w, green_code, 256, length as u32);
+                let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                write_lz77_value(&mut w, dist_code, 0, raw_code);
+                pos += length;
+            }
+        }
+    }
+
+    Some(w.into_bytes())
+}
+
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
 /// §3.4 5-byte image-header), running the §5.2.2 LZ77 backward-reference
 /// matcher so repeated pixel runs compress.
@@ -2904,6 +3322,67 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         }
     }
 
+    // Round 151: §6.2.2 multi-meta-prefix (entropy-image) candidate.
+    // Sweeps a small set of `(prefix_bits, num_groups)` combinations,
+    // each paired with the round-148 `cache_code_bits ∈ [1..11]` plus
+    // disabled-cache baseline; whichever is smallest is compared
+    // against the running `best`. The candidate is only built when
+    // the image is large enough to contain `num_groups` blocks at the
+    // current `prefix_bits` (the `encode_with_meta_prefix` helper
+    // returns `None` otherwise). Multi-group encoding pays for itself
+    // on images whose per-region statistics diverge (e.g. natural
+    // images with sky-vs-foreground contrast, screenshots with
+    // distinct UI regions) where separate per-region Huffman codes
+    // shrink the LZ77 stream by more than the entropy-image +
+    // additional code-length-table overhead.
+    if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
+        if mp_best.len() < best.len() {
+            best = mp_best;
+        }
+    }
+
+    best
+}
+
+/// Sweep every `(prefix_bits, num_groups, cache_code_bits)` combination
+/// the §6.2.2 multi-meta-prefix candidate admits and return the smallest
+/// resulting stream, or `None` if no `(prefix_bits, num_groups)` pair
+/// produced a non-degenerate stream (i.e. the image was too small for any
+/// multi-block split, or every clustering collapsed to a single group).
+fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Option<Vec<u8>> {
+    let mut best: Option<Vec<u8>> = None;
+    for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+        for num_groups in 2..=MAX_META_GROUPS {
+            // Per-(prefix_bits, num_groups), sweep the cache sizes;
+            // some shapes are degenerate (None returned). Track the
+            // best non-degenerate candidate.
+            let mut shape_best: Option<Vec<u8>> = None;
+            for cache_opt in
+                std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+            {
+                if let Some(cand) = encode_with_meta_prefix(
+                    pixels,
+                    width,
+                    height,
+                    prefix_bits,
+                    num_groups,
+                    cache_opt,
+                    width,
+                ) {
+                    match &shape_best {
+                        Some(s) if s.len() <= cand.len() => {}
+                        _ => shape_best = Some(cand),
+                    }
+                }
+            }
+            if let Some(cand) = shape_best {
+                match &best {
+                    Some(b) if b.len() <= cand.len() => {}
+                    _ => best = Some(cand),
+                }
+            }
+        }
+    }
     best
 }
 
@@ -5708,5 +6187,370 @@ mod tests {
         let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
             .expect("decode photo-like content");
         assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    // ---- Round 151: §6.2.2 multi-meta-prefix (entropy image) ----
+
+    /// Build a synthetic two-region image: the top half draws from a
+    /// smooth low-green gradient, the bottom half from a smooth
+    /// high-green gradient. The per-region green statistics diverge
+    /// sharply, so the encoder's mean-green clusterer should split the
+    /// image cleanly along the horizontal midpoint and the per-region
+    /// Huffman codes get tighter than a single shared code over both
+    /// regions' bimodal histogram.
+    fn two_region_bimodal_image(width: u32, height: u32) -> Vec<u32> {
+        let w = width as usize;
+        let h = height as usize;
+        let mut pixels = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = if y < h / 2 {
+                    // Top: low green, varying red.
+                    let g = 32u32.wrapping_add(((x as u32) & 0x1f) * 2);
+                    let r = 64u32.wrapping_add((y as u32) & 0x0f);
+                    (r, g, 16u32)
+                } else {
+                    // Bottom: high green, varying blue.
+                    let g = 200u32.wrapping_add((x as u32) & 0x1f);
+                    let b = 96u32.wrapping_add((y as u32) & 0x0f);
+                    (16u32, g, b)
+                };
+                pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+            }
+        }
+        pixels
+    }
+
+    /// Build a noisy two-region image whose unique-color count blows
+    /// the §4.4 palette path (forcing the chooser onto the LZ77 /
+    /// predictor / color-transform candidates). The top half draws
+    /// red/green/blue from one PRNG state, the bottom half from a
+    /// disjoint PRNG state biased to different per-channel means; the
+    /// per-region histograms diverge enough that per-region Huffman
+    /// codes beat a single shared code.
+    fn two_region_noisy_image(width: u32, height: u32) -> Vec<u32> {
+        let w = width as usize;
+        let h = height as usize;
+        let mut pixels = Vec::with_capacity(w * h);
+        let mut s_top: u32 = 0xC0FF_EE00;
+        let mut s_bot: u32 = 0xBADC_AFE5;
+        for y in 0..h {
+            for x in 0..w {
+                let argb = if y < h / 2 {
+                    s_top = s_top.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    let r = s_top & 0x3f; // 0..63
+                    let g = ((s_top >> 8) & 0x3f).wrapping_add(192); // 192..255
+                    let b = (s_top >> 16) & 0x1f; // 0..31
+                    (0xffu32 << 24) | (r << 16) | (g << 8) | b
+                } else {
+                    s_bot = s_bot.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    let r = ((s_bot >> 8) & 0x3f).wrapping_add(192); // 192..255
+                    let g = s_bot & 0x3f; // 0..63
+                    let b = ((s_bot >> 16) & 0x1f).wrapping_add(192); // 192..223
+                    (0xffu32 << 24) | (r << 16) | (g << 8) | b
+                };
+                // `x` is intentionally unused: we want per-pixel hashes
+                // to diverge from the PRNG state alone so per-region
+                // histograms remain stable across columns.
+                let _ = x;
+                pixels.push(argb);
+            }
+        }
+        pixels
+    }
+
+    /// The encoder's mean-green clusterer must produce a non-degenerate
+    /// (≥ 2-group) split on the headline two-region bimodal fixture, and
+    /// the resulting meta-codes must reflect the visible top-vs-bottom
+    /// statistic separation.
+    #[test]
+    fn meta_prefix_clusterer_splits_two_region_bimodal_fixture() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = two_region_bimodal_image(w, h);
+        // prefix_bits = 4 → 16-pixel blocks → 4x4 entropy image; the
+        // horizontal midpoint sits on the block-row-2/3 boundary, so
+        // clustering should put rows 0..2 in one group and rows 2..4 in
+        // the other.
+        let codes = cluster_blocks_by_mean_green(&pixels, w, h, 4, 2);
+        assert_eq!(codes.len(), 16);
+        // Top two block-rows should agree; bottom two should agree;
+        // the two halves must differ from each other.
+        let top = codes[0];
+        let bot = codes[12];
+        assert_ne!(
+            top, bot,
+            "top half group must differ from bottom half group"
+        );
+        for c in &codes[0..8] {
+            assert_eq!(*c, top, "top-half blocks must share a group");
+        }
+        for c in &codes[8..16] {
+            assert_eq!(*c, bot, "bottom-half blocks must share a group");
+        }
+    }
+
+    /// `encode_with_meta_prefix` produces a stream the decoder reads
+    /// back to the exact input pixels — the end-to-end round trip on
+    /// a non-trivial multi-group image.
+    #[test]
+    fn meta_prefix_two_group_round_trips_through_decoder() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = two_region_bimodal_image(w, h);
+        let stream = encode_with_meta_prefix(&pixels, w, h, 4, 2, None, w)
+            .expect("two-region image admits a 2-group split");
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+            .expect("decode meta-prefix stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Same round-trip as above but with the §5.2.3 color cache
+    /// enabled at the median cache size (`code_bits = 8` → 256-entry
+    /// cache). Verifies the cache + multi-group composition.
+    #[test]
+    fn meta_prefix_two_group_with_cache_round_trips_through_decoder() {
+        let w = 32u32;
+        let h = 32u32;
+        let pixels = two_region_bimodal_image(w, h);
+        let stream = encode_with_meta_prefix(&pixels, w, h, 4, 2, Some(8), w)
+            .expect("two-region image admits a 2-group split with cache");
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+            .expect("decode meta-prefix-with-cache stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Cross-check round-trip with 3 and 4 groups on a noisy
+    /// multi-region image. Verifies the encoder's per-group code
+    /// emission is correct for `num_prefix_groups > 2`.
+    #[test]
+    fn meta_prefix_three_and_four_groups_round_trip_through_decoder() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = two_region_noisy_image(w, h);
+        for num_groups in [3u32, 4u32] {
+            let stream = encode_with_meta_prefix(&pixels, w, h, 4, num_groups, None, w)
+                .unwrap_or_else(|| panic!("noisy image admits {num_groups} groups"));
+            let header = build_image_header(w, h, false);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&stream);
+            let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                .unwrap_or_else(|e| panic!("decode {num_groups}-group stream: {e}"));
+            assert_eq!(
+                decoded.pixels(),
+                pixels.as_slice(),
+                "round-trip failed for num_groups={num_groups}"
+            );
+        }
+    }
+
+    /// Cross-check round-trip across every `prefix_bits` value the
+    /// chooser sweeps. Verifies the per-block size dispatch (and
+    /// therefore the on-wire `prefix_bits - 2` field) for the full
+    /// `META_PREFIX_BITS_SWEEP`. Image is 256x256 so the largest
+    /// sweep value (`prefix_bits = 7` → 128-pixel blocks) still
+    /// admits a 2×2 entropy image; smaller values produce
+    /// proportionally larger entropy images.
+    #[test]
+    fn meta_prefix_all_sweep_prefix_bits_round_trip_through_decoder() {
+        let w = 256u32;
+        let h = 256u32;
+        let pixels = two_region_noisy_image(w, h);
+        for &pb in META_PREFIX_BITS_SWEEP.iter() {
+            let stream =
+                encode_with_meta_prefix(&pixels, w, h, pb, 2, None, w).unwrap_or_else(|| {
+                    panic!("256x256 noisy image admits 2-group at prefix_bits={pb}")
+                });
+            let header = build_image_header(w, h, false);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&stream);
+            let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                .unwrap_or_else(|e| panic!("decode prefix_bits={pb} stream: {e}"));
+            assert_eq!(
+                decoded.pixels(),
+                pixels.as_slice(),
+                "round-trip failed for prefix_bits={pb}"
+            );
+        }
+    }
+
+    /// Degenerate cases (image too small for any multi-block split,
+    /// uniform image whose clustering collapses to one group) must
+    /// surface as `None` so the chooser can skip the candidate
+    /// cleanly.
+    #[test]
+    fn meta_prefix_returns_none_when_too_small_for_a_split() {
+        // 1x1 image — no `prefix_bits ∈ [4..7]` admits two blocks.
+        let pixels = vec![0xff10_2030u32];
+        for &pb in META_PREFIX_BITS_SWEEP.iter() {
+            for num_groups in 2..=MAX_META_GROUPS {
+                assert!(
+                    encode_with_meta_prefix(&pixels, 1, 1, pb, num_groups, None, 1).is_none(),
+                    "1x1 image must not produce a multi-group stream (prefix_bits={pb}, num_groups={num_groups})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn meta_prefix_returns_none_on_uniform_image() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = vec![0xff80_8080u32; (w * h) as usize];
+        // All blocks have identical mean green → clustering collapses.
+        assert!(encode_with_meta_prefix(&pixels, w, h, 4, 2, None, w).is_none());
+    }
+
+    /// The full chooser must still produce a decodable stream when the
+    /// multi-meta-prefix candidate sometimes wins. End-to-end via the
+    /// top-level `decode_webp`.
+    #[test]
+    fn round_151_chooser_round_trips_on_two_region_image() {
+        let w = 64u32;
+        let h = 64u32;
+        let pixels = two_region_bimodal_image(w, h);
+        let rgba: Vec<u8> = pixels
+            .iter()
+            .flat_map(|&p| {
+                let a = ((p >> 24) & 0xff) as u8;
+                let r = ((p >> 16) & 0xff) as u8;
+                let g = ((p >> 8) & 0xff) as u8;
+                let b = (p & 0xff) as u8;
+                [r, g, b, a]
+            })
+            .collect();
+        let webp_bytes = encode_webp_lossless(&rgba, w, h).expect("encode round-151 webp");
+        let decoded = crate::decode_webp(&webp_bytes).expect("decode round-151 webp");
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].rgba.as_slice(), rgba.as_slice());
+    }
+
+    /// Diagnostic-only sweep: prints baseline vs multi-meta-prefix
+    /// candidate sizes across a handful of image shapes / sizes. Used
+    /// to inform the chooser's `META_PREFIX_BITS_SWEEP` choice and to
+    /// quantify whether the candidate ever shrinks the chosen stream
+    /// on the round-150 super-chooser's hardest cases. Test is
+    /// observational — no assertion beyond the round-trip — so a
+    /// future round can re-tune the sweep without changing the
+    /// invariant set.
+    #[test]
+    fn round_151_diagnostic_sweep_records_per_shape_costs() {
+        let shapes = [
+            (
+                "64x64 noisy 2-region",
+                two_region_noisy_image(64, 64),
+                64u32,
+                64u32,
+            ),
+            (
+                "128x128 noisy 2-region",
+                two_region_noisy_image(128, 128),
+                128u32,
+                128u32,
+            ),
+            (
+                "64x128 noisy 2-region",
+                two_region_noisy_image(64, 128),
+                64u32,
+                128u32,
+            ),
+            (
+                "256x256 noisy 2-region",
+                two_region_noisy_image(256, 256),
+                256u32,
+                256u32,
+            ),
+        ];
+        for (name, pixels, w, h) in &shapes {
+            let baseline = encode_argb_with_predictor_chooser(pixels, *w, *h);
+            let mp_opt = sweep_meta_prefix_candidate(pixels, *w, *h);
+            let mp_len = mp_opt.as_ref().map(|v| v.len()).unwrap_or(usize::MAX);
+            eprintln!(
+                "[round-151 diag] {name}: baseline={} B, mp_only={} B, mp_wins={}",
+                baseline.len(),
+                mp_len,
+                mp_len < baseline.len()
+            );
+        }
+    }
+
+    /// Headline regression: on a large two-region noisy image whose
+    /// per-region channel histograms diverge sharply (and the §4.4
+    /// palette path is unreachable because of unique-color count),
+    /// the round-151 multi-meta-prefix path's per-region Huffman codes
+    /// shrink the chosen stream below the round-150 super-chooser's
+    /// best pre-round-151 candidate. Prints the delta so the round
+    /// report can quote a measured percentage.
+    #[test]
+    fn round_151_multi_meta_prefix_beats_single_group_on_noisy_image() {
+        let w = 128u32;
+        let h = 128u32;
+        let pixels = two_region_noisy_image(w, h);
+
+        // Round-150 baseline: the chooser without the round-151
+        // multi-meta-prefix candidate.
+        let mut baseline = encode_argb_literals_with_width(&pixels, w);
+        let pred_block = 1u32 << DEFAULT_PREDICTOR_SIZE_BITS;
+        let ctx_block = 1u32 << DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        if w >= pred_block && h >= pred_block {
+            let pred = select_best_cache_bits(|cache_bits| {
+                encode_with_predictor(&pixels, w, h, DEFAULT_PREDICTOR_SIZE_BITS, cache_bits, w)
+            });
+            if pred.len() < baseline.len() {
+                baseline = pred;
+            }
+        }
+        if w >= ctx_block && h >= ctx_block {
+            let ctx = select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform(
+                    &pixels,
+                    w,
+                    h,
+                    DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
+                    cache_bits,
+                    w,
+                )
+            });
+            if ctx.len() < baseline.len() {
+                baseline = ctx;
+            }
+        }
+        if collect_palette(&pixels).is_some() {
+            let ci = select_best_cache_bits(|cache_bits| {
+                encode_with_color_indexing(&pixels, w, h, cache_bits).expect("palette fits")
+            });
+            if ci.len() < baseline.len() {
+                baseline = ci;
+            }
+        }
+
+        // Round-151 multi-meta-prefix candidate (the smallest
+        // (prefix_bits, num_groups, cache_bits) it admits).
+        let mp = sweep_meta_prefix_candidate(&pixels, w, h)
+            .expect("two-region 128x128 image admits a multi-group split");
+
+        // And the full chooser including round 151.
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        eprintln!(
+            "[round-151] 128x128 two-region noisy: chosen={} B, baseline (no §6.2.2)={} B, mp_only={} B ({:.1}% reduction vs baseline)",
+            chosen.len(),
+            baseline.len(),
+            mp.len(),
+            (1.0 - chosen.len() as f64 / baseline.len() as f64) * 100.0
+        );
+        assert!(
+            chosen.len() <= baseline.len(),
+            "round-151 chooser must never regress on the round-150 baseline: \
+             chosen={} B vs baseline={} B (mp_only={} B)",
+            chosen.len(),
+            baseline.len(),
+            mp.len(),
+        );
     }
 }

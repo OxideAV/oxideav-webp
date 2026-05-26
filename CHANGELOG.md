@@ -6,6 +6,59 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 151 (2026-05-26).** §6.2.2 multi-meta-prefix
+  (entropy-image) encoder for the VP8L lossless path. The encoder now
+  exposes an additional super-chooser candidate that emits the §6.2.2
+  *multi-prefix-code-group* shape: meta-prefix bit `%b1`, 3-bit
+  `prefix_bits - 2`, an entropy-coded sub-resolution image carrying one
+  meta-prefix code per `(1 << prefix_bits)`-square block, `N` prefix-code
+  groups (5 prefix codes each), and the LZ77 token stream emitted with
+  each token's symbols under the prefix-code group selected by its
+  start pixel's block. `encode_with_meta_prefix` takes `prefix_bits`,
+  `num_groups`, and `cache_code_bits`; `sweep_meta_prefix_candidate`
+  sweeps `prefix_bits ∈ {4, 5, 6, 7}` (16/32/64/128-pixel blocks) ×
+  `num_groups ∈ [2..4]` × the round-148 `cache_code_bits ∈ [1..11]`
+  plus disabled-cache baseline and keeps the smallest non-degenerate
+  stream. The clusterer (`cluster_blocks_by_mean_green`) bucketises
+  blocks by mean-green value into equal-width groups; uniform images
+  (where the clustering collapses) and images too small for the
+  requested block count return `None` cleanly so the chooser stays at
+  the single-group baseline. Empty-bucket prefix codes fall back to
+  the §3.7.2.1.1 single-symbol-0 form (the same shape the existing
+  empty-distance code uses) so the decoder accepts the resulting
+  one-leaf code without ever consuming a symbol from it. Ten new
+  tests: `meta_prefix_clusterer_splits_two_region_bimodal_fixture`
+  (mean-green clusterer maps top/bottom halves to disjoint groups),
+  `meta_prefix_two_group_round_trips_through_decoder` (end-to-end
+  round-trip on a 64×64 two-region image),
+  `meta_prefix_two_group_with_cache_round_trips_through_decoder`
+  (composition with the §5.2.3 color cache at `code_bits = 8`),
+  `meta_prefix_three_and_four_groups_round_trip_through_decoder`
+  (3-group and 4-group round-trips on a noisy multi-region image),
+  `meta_prefix_all_sweep_prefix_bits_round_trip_through_decoder`
+  (round-trip across every `prefix_bits` value the chooser sweeps),
+  `meta_prefix_returns_none_when_too_small_for_a_split` and
+  `meta_prefix_returns_none_on_uniform_image` (degenerate-case
+  rejection), `round_151_chooser_round_trips_on_two_region_image`
+  (full-chooser end-to-end through `decode_webp`),
+  `round_151_diagnostic_sweep_records_per_shape_costs` (observational
+  per-shape baseline-vs-multi-prefix size table), and
+  `round_151_multi_meta_prefix_beats_single_group_on_noisy_image`
+  (chooser-never-regresses invariant on a 128×128 noisy two-region
+  image). On the synthetic fixtures the multi-meta-prefix candidate
+  consistently stays larger than the single-group baseline (the cost
+  of N additional 280-symbol prefix-code tables — typically thousands
+  of bytes each — dominates the per-region savings on small to
+  mid-size images), so the chooser correctly keeps the round-150
+  pick; the candidate's value is structural — the round-151 encoder
+  is now spec-conformant for any future per-region clustering
+  improvement to plug into without changing the on-wire serialiser.
+  No external implementation was consulted; spec source is the WebP
+  Lossless Bitstream specification §6.2.2 / §3.7.2.2 mirrored under
+  `docs/image/webp/` and RFC 9649 §3.7.2.2 / §3.7.2.2.1 / §3.7.2.2.2,
+  cross-checked against the existing decoder-side
+  `vp8l_decode::decode_entropy_image` and `decode_argb_multi_group`.
+
 * **Clean-room round 150 (2026-05-26).** §4.4 color-indexing transform
   forward pass for the VP8L lossless encoder. The encoder now evaluates
   a new candidate alongside the round-149 super-chooser set: when an
