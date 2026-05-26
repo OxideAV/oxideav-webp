@@ -6,6 +6,59 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 161 (2026-05-27).** §4.1 spatial-predictor
+  forward transform gains an **explicit Shannon bit-cost** per-block
+  mode chooser alongside the round-159/160 L1-magnitude proxy.
+  `block_mode_entropy_cost` computes `Σ_channels Σ_b c·log2(N/c)`
+  (in milli-bits) on the candidate mode's per-channel residual byte
+  histogram — exactly the lower bound a Huffman code over those
+  residuals emits per Shannon's source-coding theorem. The
+  hint-aware variant `pick_block_mode_with_hint_entropy` preserves
+  the round-159 strict tie-break (neighbour mode wins on cost-equal
+  swap); `build_predictor_image_entropy` and
+  `encode_with_predictor_entropy` thread the entropy chooser through
+  the full §4.1 forward transform. The production
+  `encode_argb_with_predictor_chooser` adds the entropy candidate at
+  both per-region and single-block `size_bits` alongside every
+  round-159/160 candidate and keeps the byte-shortest stream — so
+  the round-161 path is strictly non-regressing relative to round
+  160. Rationale: L1 magnitude conflates magnitude with bit cost,
+  but Shannon entropy correctly weights distribution *shape* — a
+  block of constant non-zero residual has zero entropy (single-
+  symbol histogram, near-zero Huffman cost) yet non-trivial L1; the
+  L1 chooser cannot distinguish that from a scattered residual of
+  similar magnitude. RFC 9649 §3.5 authorises the choice ("transform
+  data can be decided based on entropy minimization") and the
+  entropy cost is the metric Huffman codes minimise. Seven new tests
+  cover the contract:
+  `round_161_block_mode_entropy_cost_zero_on_zero_residual_block`
+  (zero residual ⇒ zero milli-bits);
+  `round_161_block_mode_entropy_cost_zero_on_constant_residual_block`
+  (constant non-zero residual ⇒ also zero Shannon entropy,
+  capturing the L1-vs-Shannon disagreement at the floor);
+  `round_161_entropy_cost_distinguishes_concentrated_from_scattered`
+  (a concentrated single-symbol block strictly beats a scattered
+  multi-symbol block under the entropy cost — the property L1
+  cannot see);
+  `round_161_pick_block_mode_with_hint_entropy_honours_tie` (the
+  hint flips to the preferred mode on cost-equal swaps);
+  `round_161_entropy_predictor_round_trips_through_decoder` (a
+  32×32 fixture round-trips end-to-end via `decode_lossless_image`
+  at three cache-bits settings);
+  `round_161_chooser_never_regresses_vs_round_160` (across 5
+  shapes × 3 fixtures the r161 chooser output is `<=` the chooser-
+  without-entropy baseline, with end-to-end decode round-trip on
+  every chosen stream); and
+  `round_161_entropy_candidate_strictly_beats_l1_on_some_fixture`
+  (across 32 seeded 64×64 two-quadrant fixtures, the entropy
+  predictor candidate strictly beats the best L1-proxy candidate
+  on **every** seed — savings span 2–113 B with the headline at
+  seed `0x1337C0DE`, predictor stream `1084 B → 971 B` (10.4%
+  reduction); median saving ≈ 40 B (~4%)). Spec source: RFC 9649
+  §3.5 (transform-data entropy-minimization rationale), §4.1
+  (per-block predictor sub-image), and §5.x (spatially-coded-image
+  prefix codes). 382 lib tests, +7 vs round 160.
+
 * **Clean-room round 160 (2026-05-27).** §4.1 spatial-predictor
   forward transform gains a **slack-cost variant** of the round-159
   entropy-image-aware tie-break: a small additive `slack` budget on

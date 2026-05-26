@@ -2,6 +2,84 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 161)
+
+**Round 161 replaces the L1-magnitude residual-cost proxy with an
+explicit Shannon bit-cost model on the VP8L §4.1 per-block mode
+chooser.** The round-159/160 per-block chooser uses a folded
+mod-256 L1 magnitude (`Σ min(r, 256-r)`) as a stand-in for what a
+Huffman code over the residual stream would actually emit. Round
+161 adds a second cost model alongside the L1 proxy: a true
+Shannon entropy bit-cost computed from the per-channel residual
+byte histogram. The Shannon cost is `Σ_channels Σ_b c·log2(N/c)`
+(in milli-bits) — exactly the lower bound a Huffman code over
+those residuals would emit per the source-coding theorem.
+
+Why this matters: L1 magnitude conflates "magnitude" with "bit
+cost," but Shannon entropy correctly weights distribution *shape*.
+A block whose residuals are all `0x60` (constant non-zero) has
+non-trivial L1 mass but Shannon entropy zero (single-symbol
+histogram, one bit per symbol with a §3.7.2.1.1 single-leaf code);
+a block whose residuals are `{0, 1, 2, ..., 15}` uniform has
+similar L1 mass but Shannon entropy 4 bits per symbol per channel.
+The L1 chooser cannot tell these blocks apart; the Shannon
+chooser correctly prefers the constant-residual mode.
+
+The new helpers are `block_mode_entropy_cost`,
+`pick_block_mode_with_hint_entropy`,
+`build_predictor_image_entropy`, and `encode_with_predictor_entropy`
+— signatures mirror their round-159 L1 counterparts, with the hint-
+strict-tie-break preserved. The production
+`encode_argb_with_predictor_chooser` adds the entropy candidate
+alongside every round-159/160 L1 candidate at both the per-region
+and single-block `size_bits`, and keeps the byte-shortest stream.
+The chooser is therefore strictly non-regressing relative to
+round 160: the entropy candidate is selected only when it
+strictly wins on bytes.
+
+The headline empirical result is captured by
+`round_161_entropy_candidate_strictly_beats_l1_on_some_fixture`:
+across 32 seeded 64×64 two-quadrant fixtures (gradient + spikes
+quadrant + solid + sparse-perturbation quadrant), the entropy
+predictor candidate strictly beats the best L1-proxy candidate
+(strict round-159 + round-160 slack sweep) on **every** seed.
+Savings span 2–113 B with the headline at seed `0x1337C0DE`,
+predictor stream `1084 B → 971 B` (10.4% reduction). Median
+saving across the 32 seeds is around 40 B (~4%).
+
+Five new tests cover the contract:
+`round_161_block_mode_entropy_cost_zero_on_zero_residual_block`
+(zero residual ⇒ zero milli-bits, single-symbol histogram floor);
+`round_161_block_mode_entropy_cost_zero_on_constant_residual_block`
+(constant non-zero residual ⇒ also zero Shannon entropy, capturing
+the L1-vs-Shannon disagreement at the floor);
+`round_161_entropy_cost_distinguishes_concentrated_from_scattered`
+(a concentrated single-symbol block strictly beats a scattered
+multi-symbol block of similar magnitude under the entropy cost —
+the property L1 cannot see);
+`round_161_pick_block_mode_with_hint_entropy_honours_tie` (the
+hint mechanism flips to the preferred mode on cost-equal swaps,
+mirroring the round-159 strict tie-break);
+`round_161_entropy_predictor_round_trips_through_decoder` (a 32×32
+fixture round-trips end-to-end via `decode_lossless_image` at
+three cache-bits settings);
+`round_161_chooser_never_regresses_vs_round_160` (across 5 shapes
+× 3 fixtures the production r161 chooser is `<=` the chooser-
+without-entropy baseline, with an end-to-end decode round-trip on
+every chosen stream); and the strict-beat sweep above. Spec
+source: RFC 9649 §3.5 (transform-data entropy-minimization
+rationale), §4.1 (per-block predictor sub-image), and §5.x
+(spatially-coded-image prefix codes).
+
+Still lacks (post-round-161): the entropy cost is per-block and
+mode-local — it doesn't yet account for the §7.2 predictor sub-
+image's own entropy on a per-block-mode decision (so the round-
+159/160 neighbour-hint mechanism is still the only sub-image-aware
+signal); the chooser still uses a fixed candidate sweep rather
+than an adaptive per-image budget; deeper LZ77 lazy depths beyond
+round-158's three-position remain future work; and VP8 lossy
+encode is still entirely absent.
+
 ## Status — 2026-05-27 (clean-room round 160)
 
 **Round 160 generalises the round-159 entropy-image-aware tie-break

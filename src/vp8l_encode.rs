@@ -2045,6 +2045,202 @@ fn build_predictor_image_with_slack(
     (img, tw, th)
 }
 
+/// Round 161 *Shannon-entropy bit-cost* per-mode cost function.
+///
+/// Where [`block_mode_cost`] sums the folded L1 magnitude of the
+/// per-pixel residual as a *proxy* for Huffman bit cost, this
+/// function computes the actual lower-bound bit cost a Huffman code
+/// over the residual byte distribution would emit:
+///
+/// 1. Build the per-channel `[u32; 256]` histogram of the block's
+///    mod-256 residuals against the candidate `mode`.
+/// 2. Compute the Shannon entropy `H = -Σ (c/N) · log2(c/N)` over
+///    each channel's histogram (zero-count bins contribute zero).
+/// 3. Sum `N · H` across channels — this is the lower-bound bit
+///    count a per-symbol Huffman code over those residuals would
+///    emit (the encoder's actual prefix coder is within ~1 bit of
+///    this bound per symbol, so the bit-count *ordering* between
+///    modes is faithful even though absolute counts differ by O(1)
+///    per symbol).
+///
+/// The cost is returned as a fixed-point u64 in units of
+/// **milli-bits** (1 bit = 1000 units) so comparisons stay exact
+/// without floats leaking into the chooser's tie-break logic. The
+/// quantisation rounds to the nearest milli-bit which is finer
+/// than any Huffman code's per-symbol cost, so two modes that
+/// would tie in floating-point also tie in the quantised cost.
+///
+/// Walks every in-bounds pixel without an early-out (unlike
+/// [`block_mode_cost`]'s magnitude proxy which can prune): the
+/// per-channel histograms must be complete before the entropy
+/// sum is meaningful.
+#[allow(clippy::too_many_arguments)]
+fn block_mode_entropy_cost(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mode: u8,
+) -> u64 {
+    let mut hist: [[u32; 256]; 4] = [[0u32; 256]; 4];
+    let mut n: u32 = 0;
+    for dy in 0..bh {
+        let y = y0 + dy;
+        if y >= height {
+            break;
+        }
+        for dx in 0..bw {
+            let x = x0 + dx;
+            if x >= width {
+                break;
+            }
+            let pred = predictor_at(pixels, width, x, y, mode);
+            let original = pixels[y * width + x];
+            let residual = predictor_subtract(original, pred);
+            hist[0][((residual >> 24) & 0xff) as usize] += 1;
+            hist[1][((residual >> 16) & 0xff) as usize] += 1;
+            hist[2][((residual >> 8) & 0xff) as usize] += 1;
+            hist[3][(residual & 0xff) as usize] += 1;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return 0;
+    }
+    // Σ_channels Σ_b c·log2(N/c) milli-bits, with c·log2(N/c) =
+    // c·(log2(N) − log2(c)). Float arithmetic is fine here: the
+    // result is rounded to nearest milli-bit before u64 cast, so
+    // bit-for-bit determinism holds across platforms with IEEE-754
+    // ln(). The Shannon expansion picks `log2(N/c)` rather than
+    // `−log2(c/N)` to keep the per-bin operand non-negative (zero
+    // when c = N, growing as c shrinks) which is friendly to the
+    // accumulator.
+    let n_f = n as f64;
+    let log2_n = n_f.log2();
+    let mut milli_bits: f64 = 0.0;
+    for channel_hist in &hist {
+        for &count in channel_hist.iter() {
+            if count == 0 {
+                continue;
+            }
+            let c_f = count as f64;
+            // Per-bin contribution to N·H: c·log2(N/c).
+            milli_bits += c_f * (log2_n - c_f.log2());
+        }
+    }
+    // Scale to milli-bits and round to nearest.
+    (milli_bits * 1000.0 + 0.5) as u64
+}
+
+/// Round 161 *Shannon-entropy bit-cost* variant of
+/// [`pick_block_mode_with_hint`].
+///
+/// Picks the §4.1 mode minimising [`block_mode_entropy_cost`] — a
+/// true Huffman lower-bound bit cost rather than the L1 magnitude
+/// proxy the round-159/160 chooser uses. The entropy bit-cost
+/// correctly distinguishes a "near-zero with two outliers"
+/// residual distribution (low L1, but the outliers force long
+/// Huffman codes for the two distinct outlier values) from a
+/// "spread of small values" distribution (slightly higher L1, but
+/// more concentrated histogram → lower Huffman cost). The L1
+/// proxy treats them as comparable; the entropy cost reflects
+/// what the §5.x prefix-code writer will actually emit.
+///
+/// The hint mechanism mirrors [`pick_block_mode_with_hint`]: when
+/// `prefer_mode = Some(m)` and `m`'s entropy cost equals the
+/// chooser's best, the chooser returns `m` so the predictor sub-
+/// image carries longer runs of identical mode values (§7.2
+/// `entropy-coded-image` shrinks).
+///
+/// This is a strict tie-break: residual values are unchanged on
+/// cost-equal swaps, so decode round-trips are bit-identical
+/// across `prefer_mode` choices. End-to-end the encoder builds
+/// both the L1-proxy and entropy-cost candidates and keeps the
+/// shortest stream, so the entropy candidate cannot regress
+/// against the L1 path — see [`encode_argb_with_predictor_chooser`].
+#[allow(clippy::too_many_arguments)]
+fn pick_block_mode_with_hint_entropy(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    prefer_mode: Option<u8>,
+) -> u8 {
+    let mut best_mode: u8 = 0;
+    let mut best_cost = u64::MAX;
+    for mode in 0u8..=13 {
+        let cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, mode);
+        if cost < best_cost {
+            best_cost = cost;
+            best_mode = mode;
+        }
+    }
+    // Round-159-style strict tie-break under the entropy cost.
+    if let Some(m) = prefer_mode {
+        if m != best_mode {
+            let cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, m);
+            if cost == best_cost {
+                best_mode = m;
+            }
+        }
+    }
+    best_mode
+}
+
+/// Round 161 *Shannon-entropy bit-cost* variant of
+/// [`build_predictor_image`].
+///
+/// Identical structure to `build_predictor_image`, but routes every
+/// per-block mode choice through [`pick_block_mode_with_hint_entropy`]
+/// — replacing the round-159 L1-magnitude proxy with a true Huffman
+/// lower-bound bit cost. The strict-tie-break hint mechanism is
+/// preserved: the left neighbour (or top neighbour at the left
+/// edge) is the preferred mode on cost-equal swaps.
+///
+/// Round-trip correctness is unaffected by the cost model choice:
+/// the forward transform later re-derives residuals against the
+/// chosen modes, and the decoder's inverse pass uses the same modes
+/// from the sub-image, so the decoded image always equals the input.
+///
+/// The encoder chooser keeps both the L1-proxy candidates (round-
+/// 159/160) and the entropy candidate and emits the shortest
+/// stream, so a fixture on which the L1 proxy is genuinely better
+/// is simply not regressed against.
+fn build_predictor_image_entropy(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+) -> (Vec<u32>, u32, u32) {
+    let block = 1u32 << size_bits;
+    let tw = predictor_div_round_up(width, block);
+    let th = predictor_div_round_up(height, block);
+    let mut img = Vec::with_capacity((tw * th) as usize);
+    let w = width as usize;
+    let h = height as usize;
+    let bsz = block as usize;
+    let mut prev_row: Vec<Option<u8>> = vec![None; tw as usize];
+    for by in 0..th as usize {
+        let mut left_mode: Option<u8> = None;
+        for (bx, top_slot) in prev_row.iter_mut().enumerate() {
+            let x0 = bx * bsz;
+            let y0 = by * bsz;
+            let prefer = left_mode.or(*top_slot);
+            let mode = pick_block_mode_with_hint_entropy(pixels, w, h, x0, y0, bsz, bsz, prefer);
+            img.push(0xff00_0000 | ((mode as u32) << 8));
+            left_mode = Some(mode);
+            *top_slot = Some(mode);
+        }
+    }
+    (img, tw, th)
+}
+
 /// Apply the §4.1 *forward* predictor transform: for each pixel,
 /// replace it with the per-channel mod-256 residual `(original -
 /// pred)`. `pred` is computed from the **source** (un-modified)
@@ -2208,6 +2404,61 @@ fn encode_with_predictor_slack(
 
     let (predictor_image, tw, _th) =
         build_predictor_image_with_slack(pixels, width, height, size_bits, slack);
+    write_entropy_coded_image_literals(&mut w, &predictor_image);
+
+    w.write_bit(false);
+
+    let mut residuals = vec![0u32; pixels.len()];
+    apply_forward_predictor(
+        pixels,
+        &mut residuals,
+        width,
+        height,
+        &predictor_image,
+        tw,
+        size_bits,
+    );
+
+    let mut tokens = tokenize_lz77(&residuals);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, &residuals, bits);
+    }
+    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
+
+    w.into_bytes()
+}
+
+/// Round-161 *Shannon-entropy bit-cost* variant of
+/// [`encode_with_predictor`].
+///
+/// Same wire shape as `encode_with_predictor`, but the §4.1
+/// predictor sub-image is built via [`build_predictor_image_entropy`]
+/// — replacing the per-block L1-magnitude proxy with a true Huffman
+/// lower-bound bit cost on the per-channel residual histogram. The
+/// chooser hint mechanism (strict tie-break favouring the
+/// neighbour's mode) is preserved.
+///
+/// `encode_argb_with_predictor_chooser` always compares this
+/// candidate against the L1-proxy candidates (round-159 strict tie-
+/// break and round-160 slack variants), so on fixtures where the L1
+/// proxy genuinely wins, the entropy candidate is non-selecting.
+fn encode_with_predictor_entropy(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    debug_assert!((2..=9).contains(&size_bits));
+    w.write_bits((size_bits - 2) as u32, 3);
+
+    let (predictor_image, tw, _th) =
+        build_predictor_image_entropy(pixels, width, height, size_bits);
     write_entropy_coded_image_literals(&mut w, &predictor_image);
 
     w.write_bit(false);
@@ -4010,6 +4261,20 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                 )
             }));
         }
+        // Round 161: add the Shannon-entropy bit-cost candidate at
+        // the per-region `size_bits`. Per-block mode is chosen by
+        // a true Huffman lower-bound bit cost on the residual byte
+        // histogram rather than the L1-magnitude proxy used by the
+        // round-159/160 candidates. RFC 9649 §3.5 authorises the
+        // choice ("transform data can be decided based on entropy
+        // minimization"); the entropy cost replaces the proxy with
+        // the actual metric Huffman codes minimise. The chooser
+        // keeps both the entropy and L1 candidates and emits the
+        // byte-shortest stream so the round-161 path cannot
+        // regress against the round-160 baseline.
+        pred_candidates.push(select_best_cache_bits(|cache_bits| {
+            encode_with_predictor_entropy(pixels, width, height, pred_size_bits, cache_bits, width)
+        }));
         if try_pred_single_block {
             pred_candidates.push(select_best_cache_bits(|cache_bits| {
                 encode_with_predictor(
@@ -4048,6 +4313,24 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                     )
                 }));
             }
+            // Round 161: also evaluate the Shannon-entropy candidate
+            // at the single-block size_bits. With one block the hint
+            // mechanism never fires (no neighbour exists) and the
+            // entropy chooser degenerates to "pick the mode whose
+            // single-block residual histogram has the lowest Huffman
+            // bit cost" — still a strict improvement over the L1
+            // proxy on fixtures whose distribution skews the
+            // ordering between the two metrics.
+            pred_candidates.push(select_best_cache_bits(|cache_bits| {
+                encode_with_predictor_entropy(
+                    pixels,
+                    width,
+                    height,
+                    pred_single_block_size_bits,
+                    cache_bits,
+                    width,
+                )
+            }));
         }
         for cand in pred_candidates {
             if cand.len() < best.len() {
@@ -10094,5 +10377,612 @@ mod tests {
         }
 
         best
+    }
+
+    // ---- Round 161 tests: Shannon-entropy bit-cost predictor variant -------
+
+    /// Local pre-round-161 copy of `encode_argb_with_predictor_chooser`
+    /// that omits the round-161 entropy-cost predictor candidates but
+    /// **keeps** every round-160 slack-cost candidate. Used by the
+    /// round-161 non-regression and strict-beat tests as the
+    /// before-after baseline. Mirrors
+    /// `encode_argb_with_predictor_chooser_no_r160_slack` in shape.
+    fn encode_argb_with_predictor_chooser_no_r161_entropy(
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let mut best = encode_argb_literals_with_width(pixels, width);
+
+        let pred_size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+        let ctx_size_bits = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let pred_block = 1u32 << pred_size_bits;
+        let ctx_block = 1u32 << ctx_size_bits;
+
+        if width >= pred_block && height >= pred_block {
+            let mut pred_single_block_size_bits: u8 = pred_size_bits;
+            while pred_single_block_size_bits < 9
+                && ((1u32 << pred_single_block_size_bits) < width
+                    || (1u32 << pred_single_block_size_bits) < height)
+            {
+                pred_single_block_size_bits += 1;
+            }
+            let try_pred_single_block = pred_single_block_size_bits != pred_size_bits;
+            let mut pred_candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
+                encode_with_predictor(pixels, width, height, pred_size_bits, cache_bits, width)
+            })];
+            let pred_block_pixels: u64 = (1u64 << pred_size_bits) * (1u64 << pred_size_bits);
+            for slack in [
+                pred_block_pixels,
+                2 * pred_block_pixels,
+                4 * pred_block_pixels,
+            ] {
+                pred_candidates.push(select_best_cache_bits(|cache_bits| {
+                    encode_with_predictor_slack(
+                        pixels,
+                        width,
+                        height,
+                        pred_size_bits,
+                        cache_bits,
+                        width,
+                        slack,
+                    )
+                }));
+            }
+            if try_pred_single_block {
+                pred_candidates.push(select_best_cache_bits(|cache_bits| {
+                    encode_with_predictor(
+                        pixels,
+                        width,
+                        height,
+                        pred_single_block_size_bits,
+                        cache_bits,
+                        width,
+                    )
+                }));
+                let single_pred_block_pixels: u64 =
+                    (1u64 << pred_single_block_size_bits) * (1u64 << pred_single_block_size_bits);
+                for slack in [
+                    single_pred_block_pixels,
+                    2 * single_pred_block_pixels,
+                    4 * single_pred_block_pixels,
+                ] {
+                    pred_candidates.push(select_best_cache_bits(|cache_bits| {
+                        encode_with_predictor_slack(
+                            pixels,
+                            width,
+                            height,
+                            pred_single_block_size_bits,
+                            cache_bits,
+                            width,
+                            slack,
+                        )
+                    }));
+                }
+            }
+            for cand in pred_candidates {
+                if cand.len() < best.len() {
+                    best = cand;
+                }
+            }
+        }
+
+        if width >= ctx_block && height >= ctx_block {
+            let mut single_block_size_bits: u8 = ctx_size_bits;
+            while single_block_size_bits < 9
+                && ((1u32 << single_block_size_bits) < width
+                    || (1u32 << single_block_size_bits) < height)
+            {
+                single_block_size_bits += 1;
+            }
+            let try_single_block = single_block_size_bits != ctx_size_bits;
+            let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform(pixels, width, height, ctx_size_bits, cache_bits, width)
+            })];
+            if try_single_block {
+                candidates.push(select_best_cache_bits(|cache_bits| {
+                    encode_with_color_transform(
+                        pixels,
+                        width,
+                        height,
+                        single_block_size_bits,
+                        cache_bits,
+                        width,
+                    )
+                }));
+            }
+            for cand in candidates {
+                if cand.len() < best.len() {
+                    best = cand;
+                }
+            }
+        }
+
+        if collect_palette(pixels).is_some() {
+            let ci_best = select_best_cache_bits(|cache_bits| {
+                encode_with_color_indexing(pixels, width, height, cache_bits)
+                    .expect("palette feasibility already confirmed")
+            });
+            if ci_best.len() < best.len() {
+                best = ci_best;
+            }
+        }
+
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
+            if mp_best.len() < best.len() {
+                best = mp_best;
+            }
+        }
+
+        best
+    }
+
+    /// Round 161 — [`block_mode_entropy_cost`] reports zero milli-bits
+    /// on a 1×1 block of pixel `0xff_00_00_00` (the top-left border
+    /// rule sets `pred = 0xff_00_00_00`, so the residual is zero, the
+    /// histogram has a single occupied bin per channel and the
+    /// `c · log2(N/c) = N · log2(1) = 0` per-bin contribution sums to
+    /// zero). Confirms the entropy summation correctly bottoms-out
+    /// at the no-residual edge case.
+    #[test]
+    fn round_161_block_mode_entropy_cost_zero_on_zero_residual_block() {
+        let pixels = vec![0xff_00_00_00u32; 1];
+        for mode in 0u8..=13 {
+            let cost = block_mode_entropy_cost(&pixels, 1, 1, 0, 0, 1, 1, mode);
+            assert_eq!(
+                cost, 0,
+                "1×1 zero-residual block should produce zero-entropy cost under mode {mode}, got {cost}"
+            );
+        }
+    }
+
+    /// Round 161 — on an interior solid-fill block, every mode that
+    /// produces a *constant* residual (whether zero or non-zero) ties
+    /// at zero Shannon entropy — Shannon entropy measures **variety**
+    /// in the residual symbol distribution, not magnitude. This is
+    /// the key structural difference from the L1 magnitude proxy: L1
+    /// would penalise mode 0 (which emits constant non-zero residual
+    /// `0x00_60_80_50` per pixel on a `0xff_60_80_50` solid block),
+    /// while Shannon entropy correctly treats a constant-residual
+    /// distribution as zero-cost (a Huffman code over a single-symbol
+    /// alphabet emits one bit per symbol, which is the theoretical
+    /// floor and matches the §3.7.2.1.1 single-leaf encoding's
+    /// near-zero overhead).
+    ///
+    /// This test pins down that semantic: on the interior solid
+    /// block, every neighbour-predicting mode AND mode 0 all sit at
+    /// zero entropy cost; the chooser then falls through to the
+    /// lowest-index tie-break (mode 0) or the hint when one is
+    /// supplied.
+    #[test]
+    fn round_161_block_mode_entropy_cost_zero_on_constant_residual_block() {
+        let w = 8usize;
+        let h = 8usize;
+        let pixels = vec![0xff_60_80_50u32; w * h];
+        // Block [4..8) × [4..8) — interior. Every mode produces a
+        // constant residual across the block (zero for the
+        // neighbour-predicting modes; `0x00_60_80_50` for mode 0).
+        // Constant residual = single-symbol histogram per channel
+        // = zero Shannon entropy.
+        for mode in 0u8..=13 {
+            let cost = block_mode_entropy_cost(&pixels, w, h, 4, 4, 4, 4, mode);
+            assert_eq!(
+                cost, 0,
+                "constant-residual mode {mode} on interior solid block should have zero entropy cost, got {cost}"
+            );
+        }
+    }
+
+    /// Round 161 — Shannon entropy cost is strictly monotone in
+    /// residual variety: a block whose residual histogram is
+    /// peaked at a single value (zero or non-zero) has lower
+    /// entropy cost than a block whose residuals scatter across
+    /// multiple distinct values. This is the property a Huffman
+    /// code over the residuals would actually minimise — and the
+    /// L1 magnitude proxy does NOT distinguish (a constant non-
+    /// zero residual block has the same L1 sum as a scattered
+    /// block of the same mean magnitude). Confirms the entropy
+    /// cost adds real signal vs the proxy.
+    #[test]
+    fn round_161_entropy_cost_distinguishes_concentrated_from_scattered() {
+        // 16×16 image with two interior blocks. Concentrated block:
+        // pure solid grey on the [4..8) × [4..8) corner — mode 1 (L
+        // predictor) reproduces every interior pixel from its left
+        // neighbour so every residual is zero. Scattered block:
+        // checkerboard greys on the [8..12) × [8..12) corner — mode
+        // 1 produces non-zero residuals alternating across
+        // horizontal steps, populating multiple histogram bins.
+        let w = 16usize;
+        let h = 16usize;
+        let grey = 0xff_60_80_50u32;
+        let other = 0xff_70_90_60u32;
+        let mut pixels = vec![grey; w * h];
+        // Scatter `other` in a horizontal checkerboard across the
+        // scattered block region. Use an isolated mutated quadrant
+        // that doesn't reach the concentrated block; keep a buffer
+        // row/column of solid grey around the scattered block so
+        // its L neighbours at the block's left edge are still grey
+        // (giving a deterministic histogram).
+        for y in 8..12 {
+            for x in 8..12 {
+                if x % 2 == 0 {
+                    pixels[y * w + x] = other;
+                }
+            }
+        }
+        let concentrated = block_mode_entropy_cost(&pixels, w, h, 4, 4, 4, 4, 1);
+        let scattered = block_mode_entropy_cost(&pixels, w, h, 8, 8, 4, 4, 1);
+        assert!(
+            scattered > concentrated,
+            "scattered block should have higher entropy cost than concentrated: \
+             scattered={scattered}, concentrated={concentrated}"
+        );
+        assert_eq!(
+            concentrated, 0,
+            "concentrated (interior solid) block under mode 1 should have zero-entropy cost, \
+             got {concentrated}"
+        );
+        assert!(
+            scattered > 0,
+            "scattered block should have strictly positive entropy cost, got {scattered}"
+        );
+    }
+
+    /// Round 161 — the entropy chooser's tie-break mechanism mirrors
+    /// the round-159 strict tie-break: when `prefer_mode`'s entropy
+    /// cost equals the best, the chooser returns the preferred mode.
+    /// On an interior solid-fill block, *every* mode produces a
+    /// constant residual (zero or a fixed colour) and so ties at
+    /// zero Shannon entropy; the chooser falls back to the lowest-
+    /// index tie (mode 0) and the hint flips to any preferred mode.
+    #[test]
+    fn round_161_pick_block_mode_with_hint_entropy_honours_tie() {
+        let w = 8usize;
+        let h = 8usize;
+        let pixels = vec![0xff_60_80_50u32; w * h];
+        // Interior [4..8) × [4..8) block — every mode is a constant
+        // residual (Shannon entropy zero) for the reasons in
+        // [`round_161_block_mode_entropy_cost_zero_on_constant_residual_block`].
+        // No hint → lowest mode 0 wins.
+        let no_hint = pick_block_mode_with_hint_entropy(&pixels, w, h, 4, 4, 4, 4, None);
+        assert_eq!(no_hint, 0);
+        // Hint mode 11 → ties at zero → tie-break flips to 11.
+        let with_hint = pick_block_mode_with_hint_entropy(&pixels, w, h, 4, 4, 4, 4, Some(11));
+        assert_eq!(with_hint, 11);
+        // Hint mode 5 → ties at zero → tie-break flips to 5.
+        let with_hint5 = pick_block_mode_with_hint_entropy(&pixels, w, h, 4, 4, 4, 4, Some(5));
+        assert_eq!(with_hint5, 5);
+    }
+
+    /// Round 161 — `encode_with_predictor_entropy` round-trips
+    /// end-to-end through `decode_lossless_image`. Confirms the
+    /// entropy chooser produces a decodable stream regardless of
+    /// what cost model picked the modes (the §4.1 forward transform
+    /// recomputes residuals against whatever mode the sub-image
+    /// records, and the decoder applies the same inverse against
+    /// that mode).
+    #[test]
+    fn round_161_entropy_predictor_round_trips_through_decoder() {
+        let w = 32u32;
+        let h = 32u32;
+        // Mostly-uniform canvas with two small perturbations + a
+        // single-pixel sprinkle — same recipe family as the round-
+        // 160 strict-beat fixture, but smaller for fast test runs.
+        let mut pixels = vec![0xff_60_80_50u32; (w * h) as usize];
+        let mut s: u32 = 0xCAFE_BABE;
+        for y in 2..8u32 {
+            for x in 4..10u32 {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                pixels[(y * w + x) as usize] = (s & 0x0007_0707) | 0xff60_8050;
+            }
+        }
+        for cache_bits in [None, Some(2u32), Some(8u32)] {
+            let bytes = encode_with_predictor_entropy(
+                &pixels,
+                w,
+                h,
+                DEFAULT_PREDICTOR_SIZE_BITS,
+                cache_bits,
+                w,
+            );
+            let header = build_image_header(w, h, true);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&bytes);
+            let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+            let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+            assert_eq!(
+                img.pixels(),
+                pixels.as_slice(),
+                "entropy predictor round-trip mismatch at cache_bits={cache_bits:?}"
+            );
+        }
+    }
+
+    /// Round 161 — production chooser must never regress relative to
+    /// the round-160 baseline. The round-161 entropy candidate is an
+    /// additional path; the chooser keeps the byte-shortest stream,
+    /// so adding a candidate cannot lengthen the output.
+    #[test]
+    fn round_161_chooser_never_regresses_vs_round_160() {
+        let shapes: &[(u32, u32)] = &[(16, 16), (32, 32), (48, 48), (64, 32), (32, 64)];
+        for &(w, h) in shapes {
+            // Fixture A: solid fill.
+            let solid = vec![0xff_60_80_50u32; (w * h) as usize];
+            // Fixture B: low-frequency gradient.
+            let mut gradient = vec![0u32; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let r = (x * 255 / w.max(1)) as u8;
+                    let g = (y * 255 / h.max(1)) as u8;
+                    gradient[(y * w + x) as usize] =
+                        0xff00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | 0x40;
+                }
+            }
+            // Fixture C: small noise patch on a solid background.
+            let mut sparse = vec![0xff_70_70_70u32; (w * h) as usize];
+            let mut s: u32 = 0xDEAD_BEEF ^ (w * h);
+            for _ in 0..(w * h / 16) {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let idx = ((s as usize) % sparse.len()) as usize;
+                sparse[idx] = (s & 0x0003_0303) | 0xff70_7070;
+            }
+            for (name, pixels) in &[
+                ("solid", &solid),
+                ("gradient", &gradient),
+                ("sparse", &sparse),
+            ] {
+                let r160 = encode_argb_with_predictor_chooser_no_r161_entropy(pixels, w, h);
+                let r161 = encode_argb_with_predictor_chooser(pixels, w, h);
+                assert!(
+                    r161.len() <= r160.len(),
+                    "round-161 chooser regressed on {name} {w}x{h}: \
+                     r160={} B r161={} B",
+                    r160.len(),
+                    r161.len()
+                );
+                // Confirm decode round-trip on whatever the chooser
+                // emitted — the chooser may have chosen the entropy
+                // path or any of the L1 paths.
+                let header = build_image_header(w, h, true);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&r161);
+                let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+                let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+                assert_eq!(
+                    img.pixels(),
+                    pixels.as_slice(),
+                    "round-161 chooser output failed decode round-trip on {name} {w}x{h}"
+                );
+            }
+        }
+    }
+
+    /// Round 161 — sweep seeded fixtures to find at least one input
+    /// where the entropy-cost predictor candidate strictly beats the
+    /// best L1-proxy predictor candidate on raw bytes. Proves the
+    /// entropy cost is doing real work — it's not merely a
+    /// no-op-aliased duplicate of the round-160 path. The sweep
+    /// also stress-tests round-trip correctness on every fixture
+    /// where the entropy path wins.
+    ///
+    /// Construction: pre-residualised image families where the per-
+    /// block mode-cost ordering differs between L1 magnitude and
+    /// Shannon entropy. The most reliable family is one whose
+    /// "lowest L1 mode" produces a varied residual histogram while
+    /// some "slightly-higher L1 mode" produces a concentrated
+    /// residual histogram — Shannon entropy picks the concentrated
+    /// mode (faithful to what Huffman codes minimise), L1 picks the
+    /// magnitude-min mode.
+    #[test]
+    fn round_161_entropy_candidate_strictly_beats_l1_on_some_fixture() {
+        let w = 64u32;
+        let h = 64u32;
+        let size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+        let block_pixels: u64 = (1u64 << size_bits) * (1u64 << size_bits);
+        let mut found = false;
+        let mut best_savings: i64 = 0;
+        let mut seed_winner: u32 = 0;
+        let mut family_winner: &'static str = "";
+        // Family A: row-translated tile with a hand-chosen base
+        // colour. The L predictor (mode 1) reproduces each row's
+        // base colour and has zero residual on interior pixels —
+        // but the top-row predict-L rule on the first row leaks a
+        // varied histogram (each first-row pixel's residual is a
+        // function of its preceding column's source colour). Mode
+        // 0 (predict 0xff000000) emits a constant residual equal
+        // to source per pixel — zero entropy when the image is
+        // solid, non-zero entropy when scattered. On a scattered
+        // image mode 1 is L1-best but mode 0 is entropy-best.
+        for seed_init in [
+            0xCAFE_BABEu32,
+            0xC0FFEE00,
+            0xDEAD_BEEF,
+            0xFACE_F00D,
+            0xFEED_F00D,
+            0x1234_5678,
+            0xABCD_1234,
+            0x90AB_CDEF,
+            0x5A5A_5A5A,
+            0xA5A5_A5A5,
+            0xBA5E_BA11,
+            0xB16B_00B5,
+            0x00DD_BA11,
+            0xC1AB_AB00,
+            0xDEAF_BABE,
+            0xCABB_A6E0,
+            0x1337_C0DE,
+            0xABAD_CAFE,
+            0xBADF_00D0,
+            0x8BAD_F00D,
+            0xFEE1_DEAD,
+            0xDEFE_C8ED,
+            0xD15E_A5E0,
+            0x600D_F00D,
+            0xDEAD_C0DE,
+            0xBADC_0DED,
+            0xCAFE_F00D,
+            0xC0DE_F00D,
+            0xDEED_BEEF,
+            0xBEAD_F00D,
+            0x8008_5318,
+            0xD0DE_C0DE,
+        ] {
+            // Build a fixture whose per-block mode-cost ordering
+            // disagrees between L1 and Shannon entropy. The family
+            // below produces blocks of varying L1-vs-entropy
+            // disagreement intensity:
+            //
+            // Quadrant A (top-left): smooth low-frequency pattern
+            //   where neighbour-predicting modes have low L1 but
+            //   spread their residuals across multiple histogram
+            //   bins (residual varies slightly with position).
+            // Quadrant B (bottom-right): rare "spike" pixels (1 or
+            //   2 per block) where mode 0's constant residual
+            //   distribution wins on entropy.
+            //
+            // The two quadrants live in separate predictor blocks
+            // so each contributes independently to whichever mode
+            // wins on a block-by-block basis.
+            let mut pixels = vec![0xff_60_80_50u32; (w * h) as usize];
+            let mut s = seed_init;
+            // Quadrant A: 32x32 patterned image with column-driven
+            // gradient and a per-row jitter — produces non-trivial
+            // residual histograms for every mode, so the L1-vs-
+            // entropy disagreement frequency goes up.
+            for y in 0..(h / 2) {
+                for x in 0..(w / 2) {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    // Column-correlated colour + per-row jitter.
+                    let r = 0x40 + (x as u8 & 0x1f);
+                    let g = 0x60 + ((y as u8) & 0x1f) + ((s & 1) as u8);
+                    let b = 0x30 + ((x as u8 ^ y as u8) & 0x0f);
+                    pixels[(y * w + x) as usize] =
+                        0xff00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                }
+            }
+            // Quadrant B: solid grey with deliberate single-pixel
+            // spikes at predictable positions. The spikes are
+            // chosen to land inside a few of the predictor blocks
+            // so those blocks see a residual distribution with one
+            // major bin (zero) and one minor bin (the spike). The
+            // L1 chooser picks the mode that minimises spike
+            // magnitude; the entropy chooser picks the mode that
+            // minimises the count of distinct residual bins.
+            for y in (h / 2)..h {
+                for x in (w / 2)..w {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    if (s & 0x1f) == 0 {
+                        // Spike: random near-grey perturbation.
+                        let perturb = (s & 0x0f0f_0f0f) | 0xff60_8050;
+                        pixels[(y * w + x) as usize] = perturb;
+                    }
+                }
+            }
+            // Best L1-proxy predictor candidate at default
+            // size_bits: strict round-159 + round-160 slack sweep.
+            let strict_bytes = encode_with_predictor(&pixels, w, h, size_bits, None, w);
+            let mut best_l1_bytes = strict_bytes.clone();
+            for slack in [block_pixels, 2 * block_pixels, 4 * block_pixels] {
+                let bytes = encode_with_predictor_slack(&pixels, w, h, size_bits, None, w, slack);
+                if bytes.len() < best_l1_bytes.len() {
+                    best_l1_bytes = bytes;
+                }
+            }
+            let entropy_bytes = encode_with_predictor_entropy(&pixels, w, h, size_bits, None, w);
+            if entropy_bytes.len() < best_l1_bytes.len() {
+                let saved = best_l1_bytes.len() as i64 - entropy_bytes.len() as i64;
+                if saved > best_savings {
+                    best_savings = saved;
+                    seed_winner = seed_init;
+                    family_winner = "two-quadrant";
+                }
+                if !found {
+                    found = true;
+                }
+                // Round-trip the winning entropy stream end-to-end.
+                let header = build_image_header(w, h, true);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&entropy_bytes);
+                let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+                let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+                assert_eq!(
+                    img.pixels(),
+                    pixels.as_slice(),
+                    "round-161 entropy strict-beat predictor candidate round-trip mismatch on \
+                     seed=0x{seed_init:08x}"
+                );
+                eprintln!(
+                    "[round-161] entropy strict-beat: seed=0x{seed_init:08x}, \
+                     best_l1={} B entropy={} B saved={saved} B",
+                    best_l1_bytes.len(),
+                    entropy_bytes.len(),
+                );
+            }
+        }
+        // Family B: hand-crafted "constant non-zero residual"
+        // fixture — a solid-colour image where mode 0 emits a
+        // constant residual `source - 0xff000000` per pixel. The
+        // L1 cost of mode 0 is `Σ |source - black|` per pixel; the
+        // entropy cost of mode 0 is zero (single-symbol histogram).
+        // Mode 1 (L predictor) also emits zero residual for
+        // interior pixels but has non-zero residual at the leftmost
+        // column. On a small image the per-block winner depends on
+        // which of these effects dominates.
+        if !found {
+            // Build a 16×16 solid image — exactly one predictor
+            // block at size_bits=4. The L1 cost of mode 0 is huge
+            // (16² × magnitude); mode 1's cost is small (only the
+            // leftmost column contributes). L1 picks mode 1.
+            // Shannon entropy: mode 0 = 0 (constant residual);
+            // mode 1 = small but non-zero (the leftmost column
+            // residual). Entropy picks mode 0.
+            //
+            // Whether mode 0's predictor stream beats mode 1's
+            // depends on the §5.x prefix-code overhead vs the
+            // saved residual mass — not guaranteed, but a
+            // candidate worth trying.
+            let w2 = 16u32;
+            let h2 = 16u32;
+            let pixels2 = vec![0xff_80_80_80u32; (w2 * h2) as usize];
+            let l1_bytes = encode_with_predictor(&pixels2, w2, h2, size_bits, None, w2);
+            let entropy_bytes =
+                encode_with_predictor_entropy(&pixels2, w2, h2, size_bits, None, w2);
+            if entropy_bytes.len() < l1_bytes.len() {
+                let saved = l1_bytes.len() as i64 - entropy_bytes.len() as i64;
+                best_savings = saved;
+                family_winner = "solid-grey-16x16";
+                found = true;
+                let header = build_image_header(w2, h2, true);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&entropy_bytes);
+                let framed = build::build_webp_file(&payload, ImageKind::Lossless, w2, h2).unwrap();
+                let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+                assert_eq!(
+                    img.pixels(),
+                    pixels2.as_slice(),
+                    "round-161 entropy strict-beat solid-grey round-trip mismatch"
+                );
+                eprintln!(
+                    "[round-161] entropy strict-beat (solid-grey 16x16): \
+                     l1={} B entropy={} B saved={saved} B",
+                    l1_bytes.len(),
+                    entropy_bytes.len(),
+                );
+            }
+        }
+        assert!(
+            found,
+            "round-161 entropy candidate did not produce a single strict byte reduction \
+             across the seeded fixture set; the entropy cost never won \
+             (best_savings={best_savings} on seed=0x{seed_winner:08x} family={family_winner})"
+        );
     }
 }
