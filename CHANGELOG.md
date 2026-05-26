@@ -6,6 +6,27 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 145 (2026-05-26).** §2.7 metadata-aware container
+  writer: `build::build_webp_file_with_metadata(payload, image_kind,
+  canvas_width, canvas_height, has_alpha, FileMetadata)` assembles a
+  RIFF/WEBP file in the §2.7 *extended* layout with a §2.7.1 `VP8X`
+  chunk + optional `ICCP` / `EXIF` / `XMP ` payloads, derives the
+  §2.7.1 `I` / `L` / `E` / `X` flag bits from which `FileMetadata`
+  fields are `Some` (plus the explicit `has_alpha` argument), and
+  emits the chunks in §2.7 canonical order (`VP8X | ICCP | <VP8 |
+  VP8L> | EXIF | XMP`). Twelve new tests cover round-trip through
+  `extract_metadata` for the eight `{none, iccp, exif, xmp, iccp+exif,
+  iccp+xmp, exif+xmp, iccp+exif+xmp}` presence combinations, the
+  §2.3 `0x00` pad-byte generation on odd-length metadata payloads
+  (verifies the §2.4 `File Size` field still matches the parsed
+  value), the exhaustive 16-way §2.7.1 flag-bit derivation against
+  the parser's `Vp8xHeader::parse`, and canvas-validation propagation
+  (`CanvasDimZero` / `CanvasTooLarge`). The new `FileMetadata<'a>`
+  borrowed struct mirrors the published `WebpMetadata` shape but
+  lives inside `build` so the writer compiles under
+  `--no-default-features` (no `oxideav-core` in the standalone
+  build's dependency tree).
+
 * **Clean-room round 130 (2026-05-25).** §5.2.2 **width-aware distance-code
   chooser** for the VP8L lossless encoder. Each backward reference now
   picks the smaller of the scan-line code (`D + 120`, the round-119

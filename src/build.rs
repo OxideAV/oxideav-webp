@@ -40,11 +40,11 @@
 //!
 //! ## What is intentionally *not* here
 //!
-//! * No `ICCP` / `EXIF` / `XMP ` / `ANIM` / `ANMF` / `ALPH` writers —
-//!   round-5 wires only the still-image fast path. Once a `VP8L`
-//!   encoder lands, follow-up rounds can add metadata-chunk writers
-//!   plus a multi-frame `build_animated_webp_file` that walks an
-//!   ordered chunk list.
+//! * No `ANIM` / `ANMF` / `ALPH` writers — the round-5 still-image fast
+//!   path plus the §2.7 metadata-wrapper writer ([`build_webp_file_with_metadata`])
+//!   cover ICCP / EXIF / XMP. Animation chunks live in [`crate::anim_encode`]
+//!   because they need additional global parameters (`ANIM` background +
+//!   loop count, per-frame `ANMF` placement).
 //! * No payload validation. `build_webp_file` does not parse the bytes
 //!   the caller hands it as `payload`. A nonsense payload still
 //!   produces a structurally-valid RIFF — the responsibility for the
@@ -419,6 +419,157 @@ pub fn build_webp_file(
     Ok(out)
 }
 
+/// Borrowed §2.7 file-level metadata payloads for the metadata-aware
+/// container writer [`build_webp_file_with_metadata`].
+///
+/// Each field is the raw payload bytes of the corresponding §2.7.1.4 /
+/// §2.7.1.5 chunk, or `None` to omit the chunk entirely. The writer
+/// derives the §2.7.1 `VP8X` flag bits from which fields are `Some`
+/// (`I` for `iccp`, `E` for `exif`, `X` for `xmp`) so the declared
+/// feature set always matches the chunks actually emitted.
+///
+/// The `Default` impl is all-`None` — equivalent to a non-metadata
+/// extended-layout file. A caller with no metadata to embed and no
+/// alpha to declare should use [`build_webp_file`] directly instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileMetadata<'a> {
+    /// §2.7.1.4 `ICCP` ICC color-profile payload to embed, or `None` to
+    /// omit the chunk. The writer sets the §2.7.1 `I` flag iff
+    /// `Some(_)`.
+    pub iccp: Option<&'a [u8]>,
+    /// §2.7.1.5 `EXIF` Exif payload to embed, or `None` to omit the
+    /// chunk. The writer sets the §2.7.1 `E` flag iff `Some(_)`.
+    pub exif: Option<&'a [u8]>,
+    /// §2.7.1.5 `XMP ` XMP payload to embed, or `None` to omit the
+    /// chunk. The writer sets the §2.7.1 `X` flag iff `Some(_)`.
+    pub xmp: Option<&'a [u8]>,
+}
+
+impl FileMetadata<'_> {
+    /// `true` when every metadata field is `None`.
+    pub fn is_empty(&self) -> bool {
+        self.iccp.is_none() && self.exif.is_none() && self.xmp.is_none()
+    }
+}
+
+/// Build a `RIFF/WEBP` file in the §2.7 *extended* layout, wrapping a
+/// single bitstream payload with a §2.7.1 `VP8X` chunk + optional
+/// §2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / §2.7.1.5 `XMP ` metadata chunks.
+///
+/// The on-disk chunk order is the §2.7 canonical order:
+///
+/// ```text
+/// RIFF | <File Size LE u32> | WEBP | VP8X | ICCP? | <VP8 | VP8L> | EXIF? | XMP ?
+/// ```
+///
+/// (Each `?` chunk is emitted only when the corresponding
+/// [`FileMetadata`] field is `Some`.)
+///
+/// Arguments:
+///
+/// * `payload` — the opaque `VP8 ` or `VP8L` bitstream bytes.
+/// * `image_kind` — selects the bitstream chunk's FourCC; the *simple*
+///   variants ([`ImageKind::Lossy`] / [`ImageKind::Lossless`]) and the
+///   *extended* variants ([`ImageKind::ExtendedLossy`] /
+///   [`ImageKind::ExtendedLossless`]) both produce the same extended
+///   on-disk layout here — this writer *always* emits a `VP8X`
+///   ahead of the bitstream because metadata chunks require an
+///   `Extended File Format` per §2.7.
+/// * `canvas_width`, `canvas_height` — 1-based pixel dimensions written
+///   into the §2.7.1 canvas-minus-one fields (subject to the §2.7.1
+///   range / product caps enforced by [`build_vp8x_chunk`]).
+/// * `has_alpha` — value of the §2.7.1 `L` ("Alpha") flag. `true`
+///   when any frame contains transparency; carried verbatim into the
+///   `VP8X` flag byte. (Whether the bitstream payload itself carries
+///   alpha is the caller's responsibility — this writer treats the
+///   payload as opaque bytes.)
+/// * `metadata` — see [`FileMetadata`]. Setting `iccp` / `exif` / `xmp`
+///   to `Some(..)` both (a) sets the corresponding §2.7.1 flag bit
+///   (`I` / `E` / `X`) and (b) emits the chunk in §2.7 canonical
+///   position.
+///
+/// ## Round-trip guarantee
+///
+/// Every byte stream produced by this function parses successfully
+/// through [`crate::container::parse`], and its §2.7.1.4 `ICCP` /
+/// §2.7.1.5 `EXIF` / §2.7.1.5 `XMP ` payloads round-trip byte-for-byte
+/// through [`crate::extract_metadata`]. The §2.7.1 `VP8X` flag octet
+/// also round-trips through [`crate::vp8x::Vp8xHeader::parse`] —
+/// `has_iccp` / `has_exif` / `has_xmp` reflect exactly which
+/// [`FileMetadata`] fields were `Some(..)`, and `has_alpha` reflects
+/// the `has_alpha` argument.
+///
+/// ## §2.3 odd-payload pad bytes
+///
+/// Each chunk emitted here goes through [`build_chunk`], so any
+/// metadata payload of odd length receives the §2.3 `0x00` pad byte
+/// automatically. The pad byte is *not* counted in the chunk's `Size`
+/// field and *is* counted in the §2.4 file `File Size` total, mirroring
+/// what [`crate::container::parse`] expects on the read side.
+pub fn build_webp_file_with_metadata(
+    payload: &[u8],
+    image_kind: ImageKind,
+    canvas_width: u32,
+    canvas_height: u32,
+    has_alpha: bool,
+    metadata: FileMetadata<'_>,
+) -> Result<Vec<u8>, BuildError> {
+    if payload.len() as u64 > MAX_CHUNK_PAYLOAD as u64 {
+        return Err(BuildError::PayloadTooLargeForChunk { got: payload.len() });
+    }
+
+    // §2.7.1 VP8X flag byte — derive from which metadata fields are
+    // Some plus the explicit has_alpha argument.
+    let flags = Vp8xFlags {
+        has_iccp: metadata.iccp.is_some(),
+        has_alpha,
+        has_exif: metadata.exif.is_some(),
+        has_xmp: metadata.xmp.is_some(),
+        has_animation: false,
+    };
+    let vp8x_payload = build_vp8x_chunk(canvas_width, canvas_height, flags)?;
+    let vp8x_chunk = build_chunk(fourcc::VP8X, &vp8x_payload)?;
+    let bitstream_chunk = build_chunk(image_kind.bitstream_fourcc(), payload)?;
+
+    // §2.7 canonical order: VP8X, ICCP (before image data), image data,
+    // EXIF, XMP.
+    let mut body = Vec::with_capacity(
+        vp8x_chunk.len()
+            + metadata.iccp.map_or(0, |b| 8 + b.len() + (b.len() & 1))
+            + bitstream_chunk.len()
+            + metadata.exif.map_or(0, |b| 8 + b.len() + (b.len() & 1))
+            + metadata.xmp.map_or(0, |b| 8 + b.len() + (b.len() & 1)),
+    );
+    body.extend_from_slice(&vp8x_chunk);
+    if let Some(iccp) = metadata.iccp {
+        let c = build_chunk(fourcc::ICCP, iccp)?;
+        body.extend_from_slice(&c);
+    }
+    body.extend_from_slice(&bitstream_chunk);
+    if let Some(exif) = metadata.exif {
+        let c = build_chunk(fourcc::EXIF, exif)?;
+        body.extend_from_slice(&c);
+    }
+    if let Some(xmp) = metadata.xmp {
+        let c = build_chunk(fourcc::XMP, xmp)?;
+        body.extend_from_slice(&c);
+    }
+
+    // §2.4: File Size = 4 ('WEBP' FourCC) + body length.
+    let file_size = (body.len() as u64) + 4;
+    if file_size > u64::from(u32::MAX) {
+        return Err(BuildError::PayloadTooLargeForChunk { got: payload.len() });
+    }
+    let file_size = file_size as u32;
+
+    let mut out = Vec::with_capacity(12 + body.len());
+    out.extend_from_slice(&fourcc::RIFF);
+    out.extend_from_slice(&file_size.to_le_bytes());
+    out.extend_from_slice(&fourcc::WEBP);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +889,430 @@ mod tests {
         assert_eq!(c.chunks[0].size as usize, payload.len());
         assert_eq!(c.chunks[0].payload(&bytes), payload.as_slice());
         // Odd payload → §2.3 pad byte; the parser still walks cleanly.
+    }
+
+    // ─────────────────────── build_webp_file_with_metadata ───────────────────────
+
+    /// §2.7 canonical chunk order when no metadata is present: VP8X
+    /// then the bitstream chunk, nothing else.
+    #[test]
+    fn build_with_metadata_emits_vp8x_then_payload_when_no_metadata() {
+        let payload = vec![0u8; 6];
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossy,
+            64,
+            32,
+            false,
+            FileMetadata::default(),
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 2);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::VP8);
+        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+        assert!(!vp8x.has_iccp);
+        assert!(!vp8x.has_alpha);
+        assert!(!vp8x.has_exif);
+        assert!(!vp8x.has_xmp);
+        assert!(!vp8x.has_animation);
+    }
+
+    /// §2.7.1.4 ICCP-only round trip: chunk lands before the bitstream,
+    /// §2.7.1 `I` flag set, payload survives.
+    #[test]
+    fn build_with_metadata_iccp_only_round_trips() {
+        let payload = vec![0u8; 4];
+        let iccp = b"icc-profile-bytes".to_vec();
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            16,
+            16,
+            false,
+            FileMetadata {
+                iccp: Some(&iccp),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        // Order: VP8X, ICCP, VP8L.
+        assert_eq!(c.chunks.len(), 3);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::ICCP);
+        assert_eq!(c.chunks[2].fourcc, fourcc::VP8L);
+        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+        assert!(vp8x.has_iccp);
+        assert!(!vp8x.has_exif);
+        assert!(!vp8x.has_xmp);
+        // Extracted ICCP payload matches.
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
+        assert_eq!(m.exif, None);
+        assert_eq!(m.xmp, None);
+    }
+
+    /// §2.7.1.5 EXIF-only round trip: §2.7 says EXIF lands *after* the
+    /// bitstream.
+    #[test]
+    fn build_with_metadata_exif_only_round_trips() {
+        let payload = vec![0u8; 4];
+        let exif = b"Exif\x00\x00MM\x00*".to_vec();
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            8,
+            8,
+            false,
+            FileMetadata {
+                exif: Some(&exif),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 3);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::VP8L);
+        assert_eq!(c.chunks[2].fourcc, fourcc::EXIF);
+        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+        assert!(!vp8x.has_iccp);
+        assert!(vp8x.has_exif);
+        assert!(!vp8x.has_xmp);
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert_eq!(m.icc, None);
+        assert_eq!(m.exif.as_deref(), Some(&exif[..]));
+        assert_eq!(m.xmp, None);
+    }
+
+    /// §2.7.1.5 XMP-only round trip.
+    #[test]
+    fn build_with_metadata_xmp_only_round_trips() {
+        let payload = vec![0u8; 4];
+        let xmp = b"<?xpacket begin?>".to_vec();
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            8,
+            8,
+            false,
+            FileMetadata {
+                xmp: Some(&xmp),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 3);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::VP8L);
+        assert_eq!(c.chunks[2].fourcc, fourcc::XMP);
+        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+        assert!(vp8x.has_xmp);
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
+    }
+
+    /// ICCP + EXIF together: ICCP before the bitstream, EXIF after,
+    /// both flag bits set.
+    #[test]
+    fn build_with_metadata_iccp_plus_exif_round_trips() {
+        let payload = vec![0u8; 4];
+        let iccp = b"icc".to_vec();
+        let exif = b"Exif\x00\x00MM\x00*more".to_vec();
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            8,
+            8,
+            false,
+            FileMetadata {
+                iccp: Some(&iccp),
+                exif: Some(&exif),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 4);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::ICCP);
+        assert_eq!(c.chunks[2].fourcc, fourcc::VP8L);
+        assert_eq!(c.chunks[3].fourcc, fourcc::EXIF);
+        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+        assert!(vp8x.has_iccp);
+        assert!(vp8x.has_exif);
+        assert!(!vp8x.has_xmp);
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
+        assert_eq!(m.exif.as_deref(), Some(&exif[..]));
+    }
+
+    /// ICCP + XMP together: ICCP before, XMP after, no EXIF.
+    #[test]
+    fn build_with_metadata_iccp_plus_xmp_round_trips() {
+        let payload = vec![0u8; 4];
+        let iccp = b"icc-bytes-here".to_vec();
+        let xmp = b"<xmp/>".to_vec();
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            8,
+            8,
+            false,
+            FileMetadata {
+                iccp: Some(&iccp),
+                xmp: Some(&xmp),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 4);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::ICCP);
+        assert_eq!(c.chunks[2].fourcc, fourcc::VP8L);
+        assert_eq!(c.chunks[3].fourcc, fourcc::XMP);
+        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+        assert!(vp8x.has_iccp);
+        assert!(!vp8x.has_exif);
+        assert!(vp8x.has_xmp);
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
+        assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
+    }
+
+    /// EXIF + XMP together: both land after the bitstream, in §2.7 order
+    /// (EXIF before XMP).
+    #[test]
+    fn build_with_metadata_exif_plus_xmp_round_trips() {
+        let payload = vec![0u8; 4];
+        let exif = b"E".to_vec();
+        let xmp = b"X".to_vec();
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            8,
+            8,
+            false,
+            FileMetadata {
+                exif: Some(&exif),
+                xmp: Some(&xmp),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 4);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::VP8L);
+        assert_eq!(c.chunks[2].fourcc, fourcc::EXIF);
+        assert_eq!(c.chunks[3].fourcc, fourcc::XMP);
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert_eq!(m.exif.as_deref(), Some(&exif[..]));
+        assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
+    }
+
+    /// All three metadata kinds together: VP8X | ICCP | bitstream |
+    /// EXIF | XMP, every flag bit set.
+    #[test]
+    fn build_with_metadata_all_three_round_trip_in_canonical_order() {
+        let payload = vec![0u8; 4];
+        let iccp = b"ICC-profile-blob".to_vec();
+        let exif = b"Exif\x00\x00II*\x00".to_vec();
+        let xmp = b"<x:xmpmeta/>".to_vec();
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            16,
+            16,
+            true, // also flips the L bit
+            FileMetadata {
+                iccp: Some(&iccp),
+                exif: Some(&exif),
+                xmp: Some(&xmp),
+            },
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 5);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::ICCP);
+        assert_eq!(c.chunks[2].fourcc, fourcc::VP8L);
+        assert_eq!(c.chunks[3].fourcc, fourcc::EXIF);
+        assert_eq!(c.chunks[4].fourcc, fourcc::XMP);
+        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+        assert!(vp8x.has_iccp);
+        assert!(vp8x.has_alpha);
+        assert!(vp8x.has_exif);
+        assert!(vp8x.has_xmp);
+        assert!(!vp8x.has_animation);
+        // §2.7.1 canvas dims survive.
+        assert_eq!(vp8x.canvas_width, 16);
+        assert_eq!(vp8x.canvas_height, 16);
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
+        assert_eq!(m.exif.as_deref(), Some(&exif[..]));
+        assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
+    }
+
+    /// §2.3 odd-length metadata payloads trigger a single `0x00` pad
+    /// byte per chunk (not counted in `Size`), and the parser still
+    /// walks cleanly.
+    #[test]
+    fn build_with_metadata_odd_payloads_get_pad_bytes() {
+        // Three odd-length metadata payloads + an odd-length bitstream.
+        let payload = vec![0xABu8, 0xCD, 0xEF, 0x01, 0x02]; // 5 bytes (odd)
+        let iccp = b"AAA".to_vec(); // 3 bytes (odd)
+        let exif = b"BBBBB".to_vec(); // 5 bytes (odd)
+        let xmp = b"CCCCCCC".to_vec(); // 7 bytes (odd)
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            8,
+            8,
+            false,
+            FileMetadata {
+                iccp: Some(&iccp),
+                exif: Some(&exif),
+                xmp: Some(&xmp),
+            },
+        )
+        .unwrap();
+        // Each odd chunk contributes 8 (header) + len + 1 (pad).
+        // VP8X is 10 bytes (even → no pad). Total body:
+        // (8+10) + (8+3+1) + (8+5+1) + (8+5+1) + (8+7+1) = 18+12+14+14+16 = 74.
+        // File Size = 4 ('WEBP') + 74 = 78.
+        let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(declared, 78);
+        // Parser-level Size fields exclude the pad byte each.
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks[1].size, 3, "ICCP §Size excludes pad byte");
+        assert_eq!(c.chunks[2].size, 5, "VP8L §Size excludes pad byte");
+        assert_eq!(c.chunks[3].size, 5, "EXIF §Size excludes pad byte");
+        assert_eq!(c.chunks[4].size, 7, "XMP §Size excludes pad byte");
+        // Payload survives intact through the parser (the pad byte sits
+        // outside `payload()`).
+        assert_eq!(c.chunks[1].payload(&bytes), &iccp[..]);
+        assert_eq!(c.chunks[2].payload(&bytes), &payload[..]);
+        assert_eq!(c.chunks[3].payload(&bytes), &exif[..]);
+        assert_eq!(c.chunks[4].payload(&bytes), &xmp[..]);
+    }
+
+    /// §2.7.1 flag-bit derivation: each `Some(..)` field independently
+    /// flips the corresponding bit, every other combination clears it.
+    /// Exhaustively covers the 2^3 metadata-presence states (× the
+    /// `has_alpha` × 2 axis for the L bit).
+    #[test]
+    fn build_with_metadata_flag_bits_match_field_presence() {
+        let payload = vec![0u8; 2];
+        for has_icc in [false, true] {
+            for has_exif_p in [false, true] {
+                for has_xmp_p in [false, true] {
+                    for has_alpha in [false, true] {
+                        let icc_blob: &[u8] = &[0xAA];
+                        let exif_blob: &[u8] = &[0xBB];
+                        let xmp_blob: &[u8] = &[0xCC];
+                        let metadata = FileMetadata {
+                            iccp: has_icc.then_some(icc_blob),
+                            exif: has_exif_p.then_some(exif_blob),
+                            xmp: has_xmp_p.then_some(xmp_blob),
+                        };
+                        let bytes = build_webp_file_with_metadata(
+                            &payload,
+                            ImageKind::ExtendedLossless,
+                            4,
+                            4,
+                            has_alpha,
+                            metadata,
+                        )
+                        .unwrap();
+                        let c = parse(&bytes).unwrap();
+                        let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
+                        assert_eq!(
+                            vp8x.has_iccp, has_icc,
+                            "I flag (has_icc={has_icc}, has_exif={has_exif_p}, has_xmp={has_xmp_p}, has_alpha={has_alpha})"
+                        );
+                        assert_eq!(
+                            vp8x.has_alpha, has_alpha,
+                            "L flag (has_icc={has_icc}, has_exif={has_exif_p}, has_xmp={has_xmp_p}, has_alpha={has_alpha})"
+                        );
+                        assert_eq!(
+                            vp8x.has_exif, has_exif_p,
+                            "E flag (has_icc={has_icc}, has_exif={has_exif_p}, has_xmp={has_xmp_p}, has_alpha={has_alpha})"
+                        );
+                        assert_eq!(
+                            vp8x.has_xmp, has_xmp_p,
+                            "X flag (has_icc={has_icc}, has_exif={has_exif_p}, has_xmp={has_xmp_p}, has_alpha={has_alpha})"
+                        );
+                        // Animation always off — this writer never emits ANIM/ANMF.
+                        assert!(!vp8x.has_animation);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Canvas-validation failures propagate out of the metadata writer
+    /// without producing a half-baked file.
+    #[test]
+    fn build_with_metadata_propagates_canvas_validation_errors() {
+        assert_eq!(
+            build_webp_file_with_metadata(
+                &[0u8; 4],
+                ImageKind::ExtendedLossless,
+                0,
+                1,
+                false,
+                FileMetadata::default(),
+            )
+            .unwrap_err(),
+            BuildError::CanvasDimZero { which: "width" }
+        );
+        assert_eq!(
+            build_webp_file_with_metadata(
+                &[0u8; 4],
+                ImageKind::ExtendedLossless,
+                65_536,
+                65_536,
+                false,
+                FileMetadata::default(),
+            )
+            .unwrap_err(),
+            BuildError::CanvasTooLarge {
+                canvas_width: 65_536,
+                canvas_height: 65_536,
+            }
+        );
+    }
+
+    /// FileMetadata::is_empty mirrors "every field is None" — and the
+    /// writer with an empty metadata struct on a VP8L payload still
+    /// emits a parseable file (just VP8X + bitstream, no metadata
+    /// chunks).
+    #[test]
+    fn build_with_metadata_empty_metadata_omits_optional_chunks() {
+        assert!(FileMetadata::default().is_empty());
+        let payload = vec![0u8; 8];
+        let bytes = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            4,
+            4,
+            false,
+            FileMetadata::default(),
+        )
+        .unwrap();
+        let c = parse(&bytes).unwrap();
+        assert_eq!(c.chunks.len(), 2);
+        assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
+        assert_eq!(c.chunks[1].fourcc, fourcc::VP8L);
+        let m = crate::extract_metadata(&bytes).unwrap();
+        assert!(m.icc.is_none());
+        assert!(m.exif.is_none());
+        assert!(m.xmp.is_none());
     }
 
     /// Negative: a hand-crafted file with a chunk Size that runs past

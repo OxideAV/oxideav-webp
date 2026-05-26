@@ -2,6 +2,30 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 145)
+
+**Round 145 added the §2.7 metadata-aware container writer
+`build::build_webp_file_with_metadata`.** Given a `VP8 ` / `VP8L`
+payload, canvas dimensions, an `has_alpha` flag, and a
+`build::FileMetadata { iccp, exif, xmp }` triple of optional borrowed
+byte slices, the writer assembles a §2.7 extended-layout `.webp`:
+
+```text
+RIFF | <File Size LE u32> | WEBP | VP8X | ICCP? | <VP8 | VP8L> | EXIF? | XMP ?
+```
+
+with the §2.7.1 `I` / `L` / `E` / `X` flag bits derived from which
+`FileMetadata` fields are `Some(..)` (plus the explicit `has_alpha`)
+and the chunks emitted in §2.7 canonical order. Twelve new tests
+cover the eight `{none, iccp, exif, xmp, iccp+exif, iccp+xmp,
+exif+xmp, iccp+exif+xmp}` presence combinations as a round trip
+through the existing `extract_metadata` reader, plus the §2.3
+`0x00` pad-byte path on odd-length metadata payloads (a 16-way
+exhaustive sweep through the parser's `Vp8xHeader::parse` confirms
+the flag-bit derivation). The borrowed `FileMetadata<'a>` struct
+mirrors the published `WebpMetadata` shape but lives inside `build`
+so the writer still compiles under `--no-default-features`.
+
 ## Status — 2026-05-25 (clean-room round 130)
 
 **Round 130 added a §5.2.2 width-aware distance-code chooser to the VP8L
