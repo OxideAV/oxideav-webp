@@ -267,3 +267,287 @@ fn build_webp_file_with_metadata_round_trips_through_decoder() {
     assert_eq!(read.exif.as_deref(), Some(&exif[..]));
     assert_eq!(read.xmp.as_deref(), Some(&xmp[..]));
 }
+
+// ─────────── build → extract → re-build canonical-inverse round-trip ───────────
+//
+// `build_webp_file_with_metadata` is a deterministic §2.7 writer: §2.7's
+// "may appear out of order" carve-out for EXIF / XMP is collapsed by the
+// writer to a single canonical EXIF-before-XMP order, even-length pads are
+// always zero, and the §2.7.1 flag octet declares exactly the chunks that
+// follow. `extract_metadata` is its left-inverse on the metadata payloads.
+// These tests pin the canonical-inverse identity:
+//
+//     build(payload, meta) == build(payload, extract(build(payload, meta)))
+//
+// i.e. round-tripping through extract + re-build yields **byte-identical**
+// container bytes. Any change to the writer's emission order, pad
+// handling, or flag-octet computation would surface here as a byte-diff.
+
+#[test]
+fn build_with_metadata_extract_rebuild_is_byte_identical_all_three_kinds() {
+    // All-three-set canonical-inverse round trip.
+    use oxideav_webp::build::{build_webp_file_with_metadata, ImageKind, MetadataPayloads};
+
+    let (w, h) = (4u32, 4u32);
+    let argb = make_argb(w, h, true);
+    let bare = encode_vp8l_argb(&argb, w, h).expect("bare VP8L");
+
+    let icc = b"canonical-inverse-icc".to_vec();
+    let exif = b"canonical-inverse-exif".to_vec();
+    let xmp = b"canonical-inverse-xmp".to_vec();
+    let first = build_webp_file_with_metadata(
+        &bare,
+        ImageKind::Lossless,
+        w,
+        h,
+        MetadataPayloads {
+            icc: Some(&icc),
+            exif: Some(&exif),
+            xmp: Some(&xmp),
+        },
+    )
+    .expect("first build");
+
+    // Recover the metadata payloads through the published extract path …
+    let extracted = extract_metadata(&first).expect("extract");
+    assert_eq!(extracted.icc.as_deref(), Some(&icc[..]));
+    assert_eq!(extracted.exif.as_deref(), Some(&exif[..]));
+    assert_eq!(extracted.xmp.as_deref(), Some(&xmp[..]));
+
+    // … and feed them back through the writer. The §2.7 chunk-emission
+    // order is canonical (EXIF before XMP), the §2.7.1 flag octet is
+    // recomputed from the same Some-ness, and the §2.3 pad bytes are
+    // deterministic, so the second build's bytes must equal the first's.
+    let second = build_webp_file_with_metadata(
+        &bare,
+        ImageKind::Lossless,
+        w,
+        h,
+        MetadataPayloads {
+            icc: extracted.icc.as_deref(),
+            exif: extracted.exif.as_deref(),
+            xmp: extracted.xmp.as_deref(),
+        },
+    )
+    .expect("second build");
+
+    assert_eq!(
+        first, second,
+        "build_with_metadata is the canonical inverse of extract_metadata: \
+         round-tripping must produce byte-identical container bytes"
+    );
+}
+
+#[test]
+fn build_with_metadata_extract_rebuild_is_byte_identical_per_kind() {
+    // Per-kind canonical-inverse: each of ICC / Exif / XMP, on its own,
+    // must round-trip byte-identical through extract + re-build. Guards
+    // against a writer change that happens to be byte-identical only
+    // when all three are present (e.g. a flag-octet OR that depends on
+    // sibling chunks).
+    use oxideav_webp::build::{build_webp_file_with_metadata, ImageKind, MetadataPayloads};
+
+    let (w, h) = (3u32, 3u32);
+    let argb = make_argb(w, h, true);
+    let bare = encode_vp8l_argb(&argb, w, h).expect("bare VP8L");
+
+    let icc = b"per-kind-icc-payload".to_vec();
+    let exif = b"per-kind-exif-payload".to_vec();
+    let xmp = b"per-kind-xmp-payload".to_vec();
+
+    for (label, meta) in [
+        (
+            "icc-only",
+            MetadataPayloads {
+                icc: Some(&icc),
+                exif: None,
+                xmp: None,
+            },
+        ),
+        (
+            "exif-only",
+            MetadataPayloads {
+                icc: None,
+                exif: Some(&exif),
+                xmp: None,
+            },
+        ),
+        (
+            "xmp-only",
+            MetadataPayloads {
+                icc: None,
+                exif: None,
+                xmp: Some(&xmp),
+            },
+        ),
+        (
+            "icc+exif",
+            MetadataPayloads {
+                icc: Some(&icc),
+                exif: Some(&exif),
+                xmp: None,
+            },
+        ),
+        (
+            "icc+xmp",
+            MetadataPayloads {
+                icc: Some(&icc),
+                exif: None,
+                xmp: Some(&xmp),
+            },
+        ),
+        (
+            "exif+xmp",
+            MetadataPayloads {
+                icc: None,
+                exif: Some(&exif),
+                xmp: Some(&xmp),
+            },
+        ),
+    ] {
+        let first = build_webp_file_with_metadata(&bare, ImageKind::Lossless, w, h, meta)
+            .unwrap_or_else(|e| panic!("{label}: first build: {e:?}"));
+        let extracted =
+            extract_metadata(&first).unwrap_or_else(|e| panic!("{label}: extract: {e:?}"));
+        // Absent kinds must extract as None (not Some(empty)).
+        assert_eq!(extracted.icc.is_some(), meta.icc.is_some(), "{label}: icc");
+        assert_eq!(
+            extracted.exif.is_some(),
+            meta.exif.is_some(),
+            "{label}: exif"
+        );
+        assert_eq!(extracted.xmp.is_some(), meta.xmp.is_some(), "{label}: xmp");
+
+        let second = build_webp_file_with_metadata(
+            &bare,
+            ImageKind::Lossless,
+            w,
+            h,
+            MetadataPayloads {
+                icc: extracted.icc.as_deref(),
+                exif: extracted.exif.as_deref(),
+                xmp: extracted.xmp.as_deref(),
+            },
+        )
+        .unwrap_or_else(|e| panic!("{label}: second build: {e:?}"));
+        assert_eq!(
+            first, second,
+            "{label}: build is canonical inverse of extract; \
+             round-trip must be byte-identical"
+        );
+    }
+}
+
+#[test]
+fn build_with_metadata_extract_rebuild_is_byte_identical_odd_length_payloads() {
+    // §2.3 pad-byte canonical handling: a chunk with an odd-length
+    // payload gets a single trailing 0x00 pad that is NOT counted in
+    // Size. Re-extracting that chunk recovers ONLY the declared
+    // odd-length payload (the pad is dropped), so feeding the extracted
+    // bytes back through the writer must regenerate the same odd-length
+    // payload plus the same trailing zero pad. Pin this canonical inverse.
+    use oxideav_webp::build::{build_webp_file_with_metadata, ImageKind, MetadataPayloads};
+
+    let (w, h) = (4u32, 4u32);
+    let argb = make_argb(w, h, true);
+    let bare = encode_vp8l_argb(&argb, w, h).expect("bare VP8L");
+
+    // Three payloads with all-odd lengths so every metadata chunk
+    // produces a §2.3 pad byte.
+    let icc = vec![0xA5u8; 13];
+    let exif = vec![0x5Au8; 7];
+    let xmp = vec![0x3Cu8; 19];
+
+    let first = build_webp_file_with_metadata(
+        &bare,
+        ImageKind::Lossless,
+        w,
+        h,
+        MetadataPayloads {
+            icc: Some(&icc),
+            exif: Some(&exif),
+            xmp: Some(&xmp),
+        },
+    )
+    .expect("first build (odd-length)");
+
+    let extracted = extract_metadata(&first).expect("extract (odd-length)");
+    // Extracted payloads carry exactly the odd-length original — no pad.
+    assert_eq!(extracted.icc.as_deref(), Some(&icc[..]));
+    assert_eq!(extracted.exif.as_deref(), Some(&exif[..]));
+    assert_eq!(extracted.xmp.as_deref(), Some(&xmp[..]));
+    assert_eq!(extracted.icc.as_ref().map(|b| b.len()), Some(13));
+    assert_eq!(extracted.exif.as_ref().map(|b| b.len()), Some(7));
+    assert_eq!(extracted.xmp.as_ref().map(|b| b.len()), Some(19));
+
+    let second = build_webp_file_with_metadata(
+        &bare,
+        ImageKind::Lossless,
+        w,
+        h,
+        MetadataPayloads {
+            icc: extracted.icc.as_deref(),
+            exif: extracted.exif.as_deref(),
+            xmp: extracted.xmp.as_deref(),
+        },
+    )
+    .expect("second build (odd-length)");
+    assert_eq!(
+        first, second,
+        "odd-length payloads: build is canonical inverse of extract, \
+         §2.3 pad bytes must be regenerated identically"
+    );
+}
+
+#[test]
+fn build_with_metadata_extract_rebuild_is_byte_identical_lossy_kind() {
+    // The canonical-inverse identity is independent of which bitstream
+    // FourCC the writer emits. Run the same round-trip against the
+    // ExtendedLossy kind with a small synthetic VP8 chunk body so it
+    // also exercises the Lossy → ExtendedLossy promotion path.
+    use oxideav_webp::build::{build_webp_file_with_metadata, ImageKind, MetadataPayloads};
+
+    // The writer never inspects the bitstream payload; any non-empty
+    // byte sequence within §2.4 chunk-size limits is acceptable for
+    // this round-trip test. Use a deterministic 32-byte filler.
+    let bitstream: Vec<u8> = (0..32u8).collect();
+    let (w, h) = (16u32, 16u32);
+    let icc = b"lossy-icc".to_vec();
+    let xmp = b"lossy-xmp".to_vec();
+
+    let first = build_webp_file_with_metadata(
+        &bitstream,
+        ImageKind::ExtendedLossy,
+        w,
+        h,
+        MetadataPayloads {
+            icc: Some(&icc),
+            exif: None,
+            xmp: Some(&xmp),
+        },
+    )
+    .expect("first build (lossy kind)");
+
+    let extracted = extract_metadata(&first).expect("extract (lossy kind)");
+    assert_eq!(extracted.icc.as_deref(), Some(&icc[..]));
+    assert_eq!(extracted.exif, None);
+    assert_eq!(extracted.xmp.as_deref(), Some(&xmp[..]));
+
+    let second = build_webp_file_with_metadata(
+        &bitstream,
+        ImageKind::ExtendedLossy,
+        w,
+        h,
+        MetadataPayloads {
+            icc: extracted.icc.as_deref(),
+            exif: extracted.exif.as_deref(),
+            xmp: extracted.xmp.as_deref(),
+        },
+    )
+    .expect("second build (lossy kind)");
+    assert_eq!(
+        first, second,
+        "ExtendedLossy: build is canonical inverse of extract, \
+         lossy bitstream FourCC must round-trip byte-identical"
+    );
+}

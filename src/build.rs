@@ -1198,4 +1198,71 @@ mod tests {
         }
         .is_empty());
     }
+
+    /// Canonical-inverse round trip at the writer level: build a file
+    /// with metadata, read the metadata chunks back out via the
+    /// container walker, then re-build with those bytes. The two files
+    /// must be byte-identical. Pins the writer's canonical §2.7 chunk
+    /// order and §2.3 pad-byte handling against any future drift.
+    #[test]
+    fn metadata_writer_canonical_inverse_round_trip_is_byte_identical() {
+        let payload = vec![0xC3u8; 11]; // odd-length bitstream → §2.3 pad
+        let icc = b"canonical-icc-payload".to_vec();
+        let exif = b"canonical-exif".to_vec(); // odd length too
+        let xmp = b"canonical-xmp-payload".to_vec();
+
+        let first = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            32,
+            32,
+            MetadataPayloads {
+                icc: Some(&icc),
+                exif: Some(&exif),
+                xmp: Some(&xmp),
+            },
+        )
+        .unwrap();
+
+        // Recover the §2.7 metadata payloads through the container walker
+        // (the §2.3 pads are dropped on extract; only the declared
+        // payload bytes come back).
+        let c = parse(&first).expect("file parses");
+        let icc_back = c
+            .first_chunk_with_fourcc(fourcc::ICCP)
+            .map(|ch| ch.payload(&first).to_vec())
+            .expect("ICCP present");
+        let exif_back = c
+            .first_chunk_with_fourcc(fourcc::EXIF)
+            .map(|ch| ch.payload(&first).to_vec())
+            .expect("EXIF present");
+        let xmp_back = c
+            .first_chunk_with_fourcc(fourcc::XMP)
+            .map(|ch| ch.payload(&first).to_vec())
+            .expect("XMP present");
+
+        // Re-build with the round-tripped payloads. Canonical-inverse
+        // identity: the writer regenerates the same §2.7 chunk order,
+        // the same flag-octet, and the same §2.3 pad bytes, so the
+        // bytes must equal `first` exactly.
+        let second = build_webp_file_with_metadata(
+            &payload,
+            ImageKind::ExtendedLossless,
+            32,
+            32,
+            MetadataPayloads {
+                icc: Some(&icc_back),
+                exif: Some(&exif_back),
+                xmp: Some(&xmp_back),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            first, second,
+            "build_webp_file_with_metadata is the canonical inverse of \
+             the container walker on metadata chunks: re-building with \
+             the extracted payloads must produce byte-identical bytes"
+        );
+    }
 }

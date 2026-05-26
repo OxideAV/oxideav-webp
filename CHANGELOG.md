@@ -6,6 +6,33 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 144 (2026-05-26).** **Canonical-inverse round-trip
+  tests pinning `build_webp_file_with_metadata` as the byte-exact left
+  inverse of `extract_metadata` over the §2.7 metadata chunks.** §2.7's
+  "may appear out of order" carve-out for `EXIF` / `XMP ` is collapsed by
+  the writer to a single canonical `EXIF` → `XMP ` order, the §2.3 pad
+  bytes are always zero, and the §2.7.1 flag octet is recomputed from
+  the input's `Some`-ness. These three deterministic-emission properties
+  together make the round trip
+  `build(payload, meta) == build(payload, extract(build(payload, meta)))`
+  byte-identical. The new tests pin that identity so any future change
+  to the writer's emission order, pad handling, or flag-octet
+  computation surfaces as a byte-diff in CI.
+
+  No new public API. Four new integration tests in
+  [`tests/published_encode_api.rs`](tests/published_encode_api.rs) cover
+  (a) the all-three-set case, (b) every single-kind and pair-kind
+  subset (six combinations) under one parametric harness, (c) the
+  odd-length-payload case (every metadata chunk gets a §2.3 pad byte
+  that must be regenerated identically on re-build), and (d) the
+  `ImageKind::ExtendedLossy` bitstream-FourCC variant. One new inline
+  unit test in [`src/build.rs`](src/build.rs) anchors the same
+  property at the writer level via the `container::parse` walker
+  (i.e. without depending on the `extract_metadata` public path).
+
+  Total: **500** tests green (was 495: +5 from this round). Default and
+  `--no-default-features` builds both clippy + fmt clean.
+
 * **Clean-room round 143 (2026-05-26).** **Chainable
   `AnimEncoderOptions::with_default_lossy_quality(Option<u8>) -> Self`
   builder and matching `default_lossy_quality: Option<u8>` field,

@@ -2,6 +2,36 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-26 (clean-room round 144)
+
+**Round 144 pinned `build_webp_file_with_metadata` as the byte-exact left
+inverse of `extract_metadata` over the §2.7 metadata chunks.** §2.7's
+"may appear out of order" carve-out for `EXIF` / `XMP ` is collapsed by
+the writer to a single canonical `EXIF` → `XMP ` order, the §2.3 pad
+bytes are always zero, and the §2.7.1 flag octet is recomputed from the
+input's `Some`-ness. These three deterministic-emission properties make
+the round trip
+`build(payload, meta) == build(payload, extract(build(payload, meta)))`
+byte-identical: re-feeding the extracted metadata payloads back into the
+writer produces the same container bytes. The new tests pin that
+identity so any future change to the writer's emission order, pad
+handling, or flag-octet computation surfaces as a byte-diff in CI.
+
+No new public API. Four new integration tests in
+[`tests/published_encode_api.rs`](tests/published_encode_api.rs) cover
+(a) the all-three-set canonical-inverse case, (b) every single-kind and
+pair-kind subset (six combinations: `icc-only` / `exif-only` /
+`xmp-only` / `icc+exif` / `icc+xmp` / `exif+xmp`) under one parametric
+harness, (c) the odd-length-payload case (every metadata chunk gets a
+§2.3 pad byte that must be regenerated identically on re-build), and
+(d) the `ImageKind::ExtendedLossy` bitstream-FourCC variant. One new
+inline unit test in [`src/build.rs`](src/build.rs) anchors the same
+property at the writer level via the `container::parse` walker without
+depending on the `extract_metadata` public path.
+
+Total: **500** tests green (was 495: +5 from this round). Default and
+`--no-default-features` builds both clippy + fmt clean.
+
 ## Status — 2026-05-26 (clean-room round 143)
 
 **Round 143 added the chainable
