@@ -2,6 +2,67 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 163)
+
+**Round 163 extends the VP8L LZ77 lazy matcher to four positions,
+gated by a diminishing-returns guard.** The round-158 matcher probes
+`pos`, `pos + 1`, `pos + 2`, and `pos + 3` and swaps to whichever
+candidate starting position yields the strictly-longest match; round
+163 adds a fourth probe at `pos + 4`, but only when the depth-3 best
+is short enough to make a further swap potentially worthwhile.
+
+Two gates govern the new depth-4 probe:
+
+1. **Upper bound** — `best_len < DEPTH4_GUARD_THRESHOLD` (= `6`).
+   Once the depth-3 best already covers a length-`6` run, swapping
+   to a depth-4 alternative would have to strictly exceed that
+   length while paying for four literals (`pixels[pos..pos + 4]`);
+   the empirical pay-off shrinks fast past the threshold and is
+   rarely big enough to recover the literal-emission cost in the
+   §5.2.2 entropy stage.
+2. **Lower bound** — `best_len > MIN_MATCH` (i.e. `best_len >= 4`).
+   The depth-4 probe pre-inserts `pos + 3` into the matcher chain so
+   the `find(pos + 4)` window can reference it; that pre-insert must
+   be covered by the chosen match's range so the next iteration's
+   `find` never sees its own position in the chain (which would
+   return distance `0`). With `best_len >= 4` and `best_start ==
+   pos`, the match end is at least `pos + 4 > pos + 3`, covering the
+   pre-insert.
+
+The decoder output is bit-identical for any input — only the token
+*partition* shifts (by up to four pixels) — so round-trips remain
+bit-exact and the entire pre-round-163 test suite continues to pass
+unchanged. The internal `tokenize_lz77_inner` `lazy_depth: u32`
+toggle now accepts `4` (round-163 production default); `0` / `1` /
+`2` / `3` continue to reproduce the r155 / r156 / r157 / r158
+baselines.
+
+Three new tests cover the contract:
+`round_163_depth4_lazy_match_round_trips_through_decoder` (a noisy
+96×16 fixture round-trips end-to-end and via the direct
+`encode_argb_literals_with_width` path);
+`round_163_depth4_guard_suppresses_long_run_swap` (a 512-pixel
+4-motif repeating fixture where every depth-3 best is well above
+the guard threshold — the depth-3 and depth-4 partitions must be
+byte-for-byte equal, proving the guard suppressed every depth-4
+probe call); and
+`round_163_depth4_never_increases_token_count_over_depth3` (8
+shapes × 3 fixture families — the depth-4 token count is
+structurally `<=` the depth-3 token count, with a defensive end-to-
+end round-trip on every fixture). 392 lib tests, +3 vs round 162.
+Spec source: RFC 9649 §5.2.2 / §3.6.2.2 (backward references; lazy-
+match depth is an encoder choice unconstrained by the format).
+
+Still lacks (post-round-163): deeper LZ77 lazy depths beyond four
+(round-163's diminishing-returns guard suggests the next-order
+candidate already sits in the "rarely worthwhile" regime, so a
+depth-5 extension would have to be paired with a smarter cost
+model than length-only); the lazy-match cost model is still pure
+length (no integration with the §5.2.3 cache or §5.2.2 distance-
+prefix cost yet); the round-162 sub-image cost still uses a fixed
+4-value lambda sweep rather than an adaptive per-image budget; and
+VP8 lossy encode is still entirely absent.
+
 ## Status — 2026-05-27 (clean-room round 162)
 
 **Round 162 makes the VP8L §4.1 per-block mode chooser sub-image

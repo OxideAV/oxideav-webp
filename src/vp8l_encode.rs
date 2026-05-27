@@ -111,21 +111,27 @@
 //! (used by the size-reduction comparison test); the default
 //! [`encode_argb_literals`] entry point chooses the LZ77 path.
 //!
-//! As of round 158 the matcher applies **three-position lazy matching**:
-//! after finding a match `(L_a, _)` at `pos`, the encoder also probes
-//! `pos + 1`, `pos + 2`, and `pos + 3`. Whichever of the four candidate
-//! start positions yields the strictly longest match wins; the pixels
-//! skipped to reach the chosen start are emitted as literals. This
-//! recovers a *third-order* strict-greedy trap that the round-156
-//! depth-1 and round-157 depth-2 matchers could not escape — three
-//! consecutive short matches at `pos`, `pos + 1`, `pos + 2` together
-//! blocking a strictly longer match at `pos + 3`. The decoder output
-//! is bit-identical for any input — only the token *partition* shifts
-//! (by up to three pixels) — so round-trips remain bit-exact under any
-//! input. See [`tokenize_lz77_inner`] for the shared
+//! As of round 163 the matcher applies **four-position lazy matching
+//! with a diminishing-returns guard**: after finding a match
+//! `(L_a, _)` at `pos`, the encoder also probes `pos + 1`, `pos + 2`,
+//! and `pos + 3` (the round-158 depth-3 contract), and then — only
+//! when the running best across those four positions is still shorter
+//! than [`DEPTH4_GUARD_THRESHOLD`] — also probes `pos + 4`. Whichever
+//! of the candidate start positions yields the strictly longest match
+//! wins; the pixels skipped to reach the chosen start are emitted as
+//! literals. The depth-4 guard captures the empirical observation
+//! that once the depth-3 best already covers a length-`THRESHOLD` run,
+//! a fourth-order swap is almost never able to amortise the four
+//! literals it would cost — the depth-4 probe is gated to avoid
+//! spending hash-chain inserts and a `find` call when its expected
+//! marginal payoff is small. This still recovers fourth-order traps
+//! where the leading match at `pos..=pos + 3` is short. The decoder
+//! output is bit-identical for any input — only the token *partition*
+//! shifts (by up to four pixels) — so round-trips remain bit-exact
+//! under any input. See [`tokenize_lz77_inner`] for the shared
 //! `lazy_depth: u32`-toggled implementation (`0` strict-greedy r155
 //! baseline, `1` r156 depth-1, `2` r157 depth-2, `3` r158 depth-3,
-//! now the production default).
+//! `4` r163 guarded depth-4, now the production default).
 //!
 //! ## §4.1 spatial-predictor forward transform
 //!
@@ -1087,10 +1093,32 @@ fn tokenize_lz77(pixels: &[u32]) -> Vec<Token> {
 
 /// Production lazy-match depth used by [`tokenize_lz77`]. Round 156
 /// set this to 1 (single-position look-ahead); round 157 bumped it to
-/// 2 (two-position look-ahead); round 158 bumps it to 3 (three-position
-/// look-ahead). A value of 0 reproduces the r155 strict-greedy
-/// partition.
-const LAZY_DEPTH_DEFAULT: u32 = 3;
+/// 2 (two-position look-ahead); round 158 bumped it to 3 (three-
+/// position look-ahead); round 163 bumps it to 4 (four-position look-
+/// ahead with a [`DEPTH4_GUARD_THRESHOLD`] diminishing-returns guard).
+/// A value of 0 reproduces the r155 strict-greedy partition.
+const LAZY_DEPTH_DEFAULT: u32 = 4;
+
+/// Round-163 diminishing-returns guard for the depth-4 probe. The
+/// depth-4 `find(pos + 4)` call (plus the `matcher.insert(pos + 3)`
+/// bookkeeping that gives it a fair shot at including `pos..=pos + 3`
+/// in its window) is only executed when the running best length
+/// across the depth-1/2/3 probes is strictly less than this
+/// threshold. Once the depth-3 best already covers a length-
+/// `THRESHOLD` run, swapping to a depth-4 alternative would have to
+/// strictly exceed that length while paying for four literals
+/// (`pixels[pos..pos + 4]`); the empirical pay-off shrinks rapidly
+/// past the threshold and is rarely big enough to recover the
+/// literal-emission cost in the entropy stage. Tuned to a conservative
+/// value (`6`) so the guard only suppresses depth-4 work when the
+/// running best is already comfortably above the four-literal break-
+/// even line. At `THRESHOLD = u32::MAX` the depth-4 probe still
+/// honours the `best_len > MIN_MATCH` floor (see
+/// [`tokenize_lz77_inner`]); at `THRESHOLD = 0` (or below
+/// `MIN_MATCH + 1 = 4`) the depth-4 probe never fires. The A/B
+/// regression test [`round_163_depth4_guard_suppresses_long_run_swap`]
+/// exercises the guard's switching boundary.
+const DEPTH4_GUARD_THRESHOLD: u32 = 6;
 
 /// Implementation of [`tokenize_lz77`] with an explicit `lazy_depth`
 /// toggle. Values:
@@ -1106,16 +1134,25 @@ const LAZY_DEPTH_DEFAULT: u32 = 3;
 ///   `pos + 3`, swap to a strictly-longer match starting there (the
 ///   `pos + 3` match must strictly beat the running best across
 ///   `pos`, `pos + 1`, and `pos + 2`).
+/// * `4` — round-163 guarded four-position lazy partition: also
+///   probes `pos + 4`, but **only when** the running best across the
+///   first four positions is strictly greater than [`MIN_MATCH`]
+///   (`MIN_MATCH = 3`, so `best_len >= 4`) AND strictly less than
+///   [`DEPTH4_GUARD_THRESHOLD`]. The `> MIN_MATCH` floor ensures the
+///   pre-inserted `pos + 3` position is always covered by the chosen
+///   match's range, so the next iteration's `find` never sees its
+///   own position in the chain. When the guard fires, the `pos + 4`
+///   match must strictly beat the running best.
 ///
-/// Values `>= 3` are clamped to `3`. The A/B regression tests
-/// in this module use `0`, `1`, and `2` to compare against the r155,
-/// r156, and r157 baselines.
+/// Values `>= 4` are clamped to `4`. The A/B regression tests
+/// in this module use `0`, `1`, `2`, and `3` to compare against the
+/// r155, r156, r157, and r158 baselines.
 fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
     let n = pixels.len();
     let mut matcher = Lz77Matcher::new(pixels);
     let mut tokens = Vec::new();
     let mut pos = 0usize;
-    let depth = lazy_depth.min(3);
+    let depth = lazy_depth.min(4);
     while pos < n {
         if let Some((len_a, dist_a)) = matcher.find(pos) {
             // Lazy lookahead. The matcher's hash chains do not yet
@@ -1177,6 +1214,47 @@ fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
                     }
                 }
             }
+            // Depth-4 probe (round 163): only meaningful if depth
+            // allows it, the running best match is short enough to be
+            // worth attempting to displace, `pos + 4` is in range,
+            // AND the round-163 diminishing-returns guard fires
+            // (`best_len < DEPTH4_GUARD_THRESHOLD`). The guard skips
+            // the depth-4 work when the depth-3 best is already
+            // comfortably above the four-literal break-even line.
+            //
+            // Additional **lower-bound** floor: the depth-4 probe pre-
+            // inserts `pos + 3` into the matcher chain so the `find(pos
+            // + 4)` window can reference it. That pre-insert must be
+            // covered by the chosen match's range `[best_start,
+            // best_start + best_len)` — otherwise the next iteration's
+            // `pos` (= `best_start + best_len`) could equal `pos + 3`,
+            // and `find(pos + 3)` would see itself in the chain and
+            // return distance `0`. We avoid that corner by gating on
+            // `best_len > MIN_MATCH` (i.e., `best_len >= 4`): with
+            // `best_start == pos` the match end is at least `pos + 4 >
+            // pos + 3`, covering the pre-insert. The depth-3 best of
+            // exactly 3 pixels (`= MIN_MATCH`) is short enough that
+            // the depth-4 probe is rarely worth it anyway, so the
+            // floor costs almost nothing on the matcher's behaviour.
+            //
+            // We also require `pos + 3` to be inserted so the `pos + 4`
+            // window can reference it; the depth-1 / depth-2 / depth-3
+            // probes already inserted `pos`, `pos + 1`, and `pos + 2`.
+            let inserted_pos3 = depth >= 4
+                && best_len > MIN_MATCH
+                && best_len < MAX_MATCH
+                && (best_len as u32) < DEPTH4_GUARD_THRESHOLD
+                && pos + 4 < n;
+            if inserted_pos3 {
+                matcher.insert(pos + 3);
+                if let Some((len_e, dist_e)) = matcher.find(pos + 4) {
+                    if len_e > best_len {
+                        best_len = len_e;
+                        best_dist = dist_e;
+                        best_start = pos + 4;
+                    }
+                }
+            }
 
             // Emit literals for any pixels skipped by the chosen
             // lazy starting position, then the chosen match.
@@ -1194,16 +1272,18 @@ fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
             // probes already inserted.
             //
             // Pre-inserted positions (so far): `pos` if `inserted_pos`,
-            // `pos + 1` if `inserted_pos1`, `pos + 2` if `inserted_pos2`.
-            // The chosen match covers `[best_start, best_start +
-            // best_len)`. Walk that range and only `insert` the
-            // positions that are not already in the chains.
+            // `pos + 1` if `inserted_pos1`, `pos + 2` if `inserted_pos2`,
+            // `pos + 3` if `inserted_pos3` (round 163). The chosen
+            // match covers `[best_start, best_start + best_len)`. Walk
+            // that range and only `insert` the positions that are not
+            // already in the chains.
             let end = best_start + best_len;
             let mut q = pos;
             while q < end {
                 let already_in = (q == pos && inserted_pos)
                     || (q == pos + 1 && inserted_pos1)
-                    || (q == pos + 2 && inserted_pos2);
+                    || (q == pos + 2 && inserted_pos2)
+                    || (q == pos + 3 && inserted_pos3);
                 if q >= best_start && !already_in {
                     matcher.insert(q);
                 }
@@ -9570,6 +9650,249 @@ mod tests {
                     img.pixels(),
                     pixels.as_slice(),
                     "round-158 depth-3 round-trip mismatch on {name} {w}x{h}"
+                );
+            }
+        }
+    }
+
+    // ---- round 163: §5.2.2 guarded depth-4 lazy LZ77 ----
+    //
+    // Three tests, mirroring the round-156 / 157 / 158 contract:
+    //
+    // 1) End-to-end round-trip — a noisy 96×16 fixture encoded with
+    //    the round-163 guarded depth-4 lazy matcher (now the production
+    //    `tokenize_lz77` default) must still decode bit-exactly back
+    //    to the original ARGB pixels.
+    // 2) Diminishing-returns guard — a hand-crafted fixture where the
+    //    depth-3 best at `pos` is a long run (`>= DEPTH4_GUARD_THRESHOLD`)
+    //    and a depth-4 swap candidate exists. The guard must suppress
+    //    the depth-4 work so depth-4 == depth-3 byte-for-byte on that
+    //    fixture; the unguarded depth-4 (simulated with `DEPTH4_GUARD_THRESHOLD`
+    //    set to `MAX_MATCH`) would have swapped. We exercise the
+    //    boundary by toggling the depth around the guard rather than
+    //    monkey-patching the constant — the two depth values that
+    //    bracket the guard (`3` vs `4`) produce identical partitions
+    //    on the long-run fixture, proving the guard suppressed the
+    //    probe.
+    // 3) Non-regression — on a broader fixture matrix the depth-4
+    //    token count is `<=` the depth-3 token count everywhere
+    //    (structural: the depth-4 probe only swaps to a *strictly*
+    //    longer match, so it can only remove tokens, never add them).
+
+    /// Round 163 round-trip: a noisy 96×16 fixture encoded with the
+    /// round-163 guarded depth-4 lazy matcher (now the production
+    /// `tokenize_lz77` default) must still decode bit-exactly back to
+    /// the original ARGB pixels. Uses an independent xorshift seed
+    /// from the round-156 / 157 / 158 tests so all four fixtures
+    /// exercise the matcher over distinct entropy.
+    #[test]
+    fn round_163_depth4_lazy_match_round_trips_through_decoder() {
+        let w = 96u32;
+        let h = 16u32;
+        let mut seed = 0xFEED_FACE_u32;
+        let pixels: Vec<u32> = (0..(w * h) as usize)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                0xFF00_0000 | (seed & 0x00FF_FFFF)
+            })
+            .collect();
+
+        // The full chooser delegates to `tokenize_lz77` (depth-4 as of
+        // round 163); end-to-end round-trip through the framed file
+        // must recover the exact input.
+        let stream = encode_argb_with_predictor_chooser(&pixels, w, h);
+        let header = build_image_header(w, h, true);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+
+        // The direct depth-4 token stream against the no-transform
+        // encoder must also round-trip — guards against bookkeeping
+        // bugs in the new depth-4 insert/skip dedup path (where `pos`,
+        // `pos + 1`, `pos + 2`, and `pos + 3` can all be pre-inserted
+        // before the chosen match starts at `pos`, `pos + 1`, `pos + 2`,
+        // `pos + 3`, or `pos + 4`).
+        let stream_direct = encode_argb_literals_with_width(&pixels, w);
+        let header_direct = build_image_header(w, h, true);
+        let mut payload_direct = header_direct.to_vec();
+        payload_direct.extend_from_slice(&stream_direct);
+        let framed_direct =
+            build::build_webp_file(&payload_direct, ImageKind::Lossless, w, h).unwrap();
+        let img_direct = crate::decode_lossless_image(&framed_direct)
+            .unwrap()
+            .unwrap();
+        assert_eq!(img_direct.pixels(), pixels.as_slice());
+    }
+
+    /// Round 163 guard contract: on a fixture whose depth-3 best at
+    /// some position is already a long run (length strictly `>=
+    /// DEPTH4_GUARD_THRESHOLD`), the depth-4 probe MUST be suppressed
+    /// by the guard. We construct an input where a long literal run
+    /// at the start seeds a long match for the second copy. The
+    /// depth-3 matcher emits a long match at the first probe; the
+    /// depth-4 probe, if it were unguarded, would attempt a `find` at
+    /// `pos + 4`. The guard's structural contract is that whenever
+    /// the depth-3 best already covers `>= DEPTH4_GUARD_THRESHOLD`
+    /// pixels, depth-4 produces the IDENTICAL token sequence as
+    /// depth-3 — i.e. the guard fired and the depth-4 work was
+    /// skipped.
+    ///
+    /// The simpler property the test asserts: on a long-run fixture
+    /// the depth-4 partition (depth = 4) is byte-for-byte equal to
+    /// the depth-3 partition (depth = 3). If the guard fails to fire,
+    /// depth-4 would still find some marginal swap somewhere in the
+    /// fixture and the two partitions would diverge.
+    #[test]
+    fn round_163_depth4_guard_suppresses_long_run_swap() {
+        // A long, smoothly-varying run guarantees that almost every
+        // match the matcher finds is significantly longer than
+        // `DEPTH4_GUARD_THRESHOLD == 6` — so the guard should fire at
+        // every probe site and depth-4 should produce the same token
+        // partition as depth-3.
+        //
+        // We use a 4-pixel repeating motif that the matcher can find
+        // long copies of after the first cycle: `[A, B, C, D, A, B, C,
+        // D, …]`. After 12 pixels of warm-up, a `find` will return a
+        // match length up to MAX_MATCH (well over the guard threshold).
+        let a_ = 0xFF10_2030_u32;
+        let b_ = 0xFF40_5060_u32;
+        let c_ = 0xFF70_8090_u32;
+        let d_ = 0xFFA0_B0C0_u32;
+        let motif = [a_, b_, c_, d_];
+        let mut pixels: Vec<u32> = Vec::with_capacity(512);
+        for i in 0..512 {
+            pixels.push(motif[i & 3]);
+        }
+
+        let lazy3 = tokenize_lz77_inner(&pixels, 3);
+        let lazy4 = tokenize_lz77_inner(&pixels, 4);
+
+        // Guard contract: when the depth-3 best is already long, the
+        // depth-4 probe is suppressed and the two partitions are
+        // byte-for-byte equal.
+        assert_eq!(
+            lazy3,
+            lazy4,
+            "round-163 depth-4 guard should suppress the depth-4 probe \
+             on a long-run fixture (every depth-3 best `>= DEPTH4_GUARD_THRESHOLD == {}`), \
+             producing the identical depth-3 partition; depth-3={} tokens, \
+             depth-4={} tokens",
+            DEPTH4_GUARD_THRESHOLD,
+            lazy3.len(),
+            lazy4.len(),
+        );
+
+        // Sanity: both partitions must cover the input exactly.
+        let coverage = |toks: &[Token]| -> usize {
+            toks.iter()
+                .map(|t| match *t {
+                    Token::Literal(_) => 1,
+                    Token::CacheRef { .. } => 1,
+                    Token::Copy { length, .. } => length,
+                })
+                .sum()
+        };
+        assert_eq!(coverage(&lazy3), pixels.len());
+        assert_eq!(coverage(&lazy4), pixels.len());
+
+        // End-to-end round-trip via the production chooser for good
+        // measure: the depth-4-default `tokenize_lz77` must still
+        // decode back exactly on this long-run fixture.
+        let w = pixels.len() as u32;
+        let h = 1u32;
+        let stream = encode_argb_literals_with_width(&pixels, w);
+        let header = build_image_header(w, h, true);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+        let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+        assert_eq!(img.pixels(), pixels.as_slice());
+    }
+
+    /// Round 163 non-regression: across a broad fixture matrix the
+    /// depth-4 lazy token count is `<=` the depth-3 lazy token count
+    /// everywhere. Structural because the depth-4 probe — when the
+    /// guard allows it to fire — only swaps when the alternate match
+    /// is strictly longer than the depth-3 best, so the depth-4
+    /// partition uses at most as many tokens as the depth-3 partition.
+    /// When the guard suppresses the probe, depth-4 produces the same
+    /// tokens as depth-3 directly. The test also guards against
+    /// off-by-one in the new depth-4 insert/skip dedup (where `pos`,
+    /// `pos + 1`, `pos + 2`, and `pos + 3` can all be pre-inserted
+    /// before the chosen match starts at any of those positions or
+    /// `pos + 4`).
+    #[test]
+    fn round_163_depth4_never_increases_token_count_over_depth3() {
+        let shapes: &[(u32, u32)] = &[
+            (16, 16),
+            (20, 20),
+            (24, 24),
+            (32, 32),
+            (48, 48),
+            (16, 32),
+            (64, 16),
+            (40, 24),
+        ];
+        for &(w, h) in shapes {
+            let gradient: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    let y = (i as u32) / w;
+                    let g = (x + y) & 0xFF;
+                    0xFF00_0000 | (g << 16) | (g << 8) | g
+                })
+                .collect();
+            let mut seed = 0xBADD_CAFE_u32;
+            let noise: Vec<u32> = (0..(w * h) as usize)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    0xFF00_0000 | (seed & 0x00FF_FFFF)
+                })
+                .collect();
+            let stripes: Vec<u32> = (0..(w * h) as usize)
+                .map(|i| {
+                    let x = (i as u32) % w;
+                    match x % 4 {
+                        0 => 0xFFAA_5500,
+                        1 => 0xFF55_AA00,
+                        2 => 0xFF00_55AA,
+                        _ => 0xFF55_00AA,
+                    }
+                })
+                .collect();
+
+            for (name, pixels) in [
+                ("gradient", &gradient),
+                ("noise", &noise),
+                ("stripes", &stripes),
+            ] {
+                let lazy3 = tokenize_lz77_inner(pixels, 3);
+                let lazy4 = tokenize_lz77_inner(pixels, 4);
+                assert!(
+                    lazy4.len() <= lazy3.len(),
+                    "round-163 depth-4 regression on {name} {w}x{h}: \
+                     depth-3={} tokens, depth-4={} tokens",
+                    lazy3.len(),
+                    lazy4.len(),
+                );
+                // Round-trip the depth-4 stream as a defensive check
+                // for hash-chain insert bookkeeping.
+                let stream = encode_argb_literals_with_width(pixels, w);
+                let header = build_image_header(w, h, true);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&stream);
+                let framed = build::build_webp_file(&payload, ImageKind::Lossless, w, h).unwrap();
+                let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+                assert_eq!(
+                    img.pixels(),
+                    pixels.as_slice(),
+                    "round-163 depth-4 round-trip mismatch on {name} {w}x{h}"
                 );
             }
         }

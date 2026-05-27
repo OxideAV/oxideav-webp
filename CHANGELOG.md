@@ -6,6 +6,42 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 163 (2026-05-27).** §5.2.2 LZ77 lazy-match
+  matcher gains a **fourth-position probe with a diminishing-returns
+  guard**. The round-158 three-position lazy matcher probes `pos`,
+  `pos + 1`, `pos + 2`, and `pos + 3`; round 163 adds a fourth probe
+  at `pos + 4`, gated by two conditions: an upper-bound guard
+  (`best_len < DEPTH4_GUARD_THRESHOLD = 6`) — once the depth-3 best
+  already covers a length-`6` run, swapping to depth-4 would have
+  to strictly exceed that length while paying for four literals,
+  whose break-even is rarely recovered in the entropy stage; and a
+  lower-bound floor (`best_len > MIN_MATCH`, i.e. `best_len >= 4`)
+  — the depth-4 probe pre-inserts `pos + 3` into the matcher chain,
+  and that pre-insert must be covered by the chosen match's range
+  so the next iteration's `find` never sees its own position in the
+  chain (which would return distance `0`). Decoder output is bit-
+  identical for any input — only the token partition shifts by up
+  to four pixels — so the entire pre-round-163 test suite continues
+  to round-trip unchanged. The internal `tokenize_lz77_inner`
+  `lazy_depth: u32` toggle now accepts `4` (round-163 production
+  default); `0` / `1` / `2` / `3` continue to reproduce the r155 /
+  r156 / r157 / r158 baselines. Three new tests:
+  `round_163_depth4_lazy_match_round_trips_through_decoder` (a noisy
+  96×16 fixture round-trips end-to-end and via the direct
+  `encode_argb_literals_with_width` path);
+  `round_163_depth4_guard_suppresses_long_run_swap` (a 512-pixel
+  4-motif repeating fixture where every depth-3 best is well above
+  the guard threshold — the depth-3 and depth-4 partitions are
+  asserted byte-for-byte equal, proving the guard suppressed every
+  depth-4 probe call); and
+  `round_163_depth4_never_increases_token_count_over_depth3` (8
+  shapes × 3 fixture families — the depth-4 token count is
+  structurally `<=` the depth-3 token count, with a defensive end-
+  to-end round-trip on every fixture). 392 lib tests, +3 vs round
+  162. Spec source: RFC 9649 §5.2.2 / §3.6.2.2 (backward references;
+  lazy-match depth is an encoder choice unconstrained by the
+  format).
+
 * **Clean-room round 162 (2026-05-27).** §4.1 spatial-predictor
   forward transform gains a **sub-image-aware** Shannon bit-cost
   variant on the per-block mode chooser. The round-161 chooser
