@@ -915,23 +915,17 @@ impl From<oxideav_vp8::DecodeError> for WebpError {
     }
 }
 
-/// Map the `oxideav-vp8` umbrella [`oxideav_vp8::Vp8Error`] (the
-/// flat-four `InvalidData` / `Unsupported` / `Eof` / `NeedMore` surface)
-/// onto the coarse published [`WebpError`].
-///
-/// Variant correspondence is one-to-one (the published `WebpError` and
-/// `Vp8Error` share the same flat-four shape), modulo dropping vp8's
-/// `String` payload — the rebuilt `WebpError` is the unit-variant form.
-impl From<oxideav_vp8::Vp8Error> for WebpError {
-    fn from(e: oxideav_vp8::Vp8Error) -> Self {
-        match e {
-            oxideav_vp8::Vp8Error::InvalidData(_) => WebpError::InvalidData,
-            oxideav_vp8::Vp8Error::Unsupported(_) => WebpError::Unsupported,
-            oxideav_vp8::Vp8Error::Eof => WebpError::Eof,
-            oxideav_vp8::Vp8Error::NeedMore => WebpError::NeedMore,
-        }
-    }
-}
+// NOTE on the published API-COMPAT-0.1.2 `From<oxideav_vp8::Vp8Error>`
+// adapter: `Vp8Error` is the umbrella type the published `oxideav-webp
+// 0.1.2` rustdoc cited, but it is only on `oxideav-vp8` master — the
+// published `oxideav-vp8 0.2.0` release on crates.io carries only the
+// per-stage `DecodeError` (the `From<DecodeError>` adapter above is the
+// live one). The umbrella `From<Vp8Error>` adapter lands here in a
+// follow-up commit once `oxideav-vp8` publishes a release that exports
+// `Vp8Error`. The CI (`Build (no registry)`) compiles against the
+// **published** vp8 dep, not the in-workspace path, so adding the
+// adapter today would break the standalone build for downstream
+// consumers.
 
 /// Decode a WebP file to the published flat-RGBA [`WebpImage`] shape.
 ///

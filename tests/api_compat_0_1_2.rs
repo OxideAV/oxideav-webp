@@ -371,15 +371,12 @@ fn registry_decoder_make_vp8l_decoder_signature() {
     let _: fn(u32, u32) -> oxideav_webp::WebpDecoder = oxideav_webp::decoder::make_vp8l_decoder;
 }
 
-// ============================================================================
-// `From` adapter — `WebpError: From<oxideav_vp8::Vp8Error>`.
-// ============================================================================
-
-#[test]
-fn webp_error_from_vp8_error_adapter() {
-    // The flat-four `Vp8Error` maps one-to-one onto `WebpError`.
-    let e: oxideav_webp::WebpError = oxideav_webp::WebpError::from(oxideav_vp8::Vp8Error::Eof);
-    assert_eq!(e, oxideav_webp::WebpError::Eof);
-    let e: oxideav_webp::WebpError = oxideav_webp::WebpError::from(oxideav_vp8::Vp8Error::NeedMore);
-    assert_eq!(e, oxideav_webp::WebpError::NeedMore);
-}
+// NOTE: `From<oxideav_vp8::Vp8Error> for WebpError` is documented in
+// API-COMPAT-0.1.2.md but is **not** asserted here. `Vp8Error` is only
+// on `oxideav-vp8` master; the published `oxideav-vp8 0.2.0` release
+// the CI's `Build (no registry)` job pulls in does not export it. The
+// adapter (and this assertion) lands in a follow-up commit once
+// `oxideav-vp8` publishes a release that does. The
+// `From<oxideav_vp8::DecodeError> for WebpError` adapter that is wired
+// up today still exists at `oxideav_webp::WebpError::from(decode_err)`
+// (verified via the in-crate decode-error mapping tests).
