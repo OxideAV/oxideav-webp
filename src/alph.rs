@@ -58,7 +58,7 @@
 //!
 //! Cross-checked against `docs/image/webp/fixtures/lossy-with-alpha-128x128/trace.txt`
 //! which reports `header_byte=0x01 method=1 filter=0 pre_processing=0` for a
-//! libwebp-encoded fixture — only the C nibble's LSB is set, matching
+//! reference-encoder-produced fixture — only the C nibble's LSB is set, matching
 //! `compression = 1` (lossless) with everything else 0.
 
 use core::fmt;

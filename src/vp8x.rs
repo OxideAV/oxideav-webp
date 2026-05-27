@@ -44,7 +44,7 @@
 //! | 1           | A      | Animation present (`ANIM` + `ANMF` chunks follow)    |
 //! | 0           | R      | reserved, MUST be 0, readers MUST ignore             |
 //!
-//! The mapping is anchored against six libwebp-encoded fixtures in
+//! The mapping is anchored against six reference-encoder-produced fixtures in
 //! `docs/image/webp/fixtures/`: `extended-with-exif` (flags=0x08 →
 //! E), `extended-with-icc-profile` (0x20 → I), `extended-with-xmp`
 //! (0x04 → X), `lossy-with-alpha-128x128` (0x10 → L),

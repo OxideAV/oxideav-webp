@@ -49,7 +49,7 @@ pub struct Vp8FreqDeltas {
     pub uv_ac_delta: i8,
 }
 
-/// Map a libwebp-style quality scale (`0.0..=100.0`) to a VP8 qindex
+/// Map a WebP-canonical `0.0..=100.0` quality scale to a VP8 qindex
 /// (`0..=127`, lower = better).
 ///
 /// The mapping is `round((100 - quality) * 1.27)`, clamped to the
@@ -89,7 +89,7 @@ pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>, oxide
     ))
 }
 
-/// `make_encoder` plus a libwebp-style quality knob (`0.0..=100.0`).
+/// `make_encoder` plus a WebP-canonical `0.0..=100.0` quality knob.
 ///
 /// See [`quality_to_qindex`] for the projection. Currently routes to
 /// [`make_encoder`] (i.e. surfaces [`WebpError::Unsupported`]); the
@@ -128,8 +128,8 @@ pub fn make_encoder_with_qindex_and_freq_deltas(
     make_encoder(params)
 }
 
-/// `make_encoder` plus a libwebp-style quality knob and a
-/// [`Vp8FreqDeltas`] record of per-band quantiser deltas.
+/// `make_encoder` plus a WebP-canonical `0.0..=100.0` quality knob
+/// and a [`Vp8FreqDeltas`] record of per-band quantiser deltas.
 ///
 /// Currently surfaces [`WebpError::Unsupported`] until the VP8 lossy
 /// encoder lands.

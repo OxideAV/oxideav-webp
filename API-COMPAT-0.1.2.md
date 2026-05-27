@@ -10,7 +10,7 @@ disagree on a name or shape, **0.1.2 wins** for backward compatibility.
 > Source of every signature below: the per-version rustdoc at
 > `https://docs.rs/oxideav-webp/0.1.2/`. Recovered field-by-field from
 > module / type / function index pages. Not from the removed `src/`,
-> not from libwebp, not from `cwebp`/`dwebp` source.
+> not from any reference encoder source.
 
 ## Cargo features (verbatim from the 0.1.2 manifest)
 
@@ -122,7 +122,7 @@ pub fn make_encoder(params: &CodecParameters)
 
 pub fn make_encoder_with_quality(
     params: &CodecParameters,
-    quality: f32,                       // libwebp scale 0.0..=100.0
+    quality: f32,                       // WebP-canonical scale 0.0..=100.0
 ) -> Result<Box<dyn Encoder>>;
 
 pub fn make_encoder_with_qindex(

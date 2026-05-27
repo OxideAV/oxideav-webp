@@ -565,7 +565,7 @@ mod tests {
         // Round 124: the §2.5 `VP8 ` lossy path is decoded through the
         // `oxideav-vp8` sibling crate, so the registered decoder now
         // yields a frame (previously a clean Unsupported). The 1x1
-        // cwebp fixture decodes to a single 1px RGBA frame.
+        // reference-encoder-produced 1x1 fixture decodes to a single 1px RGBA frame.
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
