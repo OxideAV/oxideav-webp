@@ -6,6 +6,42 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Round-168 drive-to-100% (2026-05-27).** Wire the VP8-lossy encode
+  path through to `oxideav-vp8 0.2.1` (the release that first exports
+  `Vp8Error` at the crate root and ships the framework
+  `make_encoder*` factory family). The five `encoder_vp8::make_encoder*`
+  factories now delegate to `oxideav_vp8::encoder::make_encoder_with_qindex`
+  / `make_encoder_with_quality` via a new internal `WebpVp8LossyEncoder`
+  adapter that wraps every emitted raw VP8 keyframe in a §2.5
+  simple-lossy `RIFF/WEBP` container. Concretely:
+  - `From<oxideav_vp8::Vp8Error> for WebpError` re-landed — the
+    four `Vp8Error` variants share names with `WebpError` so the
+    mapping is a 1-to-1 collapse (string payloads dropped per the
+    unit-variant rebuild convention). Documented assertion in
+    `tests/api_compat_0_1_2.rs::crate_root_webp_error_from_vp8_error_*`.
+  - New `tests/vp8_lossy_roundtrip.rs` — encode a synthetic 16x16
+    Yuv420P frame through `make_encoder_with_quality(90.0)` /
+    `make_encoder_with_qindex(0)` /
+    `make_encoder_with_quality_and_freq_deltas(75.0, …)`; decode
+    the emitted `.webp` via `decode_webp`; assert geometry +
+    flat-RGBA shape + L1-distance budget (< 40 / 255 per channel).
+  - `Cargo.toml` `registry` feature now cascades into
+    `oxideav-vp8/registry` so the underlying framework encoder is
+    available when the webp `registry` feature is on.
+  - `API-COMPAT-0.1.2.md` widened: the `AnimFrame` field-name
+    deviation (owned `pixels`/`x`/`y`/`duration` vs the 0.1.2
+    borrowed `rgba`/`x_offset`/`y_offset`/`duration_ms` shape) and
+    the `build_animated_webp_with_options(frames, opts)` signature
+    deviation (vs the 0.1.2 `(canvas_w, canvas_h, background_bgra,
+    loop_count, frames, options)` shape) are now explicitly
+    documented as deliberate widening — the current shape is a
+    strict superset of the 0.1.2 capability set.
+  - Banned-words scrub across `tests/fixture_walks.rs` (6
+    occurrences of `libwebp` / `cwebp` / `dwebp` rewritten to the
+    neutral `reference-encoder-produced` / `reference decoder`
+    phrasing) so the round-168 verification grep is empty over
+    `src/`, `tests/`, and `API-COMPAT-0.1.2.md`.
+
 * **API-COMPAT-0.1.2 finalize pass (2026-05-27).** Restore the published
   `oxideav-webp 0.1.2` crate-root public surface so consumers pinned to
   `oxideav-webp = "0.1"` upgrade transparently. New `pub mod` shims

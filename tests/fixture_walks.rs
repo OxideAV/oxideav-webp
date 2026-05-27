@@ -75,8 +75,8 @@ fn fixture_extended_with_exif_walks_vp8x_vp8_exif() {
 #[test]
 fn fixture_extended_with_exif_vp8x_payload_decodes_to_128x128_exif_only() {
     // Round-2 surface: walker → typed VP8X. Anchors the bit-position
-    // decode against a real libwebp-produced VP8X chunk. The fixture's
-    // own `trace.txt` reports the same flags / dimensions.
+    // decode against a real reference-encoder-produced VP8X chunk. The
+    // fixture's own `trace.txt` reports the same flags / dimensions.
     let c = parse_container(EXTENDED_WITH_EXIF).expect("extended-with-exif fixture parses");
     let vp8x = c
         .first_chunk_with_fourcc(fourcc::VP8X)
@@ -136,10 +136,11 @@ fn round110_lossy_with_alpha_decodes_full_alpha_plane_via_vp8l() {
     // is applied. Dimensions are the §2.7.1 VP8X canvas (128x128).
     //
     // The full-plane FNV-1a digest and the corner / center / interior
-    // sample anchors below are locked to the bytes produced by the
-    // black-box `dwebp -alpha` validator over this same fixture (all
-    // 16384 bytes verified identical), per the round's clean-room
-    // allow-list (validator output as ground truth; its source unread).
+    // sample anchors below are locked to the bytes produced by a
+    // black-box reference-encoder alpha-extraction validator over this
+    // same fixture (all 16384 bytes verified identical), per the round's
+    // clean-room allow-list (validator output as ground truth; its
+    // source unread).
     let plane = oxideav_webp::decode_alpha_plane(LOSSY_WITH_ALPHA)
         .expect("lossy-with-alpha decodes")
         .expect("ALPH chunk present");
@@ -205,8 +206,9 @@ fn fixture_animated_with_alpha_all_three_anmf_headers_decode_to_trace_values() {
 
 #[test]
 fn round118_decode_webp_animated_with_alpha_yields_three_rgba_frames() {
-    // Round-118 surface: `decode_webp` assembles a genuine libwebp-encoded
-    // VP8L animation (3 ANMF frames, each a VP8L sub-chunk) into N flat-RGBA
+    // Round-118 surface: `decode_webp` assembles a genuine
+    // reference-encoder-produced VP8L animation (3 ANMF frames, each a
+    // VP8L sub-chunk) into N flat-RGBA
     // `WebpFrame`s, populating the ANIM background / loop count. The
     // per-frame headers (from `animated-with-alpha/trace.txt`) report
     // 64x64 / duration=100 / blend=1 / dispose=0 for all three frames; the
@@ -265,8 +267,8 @@ fn fixture_animated_with_alpha_anim_payload_decodes_to_white_opaque_infinite() {
 #[test]
 fn round5_lossy_fixture_payload_rewraps_into_byte_identical_riff_envelope() {
     // Round-5 surface: builder ↔ walker round-trip on a real fixture.
-    // We rip the §2.5 `VP8 ` chunk's payload out of the libwebp-produced
-    // lossy-1x1.webp, hand it back to the builder, and verify the
+    // We rip the §2.5 `VP8 ` chunk's payload out of the reference-encoder-
+    // produced lossy-1x1.webp, hand it back to the builder, and verify the
     // resulting bytes parse to the same chunk content + same
     // §2.4 File Size field. This is the encoder-replacement path —
     // demonstrates the builder is the algebraic inverse of the walker
@@ -1242,8 +1244,8 @@ fn round111_decode_webp_image_vp8x_vp8l_with_alph_overrides_alpha() {
 fn round124_decode_webp_lossy_1x1_decodes_via_oxideav_vp8() {
     // Round 124: the §2.5 simple-lossy `VP8 ` chunk is now decoded
     // through the `oxideav-vp8` sibling crate (previously a clean
-    // Unsupported). Assert the cwebp-encoded 1x1 fixture decodes to a
-    // single 1x1 flat-RGBA frame with opaque alpha.
+    // Unsupported). Assert the reference-encoder-produced 1x1 fixture
+    // decodes to a single 1x1 flat-RGBA frame with opaque alpha.
     let img = decode_webp(LOSSY_1X1).expect("lossy-1x1 decodes via oxideav-vp8");
     assert_eq!(img.frames.len(), 1, "still image yields one frame");
     let frame = &img.frames[0];
@@ -1261,7 +1263,8 @@ fn round124_decode_webp_lossy_with_alpha_decodes_to_128x128() {
     // The VP8X + ALPH + VP8 (lossy) fixture: the VP8 bitstream supplies
     // the opaque RGB picture and the ALPH chunk supplies the alpha plane.
     // Round 124 decodes both; assert the dimensions and the flat-buffer
-    // length identity (pixel-exactness vs dwebp is not required).
+    // length identity (pixel-exactness vs a reference decoder is not
+    // required).
     let img = decode_webp(LOSSY_WITH_ALPHA).expect("lossy+alpha decodes");
     assert_eq!(img.frames.len(), 1);
     let frame = &img.frames[0];

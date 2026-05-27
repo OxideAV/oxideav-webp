@@ -18,10 +18,18 @@
 //!   `round((100 - quality) * 1.27)`, clamped to `0..=127`; NaN
 //!   collapses to `127`. Standalone (no `oxideav-core` dependency).
 //!
-//! The factories themselves are blocked on `oxideav-vp8` growing a
-//! `CodecParameters`-typed factory; until then they surface
-//! [`crate::WebpError::Unsupported`] with a clear "VP8 lossy encoder not
-//! yet rebuilt" message rather than silently misbehaving.
+//! ## Round-168 wiring
+//!
+//! As of `oxideav-vp8 0.2.1` the VP8 encoder factories are wired up: the
+//! `make_encoder*` family below delegates to
+//! [`oxideav_vp8::encoder::make_encoder_with_qindex`] /
+//! [`oxideav_vp8::encoder::make_encoder_with_quality`] and wraps the
+//! emitted raw VP8 keyframe bitstream in the §2.5 `RIFF/WEBP` container
+//! framing so the output decodes back through [`crate::decode_webp`].
+//! The `_freq_deltas` variants pass through to the matching no-deltas
+//! factory in this round — the `Vp8FreqDeltas` argument is forwarded as
+//! a hint (the surface stays unchanged) and the per-band quantiser-delta
+//! plumbing into the underlying `oxideav-vp8` encoder is deferred.
 
 use crate::WebpError;
 
@@ -73,73 +81,183 @@ pub fn quality_to_qindex(quality: f32) -> u8 {
 // ───────────────────────── framework-side factories ─────────────────────────
 
 #[cfg(feature = "registry")]
-use oxideav_core::{CodecParameters, Encoder};
+use oxideav_core::{
+    time::TimeBase, CodecId, CodecParameters, Encoder, Error as CoreError, Frame, MediaType,
+    Packet, Result as CoreResult,
+};
+#[cfg(feature = "registry")]
+use std::collections::VecDeque;
 
 /// Build a `Box<dyn Encoder>` for the published `"webp_vp8"` codec id.
 ///
-/// The VP8 lossy encoder is not yet rebuilt clean-room (workspace
-/// task #1041 — the `oxideav-vp8` sibling has only Phase-1 silent-keyframe
-/// support published today). Until the lossy encoder lands, the factory
-/// surfaces [`WebpError::Unsupported`] so the registry path fails loudly
-/// instead of silently emitting a degenerate file.
+/// Routes to the `oxideav-vp8 0.2.1` framework factory
+/// [`oxideav_vp8::encoder::make_encoder`] (default `y_ac_qi = 32`) and
+/// wraps every emitted raw VP8 keyframe in a §2.5 simple-lossy
+/// `RIFF/WEBP` container so the output decodes through
+/// [`crate::decode_webp`].
 #[cfg(feature = "registry")]
-pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>, oxideav_core::Error> {
-    Err(oxideav_core::Error::Unsupported(
-        "oxideav-webp encoder_vp8: VP8 lossy encoder not yet rebuilt".to_string(),
-    ))
+pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
+    make_encoder_with_qindex(params, 32)
 }
 
 /// `make_encoder` plus a WebP-canonical `0.0..=100.0` quality knob.
 ///
-/// See [`quality_to_qindex`] for the projection. Currently routes to
-/// [`make_encoder`] (i.e. surfaces [`WebpError::Unsupported`]); the
-/// quality parameter is forwarded once the lossy encoder lands.
+/// `quality` is projected to a VP8 qindex (`0..=127`) via
+/// [`quality_to_qindex`] and forwarded to the underlying
+/// `oxideav-vp8 0.2.1` factory.
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_quality(
     params: &CodecParameters,
-    _quality: f32,
-) -> Result<Box<dyn Encoder>, oxideav_core::Error> {
-    make_encoder(params)
+    quality: f32,
+) -> CoreResult<Box<dyn Encoder>> {
+    make_encoder_with_qindex(params, quality_to_qindex(quality))
 }
 
 /// `make_encoder` plus an explicit `qindex` (`0..=127`, lower = better).
 ///
-/// Currently surfaces [`WebpError::Unsupported`] until the VP8 lossy
-/// encoder lands.
+/// Builds a [`WebpVp8LossyEncoder`] which delegates to the underlying
+/// `oxideav-vp8 0.2.1` framework encoder for the actual VP8 keyframe
+/// bitstream, then wraps each emitted packet in a §2.5 simple-lossy
+/// `RIFF/WEBP` container.
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_qindex(
     params: &CodecParameters,
-    _qindex: u8,
-) -> Result<Box<dyn Encoder>, oxideav_core::Error> {
-    make_encoder(params)
+    qindex: u8,
+) -> CoreResult<Box<dyn Encoder>> {
+    let inner = oxideav_vp8::encoder::make_encoder_with_qindex(params, qindex)?;
+    let width = params
+        .width
+        .ok_or_else(|| CoreError::invalid("webp_vp8 encoder: missing width"))?;
+    let height = params
+        .height
+        .ok_or_else(|| CoreError::invalid("webp_vp8 encoder: missing height"))?;
+    if width == 0 || height == 0 {
+        return Err(CoreError::invalid(
+            "webp_vp8 encoder: width and height must be positive",
+        ));
+    }
+    let mut output_params = params.clone();
+    output_params.media_type = MediaType::Video;
+    output_params.codec_id = CodecId::new(crate::CODEC_ID_VP8);
+    output_params.width = Some(width);
+    output_params.height = Some(height);
+    let time_base = params
+        .frame_rate
+        .map_or(TimeBase::new(1, 1_000), |r| TimeBase::new(r.den, r.num));
+    Ok(Box::new(WebpVp8LossyEncoder {
+        inner,
+        output_params,
+        time_base,
+        pending: VecDeque::new(),
+        flushed: false,
+    }))
 }
 
 /// `make_encoder` plus an explicit `qindex` and a [`Vp8FreqDeltas`]
 /// record of per-band quantiser deltas.
 ///
-/// Currently surfaces [`WebpError::Unsupported`] until the VP8 lossy
-/// encoder lands.
+/// In this round the `deltas` argument is forwarded as a hint only —
+/// the surface is preserved per `API-COMPAT-0.1.2.md` but plumbing the
+/// per-band deltas into the underlying `oxideav-vp8` encoder's
+/// `KeyframeParams` is deferred to a follow-up. The qindex IS honoured.
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_qindex_and_freq_deltas(
     params: &CodecParameters,
-    _qindex: u8,
+    qindex: u8,
     _deltas: Vp8FreqDeltas,
-) -> Result<Box<dyn Encoder>, oxideav_core::Error> {
-    make_encoder(params)
+) -> CoreResult<Box<dyn Encoder>> {
+    make_encoder_with_qindex(params, qindex)
 }
 
 /// `make_encoder` plus a WebP-canonical `0.0..=100.0` quality knob
 /// and a [`Vp8FreqDeltas`] record of per-band quantiser deltas.
 ///
-/// Currently surfaces [`WebpError::Unsupported`] until the VP8 lossy
-/// encoder lands.
+/// In this round the `deltas` argument is forwarded as a hint only —
+/// see [`make_encoder_with_qindex_and_freq_deltas`]. The quality IS
+/// honoured (projected via [`quality_to_qindex`]).
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_quality_and_freq_deltas(
     params: &CodecParameters,
-    _quality: f32,
+    quality: f32,
     _deltas: Vp8FreqDeltas,
-) -> Result<Box<dyn Encoder>, oxideav_core::Error> {
-    make_encoder(params)
+) -> CoreResult<Box<dyn Encoder>> {
+    make_encoder_with_quality(params, quality)
+}
+
+/// `Encoder` adapter that wraps an inner `oxideav-vp8` encoder and
+/// frames every emitted raw VP8 keyframe in a §2.5 simple-lossy
+/// `RIFF/WEBP` container. One source frame → one `.webp` packet.
+#[cfg(feature = "registry")]
+pub(crate) struct WebpVp8LossyEncoder {
+    inner: Box<dyn Encoder>,
+    output_params: CodecParameters,
+    time_base: TimeBase,
+    pending: VecDeque<Packet>,
+    flushed: bool,
+}
+
+#[cfg(feature = "registry")]
+impl std::fmt::Debug for WebpVp8LossyEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebpVp8LossyEncoder")
+            .field("width", &self.output_params.width)
+            .field("height", &self.output_params.height)
+            .field("pending", &self.pending.len())
+            .field("flushed", &self.flushed)
+            .finish()
+    }
+}
+
+#[cfg(feature = "registry")]
+impl Encoder for WebpVp8LossyEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.output_params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> CoreResult<()> {
+        // Pass the source frame through to the inner VP8 encoder.
+        self.inner.send_frame(frame)?;
+        // Drain one keyframe packet, wrap in RIFF/WEBP, queue it.
+        let vp8_pkt = self.inner.receive_packet()?;
+        let width = self.output_params.width.unwrap_or(0);
+        let height = self.output_params.height.unwrap_or(0);
+        let webp_bytes = crate::build::build_webp_file(
+            &vp8_pkt.data,
+            crate::build::ImageKind::Lossy,
+            width,
+            height,
+        )
+        .map_err(|e| CoreError::invalid(format!("webp_vp8 encoder: container framing: {e}")))?;
+        let mut pkt = Packet::new(0, self.time_base, webp_bytes);
+        pkt.pts = vp8_pkt.pts;
+        pkt.dts = vp8_pkt.pts;
+        pkt.flags.keyframe = true;
+        self.pending.push_back(pkt);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> CoreResult<Packet> {
+        if let Some(p) = self.pending.pop_front() {
+            return Ok(p);
+        }
+        if self.flushed {
+            Err(CoreError::Eof)
+        } else {
+            Err(CoreError::NeedMore)
+        }
+    }
+
+    fn flush(&mut self) -> CoreResult<()> {
+        self.flushed = true;
+        // Propagate flush to the inner encoder. Ignore errors so we
+        // always honour our own flush state.
+        let _ = self.inner.flush();
+        Ok(())
+    }
 }
 
 /// Crate-local convenience: surface a `WebpError::Unsupported` over the

@@ -26,4 +26,9 @@ oxideav-vp8 = { version = "0.2", default-features = false }
 
 [features]
 default = ["registry"]
-registry = ["dep:oxideav-core"]
+# When the webp crate's `registry` feature is on, also enable the
+# `oxideav-vp8` sibling crate's `registry` feature so its
+# `oxideav_core::Encoder` factory (`make_encoder_with_qindex`, etc.) is
+# available for `encoder_vp8::make_encoder*` to delegate to. Mirrors the
+# published 0.1.2 cascade documented in API-COMPAT-0.1.2.md.
+registry = ["dep:oxideav-core", "oxideav-vp8/registry"]

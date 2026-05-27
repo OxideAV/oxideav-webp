@@ -371,12 +371,33 @@ fn registry_decoder_make_vp8l_decoder_signature() {
     let _: fn(u32, u32) -> oxideav_webp::WebpDecoder = oxideav_webp::decoder::make_vp8l_decoder;
 }
 
-// NOTE: `From<oxideav_vp8::Vp8Error> for WebpError` is documented in
-// API-COMPAT-0.1.2.md but is **not** asserted here. `Vp8Error` is only
-// on `oxideav-vp8` master; the published `oxideav-vp8 0.2.0` release
-// the CI's `Build (no registry)` job pulls in does not export it. The
-// adapter (and this assertion) lands in a follow-up commit once
-// `oxideav-vp8` publishes a release that does. The
-// `From<oxideav_vp8::DecodeError> for WebpError` adapter that is wired
-// up today still exists at `oxideav_webp::WebpError::from(decode_err)`
-// (verified via the in-crate decode-error mapping tests).
+// ============================================================================
+// `From<oxideav_vp8::Vp8Error> for WebpError` — round-168 wiring against
+// `oxideav-vp8 0.2.1` (the release that first exports `Vp8Error` at the
+// crate root). The four variants share names with `WebpError` so the
+// mapping is a straight 1-to-1 collapse; per-variant assertions below
+// pin the contract.
+// ============================================================================
+
+#[test]
+fn crate_root_webp_error_from_vp8_error_signature() {
+    // Compile-time signature assertion — the adapter is a function from
+    // `oxideav_vp8::Vp8Error` to `oxideav_webp::WebpError`.
+    let _: fn(oxideav_vp8::Vp8Error) -> oxideav_webp::WebpError = oxideav_webp::WebpError::from;
+}
+
+#[test]
+fn crate_root_webp_error_from_vp8_error_variant_mapping() {
+    use oxideav_vp8::Vp8Error;
+    use oxideav_webp::WebpError;
+    assert_eq!(
+        WebpError::from(Vp8Error::InvalidData("truncated".into())),
+        WebpError::InvalidData
+    );
+    assert_eq!(
+        WebpError::from(Vp8Error::Unsupported("interframe".into())),
+        WebpError::Unsupported
+    );
+    assert_eq!(WebpError::from(Vp8Error::Eof), WebpError::Eof);
+    assert_eq!(WebpError::from(Vp8Error::NeedMore), WebpError::NeedMore);
+}

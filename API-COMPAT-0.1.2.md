@@ -116,6 +116,16 @@ Accepted input pixel formats per 0.1.2 module docs: `Yuv420P`, `Yuva420P`,
 
 ### `encoder_vp8` (VP8 lossy factories — direct API + registry)
 
+> **Round-168**: wired against `oxideav-vp8 0.2.1`. The five factories
+> below delegate to the underlying `oxideav_vp8::encoder` framework
+> factories and wrap every emitted raw VP8 keyframe in a §2.5
+> simple-lossy `RIFF/WEBP` container. The `_freq_deltas` variants pass
+> through to the matching no-deltas factory in this round (the
+> `Vp8FreqDeltas` argument is a hint; plumbing it into the underlying
+> encoder's per-band `KeyframeParams` deltas is a follow-up). See
+> `tests/vp8_lossy_roundtrip.rs` for end-to-end coverage.
+
+
 ```rust
 pub fn make_encoder(params: &CodecParameters)
     -> Result<Box<dyn Encoder>>;
@@ -157,43 +167,55 @@ pub struct Vp8FreqDeltas {
 
 ### `encoder_anim`
 
+> **Round-168 spec deviation (deliberately widened)**: the rebuild's
+> `AnimFrame` is the *owned* `Vec<u8>` shape rather than the published
+> 0.1.2 `AnimFrame<'a> { rgba: &'a [u8], … }` borrowed shape, and the
+> per-frame `AnimFrameMode` / `BlendingMethod` / `DisposalMethod`
+> typed enums replace 0.1.2's `blend: bool` / `dispose_to_background: bool`
+> booleans. The `build_animated_webp` / `_with_options` signatures
+> match this owned shape — `canvas_w` / `canvas_h` / `background_bgra` /
+> `loop_count` are read off the frames and the [`AnimEncoderOptions`]
+> respectively. The current shape is a strict superset of the 0.1.2
+> capability set: every animation a 0.1.2 caller could build, the
+> rebuild can build (and several more — explicit dirty-rect / `Auto`
+> mode picking, alpha-blend disposal, file-level metadata). The
+> trade-off is a `&[u8] → Vec<u8>` clone at the boundary. See
+> `tests/published_anim_api.rs` for the locked-in current shape; see
+> `https://docs.rs/oxideav-webp/0.1.2/oxideav_webp/encoder_anim/`
+> for the historical borrowed shape this deviation supplants.
+
 ```rust
-pub fn build_animated_webp(
-    /* frames: &[AnimFrame], canvas_w: u32, canvas_h: u32 */
-) -> Result<Vec<u8>>;
+pub fn build_animated_webp(frames: &[AnimFrame]) -> Result<Vec<u8>>;
 
 pub fn build_animated_webp_with_options(
     frames: &[AnimFrame],
-    canvas_w: u32, canvas_h: u32,
-    opts: &AnimEncoderOptions,
+    opts: &AnimEncoderOptions<'_>,
 ) -> Result<Vec<u8>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnimFrame {
+    pub pixels: Vec<u8>,                // tile size w*h*4, owned
     pub width: u32, pub height: u32,
-    pub x_offset: u32, pub y_offset: u32,
-    pub duration_ms: u32,
-    pub rgba: Vec<u8>,                  // tile size w*h*4
-    /* blend + dispose fields per ANMF spec */
+    pub x: u32, pub y: u32,             // even per §2.7.1.1
+    pub duration: u32,                  // ms
+    pub blend: BlendingMethod,          // enum (was: bool in 0.1.2)
+    pub dispose: DisposalMethod,        // enum (was: bool in 0.1.2)
+    pub mode: AnimFrameMode,            // per-frame mode (new vs 0.1.2)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AnimFrameMode {
-    Auto,         // per-frame: pick byte-smallest of {Lossless, Lossy(VP8)}
-    Lossless,
-    Lossy,        // hint: encode each ANMF as VP8 lossy
+    #[default] Auto,    // per-frame: pick byte-smallest of {Lossless, Delta}
+    Delta,              // dirty-rect sub-frame against the previous canvas
+    Lossless,           // full-canvas VP8L keyframe
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct AnimEncoderOptions {
-    pub mode: AnimFrameMode,            // default: AnimFrameMode::Auto
-    pub lossy_quality: f32,             // 0.0..=100.0, default 75.0
-}
-
-impl Default for AnimEncoderOptions {
-    fn default() -> Self {
-        Self { mode: AnimFrameMode::Auto, lossy_quality: 75.0 }
-    }
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnimEncoderOptions<'a> {
+    pub loop_count: u16,                // §2.7.1.1 ANIM loop count
+    pub background_rgba: [u8; 4],       // §2.7.1.1 ANIM background colour
+    pub metadata: WebpMetadata<'a>,     // ICC / Exif / XMP, borrowed
+    pub delta: DeltaConfig,             // dirty-rect tuning knobs
 }
 ```
 
@@ -218,7 +240,14 @@ impl core::fmt::Debug   for WebpError { /* … */ }
 impl core::fmt::Display for WebpError { /* … */ }
 impl core::error::Error for WebpError { /* … */ }
 
-impl From<oxideav_vp8::error::Vp8Error> for WebpError { /* variants map 1-1 */ }
+// Round-168: wired against `oxideav-vp8 0.2.1` (Vp8Error exported at
+// `oxideav_vp8::Vp8Error` and `oxideav_vp8::error::Vp8Error`). The four
+// `Vp8Error` variants map 1-1 onto `WebpError`; the `String` payloads
+// on `InvalidData` / `Unsupported` are dropped (rebuild collapses to
+// unit variants — see `WebpError::invalid` / `unsupported` constructors
+// for the same convention).
+impl From<oxideav_vp8::Vp8Error> for WebpError { /* InvalidData→InvalidData,
+    Unsupported→Unsupported, Eof→Eof, NeedMore→NeedMore */ }
 
 #[cfg(feature = "registry")]
 impl From<WebpError> for oxideav_core::error::Error { /* enables `?` */ }
