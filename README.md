@@ -13,9 +13,9 @@ ANMF). Decoder and encoder both at production status as of 2026-05-27.
   `ImageBuffer::from_raw` with zero copy.
 * The full crates.io `0.1.2` public surface is reachable, both with
   the default `registry` build and under `--no-default-features`.
-  See [`API-COMPAT-0.1.2.md`](./API-COMPAT-0.1.2.md) for the
-  per-symbol contract and [`tests/api_compat_0_1_2.rs`](./tests/api_compat_0_1_2.rs)
-  for the 29-test compile-only assertion suite.
+  [`tests/api_compat_0_1_2.rs`](./tests/api_compat_0_1_2.rs) is the
+  29-test compile-only assertion suite that pins every published
+  symbol in place.
 
 ## Install
 

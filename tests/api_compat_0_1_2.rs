@@ -7,7 +7,7 @@
 //! sanity checks on the standalone-friendly constants); the bulk of the
 //! contract enforcement is the type-bindings themselves.
 //!
-//! Truth source: [`API-COMPAT-0.1.2.md`](../API-COMPAT-0.1.2.md) — the
+//! Pins the
 //! strict minimum public surface every release on the `0.1` line must
 //! keep exposing so a consumer pinned to `oxideav-webp = "0.1"` upgrades
 //! transparently.

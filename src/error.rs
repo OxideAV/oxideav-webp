@@ -1,7 +1,7 @@
 //! Published-API `oxideav_webp::error` module — `Result` type alias plus
 //! the [`WebpError`] re-export.
 //!
-//! Per `API-COMPAT-0.1.2.md` the crate-root public surface exposes both
+//! Per the published 0.1.2 surface, the crate-root public surface exposes both
 //! `oxideav_webp::Result` (the type alias) and `oxideav_webp::WebpError`
 //! (the published error enum), and groups them under
 //! `oxideav_webp::error::{Result, WebpError}` for consumers that prefer

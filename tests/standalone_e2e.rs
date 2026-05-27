@@ -10,7 +10,7 @@
 //! cargo test -p oxideav-webp --test standalone_e2e
 //! ```
 //!
-//! The published 0.1.5 standalone surface (per `API-COMPAT-0.1.2.md` +
+//! The published 0.1.5 standalone surface (per the published 0.1.2 surface +
 //! `README.md` "Standalone use") covered here:
 //!
 //! * `decode_webp` / `WebpImage` / `WebpFrame` — top-level decode entry.

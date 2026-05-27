@@ -167,7 +167,7 @@ use oxideav_core::RuntimeContext;
 
 /// Streaming [`oxideav_core::Decoder`] implementation — re-export of the
 /// in-crate [`registry::WebpDecoder`] under the published crate-root
-/// path per `API-COMPAT-0.1.2.md`.
+/// path per the published 0.1.2 surface.
 #[cfg(feature = "registry")]
 pub use registry::WebpDecoder;
 
@@ -691,7 +691,7 @@ fn decode_lossy_image(
 //
 // The free `decode_webp` path the published crates.io releases exposed —
 // the flat, `image`-crate-compatible RGBA surface downstream consumers
-// depend on. See `API-COMPAT.md`. The `WebpImage` / `WebpFrame` /
+// depend on. The `WebpImage` / `WebpFrame` /
 // `WebpFileMetadata` / `WebpError` shapes here are the published shapes;
 // the round-115 `DecodedWebp` / `decode_webp_image` / `decode_lossless_image`
 // helpers above are the rebuild's own low-level surface and stay as
@@ -907,7 +907,7 @@ impl From<Error> for WebpError {
 /// frame header, truncated partition, bad token stream — is a bitstream
 /// problem and maps to [`WebpError::InvalidData`].
 ///
-/// Note: API-COMPAT.md specifies a `From<oxideav_vp8::Vp8Error>` adapter
+/// Note: the published surface specifies a `From<oxideav_vp8::Vp8Error>` adapter
 /// (the umbrella type), but `Vp8Error` is not yet published on crates.io
 /// (it landed on vp8 master after the v0.2.0 tag). This `DecodeError`
 /// adapter covers the live decode path against the published 0.2.0 API;
@@ -930,7 +930,7 @@ impl From<oxideav_vp8::DecodeError> for WebpError {
 /// surfaces the variant only). Wired up against `oxideav-vp8 0.2.1`
 /// (the release that first exports `Vp8Error` at the crate root).
 ///
-/// Documented in `API-COMPAT-0.1.2.md` under the `error` section; the
+/// The
 /// compile-time signature assertion lives in
 /// `tests/api_compat_0_1_2.rs::crate_root_webp_error_from_vp8_error`.
 impl From<oxideav_vp8::Vp8Error> for WebpError {
@@ -1376,7 +1376,7 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
 // round-115 in-crate VP8L encoder. `encode_vp8l_argb` / `_with` produce a
 // **bare** VP8L bitstream (no RIFF wrapper); `encode_vp8l_argb_with_metadata`
 // produces a complete `.webp`, auto-promoting to the §2.7 `VP8X` layout when
-// alpha or any metadata field is set. See `API-COMPAT.md`.
+// alpha or any metadata field is set.
 
 /// Encode an ARGB image to a **bare** §2.6 / §3.4 `VP8L` bitstream — the
 /// chunk payload (image-header + image stream), with **no** RIFF/WEBP
@@ -1503,7 +1503,7 @@ pub fn encode_vp8l_argb_with_metadata(
 // in-crate VP8L encoder + the §2.7.1.1 ANIM / ANMF container framing. Only the
 // VP8L-lossless path (`AnimFrameMode::Lossless`) is wired up; `Auto` / `Delta`
 // return `WebpError::Unsupported` (the VP8 lossy + delta paths are blocked on
-// `oxideav-vp8`, workspace task #1041). See `API-COMPAT.md`.
+// `oxideav-vp8`, workspace task #1041).
 
 #[doc(inline)]
 pub use anim_encode::{
@@ -1564,7 +1564,7 @@ pub fn register(ctx: &mut RuntimeContext) {
 /// and `"webp_vp8"` ids.
 ///
 /// This is the `RuntimeContext`-typed crate-root form per the
-/// `API-COMPAT-0.1.2.md` contract; for callers driving the registry
+/// published 0.1.2 surface; for callers driving the registry
 /// piece-wise the lower-level
 /// [`registry::register_codecs`]`(&mut ctx.codecs)` form is still
 /// available.

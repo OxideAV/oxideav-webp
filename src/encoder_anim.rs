@@ -1,7 +1,7 @@
 //! Published-API `oxideav_webp::encoder_anim` module — animation
 //! encoder surface grouped under its qualified path.
 //!
-//! Per `API-COMPAT-0.1.2.md` consumers may reach
+//! Per the published 0.1.2 surface, consumers may reach
 //! [`build_animated_webp`] / [`build_animated_webp_with_options`] /
 //! [`AnimFrame`] / [`AnimFrameMode`] / [`AnimEncoderOptions`] either at
 //! the crate root or via this module. Both paths share the same

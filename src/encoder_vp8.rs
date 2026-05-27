@@ -2,7 +2,7 @@
 //! factory façade, plus the §6 / §9 quality-knob types reproduced on
 //! top of the workspace `oxideav-vp8` sibling crate's public surface.
 //!
-//! Per `API-COMPAT-0.1.2.md` this module exposes:
+//! Per the published 0.1.2 surface, this module exposes:
 //!
 //! * [`make_encoder`], [`make_encoder_with_quality`],
 //!   [`make_encoder_with_qindex`],
@@ -157,7 +157,7 @@ pub fn make_encoder_with_qindex(
 /// record of per-band quantiser deltas.
 ///
 /// In this round the `deltas` argument is forwarded as a hint only —
-/// the surface is preserved per `API-COMPAT-0.1.2.md` but plumbing the
+/// the surface is preserved per the published 0.1.2 surface but plumbing the
 /// per-band deltas into the underlying `oxideav-vp8` encoder's
 /// `KeyframeParams` is deferred to a follow-up. The qindex IS honoured.
 #[cfg(feature = "registry")]

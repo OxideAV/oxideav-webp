@@ -1,7 +1,7 @@
 //! Published-API `oxideav_webp::demux` module — metadata extraction
 //! grouped under its qualified path.
 //!
-//! Per `API-COMPAT-0.1.2.md` consumers may reach
+//! Per the published 0.1.2 surface, consumers may reach
 //! [`extract_metadata`] either at the crate root or here. Both call
 //! sites share the same implementation in [`crate::extract_metadata`].
 

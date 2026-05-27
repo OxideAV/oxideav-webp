@@ -22,7 +22,7 @@
 //! The error surface is `oxideav-vp8`'s published
 //! [`oxideav_vp8::DecodeError`]. The crate also defines a `Vp8Error`
 //! umbrella enum (on vp8 master, commit `d85d244`) that the
-//! API-COMPAT.md published surface wants a
+//! published surface wants a
 //! `From<oxideav_vp8::Vp8Error> for WebpError` adapter against, but that
 //! type is **not yet on crates.io** (it landed after the v0.2.0 tag), so
 //! the adapter is deferred until vp8 publishes a release carrying it.

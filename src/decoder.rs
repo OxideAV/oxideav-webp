@@ -1,7 +1,7 @@
 //! Published-API `oxideav_webp::decoder` module — the published decode
 //! surface grouped under its qualified path.
 //!
-//! Per `API-COMPAT-0.1.2.md` consumers may reach the decode entry
+//! Per the published 0.1.2 surface, consumers may reach the decode entry
 //! points either at the crate root (`oxideav_webp::decode_webp`) or via
 //! this module (`oxideav_webp::decoder::decode_webp`). Both paths return
 //! the same [`WebpImage`] / [`WebpFrame`] values via the same

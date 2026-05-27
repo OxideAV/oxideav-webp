@@ -1,7 +1,7 @@
 //! Published-API `oxideav_webp::vp8l` module — the §3.4 / §4–§6 VP8L
 //! lossless surface grouped under its qualified path.
 //!
-//! Per `API-COMPAT-0.1.2.md` consumers reach the lossless encode /
+//! Per the published 0.1.2 surface, consumers reach the lossless encode /
 //! decode entry points either at the crate root
 //! (`oxideav_webp::encode_vp8l_argb`) or via this module
 //! (`oxideav_webp::vp8l::encode_vp8l_argb`).
