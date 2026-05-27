@@ -6,6 +6,34 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Round-169 end-to-end interop + standalone-API tests (2026-05-27).**
+  Two new integration test files closing the last two coverage gaps:
+  - `tests/standalone_e2e.rs` — 8 tests driving ONLY the
+    `--no-default-features` (no-`oxideav-core`) public surface:
+    lossless RGBA round-trip (bit-exact 64×64), bare-VP8L bitstream
+    wrap-and-round-trip via `build_webp_file`, VP8L with full ICC /
+    EXIF / XMP metadata round-tripping via
+    `encode_vp8l_argb_with_metadata` + `extract_metadata`, 3-frame
+    animation via `build_animated_webp` + `AnimFrame::new` with
+    per-frame `duration_ms` carried, metadata-only extraction without
+    pixel decode, plus the published coarse-error rejection paths.
+    Verified to compile + pass under both `cargo test -p oxideav-webp
+    --no-default-features --test standalone_e2e` and the default
+    `registry` build.
+  - `tests/external_oracle.rs` — 3 cross-validation tests against
+    third-party WebP tooling as opaque byte-in / byte-out oracles
+    (no source consulted): **Direction A** our lossless encode →
+    reference decoder `-pam` raw RGBA → byte-for-byte match;
+    **Direction B** our 3-frame animation → reference muxing tool
+    `-info` → frame count + per-frame width/height/duration parsed
+    and asserted; **Direction C** reference-encoded
+    `lossless-32x32-rgba.webp` fixture → our `decode_webp` vs.
+    `ffmpeg -f rawvideo -pix_fmt rgba` → both produce identical
+    bytes (additionally cross-checked against the reference decoder
+    when installed). Each direction skips cleanly via
+    `eprintln! + return` when its oracle binary is missing — no
+    `#[ignore]`.
+
 * **Round-168 drive-to-100% (2026-05-27).** Wire the VP8-lossy encode
   path through to `oxideav-vp8 0.2.1` (the release that first exports
   `Vp8Error` at the crate root and ships the framework
