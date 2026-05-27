@@ -6,6 +6,69 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 162 (2026-05-27).** §4.1 spatial-predictor
+  forward transform gains a **sub-image-aware** Shannon bit-cost
+  variant on the per-block mode chooser. The round-161 chooser
+  minimises only the per-block residual entropy and is unaware of
+  the §7.2 predictor sub-image's own prefix-code mass; round 162
+  adds a third cost component — a joint cost
+  `residual_milli_bits + (lambda * sub_image_delta_milli) / 1000`
+  — where `sub_image_delta_milli` is the marginal Shannon bit-cost
+  contribution of the candidate mode to the running sub-image
+  histogram. The new helpers are `sub_image_mode_cost_delta_milli`
+  (exact `Σ c·log2(N/c)` delta on the 14-mode sub-image
+  distribution), `pick_block_mode_with_hint_entropy_subaware` (joint
+  cost minimiser with strict-tie hint),
+  `build_predictor_image_entropy_subaware` (forward pass that
+  updates the running mode histogram per block), and
+  `encode_with_predictor_entropy_subaware` (production-shape
+  wrapper). The production `encode_argb_with_predictor_chooser` adds
+  the sub-image-aware candidate at four `lambda_milli` values
+  (`4_000`, `16_000`, `64_000`, `256_000` per-sub-image-bit) on the
+  per-region `size_bits`, alongside every round-159/160/161
+  candidate, and keeps the byte-shortest stream — so the round-162
+  path is strictly non-regressing relative to round 161. Where the
+  round-159 hint and round-160 slack budget act only on local
+  neighbour identity, round 162 accounts for the *global* sub-image
+  distribution shape: blocks that would tie-or-lose on residual cost
+  but reuse already-popular sub-image modes get a joint-cost
+  discount; blocks that would force the sub-image into a new prefix-
+  code symbol get a joint-cost penalty. `lambda_milli == 0` recovers
+  the round-161 chooser byte-for-byte. RFC 9649 §3.5 ("transform
+  data can be decided based on entropy minimization") authorises the
+  joint cost; §7.2 (sub-image prefix codes) is the cost component
+  the new term accounts for. Seven new tests cover the contract:
+  `round_162_sub_image_mode_cost_delta_zero_on_first_add` (first add
+  to an empty histogram contributes zero milli-bits — degenerate-to-
+  single-symbol floor);
+  `round_162_sub_image_mode_cost_delta_grows_on_new_symbol` (adding
+  a distinct symbol to a single-mode histogram strictly grows the
+  mass; numerical sanity ±400 milli-bits of the analytic 3.9-bit
+  expectation);
+  `round_162_lambda_zero_byte_identical_to_round_161` (lambda = 0
+  produces byte-identical streams to round-161 at both cache-disabled
+  and cache_bits = Some(6));
+  `round_162_pick_block_mode_subaware_honours_tie` (the hint flips
+  to the preferred mode on joint-cost-equal swaps, mirroring the
+  round-159 contract);
+  `round_162_subaware_round_trips_through_decoder` (three lambda
+  settings × three cache_bits settings × a mixed-statistics 32×32
+  fixture all round-trip end-to-end through
+  `decode_lossless_image`);
+  `round_162_chooser_never_regresses_vs_round_161` (5 shapes × 3
+  fixtures — the production chooser is byte-`<=` the pre-round-162
+  baseline with end-to-end decode round-trip on every chosen
+  stream); and
+  `round_162_subaware_isolated_strictly_beats_round_161_on_some_fixture`
+  (on 3 of 5 swept smooth-gradient shapes the *isolated* round-162
+  candidate strictly beats the round-161 isolated candidate, with
+  savings of 43 B / 48 B / 55 B — 32%, 33%, 44% reduction
+  respectively at `lambda_milli = 64_000`; the headline result is
+  44% reduction on a 256×128 gradient, isolated predictor payload
+  `125 B → 70 B`). 389 lib tests, +7 vs round 161. Spec source: RFC
+  9649 §3.5 (transform-data entropy-minimization rationale), §4.1
+  (per-block predictor sub-image), §7.2 (sub-image prefix codes).
+
 * **Clean-room round 161 (2026-05-27).** §4.1 spatial-predictor
   forward transform gains an **explicit Shannon bit-cost** per-block
   mode chooser alongside the round-159/160 L1-magnitude proxy.

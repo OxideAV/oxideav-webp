@@ -2,6 +2,75 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 162)
+
+**Round 162 makes the VP8L §4.1 per-block mode chooser sub-image
+aware.** The round-161 entropy chooser minimises only the per-block
+residual entropy and treats every candidate mode as having zero
+sub-image cost; round 162 adds a third cost component — a joint
+cost `residual_milli_bits + (lambda * sub_image_delta_milli) / 1000`
+— where `sub_image_delta_milli` is the marginal Shannon bit-cost
+contribution of the candidate mode to the §7.2 predictor sub-image's
+running symbol histogram. Where the round-159 hint and round-160
+slack budget act only on local neighbour identity, round 162 accounts
+for the *global* sub-image distribution shape: blocks that reuse
+already-popular sub-image modes get a joint-cost discount, blocks
+that would force the sub-image to grow a new prefix-code symbol get
+a joint-cost penalty.
+
+The new helpers are `sub_image_mode_cost_delta_milli`,
+`pick_block_mode_with_hint_entropy_subaware`,
+`build_predictor_image_entropy_subaware`, and
+`encode_with_predictor_entropy_subaware` — signatures mirror their
+round-161 entropy counterparts, with a running 14-mode histogram
+threaded through the forward pass and an additional `lambda_milli`
+weight. The strict-tie-break hint contract is preserved. The
+production `encode_argb_with_predictor_chooser` adds the sub-image-
+aware candidate at four `lambda_milli` values (`4_000`, `16_000`,
+`64_000`, `256_000` per-sub-image-bit) on the per-region `size_bits`,
+alongside every round-159/160/161 candidate, and keeps the byte-
+shortest stream. `lambda_milli == 0` recovers the round-161 chooser
+byte-for-byte; the round-162 path is therefore strictly non-
+regressing relative to round 161.
+
+The headline empirical result is captured by
+`round_162_subaware_isolated_strictly_beats_round_161_on_some_fixture`:
+across a five-shape smooth-gradient sweep, the *isolated* round-162
+candidate (compared like-for-like against the round-161 isolated
+candidate at the same `size_bits = 4`) strictly beats round-161 on
+three shapes with savings 43 B (64×64, 32.3%), 48 B (128×128, 33.1%),
+and 55 B (256×128, **44.0%** — the headline; payload 125 B → 70 B).
+The remaining two gradients tie, never regress. Smooth gradients are
+the canonical "many sub-image entries / small per-block residual
+mass" regime: the gradient predictors all yield near-zero residuals,
+so the sub-image's prefix-code mass becomes the dominant cost and
+converging the mode set drops total bytes faster than the residual
+mass grows.
+
+Seven new tests cover the contract:
+`round_162_sub_image_mode_cost_delta_zero_on_first_add` (first add to
+empty histogram → zero milli-bits),
+`round_162_sub_image_mode_cost_delta_grows_on_new_symbol` (new symbol
+strictly grows mass; numerical sanity ±400 milli-bits of the analytic
+expectation), `round_162_lambda_zero_byte_identical_to_round_161`
+(lambda = 0 produces byte-identical streams to round-161 at both
+cache settings), `round_162_pick_block_mode_subaware_honours_tie`
+(hint flips on joint-cost-equal swaps),
+`round_162_subaware_round_trips_through_decoder` (three lambda
+settings × three cache settings × mixed-statistics fixture all round-
+trip end-to-end), `round_162_chooser_never_regresses_vs_round_161` (5
+shapes × 3 fixtures), and the strict-beat sweep above. Spec source:
+RFC 9649 §3.5 (transform-data entropy-minimization rationale), §4.1
+(per-block predictor sub-image), §7.2 (sub-image prefix codes).
+
+Still lacks (post-round-162): the sub-image cost still uses a fixed
+4-value lambda sweep rather than an adaptive per-image budget that
+finds the residual-vs-sub-image crossover automatically; the
+sub-image-aware chooser is only at the per-region `size_bits` (the
+single-block path is unchanged because its sub-image is trivially
+one entry); deeper LZ77 lazy depths beyond round-158's three-position
+remain future work; and VP8 lossy encode is still entirely absent.
+
 ## Status — 2026-05-27 (clean-room round 161)
 
 **Round 161 replaces the L1-magnitude residual-cost proxy with an
