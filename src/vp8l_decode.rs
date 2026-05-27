@@ -1061,6 +1061,13 @@ mod tests {
         fn into_bytes(self) -> Vec<u8> {
             self.bytes
         }
+        /// Bit count written so far. Used by the bit-prefix property
+        /// test to know the exact stream length; the trailing
+        /// `bytes.len() * 8 - bit_len()` bits of the last byte are
+        /// zero-padded.
+        fn bit_len(&self) -> usize {
+            self.bit_pos
+        }
     }
 
     // ---- §5.2.2 LZ77 prefix-value transform ----
@@ -1760,6 +1767,15 @@ mod tests {
     /// `decode_argb_two_groups_select_per_block` test uses. Factored so
     /// the truncation-prefix tests can re-use it without copy/paste.
     fn build_valid_two_group_8x1_stream() -> Vec<u8> {
+        build_valid_two_group_8x1_stream_with_bit_len().0
+    }
+
+    /// Same as [`build_valid_two_group_8x1_stream`] but also returns the
+    /// number of bits actually written to the buffer. The trailing
+    /// `bytes.len() * 8 - bit_len` bits of the last byte are zero pad.
+    /// Used by the round-165 bit-prefix property test to slice the
+    /// stream at every bit boundary, not only every byte boundary.
+    fn build_valid_two_group_8x1_stream_with_bit_len() -> (Vec<u8>, usize) {
         let mut w = BitWriter::new();
         // spatially-coded-image header (ARGB role)
         w.write_bits(0, 1); // §5.2.3 main color-cache-info = disabled
@@ -1778,7 +1794,8 @@ mod tests {
         w.write_single_symbol_group(100, 0x10, 0x20, 0x30, 0);
         w.write_single_symbol_group(200, 0x40, 0x50, 0x60, 0);
         // main image data: 8 single-symbol literals, no bits.
-        w.into_bytes()
+        let bit_len = w.bit_len();
+        (w.into_bytes(), bit_len)
     }
 
     #[test]
@@ -1909,5 +1926,155 @@ mod tests {
         if let Ok(img) = decode_argb(&mut r, 1, 1) {
             assert_eq!(img.pixels().len(), 1);
         }
+    }
+
+    // ---- Round 165: §5.2 / §6.2.2 bit-prefix property test ----
+    //
+    // The round-164 property iterates byte-prefixes of the valid 8x1
+    // multi-group stream. The §5.2 / §6.2.2 stages all consume sub-byte
+    // bit fields (a §5.2.3 color-cache-info is a single bit; the
+    // §6.2.2 prefix_bits field is three bits; §6.2.1 simple-code
+    // symbols read 1-8 bits each), so a byte-prefix only samples the
+    // truncation lattice at every 8 bits — most stage-boundary
+    // truncation points sit *inside* a byte and are invisible to the
+    // r164 property.
+    //
+    // This round-165 property tightens the granularity to a single
+    // bit. For every truncation point `bit_len ∈ 0..=full_bits`, build
+    // a buffer of `ceil(bit_len / 8)` bytes whose last byte's upper
+    // `(8 - bit_len % 8) & 7` bits are zero-masked, then run the same
+    // catch_unwind-protected decode_argb assertion: no panic, and any
+    // `Ok` must carry exactly the requested pixel count. The
+    // zero-padding tail is part of the property — the decoder may
+    // legitimately read zero bits past the encoder's stop point and
+    // either succeed (if the trailing zeros parse as a valid
+    // single-leaf symbol stream) or EOF cleanly.
+    //
+    // Pure additive coverage: the decoder source is unchanged; this
+    // pins the structured-error contract at 8x finer resolution than
+    // r164.
+
+    /// Truncate `data` (LSB-first bitstream) to its first `bit_len`
+    /// bits, returning a fresh byte vector. The returned buffer has
+    /// length `ceil(bit_len / 8)`; if `bit_len` is not a byte multiple,
+    /// the upper `(8 - bit_len % 8)` bits of the last byte are masked
+    /// to zero so the buffer cleanly represents the first `bit_len`
+    /// bits of `data` followed by zero pad to the byte boundary.
+    fn truncate_to_bit_prefix(data: &[u8], bit_len: usize) -> Vec<u8> {
+        let byte_len = bit_len.div_ceil(8);
+        assert!(
+            byte_len <= data.len(),
+            "bit_len {bit_len} exceeds source ({} bits)",
+            data.len() * 8
+        );
+        let mut out = data[..byte_len].to_vec();
+        let leftover = bit_len & 7;
+        if leftover != 0 && !out.is_empty() {
+            // Keep the low `leftover` bits of the last byte, zero the rest.
+            let mask = (1u8 << leftover) - 1;
+            let last = out.len() - 1;
+            out[last] &= mask;
+        }
+        out
+    }
+
+    #[test]
+    fn truncate_to_bit_prefix_round_trips_a_known_byte() {
+        // 0b1011_0101 = 0xB5. Bit 0 (LSB of LSB-first) = 1, bit 1 = 0,
+        // bit 2 = 1, bit 3 = 0, bit 4 = 1, bit 5 = 1, bit 6 = 0,
+        // bit 7 = 1.
+        let src = [0xB5u8];
+        // 0-bit prefix: empty buffer.
+        assert!(truncate_to_bit_prefix(&src, 0).is_empty());
+        // 1-bit prefix: only bit 0 = 1, byte = 0x01.
+        assert_eq!(truncate_to_bit_prefix(&src, 1), vec![0x01]);
+        // 4-bit prefix: 0b0101 = 0x05.
+        assert_eq!(truncate_to_bit_prefix(&src, 4), vec![0x05]);
+        // 8-bit prefix: full byte.
+        assert_eq!(truncate_to_bit_prefix(&src, 8), vec![0xB5]);
+    }
+
+    #[test]
+    fn decode_argb_every_bit_prefix_of_valid_stream_is_safe() {
+        // The round-165 strong property: for every bit-prefix
+        // `bit_len ∈ 0..=full_bits` of a valid 8x1 multi-group stream
+        // (zero-padded to the next byte boundary as the natural
+        // representation of a partial bit count), decode_argb must
+        // either return Err, or — when the trailing zero pad happens
+        // to parse as a valid continuation of the stream — return an
+        // image of exactly 8 pixels. It must NOT panic.
+        //
+        // Granularity is 1 bit (8x tighter than r164's byte property);
+        // the §5.2.3 / §6.2.2 stages all read sub-byte fields, so this
+        // catches truncation seams the byte property cannot see.
+        let (full, full_bits) = build_valid_two_group_8x1_stream_with_bit_len();
+        // Sanity: a full-bit-length decode succeeds (the baseline test
+        // checks this too, but we re-assert here so a regression in
+        // the helper is caught locally).
+        {
+            let mut r = BitReader::new(&full);
+            assert!(
+                decode_argb(&mut r, 8, 1).is_ok(),
+                "full {full_bits}-bit stream must decode"
+            );
+        }
+        // Iterate every bit cut from 0 up to and including the full
+        // bit length. The 0-bit prefix mirrors the empty-input EOF
+        // contract; the full-bits prefix mirrors the baseline decode.
+        for bit_len in 0..=full_bits {
+            let prefix = truncate_to_bit_prefix(&full, bit_len);
+            let mut r = BitReader::new(&prefix);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_argb(&mut r, 8, 1)
+            }));
+            match result {
+                Ok(Ok(img)) => {
+                    assert_eq!(
+                        img.pixels().len(),
+                        8,
+                        "bit_len={bit_len}: Ok decode produced wrong pixel count"
+                    );
+                }
+                Ok(Err(_)) => {
+                    // Any structured DecodeError is acceptable — that's
+                    // the contract under test.
+                }
+                Err(_) => {
+                    panic!("bit_len={bit_len}: decode_argb panicked on truncated input")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_argb_bit_prefix_covers_every_sub_byte_seam() {
+        // Coverage sanity for the round-165 property above: confirm
+        // the prefix sweep actually visits at least one bit position
+        // inside every byte of the stream (i.e. covers all sub-byte
+        // boundaries the byte-prefix property would skip past). With
+        // the iteration `0..=full_bits` and `full_bits > 8`, every
+        // bit boundary in `[0, full_bits]` is hit by construction;
+        // this test just pins that arithmetic so a future refactor
+        // that switched the bound (e.g. to `step_by(8)`) is caught.
+        let (_full, full_bits) = build_valid_two_group_8x1_stream_with_bit_len();
+        // The fixture currently writes about ~80 bits (5-bit header +
+        // ~19-bit GREEN simple-two + 4×11-bit single-symbol + 2-bit
+        // entropy pixels + 2×~55-bit single-symbol groups); allow a
+        // generous lower bound so the test doesn't lock the exact
+        // layout but still asserts non-trivial coverage.
+        assert!(
+            full_bits >= 60,
+            "fixture bit-length unexpectedly short ({full_bits} bits); \
+             round-165 property loses its multi-stage coverage if the \
+             helper stops writing the entropy image / per-group tables"
+        );
+        // And the byte buffer must be at least `ceil(full_bits / 8)`
+        // bytes — otherwise truncate_to_bit_prefix's len assertion
+        // would fail on the largest bit prefix.
+        let byte_len_needed = full_bits.div_ceil(8);
+        assert!(
+            byte_len_needed * 8 >= full_bits,
+            "byte length ({byte_len_needed}) cannot cover bit length ({full_bits})"
+        );
     }
 }

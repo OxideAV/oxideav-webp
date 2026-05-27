@@ -6,6 +6,33 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 165 (2026-05-27).** §5.2 / §6.2.2 VP8L
+  `decode_argb` malformed-input safety net gains an **8x finer
+  granularity bit-prefix property test**. The round-164 property
+  sweeps byte-prefixes of a valid 8×1 multi-group stream; the
+  §5.2.3 / §6.2.2 stages all read sub-byte fields (single-bit
+  color-cache flag, 3-bit `prefix_bits`, 1–8-bit §6.2.1 simple-code
+  symbols), so a byte-prefix only samples truncation points at
+  every 8 bits and misses every stage seam that sits inside a byte.
+  Round 165 adds three new tests:
+  `truncate_to_bit_prefix_round_trips_a_known_byte` (unit-tests the
+  bit-slicing helper on a known byte to lock its zero-padding
+  contract), `decode_argb_bit_prefix_covers_every_sub_byte_seam`
+  (regression-guard on the fixture's bit length so a future
+  refactor cannot silently reduce coverage), and the strong
+  property `decode_argb_every_bit_prefix_of_valid_stream_is_safe`
+  (catch-unwind sweep over every bit-prefix `0..=full_bits` of the
+  same 8×1 multi-group stream, zero-padded to the next byte
+  boundary; every prefix must return either a structured `Err` or
+  an `Ok` with exactly 8 pixels, never a panic). A new test-only
+  `BitWriter::bit_len()` accessor + a sibling
+  `build_valid_two_group_8x1_stream_with_bit_len()` helper expose
+  the exact stream bit-length so the property sweep can iterate at
+  bit resolution rather than byte resolution. 401 lib tests, +3 vs
+  round 164. Decoder source unchanged — pure additive coverage at
+  8× tighter resolution. Spec source: RFC 9649 §5.2 (image data)
+  and §6.2.2 (meta-prefix codes).
+
 * **Clean-room round 164 (2026-05-27).** §5.2 / §6.2.2 VP8L
   `decode_argb` malformed-input safety net. The full ARGB-role
   decode pipeline — §5.2.3 color-cache info, §6.2.2 meta-prefix

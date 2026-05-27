@@ -2,6 +2,43 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 165)
+
+**Round 165 tightens round 164's `decode_argb` byte-prefix property
+to a bit-prefix property at 8× finer granularity.** The §5.2.3 /
+§6.2.2 stages of the ARGB-role decoder all consume sub-byte bit
+fields (a single-bit color-cache flag, a 3-bit `prefix_bits` field,
+1–8-bit §6.2.1 simple-code symbols), so the round-164 byte-prefix
+sweep only samples the truncation lattice at every eighth bit and
+misses every stage seam that lands inside a byte. Round 165 adds a
+parallel property that iterates every bit-prefix
+`bit_len ∈ 0..=full_bits` of the same valid 8×1 two-group stream,
+zero-padded to the next byte boundary as the natural
+representation of a partial bit count.
+
+The strong test
+`decode_argb_every_bit_prefix_of_valid_stream_is_safe` runs the
+same `catch_unwind`-protected `decode_argb` assertion as r164 over
+this finer lattice: every prefix must return either a structured
+`Err` or an `Ok` of exactly 8 pixels, never a panic. Two
+supporting tests pin the supporting infrastructure:
+`truncate_to_bit_prefix_round_trips_a_known_byte` exercises the
+bit-slicing helper (which masks the trailing `(8 - bit_len % 8)`
+bits of the last byte to zero) on a known byte to lock its
+zero-padding contract, and `decode_argb_bit_prefix_covers_every_sub_byte_seam`
+guards the fixture's bit length so a future refactor that switched
+to a smaller helper cannot silently reduce coverage.
+
+A new test-only `BitWriter::bit_len()` accessor plus the sibling
+`build_valid_two_group_8x1_stream_with_bit_len()` helper expose
+the exact stream bit-length so the property sweep can iterate at
+bit resolution.
+
+The decoder source itself is unchanged — this is purely additive
+coverage at 8× tighter resolution than r164. 401 lib tests, **+3**
+vs round 164 (398 → 401). RFC 9649 §5.2 (image data) and §6.2.2
+(meta-prefix codes) are the spec sources.
+
 ## Status — 2026-05-27 (clean-room round 164)
 
 **Round 164 nails down the VP8L `decode_argb` malformed-input
