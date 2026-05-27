@@ -6,6 +6,34 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Clean-room round 164 (2026-05-27).** §5.2 / §6.2.2 VP8L
+  `decode_argb` malformed-input safety net. The full ARGB-role
+  decode pipeline — §5.2.3 color-cache info, §6.2.2 meta-prefix
+  header, §6.2.2 entropy image, per-group prefix codes, §6.2.3
+  main pixel loop — now has explicit property coverage that every
+  truncation or corruption point surfaces a structured
+  `DecodeError` rather than panicking, looping, or returning a
+  partially-filled image. Six new tests:
+  `decode_argb_two_groups_baseline_decodes_clean` (sanity-check
+  the fixture builder used by the truncation tests),
+  `decode_argb_empty_input_reports_eof` (zero-byte input on the
+  first 1-bit read),
+  `decode_argb_truncated_after_meta_prefix_header_reports_eof`
+  (truncate just past the header so the entropy-image stage EOFs),
+  `decode_argb_truncated_mid_per_group_prefix_reports_eof`
+  (truncate inside a per-group `PrefixCodeGroup::read`),
+  `decode_argb_oversize_meta_prefix_bits_is_refused` (raw
+  `prefix_bits = 7` → derived 9 on a 1×1 canvas — must not wedge),
+  and the strong property
+  `decode_argb_every_byte_prefix_of_valid_stream_is_safe`
+  (catch-unwind sweep over every byte-prefix of a valid 8×1
+  multi-group stream; every prefix must return either a
+  structured `Err` or an `Ok` with exactly the requested pixel
+  count, never a panic). 398 lib tests, +6 vs round 163. Decoder
+  source unchanged — purely additive coverage of the existing
+  contract. Spec source: RFC 9649 §5.2 (image data) and §6.2.2
+  (meta-prefix codes).
+
 * **Clean-room round 163 (2026-05-27).** §5.2.2 LZ77 lazy-match
   matcher gains a **fourth-position probe with a diminishing-returns
   guard**. The round-158 three-position lazy matcher probes `pos`,

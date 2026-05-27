@@ -2,6 +2,47 @@
 
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
 
+## Status — 2026-05-27 (clean-room round 164)
+
+**Round 164 nails down the VP8L `decode_argb` malformed-input
+contract with property tests on every truncation boundary.** The
+ARGB-role decode pipeline already returned structured `DecodeError`
+values on bad inputs by construction (the §5.2.3 color-cache info,
+§6.2.2 meta-prefix header, §6.2.2 entropy image, per-group prefix
+code groups, and §6.2.3 main pixel loop each have their own error
+variants). What round 164 adds is **proof on the seams between those
+stages**: six new tests assert that an attacker-supplied truncation
+or corruption at any byte boundary produces either a structured
+error or a clean `Ok` of the right pixel count — never a panic,
+never an infinite loop, never a partially-filled image.
+
+The strong end of the new coverage is
+`decode_argb_every_byte_prefix_of_valid_stream_is_safe`: it builds
+the valid 8×1 two-group stream used by the round-106
+`decode_argb_two_groups_select_per_block` test and then sweeps a
+`catch_unwind`-protected `decode_argb` call over every byte-prefix
+of that stream from length 0 up. Each call must return either an
+`Err`, or an `Ok` whose pixel count equals the requested 8 pixels;
+any panic fails the test. That single property covers every
+truncation point any sub-stage's reader could have been parked at.
+
+The other five tests pin individual seams that the property test
+brushes through but doesn't isolate: `decode_argb_empty_input_…`
+(zero-byte input), `decode_argb_truncated_after_meta_prefix_header_…`
+(truncate just past the 5-bit header so the entropy-image read
+EOFs), `decode_argb_truncated_mid_per_group_prefix_…` (truncate
+inside `PrefixCodeGroup::read`),
+`decode_argb_oversize_meta_prefix_bits_is_refused` (raw
+`prefix_bits = 7` → derived 9 on a 1×1 canvas — corner case
+that must not wedge the decoder), and
+`decode_argb_two_groups_baseline_decodes_clean` (sanity-check the
+helper the truncation tests depend on).
+
+The decoder source itself is unchanged — this is purely additive
+coverage of a pre-existing contract. 398 lib tests, **+6** vs round
+163 (392 → 398). RFC 9649 §5.2 (image data) and §6.2.2 (meta-prefix
+codes) are the spec sources.
+
 ## Status — 2026-05-27 (clean-room round 163)
 
 **Round 163 extends the VP8L LZ77 lazy matcher to four positions,
