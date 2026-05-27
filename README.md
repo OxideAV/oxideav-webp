@@ -1,113 +1,167 @@
 # oxideav-webp
 
-Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF).
+Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM +
+ANMF). Decoder and encoder both at production status as of 2026-05-27.
 
-## Status
-
-**Production-ready, both decoder and encoder at ✅ 100% as of 2026-05-27.**
-
-* **Decoder** — RFC 9649 RIFF container; VP8 lossy (via the
-  `oxideav-vp8` sibling); VP8L lossless (full §3–§7 path including
-  LZ77, spatial / color / color-indexing transforms, color cache,
-  multi-meta-prefix); `ALPH` alpha plane; animated WebP (`ANIM` +
-  `ANMF`); `VP8X` extended container with ICCP / EXIF / XMP
-  metadata. File-level metadata extraction without pixel decode.
-* **Encoder** — VP8L lossless (LZ77 + spatial + color transform +
-  color cache + color indexing + multi-meta-prefix + histogram-
-  distance clusterer + Shannon-entropy chooser + depth-4 lazy
-  matching); VP8 lossy wired through `oxideav-vp8 0.2.1` (a
-  `WebpVp8LossyEncoder` adapter wraps every emitted raw VP8
-  keyframe in a §2.5 simple-lossy `RIFF/WEBP` container).
-  Animation encoder emits dirty-rect `ANMF` sub-frames with
-  `Auto` / `Delta` / `Lossless` per-frame mode selection.
-* **0.1.2 public-surface lock** — every symbol the published
-  crates.io `0.1.2` release exposed is reachable, both with the
-  default `registry` build and under `--no-default-features`. See
-  [`API-COMPAT-0.1.2.md`](./API-COMPAT-0.1.2.md) for the
+* Full **decode** of every container variant: simple-lossy (VP8),
+  simple-lossless (VP8L), extended (`VP8X`) with `ALPH` alpha plane,
+  ICCP / EXIF / XMP metadata, and animated WebP (`ANIM` + `ANMF`).
+* **Encode** of complete `.webp` files in both lossless (VP8L) and
+  lossy (VP8) modes, plus complete animated `.webp` files.
+* Decoded pixels land in a tightly-packed `Vec<u8>` of `width * height
+  * 4` RGBA bytes — drops directly into [`image`](https://crates.io/crates/image)'s
+  `ImageBuffer::from_raw` with zero copy.
+* The full crates.io `0.1.2` public surface is reachable, both with
+  the default `registry` build and under `--no-default-features`.
+  See [`API-COMPAT-0.1.2.md`](./API-COMPAT-0.1.2.md) for the
   per-symbol contract and [`tests/api_compat_0_1_2.rs`](./tests/api_compat_0_1_2.rs)
-  for the 29-test compile-only assertion suite. One deliberate
-  spec deviation — the rebuild's `AnimFrame` owned shape replaces
-  0.1.2's borrowed shape — is documented in the spec.
+  for the 29-test compile-only assertion suite.
 
-## Cargo features
+## Install
+
+```toml
+# Standalone — flat RGBA in / flat RGBA out, no framework dep:
+[dependencies]
+oxideav-webp = { version = "0.1", default-features = false }
+
+# With the OxideAV runtime:
+[dependencies]
+oxideav-webp = "0.1"
+```
 
 | Feature | Default | What it does |
 |---|---|---|
-| `registry` | ✅ on | Enables the `oxideav-core` dependency and the framework-trait factories. Cascades into `oxideav-vp8/registry` so the VP8-lossy encode delegation can reach the sibling crate's `make_encoder*` factories. |
+| `registry` | ✅ on | Pulls `oxideav-core` plus the framework-trait factories. Cascades into `oxideav-vp8/registry` so the VP8-lossy encode delegation can reach the sibling crate's factories. With this off, **lossless encode/decode + animation + metadata extraction all still work**; only the VP8-lossy *encode* requires `registry`. |
 
-The crate builds and tests cleanly under both `cargo build -p oxideav-webp`
-and `cargo build -p oxideav-webp --no-default-features`; both
-configurations are kept green in CI.
+## Standalone use (no `oxideav-core`)
 
-## Direct-API entry points
-
-### Decode
+### Decode any `.webp` file
 
 ```rust
-use oxideav_webp::{decode_webp, extract_metadata, WebpImage};
+use oxideav_webp::{decode_webp, WebpImage};
 
-// Full decode — image::ImageBuffer::from_raw consumes the RGBA buffer
-// zero-copy because `WebpFrame.rgba` is a tight Vec<u8> of width*height*4.
-let image: WebpImage = decode_webp(&webp_bytes)?;
+let webp_bytes: &[u8] = /* file bytes from disk, HTTP, … */;
+let image: WebpImage = decode_webp(webp_bytes)?;
+
+println!("{} × {}, {} frame(s)", image.width, image.height, image.frames.len());
 for frame in &image.frames {
-    let rgba = &frame.rgba;
-    // ... assert_eq!(rgba.len(), (frame.width * frame.height * 4) as usize);
+    // frame.rgba is a tight Vec<u8> of width*height*4 RGBA bytes,
+    // row-major, no per-row padding — drops into `image::ImageBuffer`:
+    //
+    //   let img = image::RgbaImage::from_raw(frame.width, frame.height,
+    //                                        frame.rgba.clone()).unwrap();
+    //
+    println!("  frame: {}×{}, {} ms", frame.width, frame.height, frame.duration_ms);
 }
 
-// Metadata only, no pixel decode.
-let meta = extract_metadata(&webp_bytes)?;
-let icc  = meta.icc.as_deref();
-let exif = meta.exif.as_deref();
-let xmp  = meta.xmp.as_deref();
+// ICC / EXIF / XMP are on image.metadata.{icc, exif, xmp} (each Option<Vec<u8>>).
 ```
 
-### Encode
+### Read metadata only (no pixel decode)
 
 ```rust
-use oxideav_webp::{
-    vp8l::encode_vp8l_argb,
-    encoder_vp8::{make_encoder_with_quality, make_encoder_with_qindex, quality_to_qindex},
-    build_animated_webp,
-    build_animated_webp_with_options,
-    AnimEncoderOptions,
+use oxideav_webp::extract_metadata;
+
+let meta = extract_metadata(webp_bytes)?;
+if let Some(icc) = meta.icc.as_deref()  { /* color-management profile */ }
+if let Some(exif) = meta.exif.as_deref() { /* EXIF blob */ }
+if let Some(xmp) = meta.xmp.as_deref()   { /* XMP UTF-8 XML */ }
+```
+
+### Encode a lossless `.webp` from RGBA bytes
+
+The shortest path — flat RGBA in, complete `.webp` file out:
+
+```rust
+use oxideav_webp::encode_webp_lossless;
+
+let rgba: Vec<u8> = /* width*height*4 RGBA bytes */;
+let webp_bytes: Vec<u8> = encode_webp_lossless(&rgba, width, height)?;
+// Write to disk:
+std::fs::write("out.webp", &webp_bytes)?;
+```
+
+### Encode lossless with metadata (ICC / EXIF / XMP)
+
+```rust
+use oxideav_webp::{encode_vp8l_argb_with_metadata, WebpMetadata};
+
+// VP8L works in ARGB, one u32/pixel.
+let argb: Vec<u32> = /* width*height ARGB pixels */;
+
+let meta = WebpMetadata {
+    icc:  Some(&my_icc_profile),
+    exif: Some(&my_exif_blob),
+    xmp:  Some(&my_xmp_xml),
 };
-
-// Bare VP8L bitstream (no RIFF wrap).
-let bitstream: Vec<u8> = encode_vp8l_argb(&argb, width, height)?;
-
-// VP8 lossy via the framework path (RIFF/WEBP wrapped output).
-let mut ctx = oxideav_core::RuntimeContext::new();
-oxideav_webp::register(&mut ctx);
-let enc = make_encoder_with_quality(&params, 75.0)?;
-// ... drive enc.send_frame(...) / enc.receive_packet(...) as usual.
-
-// Animated WebP.
-let file = build_animated_webp(&frames)?;
+let webp_bytes = encode_vp8l_argb_with_metadata(
+    width, height, &argb, /* has_alpha = */ true, &meta,
+)?;
 ```
 
-The `_freq_deltas` factories (`make_encoder_with_qindex_and_freq_deltas`,
-`make_encoder_with_quality_and_freq_deltas`) accept a `Vp8FreqDeltas`
-record of per-band quantiser deltas — currently a forwarded hint (the
-qindex is honoured; per-band plumbing into `oxideav-vp8`'s
-`KeyframeParams` is a follow-up).
+If `has_alpha` is `true` or any metadata field is set, the output
+auto-promotes to the extended `VP8X` layout; otherwise it's the
+simple lossless layout.
 
-## Registry path
+### Bare VP8L bitstream (no RIFF wrap)
+
+For consumers that wrap the bitstream themselves:
 
 ```rust
-let mut ctx = oxideav_core::RuntimeContext::new();
-oxideav_webp::register(&mut ctx);
-// ctx now has the "webp" container plus "webp_vp8" + "webp_vp8l" codecs.
+use oxideav_webp::vp8l::encode_vp8l_argb;
+let vp8l: Vec<u8> = encode_vp8l_argb(&argb, width, height)?;
 ```
 
-Codec / container IDs:
+### Build an animated `.webp`
 
-| Constant | Value | Notes |
-|---|---|---|
-| `CODEC_ID_VP8`  | `"webp_vp8"`  | VP8 lossy bitstream. |
-| `CODEC_ID_VP8L` | `"webp_vp8l"` | VP8L lossless bitstream. |
+```rust
+use oxideav_webp::{build_animated_webp, build_animated_webp_with_options,
+                   AnimFrame, AnimEncoderOptions};
 
-Container: `"webp"`, matched by the `.webp` extension and the
-`RIFF`/`WEBP` magic.
+// Each AnimFrame is a tile (width × height RGBA) at (x, y) on the
+// canvas, with a duration in milliseconds.
+let frames = vec![
+    AnimFrame::new(/* w */ 64, /* h */ 64, /* rgba */ frame0_rgba, /* duration_ms */ 100),
+    AnimFrame::new(64, 64, frame1_rgba, 100),
+    AnimFrame::new(64, 64, frame2_rgba, 100),
+];
+
+// Defaults: per-frame Auto mode (picks byte-smallest of Lossless / Delta).
+let webp = build_animated_webp(&frames)?;
+
+// Or with options (loop count, background colour, file-level metadata):
+let opts = AnimEncoderOptions {
+    loop_count: 0,                      // 0 = infinite
+    background_rgba: [0xff, 0xff, 0xff, 0xff],
+    ..Default::default()
+};
+let webp = build_animated_webp_with_options(&frames, &opts)?;
+```
+
+## With the OxideAV runtime (`registry` feature on)
+
+```rust
+use oxideav_core::RuntimeContext;
+use oxideav_webp::{CODEC_ID_VP8, CODEC_ID_VP8L};   // "webp_vp8" / "webp_vp8l"
+
+let mut ctx = RuntimeContext::new();
+oxideav_webp::register(&mut ctx);
+// ctx now exposes the "webp" container plus "webp_vp8" + "webp_vp8l" codecs.
+```
+
+This is the only way to reach the **VP8-lossy encoder** — it delegates
+to the `oxideav-vp8` sibling crate's framework factory family:
+
+```rust
+use oxideav_webp::encoder_vp8::{make_encoder_with_quality, make_encoder_with_qindex};
+
+// Returns Box<dyn oxideav_core::Encoder>; emits RIFF/WEBP-wrapped output.
+let enc = make_encoder_with_quality(&params, 75.0)?;
+let enc = make_encoder_with_qindex(&params, 32)?;
+```
+
+(Lossless encode + decode + animation + metadata extraction all work
+without `registry`; only the VP8 *lossy* encode path needs it.)
 
 ## Clean-room sources
 
@@ -115,18 +169,16 @@ Implementation is derived entirely from the public format specs:
 
 * **RFC 9649** — WebP Image Format
   (`docs/image/webp/rfc9649-webp.txt`, also `rfc9649-webp.pdf`).
-* **WebP Lossless Bitstream Specification** — `docs/image/webp/
-  google-webp-lossless-bitstream.html` (also reproduced in RFC 9649
-  §3). Covers the VP8L LZ77 + prefix-coded literals + color cache +
-  spatial / color / color-indexing transforms.
+* **WebP Lossless Bitstream Specification** — the LZ77 + prefix-coded
+  literals + color cache + spatial / color / color-indexing transforms
+  (also reproduced in RFC 9649 §3).
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`) for the VP8 lossy
   framing routed through the `oxideav-vp8` sibling.
 
 The 18-fixture corpus at `docs/image/webp/fixtures/` is consumed as
 opaque byte streams; end-to-end fixture tests validate against the
-ARGB pixels of each fixture's committed `expected.png` (a clean-room
-PNG decode of the corpus' own ground-truth files). No third-party
+ARGB pixels of each fixture's committed `expected.png`. No third-party
 codec library source is consulted.
 
 ## License
