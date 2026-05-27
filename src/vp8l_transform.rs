@@ -76,14 +76,25 @@ fn pack_argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
 // ---- §4.1 predictor primitives ----
 
 /// §4.1 `Average2`, per ARGB component: `(a + b) / 2`.
+///
+/// **SWAR rewrite** (round 170, see `BENCHMARKS.md`): the standard
+/// `(a + b) >> 1` lane-parallel average expressed as
+/// `((a ^ b) >> 1) & 0x7f7f7f7f + (a & b)`. This computes four
+/// independent 8-bit `(x + y) / 2` values inside one u32 with no
+/// carry between lanes, and matches the §4.1 truncating-divide
+/// semantics exactly because the original `(ca + cb) / 2` is the
+/// arithmetic-mean formula `(a ^ b) / 2 + (a & b)` for two 8-bit
+/// values (commonly written as the "halving add"). Predictor modes
+/// 5..10 each call this 1–3× per pixel, so the win compounds in the
+/// inverse-predictor loop that the round-170 profile flagged as
+/// ~80% of decode self-time.
 #[inline]
 fn average2(a: u32, b: u32) -> u32 {
-    let f = |sh: u32| -> u32 {
-        let ca = (a >> sh) & 0xff;
-        let cb = (b >> sh) & 0xff;
-        (ca + cb) / 2
-    };
-    (f(24) << 24) | (f(16) << 16) | (f(8) << 8) | f(0)
+    // Halving-add identity for unsigned bytes:
+    //   avg(a, b) = (a & b) + ((a ^ b) >> 1)
+    // No carry crosses lane boundaries because (a ^ b) >> 1 has each
+    // byte's MSB cleared and (a & b) is bit-wise per-lane.
+    (a & b).wrapping_add((a ^ b) >> 1 & 0x7f7f_7f7f)
 }
 
 /// §4.1 `Clamp`: clamp `a` to `[0, 255]`.
@@ -169,13 +180,30 @@ fn predict(mode: u8, l: u32, t: u32, tr: u32, tl: u32) -> u32 {
 
 /// §4.1 per-channel residual add: `final = residual + pred` per channel,
 /// each wrapped to 8 bits.
+///
+/// **SWAR rewrite** (round 170, see `BENCHMARKS.md`): four parallel
+/// 8-bit lane adds packed inside one 32-bit add, masked back to byte
+/// lanes. Carry between lanes is suppressed by masking each pair of
+/// lanes separately and re-combining. The §4.1 contract is "add per
+/// channel mod 256"; this expression is bit-identical to the original
+/// four `u8::wrapping_add` calls and gives the decoder a measurable
+/// per-pixel win because the predictor loop is the lossless decode
+/// hot path (~80% of self-time per the round-170 profile).
+///
+/// Identity:
+/// ```text
+///   (residual & 0x00ff00ff) + (pred & 0x00ff00ff) → lanes 0 + 2
+///   (residual & 0xff00ff00) + (pred & 0xff00ff00) → lanes 1 + 3 (
+///       carry into the next lane is harmless: the contributing
+///       lanes are already in the high byte of their u16 pair, so
+///       wrapping to the next lane's low byte zeroes them; we mask
+///       back to the original pattern before OR-combining).
+/// ```
 #[inline]
 fn add_pred(residual: u32, pred: u32) -> u32 {
-    let a = alpha(residual).wrapping_add(alpha(pred));
-    let r = red(residual).wrapping_add(red(pred));
-    let g = green(residual).wrapping_add(green(pred));
-    let b = blue(residual).wrapping_add(blue(pred));
-    pack_argb(a, r, g, b)
+    let lo = (residual & 0x00ff_00ff).wrapping_add(pred & 0x00ff_00ff) & 0x00ff_00ff;
+    let hi = (residual & 0xff00_ff00).wrapping_add(pred & 0xff00_ff00) & 0xff00_ff00;
+    lo | hi
 }
 
 /// Apply the §4.1 inverse predictor transform in place.
@@ -314,12 +342,31 @@ pub fn inverse_color(
 
 /// Apply the §4.3 inverse subtract-green transform in place: add the
 /// green channel into both red and blue (`& 0xff`).
+///
+/// **SWAR rewrite** (round 170, see `BENCHMARKS.md`): the per-pixel
+/// work is `r = r + g; b = b + g` (mod 256). Broadcasting the green
+/// byte into both the red lane (bits 16..24) and the blue lane (bits
+/// 0..8) gives a single SWAR mask `0x00gg00gg`; one masked add into
+/// the original ARGB pixel, with carry suppressed by the same
+/// odd/even lane split as [`add_pred`], lands the new red + blue
+/// bytes in one shot while leaving alpha and green untouched. The
+/// emitted bytes are identical to the per-channel `u8::wrapping_add`
+/// loop.
 pub fn inverse_subtract_green(pixels: &mut [u32]) {
     for px in pixels.iter_mut() {
-        let g = green(*px);
-        let r = red(*px).wrapping_add(g);
-        let b = blue(*px).wrapping_add(g);
-        *px = pack_argb(alpha(*px), r, g, b);
+        let p = *px;
+        // Green byte broadcast into the red lane and the blue lane
+        // (alpha + green lanes zeroed → only r and b receive the
+        // green delta).
+        let g = (p >> 8) & 0xff;
+        let mask = (g << 16) | g; // 0x00gg00gg
+                                  // Add the broadcast green into the [r, b] lanes using the
+                                  // `add_pred`-style SWAR pattern. `mask` only lives in the
+                                  // 0x00ff00ff lane group, so carry never enters the green or
+                                  // alpha lanes.
+        let lo = (p & 0x00ff_00ff).wrapping_add(mask) & 0x00ff_00ff;
+        let hi = p & 0xff00_ff00; // alpha + green unchanged
+        *px = lo | hi;
     }
 }
 

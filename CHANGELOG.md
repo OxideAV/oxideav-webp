@@ -6,6 +6,57 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **Round-170 benchmark + profile + optimize pass (2026-05-27).**
+  - New `benches/` directory with four criterion harnesses:
+    `lossless_encode` (two functions: 256×256 gradient and 128×128
+    natural-tile), `lossless_decode` (256×256 round-trip),
+    `lz77_match` (4096-pixel synthetic tile through the public
+    LZ77 entry point), and `argb_to_rgba` (`Vp8lImage::to_rgba` on
+    a 256×256 image). Each bench preallocates its input outside
+    `b.iter`. `criterion = "0.5"` added under `[dev-dependencies]`.
+  - New `simd` cargo feature (default off, nightly-only). Activates
+    `#![feature(portable_simd)]` at crate root and turns on a
+    `std::simd::u8x16`-shuffle path inside `Vp8lImage::to_rgba_simd`.
+    Byte-identical to the scalar path (asserted by
+    `vp8l::tests::to_rgba_simd_matches_scalar_byte_for_byte` on a
+    67-pixel buffer that exercises the SIMD body and its tail).
+  - New `Vp8lImage::to_rgba_scalar` public method — direct entry to
+    the scalar repack path, retained as the stable byte-identical
+    fallback for the `simd` path.
+  - New top-level `BENCHMARKS.md` documenting baseline numbers,
+    `/usr/bin/sample` profile findings (the §4.1 inverse-predictor
+    inner loop takes ~80% of decode self-time on a gradient), and
+    the round-170 optimization deltas.
+
+### Changed
+
+* **Round-170 lossless-decode hot-path optimizations (2026-05-27).**
+  SWAR (single-word lane-parallel) rewrites of three §4
+  inverse-transform primitives that the round-170 profile flagged as
+  the decode hot path. All three are byte-identical to the
+  per-channel scalar implementations they replaced; the existing
+  408-test suite (now 410 with the new SIMD-byte-identity tests)
+  passes unchanged.
+  - `vp8l_transform::add_pred` — four `u8::wrapping_add` calls
+    replaced by two masked u32 adds (`0x00ff_00ff` low-pair,
+    `0xff00_ff00` high-pair).
+  - `vp8l_transform::average2` — per-channel `(ca + cb) / 2` loop
+    replaced by the SWAR halving-add identity
+    `(a & b) + ((a ^ b) >> 1 & 0x7f7f_7f7f)`.
+  - `vp8l_transform::inverse_subtract_green` — per-pixel four-byte
+    pack-and-unpack replaced by a broadcast green-byte mask
+    `(g << 16) | g` + one masked u32 add.
+  - `Vp8lImage::to_rgba` — replaced the four-`Vec::push`-per-pixel
+    loop with a pre-sized `vec![0; n*4]` + `chunks_exact_mut(4)`
+    zip over the pixel iterator. The compiler now auto-vectorises
+    the strided byte stores.
+  Measured: `argb_to_rgba` 126.3 → 8.7 µs (−93.1%, ~14.5×),
+  additionally `argb_to_rgba` 8.7 → 6.4 µs (−27%) when the new
+  `simd` feature is on, and `lossless_decode_argb_256` 1.005 → 0.773
+  ms (−23.0%). Encode benches unchanged within noise (encode
+  self-time is spread across the chooser sweep, not the inverse
+  predictor; a separate round will target the chooser).
+
 * **Round-169 end-to-end interop + standalone-API tests (2026-05-27).**
   Two new integration test files closing the last two coverage gaps:
   - `tests/standalone_e2e.rs` — 8 tests driving ONLY the

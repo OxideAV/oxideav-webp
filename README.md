@@ -32,6 +32,20 @@ oxideav-webp = "0.1"
 | Feature | Default | What it does |
 |---|---|---|
 | `registry` | ✅ on | Pulls `oxideav-core` plus the framework-trait factories. Cascades into `oxideav-vp8/registry` so the VP8-lossy encode delegation can reach the sibling crate's factories. With this off, **lossless encode/decode + animation + metadata extraction all still work**; only the VP8-lossy *encode* requires `registry`. |
+| `simd` | off (nightly only) | Opt-in `std::simd` acceleration of the hottest pixel-repack loop (`Vp8lImage::to_rgba`). Requires a nightly rustc because it activates `#![feature(portable_simd)]`. Byte-identical to the scalar path (asserted by `vp8l::tests::to_rgba_simd_matches_scalar_byte_for_byte`); see [`BENCHMARKS.md`](./BENCHMARKS.md) for the round-170 before/after numbers. |
+
+### Benchmarks
+
+The crate ships four criterion benches under `benches/` (decode +
+encode + LZ77 matcher + `argb→rgba` repack). Numbers, profile
+findings, and the optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md).
+Run with:
+
+```text
+CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
+  cargo bench --manifest-path crates/oxideav-webp/Cargo.toml \
+    --bench <name> -- --quick
+```
 
 ## Standalone use (no `oxideav-core`)
 

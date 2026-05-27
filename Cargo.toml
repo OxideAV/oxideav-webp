@@ -32,3 +32,40 @@ default = ["registry"]
 # available for `encoder_vp8::make_encoder*` to delegate to. Mirrors the
 # published 0.1.2 cascade documented in API-COMPAT-0.1.2.md.
 registry = ["dep:oxideav-core", "oxideav-vp8/registry"]
+# Opt-in `std::simd` (portable SIMD) acceleration of the hottest pixel-
+# repack / inverse-transform loops. Nightly-only because it activates
+# `#![feature(portable_simd)]`. Every SIMD code path has a stable
+# byte-identical scalar fallback compiled in by default; toggling this
+# feature must NEVER change emitted bytes. See `BENCHMARKS.md` for the
+# specific loops affected and the measured before/after numbers.
+simd = []
+
+[dev-dependencies]
+# Round-170 (benchmark + profile dispatch): Criterion drives the
+# four bench harnesses (`lossless_encode`, `lossless_decode`,
+# `lz77_match`, `argb_to_rgba`) so future webp encoder / decoder
+# rounds can A/B their changes. Pinned to the same 0.5 line every
+# other OxideAV crate with benches (cinepak / bmp / flac / gif /
+# hdr) already tracks.
+criterion = "0.5"
+
+# Round-170 benches. Each binary lives in `benches/<name>.rs` and is
+# self-contained (no committed fixture files — the benches build the
+# input ARGB / RGBA on the fly via the public API or the existing
+# `tests/data/` fixtures). Run with:
+#     cargo bench -p oxideav-webp --bench <name>
+[[bench]]
+name = "lossless_encode"
+harness = false
+
+[[bench]]
+name = "lossless_decode"
+harness = false
+
+[[bench]]
+name = "lz77_match"
+harness = false
+
+[[bench]]
+name = "argb_to_rgba"
+harness = false

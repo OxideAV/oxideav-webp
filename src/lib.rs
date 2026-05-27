@@ -128,6 +128,12 @@
 //! externally pre-computed codec payload.
 
 #![warn(missing_debug_implementations)]
+// Opt-in `std::simd` acceleration of the hottest pixel-repack /
+// inverse-transform loops. Nightly-only because `portable_simd` is
+// still an unstable feature; every SIMD path has a stable scalar
+// fallback that produces byte-identical output. See `BENCHMARKS.md`
+// and the `simd` cargo feature in `Cargo.toml`.
+#![cfg_attr(feature = "simd", feature(portable_simd))]
 
 pub mod alph;
 pub mod anim;
