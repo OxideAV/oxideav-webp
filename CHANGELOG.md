@@ -4,7 +4,7 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
-## [0.1.6](https://github.com/OxideAV/oxideav-webp/compare/v0.1.5...v0.1.6) - 2026-05-27
+## [0.2.0](https://github.com/OxideAV/oxideav-webp/compare/v0.1.5...v0.2.0) - 2026-05-27
 
 ### Other
 
