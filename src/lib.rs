@@ -135,11 +135,19 @@ pub mod anim_encode;
 pub mod anmf;
 pub mod build;
 pub mod container;
+pub mod decoder;
+pub mod demux;
+pub mod encoder;
+pub mod encoder_anim;
+pub mod encoder_vp8;
+pub mod error;
 pub mod meta_prefix;
 #[cfg(feature = "registry")]
 pub mod registry;
+pub mod riff;
 pub mod vp8_chunk;
 pub mod vp8_decode;
+pub mod vp8l;
 pub mod vp8l_chunk;
 pub mod vp8l_decode;
 pub mod vp8l_encode;
@@ -150,6 +158,12 @@ pub mod vp8x;
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;
+
+/// Streaming [`oxideav_core::Decoder`] implementation — re-export of the
+/// in-crate [`registry::WebpDecoder`] under the published crate-root
+/// path per `API-COMPAT-0.1.2.md`.
+#[cfg(feature = "registry")]
+pub use registry::WebpDecoder;
 
 /// Crate-local error type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -687,6 +701,14 @@ fn decode_lossy_image(
 /// `image::ImageBuffer::from_raw(width, height, rgba)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebpImage {
+    /// Canvas width in pixels (the §2.7.1 `VP8X` canvas width for an
+    /// extended file, or the §3.4 / RFC 6386 §9.1 image-header width
+    /// for a simple-lossless / simple-lossy file). Matches the first
+    /// frame's width for a single-frame image.
+    pub width: u32,
+    /// Canvas height in pixels — see [`Self::width`] for the spec
+    /// citation.
+    pub height: u32,
     /// Decoded frames. A still image yields exactly one frame; an
     /// animation yields one per `ANMF` chunk (animation decode is not
     /// rebuilt yet — see [`decode_webp`]).
@@ -834,6 +856,28 @@ impl core::fmt::Display for WebpError {
 
 impl std::error::Error for WebpError {}
 
+impl WebpError {
+    /// Build an `InvalidData` variant from any string-like message.
+    ///
+    /// The 0.1.2 published `WebpError::InvalidData` carried a `String`
+    /// payload; the current rebuild collapses every malformed-bitstream
+    /// failure to the unit variant so the historical *constructor* shape
+    /// `WebpError::invalid("message")` keeps compiling. The message
+    /// itself is discarded; callers that need the underlying diagnostic
+    /// can match on the richer in-crate [`Error`] instead.
+    pub fn invalid<S: Into<String>>(_msg: S) -> Self {
+        // The message is intentionally dropped — see the doc comment for
+        // why the unit-variant rebuild surfaces the constructor only.
+        Self::InvalidData
+    }
+
+    /// Build an `Unsupported` variant from any string-like message — the
+    /// constructor counterpart of [`Self::invalid`].
+    pub fn unsupported<S: Into<String>>(_msg: S) -> Self {
+        Self::Unsupported
+    }
+}
+
 /// Map the rich internal [`Error`] onto the coarse published [`WebpError`].
 ///
 /// `Unsupported` / `NotImplemented` collapse to [`WebpError::Unsupported`];
@@ -867,6 +911,24 @@ impl From<oxideav_vp8::DecodeError> for WebpError {
         match e {
             oxideav_vp8::DecodeError::Unsupported(_) => WebpError::Unsupported,
             _ => WebpError::InvalidData,
+        }
+    }
+}
+
+/// Map the `oxideav-vp8` umbrella [`oxideav_vp8::Vp8Error`] (the
+/// flat-four `InvalidData` / `Unsupported` / `Eof` / `NeedMore` surface)
+/// onto the coarse published [`WebpError`].
+///
+/// Variant correspondence is one-to-one (the published `WebpError` and
+/// `Vp8Error` share the same flat-four shape), modulo dropping vp8's
+/// `String` payload — the rebuilt `WebpError` is the unit-variant form.
+impl From<oxideav_vp8::Vp8Error> for WebpError {
+    fn from(e: oxideav_vp8::Vp8Error) -> Self {
+        match e {
+            oxideav_vp8::Vp8Error::InvalidData(_) => WebpError::InvalidData,
+            oxideav_vp8::Vp8Error::Unsupported(_) => WebpError::Unsupported,
+            oxideav_vp8::Vp8Error::Eof => WebpError::Eof,
+            oxideav_vp8::Vp8Error::NeedMore => WebpError::NeedMore,
         }
     }
 }
@@ -923,6 +985,8 @@ pub fn decode_webp(bytes: &[u8]) -> Result<WebpImage, WebpError> {
     // rebuilt yet, so any animated file already errored Unsupported above
     // via the NoImageData path.)
     Ok(WebpImage {
+        width: frame.width,
+        height: frame.height,
         frames: vec![frame],
         metadata,
         anim_background_rgba: None,
@@ -1093,6 +1157,8 @@ fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpIm
     }
 
     Ok(WebpImage {
+        width: canvas_w,
+        height: canvas_h,
         frames,
         metadata: metadata_from_container(bytes, c),
         anim_background_rgba: Some([bg.red, bg.green, bg.blue, bg.alpha]),
@@ -1438,6 +1504,20 @@ pub use anim_encode::{
 /// codec registry — the published `"webp_vp8l"` name.
 pub const CODEC_ID_VP8L: &str = "webp_vp8l";
 
+/// Stable codec identifier the VP8 lossy encoder registers under in the
+/// codec registry — the published `"webp_vp8"` name. The encoder itself
+/// is blocked on the `oxideav-vp8` Phase-2 lossy encoder (workspace task
+/// #1041); the id is reserved so consumers can look it up today and the
+/// registry slots in the factory once the encoder lands.
+pub const CODEC_ID_VP8: &str = "webp_vp8";
+
+// `Result` is published at `oxideav_webp::error::Result` (see
+// `crate::error`). It is NOT re-exported at the crate root because the
+// crate's source uses `Result<T, E>` extensively with two type
+// parameters (the std prelude form); shadowing that name at the root
+// would break those call sites. The published-0.1.2 documented path is
+// the qualified `oxideav_webp::error::Result`.
+
 /// Repack a scan-line-order ARGB pixel buffer (`(a<<24)|(r<<16)|(g<<8)|b`)
 /// into interleaved 8-bit `[R, G, B, A]` bytes — the
 /// `oxideav_core::PixelFormat::Rgba` layout.
@@ -1466,6 +1546,31 @@ fn argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut RuntimeContext) {
     registry::register(ctx);
+}
+
+/// Install only the WebP **codec** factories into `ctx` — the
+/// per-codec `Decoder` / `Encoder` impls under the `"webp"`, `"webp_vp8l"`,
+/// and `"webp_vp8"` ids.
+///
+/// This is the `RuntimeContext`-typed crate-root form per the
+/// `API-COMPAT-0.1.2.md` contract; for callers driving the registry
+/// piece-wise the lower-level
+/// [`registry::register_codecs`]`(&mut ctx.codecs)` form is still
+/// available.
+#[cfg(feature = "registry")]
+pub fn register_codecs(ctx: &mut RuntimeContext) {
+    registry::register_codecs(&mut ctx.codecs);
+}
+
+/// Install only the WebP **container** hooks into `ctx` — the `.webp`
+/// file-extension mapping that lets a demuxer-discovery pass route a
+/// `.webp` file back to the WebP codec id.
+///
+/// `RuntimeContext`-typed counterpart of
+/// [`registry::register_containers`]`(&mut ctx.containers)`.
+#[cfg(feature = "registry")]
+pub fn register_containers(ctx: &mut RuntimeContext) {
+    registry::register_containers(&mut ctx.containers);
 }
 
 #[cfg(feature = "registry")]

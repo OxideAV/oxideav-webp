@@ -6,6 +6,55 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+* **API-COMPAT-0.1.2 finalize pass (2026-05-27).** Restore the published
+  `oxideav-webp 0.1.2` crate-root public surface so consumers pinned to
+  `oxideav-webp = "0.1"` upgrade transparently. New `pub mod` shims
+  under `oxideav_webp::{decoder, demux, encoder, encoder_anim,
+  encoder_vp8, error, riff, vp8l}` re-export every published-0.1.2
+  symbol at its documented qualified path; the same shapes remain
+  reachable at the crate root via the existing `pub use` lines.
+  Concretely:
+  - `oxideav_webp::error::{Result, WebpError}` — new `Result<T>` alias
+    plus `WebpError::invalid(impl Into<String>)` /
+    `WebpError::unsupported(impl Into<String>)` constructors
+    matching the 0.1.2 `WebpError::InvalidData(String)` /
+    `WebpError::Unsupported(String)` *constructor* shape (the
+    message is dropped — the rebuild's `WebpError` stays the
+    unit-variant form so existing `Err(WebpError::InvalidData)`
+    matches keep compiling).
+  - `oxideav_webp::vp8l::{VP8L_SIGNATURE, decode, encode_vp8l_argb,
+    encode_vp8l_argb_with, Vp8lImage, HuffmanGroup}` plus the
+    `vp8l::{bit_reader, encoder, huffman, transform}` sub-modules.
+    `Vp8lImage::to_rgba()` repacks the §3.4 ARGB pixels into the
+    flat-RGBA8 buffer the `image` crate consumes zero-copy.
+  - `oxideav_webp::encoder_vp8::{Vp8FreqDeltas, quality_to_qindex,
+    make_encoder*}` — the per-band quantiser-delta record plus the
+    libwebp-style `round((100 - quality) * 1.27)` projection;
+    NaN-safe and clamped to `0..=127`. The framework-trait
+    factories surface `WebpError::Unsupported` until the
+    `oxideav-vp8` Phase-2 lossy encoder lands.
+  - `oxideav_webp::WebpImage` gains `width: u32` + `height: u32`
+    fields (additive; existing `frames` / `metadata` /
+    `anim_background_rgba` / `anim_loop_count` unchanged) so the
+    0.1.2 `WebpImage { width, height, frames, metadata }` shape
+    resolves at the field level.
+  - New crate-root constant `CODEC_ID_VP8 = "webp_vp8"`.
+  - New `RuntimeContext`-typed crate-root entry points
+    `oxideav_webp::register_codecs` / `register_containers`
+    (alongside the existing `&mut CodecRegistry` /
+    `&mut ContainerRegistry` forms in `oxideav_webp::registry`).
+  - New `impl From<oxideav_vp8::Vp8Error> for WebpError`
+    (variant-by-variant pass-through over the flat-four shape).
+  - `tests/api_compat_0_1_2.rs` — compile-only assertion suite that
+    type-binds every published-0.1.2 symbol at its documented path
+    (23 tests standalone, 28 tests with the registry feature on);
+    locks the surface in place so a future commit cannot regress it.
+  All changes are additive: every existing test (`fixture_walks` +
+  `published_decode_api` + `published_encode_api` + `published_anim_api`
+  + 408 in-crate / 393 standalone unit tests) continues to pass on both
+  feature configurations. Standalone build keeps zero `oxideav-core`
+  edges per `cargo tree -p oxideav-webp --no-default-features`.
+
 * **Clean-room round 165 (2026-05-27).** §5.2 / §6.2.2 VP8L
   `decode_argb` malformed-input safety net gains an **8x finer
   granularity bit-prefix property test**. The round-164 property
