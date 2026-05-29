@@ -4,6 +4,12 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/OxideAV/oxideav-webp/compare/v0.2.0...v0.2.1) - 2026-05-29
+
+### Other
+
+- round 180 — §4.1 inverse_predictor border-rule hoist
+
 ### Optimized
 
 - §4.1 `inverse_predictor`: hoist border-rule branches out of the
