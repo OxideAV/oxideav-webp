@@ -4,6 +4,24 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Optimized
+
+- §4.1 `inverse_predictor`: hoist border-rule branches out of the
+  inner loop. Top-left pixel, top row (always L), left column (always
+  T), and the right-column TR-wraparound case each run as their own
+  region; the interior region (`x in 1..w-1`, `y >= 1`) is now a
+  branch-free hot path with a single predictor-mode dispatch per
+  pixel. Bit-identical to the previous per-pixel `if/else if` chain
+  (asserted by a new randomised cross-check test against a straight
+  per-pixel reference at seven `(w, h, size_bits)` configurations
+  including 1×N, N×1, 2×2, and `size_bits = 0`). Decode self-time was
+  ~80% in this function per the round-170 profile;
+  `lossless_decode_argb_256` median drops from 773 µs to ~747 µs (≈
+  −3.4%) on the round-170 reference machine. New test
+  `inverse_predictor_right_column_uses_row_leftmost_as_tr` pins the
+  §4.1 rightmost-column rule (`tr = pixels[idx - w - (w - 1)]`) after
+  the loop split.
+
 ## [0.2.0](https://github.com/OxideAV/oxideav-webp/compare/v0.1.5...v0.2.0) - 2026-05-27
 
 ### Other

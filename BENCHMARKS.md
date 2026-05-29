@@ -116,6 +116,50 @@ comfortably; the LZ77 + encode benches were not the round-170
 focus (LZ77 is already a tight hash-chain loop; encode self-time is
 spread across the chooser).
 
+## Round-180 (2026-05-29) — predictor border-rule hoist
+
+The round-170 profile attributed ~80% of decode self-time to
+`vp8l_transform::inverse_predictor`. The SWAR rewrites of
+`add_pred` / `average2` / `inverse_subtract_green` cut the
+arithmetic per pixel; the round-180 change cuts the *control flow*
+per pixel. Each iteration of the original inner loop ran a
+four-arm chain (`x == 0 && y == 0` → `y == 0` → `x == 0` → else)
+plus a nested `x == w - 1` check inside the else branch — five
+predictable but per-pixel branches. We hoist all of them out so
+the predicate is implicit in which loop the iteration is part of:
+
+* `(0, 0)` — one statement, runs once.
+* Top row (`y == 0`, `x in 1..w`) — its own loop, always predicts L.
+* Left column (`x == 0`, `y in 1..h`) — its own loop, always
+  predicts T.
+* Interior + right column (`y in 1..h`, `x in 1..w`) — split into a
+  branch-free `x in 1..w-1` loop and a one-statement right-column
+  case (the §4.1 wraparound `tr = pixels[idx - w - (w - 1)]`).
+
+| Bench | Round-170 | Round-180 | Δ vs. round-170 | Δ vs. baseline |
+|---|---:|---:|---:|---:|
+| `lossless_decode_argb_256` | 773 µs | **747 µs** | −3.4% | −25.7% |
+| `argb_to_rgba` (scalar) | 8.71 µs | 8.56 µs | within noise | −93.2% |
+
+Decode-side win is modest (~3.4%) because (a) for the 256×256
+gradient fixture the predictor self-time is amortised against the
+prefix-code read in the §6.2 entropy loop, and (b) the branch
+predictor already does a good job on the original pattern (`(0, 0)`
+is taken exactly once, `y == 0` for one whole row, `x == 0` for one
+column per row). The structural win — branch-free interior — is the
+foundation for a future round-N SWAR pass over the predictor body
+itself (modes 5–13 still do per-channel `u8` arithmetic in
+`select` / `clamp_add_subtract_*`); the round-180 split makes those
+inner-loop calls auto-vectorisable without re-introducing the border
+branches.
+
+Bit-identical to the prior implementation per the new
+`inverse_predictor_matches_unsplit_reference_random` test, which
+runs seven `(width, height, size_bits)` shapes against an in-test
+copy of the original per-pixel reference (including `1×N`, `N×1`,
+`2×2`, and `size_bits = 0`, the four boundary regimes where the
+split is most subtle).
+
 ## Reproducing
 
 ```bash

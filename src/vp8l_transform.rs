@@ -226,38 +226,76 @@ pub fn inverse_predictor(
     }
     let w = width as usize;
     let h = height as usize;
-    for y in 0..h {
-        for x in 0..w {
-            let idx = y * w + x;
-            // Border prediction rules (§4.1):
-            let pred = if x == 0 && y == 0 {
-                // Left-topmost pixel.
-                0xff00_0000
-            } else if y == 0 {
-                // Top row → L pixel.
-                pixels[idx - 1]
-            } else if x == 0 {
-                // Leftmost column → T pixel.
-                pixels[idx - w]
-            } else {
-                // Interior + rightmost column: pick the block's mode.
-                let block_index =
-                    (y as u32 >> size_bits) * transform_width + (x as u32 >> size_bits);
-                let mode = green(predictor_image[block_index as usize]);
-                let l = pixels[idx - 1];
-                let t = pixels[idx - w];
-                let tl = pixels[idx - w - 1];
-                // §4.1: rightmost column uses the row's leftmost pixel as
-                // TR; otherwise the actual top-right neighbour.
-                let tr = if x == w - 1 {
-                    pixels[idx - w - (w - 1)]
-                } else {
-                    pixels[idx - w + 1]
-                };
-                predict(mode, l, t, tr, tl)
-            };
+
+    // §4.1 border-rule hoist (round 180): the per-pixel branch chain
+    // on `(x == 0, y == 0, x == w - 1)` is the same outcome for entire
+    // rows and entire columns, so we run each border region in its own
+    // loop and leave the interior loop (`x in 1..w-1`, `y >= 1`)
+    // branch-free. The body of each region is bit-identical to the
+    // original per-pixel `if/else if`; only the loop structure changes.
+    // Decode self-time was ~80% in this function per the round-170
+    // profile, so collapsing the inner conditional is a meaningful win.
+
+    // (0, 0): left-topmost pixel predicts 0xff00_0000.
+    pixels[0] = add_pred(pixels[0], 0xff00_0000);
+
+    // Top row (y == 0, x in 1..w): predict L (the left neighbour).
+    for x in 1..w {
+        let pred = pixels[x - 1];
+        pixels[x] = add_pred(pixels[x], pred);
+    }
+    if h == 1 {
+        return;
+    }
+
+    // Left column (x == 0, y in 1..h): predict T (the top neighbour).
+    // We could fuse this into the interior y-loop, but keeping it
+    // separate lets the interior loop start at idx = y*w + 1 with no
+    // x == 0 special case.
+    for y in 1..h {
+        let idx = y * w;
+        let pred = pixels[idx - w];
+        pixels[idx] = add_pred(pixels[idx], pred);
+    }
+
+    // Interior + right column (x in 1..w, y in 1..h). The original
+    // body did a per-pixel `x == w - 1` check; we hoist that out by
+    // running the interior `x in 1..w-1` loop separately and handling
+    // x = w - 1 in a single statement after it. For 1-column images
+    // (w == 1) this whole region is empty.
+    if w == 1 {
+        return;
+    }
+    let tw = transform_width as usize;
+    for y in 1..h {
+        let row = y * w;
+        let block_row = (y >> size_bits) * tw;
+        // Interior: x in 1..w-1, TR is the actual top-right neighbour.
+        for x in 1..w - 1 {
+            let idx = row + x;
+            let block_index = block_row + (x >> size_bits);
+            let mode = green(predictor_image[block_index]);
+            let l = pixels[idx - 1];
+            let t = pixels[idx - w];
+            let tl = pixels[idx - w - 1];
+            let tr = pixels[idx - w + 1];
+            let pred = predict(mode, l, t, tr, tl);
             pixels[idx] = add_pred(pixels[idx], pred);
         }
+        // Right column (x = w - 1): §4.1 rightmost-column rule uses the
+        // row's leftmost pixel as TR. `idx - w - (w - 1)` collapses to
+        // `idx - 2*w + 1` which is the top-row leftmost; equivalent to
+        // `row - w` (start of previous row).
+        let x = w - 1;
+        let idx = row + x;
+        let block_index = block_row + (x >> size_bits);
+        let mode = green(predictor_image[block_index]);
+        let l = pixels[idx - 1];
+        let t = pixels[idx - w];
+        let tl = pixels[idx - w - 1];
+        let tr = pixels[row - w];
+        let pred = predict(mode, l, t, tr, tl);
+        pixels[idx] = add_pred(pixels[idx], pred);
     }
 }
 
@@ -747,6 +785,136 @@ mod tests {
         assert_eq!(green(px[0]), 10);
         assert_eq!(green(px[1]), 15);
         assert_eq!(green(px[2]), 20);
+    }
+
+    #[test]
+    fn inverse_predictor_right_column_uses_row_leftmost_as_tr() {
+        // §4.1 rightmost-column rule: TR is `pixels[idx - w - (w - 1)]`
+        // i.e. the leftmost pixel of the row ABOVE (= start of the
+        // previous row), not the actual top-right (which doesn't exist
+        // at x = w - 1). This test pins that wraparound after the
+        // round-180 region-split rewrite.
+        //
+        // Layout (2×2, mode 3 = TR predictor everywhere):
+        //   row 0: [A, B]
+        //   row 1: [C, D]    where D is the right-column case.
+        //
+        // For pixel D (x=1, y=1): mode=3 picks `tr`. The §4.1 rule
+        // says tr = pixels[idx - w - (w-1)] = pixels[3 - 2 - 1] = A.
+        // So D's prediction is pixel A (the row's leftmost).
+        // After add_pred, pixels[D] = residual_D + A (per channel).
+        let a_after = pack_argb(255, 100, 50, 25); // value of A after decode
+        let res_d = pack_argb(0, 1, 2, 3); // residual for D
+                                           // Predictor image: 1 block, mode 3 (TR).
+        let pred_img = vec![pack_argb(0, 0, 3, 0)];
+        // Set up so that pixel A decodes to `a_after`. A is the
+        // top-left pixel so its prediction is 0xff00_0000; with
+        // residual = a_after - 0xff00_0000 per channel, A ends up at
+        // `a_after`. We pick a_after with alpha=255 so the residual
+        // alpha is 0 (255 + 0 = 255).
+        let res_a = pack_argb(0, 100, 50, 25);
+        // Other pixels: residuals are zero; predictions handle them.
+        // B (x=1, y=0): top-row rule → predict L = A.
+        //   pixels[B] = 0 + A = A.
+        // C (x=0, y=1): left-column rule → predict T = A.
+        //   pixels[C] = 0 + A = A.
+        let mut px = vec![res_a, 0u32, 0u32, res_d];
+        inverse_predictor(&mut px, 2, 2, &pred_img, 1, 9);
+        // A reconstructed:
+        assert_eq!(px[0], a_after);
+        // B and C predicted from A with residual 0:
+        assert_eq!(px[1], a_after);
+        assert_eq!(px[2], a_after);
+        // D = residual + A (per channel, SWAR add):
+        let expected_d = add_pred(res_d, a_after);
+        assert_eq!(px[3], expected_d);
+    }
+
+    #[test]
+    fn inverse_predictor_matches_unsplit_reference_random() {
+        // Cross-check the round-180 split-loop layout against a
+        // straight-line per-pixel reference (the pre-split structure).
+        // This pins that no region's body diverged from the original.
+        fn reference(
+            pixels: &mut [u32],
+            width: u32,
+            height: u32,
+            predictor_image: &[u32],
+            transform_width: u32,
+            size_bits: u8,
+        ) {
+            if width == 0 || height == 0 {
+                return;
+            }
+            let w = width as usize;
+            let h = height as usize;
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = y * w + x;
+                    let pred = if x == 0 && y == 0 {
+                        0xff00_0000
+                    } else if y == 0 {
+                        pixels[idx - 1]
+                    } else if x == 0 {
+                        pixels[idx - w]
+                    } else {
+                        let bi =
+                            (y as u32 >> size_bits) * transform_width + (x as u32 >> size_bits);
+                        let mode = green(predictor_image[bi as usize]);
+                        let l = pixels[idx - 1];
+                        let t = pixels[idx - w];
+                        let tl = pixels[idx - w - 1];
+                        let tr = if x == w - 1 {
+                            pixels[idx - w - (w - 1)]
+                        } else {
+                            pixels[idx - w + 1]
+                        };
+                        predict(mode, l, t, tr, tl)
+                    };
+                    pixels[idx] = add_pred(pixels[idx], pred);
+                }
+            }
+        }
+
+        // Deterministic LCG so the test is reproducible without any
+        // rand-crate dep. Cover several aspect ratios so the
+        // top-row / left-column / right-column / interior loops all
+        // get exercised, including 1-pixel-tall and 1-pixel-wide.
+        let mut seed: u32 = 0x1234_5678;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+        for &(w, h, size_bits) in &[
+            (1u32, 1u32, 3u8),
+            (1, 7, 2),
+            (7, 1, 2),
+            (2, 2, 1),
+            (5, 5, 1),
+            (8, 6, 0), // size_bits=0 → 1-pixel blocks, transform == image.
+            (13, 9, 2),
+        ] {
+            let n = (w as usize) * (h as usize);
+            let pixels: Vec<u32> = (0..n).map(|_| rng()).collect();
+            let tw = div_round_up(w, 1u32 << size_bits);
+            let th = div_round_up(h, 1u32 << size_bits);
+            let pred_n = (tw as usize) * (th as usize);
+            // Predictor image: only the green channel matters, and
+            // only values [0..=13] are defined modes. Clamp.
+            let pred_img: Vec<u32> = (0..pred_n)
+                .map(|_| pack_argb(0, 0, (rng() % 14) as u8, 0))
+                .collect();
+
+            let mut new_path = pixels.clone();
+            inverse_predictor(&mut new_path, w, h, &pred_img, tw, size_bits);
+            let mut ref_path = pixels.clone();
+            reference(&mut ref_path, w, h, &pred_img, tw, size_bits);
+            assert_eq!(
+                new_path, ref_path,
+                "split-loop diverges from per-pixel reference at \
+                 (w={w}, h={h}, size_bits={size_bits})"
+            );
+        }
     }
 
     // ---- §4.2 color transform ----
