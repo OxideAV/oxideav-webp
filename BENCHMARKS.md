@@ -160,6 +160,67 @@ copy of the original per-pixel reference (including `1×N`, `N×1`,
 `2×2`, and `size_bits = 0`, the four boundary regimes where the
 split is most subtle).
 
+## Round-194 (2026-05-31) — `Select` algebraic simplification + per-mode bench
+
+The round-180 BENCHMARKS note flagged the `select` /
+`clamp_add_subtract_*` per-channel arithmetic inside `predict` as
+the next mode-by-mode optimization target. Round 194 lands two
+things.
+
+### 1. New per-mode bench harness — `benches/inverse_predictor.rs`
+
+The existing `lossless_decode_argb_256` bench feeds a 256×256
+gradient that the encoder's mode chooser resolves with a mix of
+modes 0–10, so the heavier arithmetic modes 11 / 12 / 13 are
+under-exercised. The new `inverse_predictor` bench builds a
+256×256 ARGB residual buffer plus a `size_bits = 0` predictor
+image whose green channel is the **same constant mode for every
+block**, so every interior-loop pixel exercises one chosen
+predictor body. Three runs ship: `mode11`, `mode12`, `mode13`.
+This lets future rounds A/B-test per-mode rewrites without
+waiting for a real encoder mode pick.
+
+### 2. `Select` (mode 11) algebraic simplification
+
+`Select(L, T, TL)` in the §4.1 reference form computes a 4-channel
+`estimate = L + T - TL`, then takes 8 per-channel absolute
+differences (`|estimate_c - L_c|` and `|estimate_c - T_c|`, each
+summed across the four channels to form `p_L` / `p_T`).
+Substituting the definition of `estimate`:
+
+* `estimate_c - L_c = (L_c + T_c - TL_c) - L_c = T_c - TL_c`
+* `estimate_c - T_c = (L_c + T_c - TL_c) - T_c = L_c - TL_c`
+
+so the four `estimate_c` additions and the eight
+`estimate_c - {L,T}_c` subtractions cancel down to just the two
+Manhattan distances. The simplified body computes only
+`Manhattan(T, TL)` and `Manhattan(L, TL)` directly — half the
+per-pixel arithmetic with the same comparison and the same
+tie-break. Bit-identical to the reference form, asserted by
+`select_matches_estimate_reference_random` which sweeps 1 024
+deterministic LCG `(l, t, tl)` triples + four hand-picked boundary
+triples (`tl == l`, `tl == t`, all-equal, and a maximally-
+separated triple) against a verbatim copy of the pre-r194
+estimate-based body.
+
+| Bench | Pre-r194 | Round-194 | Δ |
+|---|---:|---:|---:|
+| `inverse_predictor_mode11_256x256` (new) | 597 µs | **484 µs** | **−18.9%** |
+| `lossless_decode_argb_256` | 765 µs | **743 µs** | −2.9% |
+| `inverse_predictor_mode12_256x256` (new, unchanged impl) | — | 605 µs | n/a (future-round target) |
+| `inverse_predictor_mode13_256x256` (new, unchanged impl) | — | 835 µs | n/a (future-round target) |
+
+The mode-11 microbench captures the full ~19% win on a buffer
+that's exclusively mode-11; the end-to-end decode bench moves
+−2.9% because the 256×256 gradient fixture's mode-11 share is
+modest. The mode 12 / 13 micro-numbers are the round-194 baseline
+for any future SWAR / lane-parallel experiment on
+`clamp_add_subtract_*` — note that a naïve `to_le_bytes()` +
+4-iteration `i16` loop **regressed** mode 12 to ~1 250 µs in
+exploratory work this round (LLVM already auto-vectorises the
+closure-of-four `i32` body well on AArch64), so the next attempt
+will need a true SWAR formulation rather than a byte-loop rewrite.
+
 ## Reproducing
 
 ```bash

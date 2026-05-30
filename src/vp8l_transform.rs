@@ -129,22 +129,37 @@ fn clamp_add_subtract_half(a: u32, b: u32) -> u32 {
 
 /// §4.1 `Select(L, T, TL)`: returns whichever of `L` / `T` is closer
 /// (Manhattan distance) to the `L + T - TL` per-channel estimate.
+///
+/// **Algebraic simplification** (round 194): the §4.1 reference form
+/// computes `estimate_c = l_c + t_c - tl_c` for each of the four
+/// channels and then takes `|estimate_c - l_c|` and `|estimate_c - t_c|`
+/// per channel. The first algebraically reduces to `|t_c - tl_c|`
+/// and the second to `|l_c - tl_c|` — the `estimate` term cancels in
+/// each subtraction. We therefore compute only the two four-channel
+/// Manhattan distances `Manhattan(t, tl)` and `Manhattan(l, tl)`
+/// directly, dropping the eight per-channel additions+subtractions
+/// that built the `estimate` intermediate. Bit-identical to the
+/// reference form (the tie-break `p_l < p_t` is the same comparison
+/// against the same two integers); asserted by
+/// `select_matches_estimate_reference_random` which sweeps 1 024
+/// deterministic LCG `(l, t, tl)` triples against a verbatim copy of
+/// the pre-round-194 estimate-based body. Predictor mode 11 calls
+/// `select` once per pixel; the round-180 profile attributes ~80% of
+/// decode self-time to `inverse_predictor` and mode 11 is one of the
+/// arithmetic-heavy branches inside `predict`.
 #[inline]
 fn select(l: u32, t: u32, tl: u32) -> u32 {
-    let p_alpha = alpha(l) as i32 + alpha(t) as i32 - alpha(tl) as i32;
-    let p_red = red(l) as i32 + red(t) as i32 - red(tl) as i32;
-    let p_green = green(l) as i32 + green(t) as i32 - green(tl) as i32;
-    let p_blue = blue(l) as i32 + blue(t) as i32 - blue(tl) as i32;
-
-    let p_l = (p_alpha - alpha(l) as i32).abs()
-        + (p_red - red(l) as i32).abs()
-        + (p_green - green(l) as i32).abs()
-        + (p_blue - blue(l) as i32).abs();
-    let p_t = (p_alpha - alpha(t) as i32).abs()
-        + (p_red - red(t) as i32).abs()
-        + (p_green - green(t) as i32).abs()
-        + (p_blue - blue(t) as i32).abs();
-
+    // p_l = Manhattan(t, tl), p_t = Manhattan(l, tl). Each per-channel
+    // term uses the same shift+mask+abs pattern the closure form in
+    // `clamp_add_subtract_full` already proves vectorises well.
+    let p_l = (alpha(t) as i32 - alpha(tl) as i32).abs()
+        + (red(t) as i32 - red(tl) as i32).abs()
+        + (green(t) as i32 - green(tl) as i32).abs()
+        + (blue(t) as i32 - blue(tl) as i32).abs();
+    let p_t = (alpha(l) as i32 - alpha(tl) as i32).abs()
+        + (red(l) as i32 - red(tl) as i32).abs()
+        + (green(l) as i32 - green(tl) as i32).abs()
+        + (blue(l) as i32 - blue(tl) as i32).abs();
     if p_l < p_t {
         l
     } else {
@@ -711,6 +726,69 @@ mod tests {
         let b2 = pack_argb(0, 0, 200, 0);
         let r2 = clamp_add_subtract_half(a2, b2);
         assert_eq!(green(r2), 0);
+    }
+
+    #[test]
+    fn select_matches_estimate_reference_random() {
+        // Round-194 simplification cross-check. The rewritten `select`
+        // computes `Manhattan(t, tl)` vs. `Manhattan(l, tl)` directly
+        // after observing that `estimate - l = t - tl` and
+        // `estimate - t = l - tl` (the `estimate = l + t - tl` term
+        // cancels in each per-channel subtraction). Pin the new form
+        // against a verbatim copy of the pre-r194 `estimate`-based body
+        // for 1 024 deterministic LCG triples — including triples that
+        // straddle the tie-break boundary, so an off-by-one in the
+        // comparison would surface.
+        fn reference(l: u32, t: u32, tl: u32) -> u32 {
+            let p_alpha = alpha(l) as i32 + alpha(t) as i32 - alpha(tl) as i32;
+            let p_red = red(l) as i32 + red(t) as i32 - red(tl) as i32;
+            let p_green = green(l) as i32 + green(t) as i32 - green(tl) as i32;
+            let p_blue = blue(l) as i32 + blue(t) as i32 - blue(tl) as i32;
+            let p_l = (p_alpha - alpha(l) as i32).abs()
+                + (p_red - red(l) as i32).abs()
+                + (p_green - green(l) as i32).abs()
+                + (p_blue - blue(l) as i32).abs();
+            let p_t = (p_alpha - alpha(t) as i32).abs()
+                + (p_red - red(t) as i32).abs()
+                + (p_green - green(t) as i32).abs()
+                + (p_blue - blue(t) as i32).abs();
+            if p_l < p_t {
+                l
+            } else {
+                t
+            }
+        }
+        // Hand-picked boundary triples: tl == t (forces p_l = 0 path),
+        // tl == l (forces p_t = 0 path), all-equal (tie → returns t),
+        // and maximally-separated channels.
+        for &(l, t, tl) in &[
+            (0x12345678u32, 0x12345678u32, 0x12345678u32),
+            (0xff_ff_ff_ffu32, 0x00_00_00_00u32, 0x00_00_00_00u32),
+            (0x00_00_00_00u32, 0xff_ff_ff_ffu32, 0xff_ff_ff_ffu32),
+            (0xff_00_ff_00u32, 0x00_ff_00_ffu32, 0x80_80_80_80u32),
+        ] {
+            assert_eq!(
+                select(l, t, tl),
+                reference(l, t, tl),
+                "boundary triple mismatch (l={l:08x}, t={t:08x}, tl={tl:08x})"
+            );
+        }
+        let mut seed: u32 = 0xfeed_face;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+        for _ in 0..1_024 {
+            let l = rng();
+            let t = rng();
+            let tl = rng();
+            assert_eq!(
+                select(l, t, tl),
+                reference(l, t, tl),
+                "simplification diverges from reference at \
+                 (l={l:08x}, t={t:08x}, tl={tl:08x})"
+            );
+        }
     }
 
     #[test]

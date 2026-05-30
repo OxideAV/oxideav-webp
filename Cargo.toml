@@ -69,3 +69,7 @@ harness = false
 [[bench]]
 name = "argb_to_rgba"
 harness = false
+
+[[bench]]
+name = "inverse_predictor"
+harness = false

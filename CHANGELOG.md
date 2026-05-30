@@ -4,6 +4,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Optimized
+
+- §4.1 `Select` (predictor mode 11): algebraic simplification of the
+  reference-form `|estimate_c - L_c|` / `|estimate_c - T_c|`
+  per-channel absolute differences. Substituting
+  `estimate = L + T - TL` makes the two terms reduce to `|T_c - TL_c|`
+  and `|L_c - TL_c|` respectively (the `estimate` term cancels), so
+  the per-pixel body computes only `Manhattan(T, TL)` and
+  `Manhattan(L, TL)` directly — half the per-pixel arithmetic with
+  the same `p_L < p_T` tie-break.
+  `inverse_predictor_mode11_256x256` (new bench) drops from 597 µs to
+  484 µs (−18.9%); end-to-end `lossless_decode_argb_256` drops from
+  765 µs to 743 µs (−2.9%) on the 256×256 gradient fixture where mode
+  11 is one of several modes the encoder picks. Bit-identical to the
+  reference form per the new `select_matches_estimate_reference_random`
+  test which sweeps 1 024 deterministic LCG triples + four hand-picked
+  boundary triples against a verbatim copy of the pre-r194 body.
+
+### Added
+
+- `benches/inverse_predictor.rs` — three per-mode criterion benches
+  (`mode11_256x256`, `mode12_256x256`, `mode13_256x256`) driving
+  `inverse_predictor` against a 256×256 ARGB residual buffer plus a
+  `size_bits = 0` predictor image whose green channel is a constant
+  mode, so every interior-loop pixel exercises one chosen predictor
+  body. Lets future rounds A/B-test per-mode rewrites without
+  waiting for a real encoder mode pick. The mode 12 / 13 numbers
+  (605 µs / 835 µs at r194) are the baseline for the next round's
+  arithmetic-rewrite experiment on `clamp_add_subtract_*` — flagged
+  as the next target by the round-180 BENCHMARKS note.
+
 ## [0.2.1](https://github.com/OxideAV/oxideav-webp/compare/v0.2.0...v0.2.1) - 2026-05-29
 
 ### Other
