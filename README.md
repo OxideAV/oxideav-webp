@@ -47,6 +47,30 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
     --bench <name> -- --quick
 ```
 
+### Fuzzing
+
+The crate ships four `cargo-fuzz` harnesses under `fuzz/` that drive
+attacker-controlled bytes through the public RFC 9649 §2 entry points
+(`decode_webp`, `parse_vp8x_header`, `parse_alph_header` +
+`decode_alpha_plane`, `parse_anim_header` + `parse_anmf_header`). Each
+harness must always return a `Result` — never panic, abort, OOM on
+forged canvas dimensions, or take unbounded time to give up. A daily
+GitHub Actions run (`.github/workflows/fuzz.yml`) splits a 30-minute
+budget across the four targets and uploads any crashing input as a
+workflow artifact. To run locally on a nightly toolchain:
+
+```text
+cd crates/oxideav-webp/fuzz
+cargo +nightly fuzz run decode -- -max_total_time=60
+cargo +nightly fuzz run parse_vp8x -- -max_total_time=60
+cargo +nightly fuzz run parse_alph_decode_alpha -- -max_total_time=60
+cargo +nightly fuzz run parse_anmf_anim -- -max_total_time=60
+```
+
+The committed `fuzz/corpus/<target>/` directories carry the small
+seed corpora (in-tree `tests/data/` fixtures for `decode`; minimal
+RFC §2.7.1 byte-shaped inputs for the three header parsers).
+
 ## Standalone use (no `oxideav-core`)
 
 ### Decode any `.webp` file

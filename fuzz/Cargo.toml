@@ -1,0 +1,55 @@
+[package]
+name = "oxideav-webp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Each target drives attacker-controlled bytes through a single
+# entry point on the crate and asserts the call *returns* — a
+# well-formed buffer yields `Ok(...)`, a malformed one yields
+# `Err(WebpError::...)`, and neither path may panic, abort, OOM,
+# or take quadratic time to give up. The harnesses are entirely
+# self-contained: no cross-decode oracle, no third-party crate, no
+# `dlopen`. RFC 9649 + the in-tree `src/` are the only sources of
+# truth.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-webp]
+path = ".."
+default-features = false
+
+# Detach from the umbrella workspace so `cargo build` at the
+# workspace root does not pull in `libfuzzer-sys`.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_vp8x"
+path = "fuzz_targets/parse_vp8x.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_alph_decode_alpha"
+path = "fuzz_targets/parse_alph_decode_alpha.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_anmf_anim"
+path = "fuzz_targets/parse_anmf_anim.rs"
+test = false
+doc = false

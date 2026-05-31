@@ -1,10 +1,12 @@
 name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
-# 30-minute total budget across the 5 targets (~6 min each). The
-# cross-decode harnesses dlopen libwebp at runtime via libloading; the
-# CI runner needs `libwebp-dev` so they actually validate instead of
-# silently skipping.
+# 30-minute total budget evenly across the discovered targets. Each
+# harness is self-contained — it drives bytes straight into the
+# crate's own parser entry points (`decode_webp`, `parse_vp8x_header`,
+# `parse_alph_header` + `decode_alpha`, `parse_anmf_header` +
+# `parse_anim_header`) and asserts the call returns rather than
+# panicking / aborting / OOMing. No external dependencies pulled in.
 
 on:
   schedule:
@@ -15,6 +17,5 @@ jobs:
   fuzz:
     uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
     with:
-      extra_packages_apt: "libwebp-dev"
       time_budget_seconds: 1800
     secrets: inherit

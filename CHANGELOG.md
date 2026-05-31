@@ -4,6 +4,43 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `fuzz/` — first cargo-fuzz workspace for the crate. Four
+  libfuzzer harnesses driving attacker-controlled bytes into the
+  crate's RFC 9649 §2 entry points:
+  * `decode` — end-to-end `decode_webp(&[u8])` (reaches every
+    chunk type the container walker handles: `VP8 `, `VP8L`,
+    `VP8X`, `ALPH`, `ANIM`, `ANMF`, `ICCP`, `EXIF`, `XMP `).
+    Seeded with six in-tree `tests/data/` fixtures covering
+    simple-lossy, simple-lossless, extended-with-EXIF, animated,
+    and color-indexed palette variants.
+  * `parse_vp8x` — §2.7.1 VP8X header (10-byte fixed payload,
+    flags-byte + 24-bit canvas dims), focused on the reserved-zero
+    + 16384 × 16384 canvas-cap rejection paths. Seeds: empty,
+    one-byte short, canonical 16 × 16.
+  * `parse_alph_decode_alpha` — §2.7.1.2 ALPH 1-byte flags
+    parser PLUS the full `decode_alpha_plane` path through a
+    synthetic RIFF/WEBP wrapper carrying a fuzzer-derived VP8X +
+    ALPH pair. Stresses the (filtering, compression,
+    pre-processing) field combinations and the forged-canvas
+    allocation guard. Seeds: four flags-byte variants.
+  * `parse_anmf_anim` — §2.7.1.1 ANIM 6-byte header + ANMF
+    16-byte header, split-at-pivot so a single iteration drives
+    both parsers and the per-frame 24-bit dimension /
+    duration / blend-dispose flag-byte arithmetic. Seeds: zero,
+    five-loop, and a 16 × 16 / 100 ms ANMF.
+  Each harness contract is "always return a `Result` — never
+  panic, abort, OOM on attacker-chosen canvas dims, or take
+  unbounded time to give up". The fuzz crate detaches from the
+  umbrella workspace (`[workspace] members = ["."]`) so the
+  `libfuzzer-sys` dep does not leak into umbrella consumers.
+- `.github/workflows/fuzz.yml` rewritten to a self-contained run
+  (no host packages, no cross-decode oracle); the reusable
+  `crate-fuzz.yml@master` auto-discovers the four targets and
+  splits a 30-minute total budget evenly across them on the
+  04:37 UTC daily schedule.
+
 ### Optimized
 
 - §4.1 `Select` (predictor mode 11): algebraic simplification of the
