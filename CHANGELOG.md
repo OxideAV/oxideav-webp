@@ -34,6 +34,25 @@ All notable changes to `oxideav-webp` are recorded here.
   (605 µs / 835 µs at r194) are the baseline for the next round's
   arithmetic-rewrite experiment on `clamp_add_subtract_*` — flagged
   as the next target by the round-180 BENCHMARKS note.
+- `fuzz/` — first cargo-fuzz harness for `oxideav-webp`. Three
+  libFuzzer targets exercise the public single-shot entry points:
+  - `decode` — feed arbitrary bytes to `decode_webp` and assert the
+    call always returns a `Result` (no panic / OOM / out-of-bounds)
+    across the §2 RIFF walk, §2.7 `VP8X` / `ALPH` / `ANIM` / `ANMF`
+    extended container, and §3 VP8L bitstream + §4 transform stack.
+  - `extract_metadata` — feed arbitrary bytes to `extract_metadata`
+    and assert the same returns-always contract on the
+    metadata-only chunk walk (`ICCP` / `EXIF` / `XMP `).
+  - `roundtrip_lossless` — synthesise a 1..=64 × 1..=64 RGBA tile
+    from fuzz-controlled dimensions + per-pixel bytes, run it
+    through `encode_webp_lossless` and `decode_webp`, and assert
+    the §3 lossless contract pixel-for-pixel.
+
+  The sub-package carries its own `[workspace]` block so the umbrella
+  `members = ["crates/*"]` glob does not try to compile the libFuzzer
+  harnesses on stable. Pulls in `oxideav-webp` with
+  `default-features = false` so the framework-free standalone surface
+  is what gets fuzzed.
 
 ## [0.2.1](https://github.com/OxideAV/oxideav-webp/compare/v0.2.0...v0.2.1) - 2026-05-29
 

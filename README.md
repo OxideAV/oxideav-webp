@@ -47,6 +47,22 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
     --bench <name> -- --quick
 ```
 
+### Fuzzing
+
+Three [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
+`decode` and `extract_metadata` feed arbitrary bytes through the two
+public single-shot entry points; `roundtrip_lossless` synthesises a
+≤64 × 64 RGBA tile from fuzz-controlled bytes and asserts the §3
+lossless contract pixel-for-pixel across `encode_webp_lossless` →
+`decode_webp`. Run any one with (nightly + `cargo-fuzz` installed):
+
+```text
+cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run extract_metadata     --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run roundtrip_lossless   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+```
+
 ## Standalone use (no `oxideav-core`)
 
 ### Decode any `.webp` file

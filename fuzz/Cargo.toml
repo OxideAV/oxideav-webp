@@ -1,0 +1,67 @@
+[package]
+name = "oxideav-webp-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone sub-package owned by cargo-fuzz. The `[workspace]` block
+# below makes it its own one-member workspace so the umbrella
+# `members = ["crates/*"]` glob does not try to build the libFuzzer
+# harnesses (libfuzzer-sys requires nightly + a `-C passes=sancov`
+# rustc the umbrella stable build does not configure).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+# The §2 RIFF + §2.6 VP8L lossless bitstream + §2.7 VP8X / ALPH / ANIM /
+# ANMF extended-container framing parsed by `oxideav_webp::decode_webp`
+# is a layered walk: outer RIFF chunk loop, §2.7.1 feature-flag octet,
+# per-chunk header validation, §3 VP8L image-header + prefix-coded
+# entropy stream, §4 transform stack. Every byte along that path comes
+# from an attacker-controlled file. Two of the three harnesses below
+# feed arbitrary bytes straight into the public single-shot entry points
+# (`decode_webp` and `extract_metadata`) and assert the only contract is
+# "always returns a `Result`" — no panic, no debug-build
+# integer overflow, no out-of-bounds index, no allocation sized by a
+# header field the limits did not bound. The third harness is a
+# round-trip oracle on the lossless encode path: fuzz-controlled RGBA
+# bytes + dimensions go through `encode_webp_lossless`; the output bytes
+# are decoded through `decode_webp`; pixel-for-pixel equality is
+# asserted. Round-trip exactness is the §3 lossless contract.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Pulled in with `default-features = false` so the fuzz build exercises
+# the framework-free standalone surface (`decode_webp`,
+# `extract_metadata`, `encode_webp_lossless`) and never links
+# `oxideav-core` — the same shape every other fuzz harness in this
+# workspace uses.
+[dependencies.oxideav-webp]
+path = ".."
+default-features = false
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_metadata"
+path = "fuzz_targets/extract_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_lossless"
+path = "fuzz_targets/roundtrip_lossless.rs"
+test = false
+doc = false
+bench = false
