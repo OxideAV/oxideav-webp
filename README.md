@@ -36,16 +36,40 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships four criterion benches under `benches/` (decode +
-encode + LZ77 matcher + `argb→rgba` repack). Numbers, profile
-findings, and the optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md).
-Run with:
+The crate ships five criterion benches under `benches/` (decode +
+encode + LZ77 matcher + `argb→rgba` repack + per-mode
+`inverse_predictor`). Numbers, profile findings, and the optimization
+log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run with:
 
 ```text
 CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
   cargo bench --manifest-path crates/oxideav-webp/Cargo.toml \
     --bench <name> -- --quick
 ```
+
+### Fuzzing
+
+The crate ships two cargo-fuzz harnesses under `fuzz/`:
+
+* `decode` — feeds arbitrary bytes through `decode_webp` and
+  asserts the call always returns a `Result` (no panic / abort /
+  OOM). Drives the RIFF walk, VP8L bitstream (§3 prefix codes +
+  §4 transforms + §5 LZ77 + §6 meta-prefix), VP8 lossy framing,
+  the `VP8X` extended layout, the `ALPH` alpha plane, and the
+  `ANIM` + `ANMF` animation chunks.
+* `extract_metadata` — feeds arbitrary bytes through
+  `extract_metadata` so the `ICCP` / `EXIF` / `XMP ` chunk readers
+  are driven in isolation.
+
+```text
+# Nightly is required by libfuzzer-sys's sanitizer flags.
+RUSTUP_TOOLCHAIN=nightly cargo fuzz run decode
+RUSTUP_TOOLCHAIN=nightly cargo fuzz run extract_metadata
+```
+
+Seed the corpus from the in-tree fixtures at
+`docs/image/webp/fixtures/*/input.webp` to bootstrap meaningful
+coverage from the first iteration.
 
 ## Standalone use (no `oxideav-core`)
 

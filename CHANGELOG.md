@@ -4,6 +4,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `fuzz/` — first cargo-fuzz harness for the crate. Two libfuzzer
+  targets:
+  * `decode` — feeds arbitrary bytes through the public
+    `decode_webp` entry point and asserts the call always returns a
+    `Result` (no panic / abort / OOM). Drives the RIFF walk, VP8L
+    bitstream (§3 prefix codes + §4 transforms + §5 LZ77 + §6
+    meta-prefix), VP8 lossy framing (delegated to the
+    `oxideav-vp8` sibling), the `VP8X` extended layout, the `ALPH`
+    alpha plane, and the `ANIM` + `ANMF` animation chunks in one
+    pass.
+  * `extract_metadata` — feeds arbitrary bytes through
+    `extract_metadata` so the `ICCP` / `EXIF` / `XMP ` chunk
+    readers are exercised in isolation (no pixel decode budget
+    spent).
+  Build with `RUSTUP_TOOLCHAIN=nightly cargo fuzz build` (nightly
+  required by libfuzzer-sys's sanitizer flags). Both targets
+  compile cleanly under the standalone build
+  (`oxideav-webp = { default-features = false }`), so the fuzz
+  harness has no `oxideav-core` dep. Round-204 smoke runs:
+  50 000 iterations each, seeded from the 18 in-tree fixture
+  WEBPs. `extract_metadata` completes panic-free at 97 cov / 160
+  features (no findings); `decode` surfaces a multiply-overflow
+  panic in the `oxideav-vp8` sibling's
+  `inverse_transform::inverse_dct_4x4` on a fuzzer-mutated VP8
+  lossy `RIFF` envelope — a cross-crate finding scoped to
+  `oxideav-vp8`, not `oxideav-webp`, so flagged as a follow-up
+  rather than fixed inline.
+
 ### Optimized
 
 - §4.1 `Select` (predictor mode 11): algebraic simplification of the

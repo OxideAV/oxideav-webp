@@ -221,6 +221,73 @@ exploratory work this round (LLVM already auto-vectorises the
 closure-of-four `i32` body well on AArch64), so the next attempt
 will need a true SWAR formulation rather than a byte-loop rewrite.
 
+## Round-204 (2026-06-01) — SWAR + per-block mode-hoist exploration (no commit)
+
+The round-194 BENCHMARKS note flagged
+`inverse_predictor_mode12_256x256` (605 µs) and
+`inverse_predictor_mode13_256x256` (835 µs) as the next mode-by-mode
+targets. Round 204 explored two structural rewrites that the round-194
+note explicitly anticipated; **both regressed** and were not committed.
+The notes here are recorded so the next attempt doesn't re-walk the
+same path.
+
+### Attempt 1 — true SWAR for `clamp_add_subtract_full`
+
+The round-194 note warned that a naïve `to_le_bytes()` + 4-iteration
+`i16` loop regressed mode 12, and suggested a "true SWAR formulation"
+instead. The natural SWAR for `clamp(a + b - c)` per 8-bit channel
+biases each lane by 0x100 to dodge underflow:
+
+* `sum = a + b + 0x0100_0100 - c` per even / odd 16-bit-lane pair,
+  with `a`, `b`, `c` masked to `0x00ff_00ff`. Each lane is in
+  `[0x001, 0x2fe]` (no inter-lane carry).
+* `q = sum >> 8 & 0x0003_0003` is `{0, 1, 2}` per lane:
+  `0` → clamp-to-0, `1` → take low byte of sum, `2` → clamp-to-255.
+* The per-lane "0xff if set" mask is built with the
+  shift-and-subtract trick `(x << 8) - x` (multiplication-free
+  because `0x0001_0001 * 0xff` carries across lanes).
+
+Verified bit-identical to the closure-of-four reference for 4 096
+randomised triples + a single-channel exhaustive sweep over
+`[0,255]^3` = 16.7 M triples. **Performance regressed mode 12 from
+586 µs to 663 µs (+13%) and mode 13 from 812 µs to 894 µs (+10%).**
+LLVM auto-vectorises the i32 reference closure to NEON
+add/sub/min/max instructions on aarch64; the SWAR sequence's
+sequential dependency chain through `sum → q → in_range_bit
+→ in_range_mask → result` is longer than the four-way ILP that the
+closure form enables.
+
+### Attempt 2 — per-block mode-hoist
+
+`DEFAULT_PREDICTOR_SIZE_BITS = 4` (the encoder default) makes each
+predictor-image block 16 pixels wide, so the per-pixel match-dispatch
+on `mode` in `inverse_predictor`'s inner loop runs 16 times for a
+constant `mode`. Hoisting the match out (read `mode` per block, then
+run a mode-specialised inner loop for `block_w` pixels) eliminates
+the redundant match work and the redundant TR-load for 8 of 14 modes.
+**Performance regressed at `size_bits = 0`** (where the bench runs)
+because each block is one pixel: the outer block-walk adds dispatch
+overhead with no amortisation, raising mode 12 to 653 µs (+11%) and
+mode 13 to 863 µs (+6%). The real-world `lossless_decode_argb_256`
+bench (256×256 gradient at `size_bits = 4`) also drifted +1.3% — the
+gradient's mode mix is dominated by light-arithmetic predictors so
+the saved match dispatch doesn't recover the added block-loop cost.
+
+Both rewrites need a separate amortising bench (e.g. a fixture that
+forces `size_bits >= 2` and exercises mode 12 / 13 with realistic
+density) before they can be evaluated honestly; the existing
+`inverse_predictor_mode{11,12,13}_256x256` benches over-amortise the
+per-pixel work at `size_bits = 0` and hide the per-block savings.
+
+The structural follow-up: add a parametric bench that takes
+`size_bits in {2, 4}` and runs the existing constant-mode pattern
+over a fixture sized to amortise the per-block cost (e.g. a
+512×512 buffer at `size_bits = 4` = 1 024 blocks of 16 pixels, the
+real-world operating point of the default encoder). With that bench
+in place, both rewrites can be re-measured against a representative
+operating point without confusing per-pixel-mode-bench regressions
+for global wins or losses.
+
 ## Reproducing
 
 ```bash

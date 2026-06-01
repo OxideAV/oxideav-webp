@@ -1,0 +1,119 @@
+[package]
+name = "oxideav-webp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# WebP's RIFF + VP8 + VP8L + VP8X + ALPH + ANIM + ANMF stack is a
+# layered byte-stream parser with several classic memory-safety
+# trap-doors that a fuzz target should drive against arbitrary input:
+#
+#  * `decode_webp`            — feed arbitrary bytes to the full
+#                               public decoder and assert it always
+#                               returns a `Result` rather than
+#                               panicking / aborting / OOMing. This
+#                               drives the RIFF walk, VP8L bitstream
+#                               (LZ77 + prefix codes + §4 transforms +
+#                               color-cache + meta-prefix), VP8 lossy
+#                               framing (delegated to the
+#                               `oxideav-vp8` sibling), the `VP8X`
+#                               extended layout, the `ALPH` alpha
+#                               plane, and the `ANIM` + `ANMF`
+#                               animation chunks all in one pass.
+#                               Classic WebP danger spots:
+#
+#                                 - 12-byte RIFF preamble: a hostile
+#                                   chunk-size word must not allow
+#                                   reading past the slice when the
+#                                   declared size exceeds the actual
+#                                   payload (commonly seen in
+#                                   `RIFFxxxxWEBPVP8 …` truncated
+#                                   files).
+#                                 - VP8L 14-bit width/height: the
+#                                   spec admits up to 16384×16384;
+#                                   the decoder must cross-check the
+#                                   declared canvas against the
+#                                   remaining bitstream budget before
+#                                   allocating `width * height * 4`
+#                                   bytes.
+#                                 - LZ77 backref distances + length
+#                                   codes: a hostile sequence must
+#                                   either refuse on out-of-window
+#                                   distances or wrap them per §5.2.2
+#                                   without index-out-of-bounds.
+#                                 - Meta-prefix code-length code:
+#                                   §3.7 codes use the §3.5.6 simple
+#                                   / normal length distinction, and
+#                                   the normal path itself runs a
+#                                   second-level prefix decode — a
+#                                   hostile combination must not loop
+#                                   or panic during the inner walk.
+#                                 - §4 transform chain: up to four
+#                                   transforms can appear in any
+#                                   order. The decoder applies the
+#                                   inverses in reverse; a hostile
+#                                   `transform_present` chain that
+#                                   repeats the same transform must
+#                                   refuse rather than re-apply.
+#                                 - ANMF rectangle bounds: per-frame
+#                                   tile offset + width + height
+#                                   must stay inside the canvas; a
+#                                   hostile `(x_offset, frame_width)`
+#                                   that overflows `u32` arithmetic
+#                                   must surface as `Err(…)`.
+#                                 - `ALPH` filter / preproc bits:
+#                                   four filter methods + two
+#                                   preproc modes + an optional
+#                                   compressed alpha lossless
+#                                   sub-bitstream — every combination
+#                                   must classify without panicking.
+#
+#  * `extract_metadata`       — feed arbitrary bytes to the public
+#                               `extract_metadata` entry point. This
+#                               drives the RIFF walk and the `ICCP`
+#                               / `EXIF` / `XMP ` chunk readers
+#                               without paying for the pixel decode.
+#                               A hostile chunk-size field on any of
+#                               the three metadata chunks must not
+#                               allow the reader to allocate beyond
+#                               the declared input length.
+#
+# Black-box validators (`cwebp` / `dwebp` / `ffmpeg` binaries) are
+# allowed but the fuzz harness doesn't dlopen them — panic-freedom
+# is the contract under test, and that's a self-contained property.
+# The clean-room wall bars libwebp / `image` crate as a cross-decode
+# oracle.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-webp]
+path = ".."
+default-features = false
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extract_metadata"
+path = "fuzz_targets/extract_metadata.rs"
+test = false
+doc = false
