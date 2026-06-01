@@ -27,6 +27,8 @@ the medians are still stable to a few percent.
 | `benches/lossless_decode.rs` | `lossless_decode_argb_256` | Full RIFF/WEBP decode of the encoded 256×256 gradient |
 | `benches/lz77_match.rs`      | `vp8l_lz77_match` | §5.2.2 hash-chain LZ77 matcher over a 4096-pixel synthetic tile |
 | `benches/argb_to_rgba.rs`    | `argb_to_rgba` | `Vp8lImage::to_rgba` repack on a 256×256 image |
+| `benches/inverse_predictor.rs` | `inverse_predictor_modeN_256x256` | §4.1 inverse predictor on a 256×256 buffer, mode-pinned (N ∈ {11, 12, 13}) |
+| `benches/inverse_color.rs` | `inverse_color_256x256_sbN` | §4.2 inverse color transform on a 256×256 buffer, parameterised over `size_bits` (N ∈ {0, 3, 5, 7}) |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -220,6 +222,66 @@ for any future SWAR / lane-parallel experiment on
 exploratory work this round (LLVM already auto-vectorises the
 closure-of-four `i32` body well on AArch64), so the next attempt
 will need a true SWAR formulation rather than a byte-loop rewrite.
+
+## Round-207 (2026-06-02) — `inverse_color` per-block CTE hoist
+
+The §4.2 inverse color transform reads a `ColorTransformElement`
+(three signed-byte coefficients: `green_to_red`, `green_to_blue`,
+`red_to_blue`) from a sub-resolution color image and applies them
+to every pixel. The CTE is **constant inside each `1 << size_bits`
+block**, so the original per-pixel `block_index` recomputation +
+`color_image[]` load + three byte extracts are recomputed for every
+pixel even though their value is identical across the entire block.
+
+Round-207 hoists that work out: the inner loop is replaced by a
+nested block-walk that loads the CTE once at each block boundary
+and then iterates the pixels inside the block with the three
+coefficients held in registers. Row-base offsets (`row_off = y * w`
+and `block_row = (y >> size_bits) * tw`) are also hoisted out of
+the x-loop.
+
+The `size_bits == 0` corner (block size 1, one CTE per pixel) is
+special-cased to a flat double `for` loop, because the nested
+block-walk degenerates into an extra loop layer the optimizer
+can't always flatten and would otherwise regress that case.
+
+Bit-identical to the pre-r207 per-pixel form, asserted by
+`inverse_color_matches_per_pixel_reference_random` which sweeps
+seven `(size_bits, w, h)` configurations (including the
+`size_bits = 0` no-op corner, a 1-row image, a 1-column image,
+sub-block-sized edge tiles, and a block larger than the image)
+against a verbatim copy of the pre-r207 per-pixel body.
+
+### New bench: `inverse_color`
+
+`benches/inverse_color.rs` drives `inverse_color` on a 256×256 ARGB
+buffer with a deterministic LCG fill, parameterised over four
+`size_bits` ∈ {0, 3, 5, 7}. The color image is sized to match
+(`ceil(W / (1 << size_bits))` × `ceil(H / (1 << size_bits))`) and
+its CTE bytes are LCG-filled so the signed-delta path actually
+runs for every block.
+
+| Bench | Pre-r207 | Round-207 | Δ |
+|---|---:|---:|---:|
+| `inverse_color_256x256_sb0` | 69.0 µs | **29.6 µs** | **−57.1%** |
+| `inverse_color_256x256_sb3` | 70.2 µs | **50.6 µs** | **−27.9%** |
+| `inverse_color_256x256_sb5` | 70.0 µs | **23.1 µs** | **−67.0%** |
+| `inverse_color_256x256_sb7` | 71.4 µs | **24.4 µs** | **−65.8%** |
+
+The sb0 win comes entirely from hoisting `row_off` and `block_row`
+out of the x-loop (the per-pixel work itself is unchanged). For
+sb3..sb7 the win scales with block size: amortising one CTE load +
+three byte extracts across 64 / 1024 / 16384 pixels per block. sb5
+and sb7 plateau at ~24 µs — at that point the per-pixel
+`inverse_color_pixel` arithmetic (three signed multiplies + three
+arithmetic shifts + the new-red feedback into new-blue) dominates,
+not the block-level overhead.
+
+The end-to-end `lossless_decode_argb_256` bench is unchanged
+(~643 µs) because the 256×256 LCG-encoded gradient fixture happens
+not to elect the color transform on its mode chooser; the win
+shows up on natural images and on any fixture whose encoder
+selected the §4.2 transform.
 
 ## Reproducing
 

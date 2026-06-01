@@ -6,6 +6,31 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Optimized
 
+- §4.2 `inverse_color`: hoist the per-block `ColorTransformElement`
+  load + three byte extracts (`red_to_blue` / `green_to_blue` /
+  `green_to_red`) out of the inner pixel loop. The CTE is constant
+  across each `1 << size_bits` block, so the original per-pixel
+  `block_index` recomputation + `color_image[]` load + three byte
+  extracts now run once at each block boundary and the three
+  coefficients are reused across every pixel in the block. Row-base
+  `y * w` and `(y >> size_bits) * tw` are also hoisted out of the
+  x-loop. The `size_bits == 0` corner (block size 1, one CTE per
+  pixel) is special-cased to a flat double `for` loop so the nested
+  block-walk degenerating into an extra loop layer doesn't regress
+  that path. Bit-identical to the per-pixel form, asserted by a new
+  `inverse_color_matches_per_pixel_reference_random` test that
+  sweeps seven `(size_bits, w, h)` configurations (`size_bits = 0`
+  no-op corner, a 1-row image, a 1-column image, sub-block-sized
+  edge tiles, and a block larger than the image) against a verbatim
+  copy of the pre-r207 per-pixel body. New `benches/inverse_color.rs`
+  drives `inverse_color` on a 256×256 LCG-filled buffer parameterised
+  over `size_bits` ∈ {0, 3, 5, 7}: sb0 drops from 69.0 µs to 29.6 µs
+  (−57.1%), sb3 from 70.2 µs to 50.6 µs (−27.9%), sb5 from 70.0 µs
+  to 23.1 µs (−67.0%), sb7 from 71.4 µs to 24.4 µs (−65.8%). The sb0
+  win comes entirely from the row-offset hoist; sb3..sb7 wins scale
+  with block size as the CTE-extract overhead amortises across more
+  pixels.
+
 - §4.1 `Select` (predictor mode 11): algebraic simplification of the
   reference-form `|estimate_c - L_c|` / `|estimate_c - T_c|`
   per-channel absolute differences. Substituting
@@ -24,6 +49,14 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/inverse_color.rs` — criterion bench that drives
+  `vp8l_transform::inverse_color` on a deterministic LCG-filled
+  256×256 ARGB buffer parameterised over four `size_bits` ∈
+  {0, 3, 5, 7}. The color image is sized to match
+  (`ceil(W / (1 << size_bits))` per axis) and its CTE bytes are
+  LCG-filled so the signed-delta path actually runs for every block.
+  Lets future rounds A/B-test §4.2 rewrites without waiting for a
+  real encoder color-transform pick.
 - `benches/inverse_predictor.rs` — three per-mode criterion benches
   (`mode11_256x256`, `mode12_256x256`, `mode13_256x256`) driving
   `inverse_predictor` against a 256×256 ARGB residual buffer plus a

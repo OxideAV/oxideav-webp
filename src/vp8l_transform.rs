@@ -353,6 +353,22 @@ fn inverse_color_pixel(
 /// `transform_width * transform_height`. Per §4.2 each pixel encodes a
 /// `ColorTransformElement` as: red = `red_to_blue`, green =
 /// `green_to_blue`, blue = `green_to_red`.
+///
+/// **Per-block CTE hoist** (round 207): the `ColorTransformElement` is
+/// constant across each `1 << size_bits` block, so the original code's
+/// `block_index` recomputation + `cte` load + three byte extracts
+/// (`red_to_blue` / `green_to_blue` / `green_to_red`) per pixel are
+/// hoisted out of the inner pixel loop and refreshed once per block in
+/// x. The row-base `y * w` and the block-row base
+/// `(y >> size_bits) * tw` are also hoisted out of the x loop. Same
+/// arithmetic per pixel — only the loop structure changes; bit-identical
+/// to the per-pixel form (asserted by a randomised cross-check test that
+/// compares the hoisted form against a verbatim copy of the pre-r207
+/// per-pixel body at seven `(size_bits, w, h)` configurations).
+///
+/// The hoist is a no-op when `size_bits == 0` (one CTE per pixel, no
+/// block to amortise across); for `size_bits >= 1` it strictly reduces
+/// per-pixel work in the inner loop.
 pub fn inverse_color(
     pixels: &mut [u32],
     width: u32,
@@ -366,27 +382,66 @@ pub fn inverse_color(
     }
     let w = width as usize;
     let h = height as usize;
+    let tw = transform_width as usize;
+    if size_bits == 0 {
+        // Block size 1 → one CTE per pixel; the hoist degenerates into
+        // an extra layer of loop the optimizer can't always flatten.
+        // Keep the original flat double loop for this corner; only the
+        // hoist of `row_off` and `block_row` (constant across the x
+        // loop) survives.
+        for y in 0..h {
+            let row_off = y * w;
+            let block_row = y * tw;
+            for x in 0..w {
+                let idx = row_off + x;
+                let cte = color_image[block_row + x];
+                let red_to_blue = red(cte);
+                let green_to_blue = green(cte);
+                let green_to_red = blue(cte);
+                let px = pixels[idx];
+                let (new_red, new_blue) = inverse_color_pixel(
+                    red(px),
+                    green(px),
+                    blue(px),
+                    green_to_red,
+                    green_to_blue,
+                    red_to_blue,
+                );
+                pixels[idx] = pack_argb(alpha(px), new_red, green(px), new_blue);
+            }
+        }
+        return;
+    }
+    let block_w = 1usize << size_bits;
     for y in 0..h {
-        for x in 0..w {
-            let idx = y * w + x;
-            let block_index = (y as u32 >> size_bits) * transform_width + (x as u32 >> size_bits);
-            let cte = color_image[block_index as usize];
+        let row_off = y * w;
+        let block_row = (y >> size_bits) * tw;
+        let mut x = 0usize;
+        while x < w {
+            // CTE is constant across [x, x + block_w) in this row.
+            let block_index = block_row + (x >> size_bits);
+            let cte = color_image[block_index];
             // §4.2: cte.red_to_blue = RED, green_to_blue = GREEN,
             // green_to_red = BLUE of the color-image pixel.
             let red_to_blue = red(cte);
             let green_to_blue = green(cte);
             let green_to_red = blue(cte);
-
-            let px = pixels[idx];
-            let (new_red, new_blue) = inverse_color_pixel(
-                red(px),
-                green(px),
-                blue(px),
-                green_to_red,
-                green_to_blue,
-                red_to_blue,
-            );
-            pixels[idx] = pack_argb(alpha(px), new_red, green(px), new_blue);
+            // Walk all pixels in this block of the current row.
+            let x_end = (x + block_w).min(w);
+            for xi in x..x_end {
+                let idx = row_off + xi;
+                let px = pixels[idx];
+                let (new_red, new_blue) = inverse_color_pixel(
+                    red(px),
+                    green(px),
+                    blue(px),
+                    green_to_red,
+                    green_to_blue,
+                    red_to_blue,
+                );
+                pixels[idx] = pack_argb(alpha(px), new_red, green(px), new_blue);
+            }
+            x = x_end;
         }
     }
 }
@@ -1037,6 +1092,90 @@ mod tests {
         let color_img = vec![pack_argb(255, 0, 0, 0)];
         inverse_color(&mut px, 1, 1, &color_img, 1, 9);
         assert_eq!(px[0], pack_argb(255, 100, 50, 200));
+    }
+
+    #[test]
+    fn inverse_color_matches_per_pixel_reference_random() {
+        // Round-207 per-block-CTE hoist cross-check. The new
+        // `inverse_color` walks blocks of `1 << size_bits` pixels in
+        // x with the CTE coefficients cached at the block boundary;
+        // assert the per-pixel emitted bytes still match a verbatim
+        // copy of the pre-r207 per-pixel body across deterministic
+        // LCG fills at seven `(size_bits, w, h)` configurations,
+        // including the size_bits = 0 corner (block_w = 1, hoist is
+        // a no-op), a 1-row image, a 1-column image, sub-block-sized
+        // edge tiles, and a large block that exceeds image bounds.
+        fn reference(
+            pixels: &mut [u32],
+            width: u32,
+            height: u32,
+            color_image: &[u32],
+            transform_width: u32,
+            size_bits: u8,
+        ) {
+            if width == 0 || height == 0 {
+                return;
+            }
+            let w = width as usize;
+            let h = height as usize;
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = y * w + x;
+                    let block_index =
+                        (y as u32 >> size_bits) * transform_width + (x as u32 >> size_bits);
+                    let cte = color_image[block_index as usize];
+                    let red_to_blue = red(cte);
+                    let green_to_blue = green(cte);
+                    let green_to_red = blue(cte);
+                    let px = pixels[idx];
+                    let (new_red, new_blue) = inverse_color_pixel(
+                        red(px),
+                        green(px),
+                        blue(px),
+                        green_to_red,
+                        green_to_blue,
+                        red_to_blue,
+                    );
+                    pixels[idx] = pack_argb(alpha(px), new_red, green(px), new_blue);
+                }
+            }
+        }
+
+        let cases: &[(u32, u32, u8)] = &[
+            (16, 16, 0), // block_w = 1, hoist is a no-op
+            (16, 16, 2), // 4×4 blocks
+            (32, 32, 3), // 8×8 blocks
+            (64, 16, 5), // 32-wide blocks, edge tile straddles
+            (1, 32, 3),  // single column
+            (32, 1, 3),  // single row
+            (17, 17, 7), // block (128) > image; one CTE for the whole image
+        ];
+
+        let mut seed: u32 = 0x9876_5432;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+
+        for &(w, h, size_bits) in cases {
+            let n = (w as usize) * (h as usize);
+            let mut pixels: Vec<u32> = (0..n).map(|_| rng()).collect();
+            let block = 1u32 << size_bits;
+            let tw = w.div_ceil(block);
+            let th = h.div_ceil(block);
+            let cn = (tw as usize) * (th as usize);
+            let color_image: Vec<u32> = (0..cn).map(|_| rng()).collect();
+
+            let mut expected = pixels.clone();
+            reference(&mut expected, w, h, &color_image, tw, size_bits);
+            inverse_color(&mut pixels, w, h, &color_image, tw, size_bits);
+
+            assert_eq!(
+                pixels, expected,
+                "hoist diverges from per-pixel reference at \
+                 (w={w}, h={h}, size_bits={size_bits})"
+            );
+        }
     }
 
     // ---- §4.3 subtract-green ----
