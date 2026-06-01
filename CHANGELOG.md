@@ -4,6 +4,13 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/OxideAV/oxideav-webp/compare/v0.2.1...v0.2.2) - 2026-06-01
+
+### Other
+
+- round 204 — first cargo-fuzz harness (decode + extract_metadata)
+- round 194 — §4.1 Select algebraic simplification + per-mode bench
+
 ### Added
 
 - `fuzz/` — first cargo-fuzz harness for the crate. Two libfuzzer
