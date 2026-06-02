@@ -29,6 +29,7 @@ the medians are still stable to a few percent.
 | `benches/argb_to_rgba.rs`    | `argb_to_rgba` | `Vp8lImage::to_rgba` repack on a 256×256 image |
 | `benches/inverse_predictor.rs` | `inverse_predictor_modeN_256x256` | §4.1 inverse predictor on a 256×256 buffer, mode-pinned (N ∈ {11, 12, 13}) |
 | `benches/inverse_color.rs` | `inverse_color_256x256_sbN` | §4.2 inverse color transform on a 256×256 buffer, parameterised over `size_bits` (N ∈ {0, 3, 5, 7}) |
+| `benches/inverse_color_indexing.rs` | `inverse_color_indexing_256x256_paletteN` | §4.4 inverse color-indexing transform on a 256×256 output buffer, parameterised over palette size (N ∈ {2, 4, 16, 256}) which selects all four `width_bits` bundling levels |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -282,6 +283,82 @@ The end-to-end `lossless_decode_argb_256` bench is unchanged
 not to elect the color transform on its mode chooser; the win
 shows up on natural images and on any fixture whose encoder
 selected the §4.2 transform.
+
+## Round-210 (2026-06-02) — `inverse_color_indexing` per-bundle hoist
+
+The §4.4 inverse color-indexing transform replaces each output pixel
+with `color_table[green(packed_pixel)]`. For palettes of ≤16 colors
+the packed buffer is **bundled**: `count = 1 << width_bits` output
+pixels share one packed green byte, with each index occupying `bits
+= 8 / count` bits in that byte (LSB-first per §4.4).
+
+The pre-round-210 inner loop recomputed three quantities for every
+output pixel even though they are constant across larger units:
+
+* `y * packed_w + x / count` — the packed-row index. Constant across
+  each `count`-pixel run; the row base `y * packed_w` is constant
+  across an entire row.
+* `y * orig_width + x` — the output-row index. The row base
+  `y * orig_width` is constant across an entire row.
+* `(x % count) * bits` — the field-selector shift. Cycles through
+  the same `count` values per bundle (`0, bits, 2*bits, …`).
+
+Round-210 hoists the two row bases out of the x loop and walks the
+row as a sequence of `count`-wide bundles: load the packed green
+byte once at the bundle boundary, then iterate `count` sub-indices
+with a stepping `shift` variable that increments by `bits` each
+iteration. The trailing partial bundle at row end (when `orig_width`
+is not a multiple of `count`) reuses the inner-bundle walk under a
+`min` clamp.
+
+The `width_bits = 0` (no-bundle) path was already tight (a
+`zip`-based slice walk with no row arithmetic) and is left
+unchanged.
+
+Bit-identical to the per-pixel form, asserted by
+`color_indexing_matches_per_pixel_reference_random` which sweeps
+nine `(orig_width, height, table_size)` configurations spanning all
+four `width_bits` levels, exact-bundle widths, trailing partial
+bundles, a single column (entire row falls inside the trailing
+partial), a single row, and out-of-range indices that must collapse
+to transparent black — against a verbatim copy of the pre-r210
+per-pixel body.
+
+### New bench: `inverse_color_indexing`
+
+`benches/inverse_color_indexing.rs` drives `inverse_color_indexing`
+on a 256×256 output buffer with a deterministic LCG fill,
+parameterised over four palette sizes that select all four
+bundling levels:
+
+| Palette size | `width_bits` | `count` (outputs/byte) | `bits` (per index) |
+|---:|---:|---:|---:|
+| 2 | 3 | 8 | 1 |
+| 4 | 2 | 4 | 2 |
+| 16 | 1 | 2 | 4 |
+| 256 | 0 | 1 (no bundle) | 8 |
+
+| Bench | Pre-r210 | Round-210 | Δ |
+|---|---:|---:|---:|
+| `inverse_color_indexing_256x256_palette2` | 40.7 µs | **31.6 µs** | **−22.4%** |
+| `inverse_color_indexing_256x256_palette4` | 40.7 µs | 39.4 µs | −3.2% |
+| `inverse_color_indexing_256x256_palette16` | 40.2 µs | 39.2 µs | −2.6% |
+| `inverse_color_indexing_256x256_palette256` | 19.2 µs | 18.6 µs | −2.7% (unchanged path; noise) |
+
+The big win lands on the highest-bundle-count case (palette-2,
+`count = 8`) where amortising the packed-row index lookup across
+8 output pixels dominates. The lower-bundle cases see only the
+row-offset hoist contribution; `(x % 4) * 2` and `(x % 2) * 4` were
+already cheap constant-power-of-two operations the optimizer
+already folded well. The unbundled path was untouched and the
+~2.7% movement on palette-256 is within criterion-`--quick`
+sampling noise on the M-series host.
+
+The end-to-end `lossless_decode_argb_256` bench is unchanged because
+the 256×256 LCG gradient fixture happens not to elect the §4.4
+transform on the encoder's mode chooser; the win shows up on
+small-palette images (icons, logos, screenshots with limited color
+counts) whose encoder selected color-indexing with `width_bits = 3`.
 
 ## Reproducing
 

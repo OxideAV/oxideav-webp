@@ -6,6 +6,42 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Optimized
 
+- §4.4 `inverse_color_indexing` bundled path: hoist the per-pixel
+  packed-row index (`y * packed_w + x / count`), output-row base
+  (`y * orig_width + x`), and field-selector computation
+  (`(x % count) * bits`) out of the x-loop. Every `count = 1 <<
+  width_bits` outputs share the same packed green byte (8 outputs
+  per byte at `width_bits = 3`, 4 at `width_bits = 2`, 2 at
+  `width_bits = 1`); the original body recomputed those three
+  quantities for every output pixel even though the packed-row
+  index is constant across an entire row and the green byte +
+  bundle origin are constant across each `count`-pixel run. The
+  rewrite walks the row in `count`-wide bundles: load the green
+  byte once at the bundle boundary, then iterate `count` sub-
+  indices with `shift = 0, bits, 2*bits, …`. The trailing partial
+  bundle at row end (when `orig_width` is not a multiple of
+  `count`) reuses the inner-bundle walk under a `min` clamp.
+  Bit-identical to the per-pixel form, asserted by a new
+  `color_indexing_matches_per_pixel_reference_random` test that
+  sweeps nine `(orig_width, height, table_size)` configurations
+  spanning all four `width_bits` levels, exact-bundle widths,
+  trailing partial bundles, a single column (entire row falls
+  inside the trailing partial), a single row, and out-of-range
+  indices that must collapse to transparent black, against a
+  verbatim copy of the pre-r210 per-pixel body. New
+  `benches/inverse_color_indexing.rs` parameterises four palette
+  sizes mapping to the four bundling levels on a 256×256 output:
+  palette-2 (`width_bits = 3`, 8 outputs/byte) 40.7 µs → 31.6 µs
+  (−22.4%), palette-4 (`width_bits = 2`, 4 outputs/byte) 40.7 µs
+  → 39.4 µs (−3.2%), palette-16 (`width_bits = 1`, 2 outputs/byte)
+  40.2 µs → 39.2 µs (−2.6%), palette-256 (`width_bits = 0`, no
+  bundle — unchanged code path) 19.2 µs → 18.6 µs (within ±3%
+  noise). The big win lands on the highest-bundle-count case
+  where amortising one packed-row index lookup across 8 output
+  pixels dominates; smaller wins on lower bundle counts because
+  the original `x % count` and `x / count` were already cheap
+  constant-power-of-two ops the optimizer folded well.
+
 - §4.2 `inverse_color`: hoist the per-block `ColorTransformElement`
   load + three byte extracts (`red_to_blue` / `green_to_blue` /
   `green_to_red`) out of the inner pixel loop. The CTE is constant

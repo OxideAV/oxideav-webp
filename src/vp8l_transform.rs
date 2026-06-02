@@ -522,6 +522,22 @@ fn color_indexing_width_bits(color_table_size: usize) -> u8 {
 /// Returns a fresh `orig_width * height` ARGB buffer. Each output pixel
 /// is `color_table[index]`, or transparent black (`0x00000000`) when
 /// `index >= color_table.len()`.
+///
+/// **Round-210 per-bundle hoist** (see `BENCHMARKS.md`): the bundled
+/// path (`width_bits` ∈ {1, 2, 3}) has `count = 1 << width_bits`
+/// output pixels share the same packed green byte. The original code
+/// recomputed `y * packed_w + (x / count)`, `y * ow + x`, and
+/// `(x % count) * bits` for every output pixel, even though the
+/// packed-row index is constant across each row and the green byte +
+/// bundle origin are constant across each `count`-pixel run. The
+/// rewrite hoists the two row bases out of the x loop and walks the
+/// row as a sequence of `count`-wide bundles: load the green byte
+/// once at the bundle boundary, then iterate `count` sub-indices with
+/// `shift = 0, bits, 2*bits, …`. The trailing partial bundle at row
+/// end (when `orig_width` is not a multiple of `count`) reuses the
+/// inner-bundle walk under a `min` clamp. Bit-identical to the
+/// per-pixel form (asserted by `color_indexing_matches_per_pixel_
+/// reference_random`).
 pub fn inverse_color_indexing(
     packed: &[u32],
     orig_width: u32,
@@ -542,19 +558,51 @@ pub fn inverse_color_indexing(
         return out;
     }
 
-    // Bundled: `count = 1 << width_bits` indices share one green byte at
-    // packed-x = x / count; index occupies `bits` bits, sub-index `x %
-    // count` selects the field (LSB first per §4.4).
+    // Bundled: `count = 1 << width_bits` indices share one green byte
+    // at packed-x = x / count; index occupies `bits` bits, sub-index
+    // `x % count` selects the field (LSB first per §4.4).
     let count = 1usize << width_bits;
     let bits = 8 / count; // 4, 2, or 1 bits per index.
     let mask = (1u32 << bits) - 1;
     let packed_w = div_round_up(orig_width, count as u32) as usize;
+    let table_len = color_table.len();
     for y in 0..h {
-        for x in 0..ow {
-            let px = packed[y * packed_w + (x / count)];
-            let shift = (x % count) * bits;
-            let index = ((green(px) as u32 >> shift) & mask) as usize;
-            out[y * ow + x] = color_table.get(index).copied().unwrap_or(0);
+        let packed_row = y * packed_w;
+        let out_row = y * ow;
+        let mut x = 0usize;
+        // Whole bundles: every iteration consumes `count` output pixels
+        // from one packed green byte. The bound `x + count <= ow`
+        // skips the trailing partial bundle, handled below.
+        while x + count <= ow {
+            let g = green(packed[packed_row + (x >> width_bits)]) as u32;
+            let base = out_row + x;
+            let mut shift = 0u32;
+            for sub in 0..count {
+                let index = ((g >> shift) & mask) as usize;
+                out[base + sub] = if index < table_len {
+                    color_table[index]
+                } else {
+                    0
+                };
+                shift += bits as u32;
+            }
+            x += count;
+        }
+        // Trailing partial bundle when `ow` is not a multiple of count.
+        if x < ow {
+            let g = green(packed[packed_row + (x >> width_bits)]) as u32;
+            let base = out_row + x;
+            let remaining = ow - x;
+            let mut shift = 0u32;
+            for sub in 0..remaining {
+                let index = ((g >> shift) & mask) as usize;
+                out[base + sub] = if index < table_len {
+                    color_table[index]
+                } else {
+                    0
+                };
+                shift += bits as u32;
+            }
         }
     }
     out
@@ -1270,5 +1318,98 @@ mod tests {
         assert_eq!(color_indexing_width_bits(16), 1);
         assert_eq!(color_indexing_width_bits(17), 0);
         assert_eq!(color_indexing_width_bits(256), 0);
+    }
+
+    #[test]
+    fn color_indexing_matches_per_pixel_reference_random() {
+        // Round-210 per-bundle hoist cross-check. The new
+        // `inverse_color_indexing` walks bundles of `count = 1 <<
+        // width_bits` pixels with the packed green byte cached at the
+        // bundle boundary; assert the emitted output still matches a
+        // verbatim copy of the pre-r210 per-pixel body across
+        // deterministic LCG fills at six configurations covering all
+        // three bundling levels, including row widths that straddle
+        // bundle boundaries, a single-row image, a single-column
+        // image (which falls entirely inside the trailing partial
+        // bundle), and out-of-range indices that must collapse to
+        // transparent black.
+        fn reference(
+            packed: &[u32],
+            orig_width: u32,
+            height: u32,
+            color_table: &[u32],
+        ) -> Vec<u32> {
+            let width_bits = color_indexing_width_bits(color_table.len());
+            let ow = orig_width as usize;
+            let h = height as usize;
+            let mut out = vec![0u32; ow * h];
+            if width_bits == 0 {
+                for (o, &p) in out.iter_mut().zip(packed.iter()) {
+                    let index = green(p) as usize;
+                    *o = color_table.get(index).copied().unwrap_or(0);
+                }
+                return out;
+            }
+            let count = 1usize << width_bits;
+            let bits = 8 / count;
+            let mask = (1u32 << bits) - 1;
+            let packed_w = div_round_up(orig_width, count as u32) as usize;
+            for y in 0..h {
+                for x in 0..ow {
+                    let px = packed[y * packed_w + (x / count)];
+                    let shift = (x % count) * bits;
+                    let index = ((green(px) as u32 >> shift) & mask) as usize;
+                    out[y * ow + x] = color_table.get(index).copied().unwrap_or(0);
+                }
+            }
+            out
+        }
+
+        // (orig_width, height, table_size). table_size drives the
+        // bundling level via `color_indexing_width_bits`:
+        //   >=17 → width_bits 0 (no bundle), 5..=16 → 1 (count 2),
+        //   3..=4 → 2 (count 4), 1..=2 → 3 (count 8).
+        let cases: &[(u32, u32, usize)] = &[
+            (16, 16, 8), // width_bits 1, count 2, exact bundles
+            (15, 9, 8),  // width_bits 1, count 2, trailing partial
+            (32, 32, 4), // width_bits 2, count 4, exact bundles
+            (17, 5, 4),  // width_bits 2, count 4, partial 1
+            (24, 7, 2),  // width_bits 3, count 8, exact bundles
+            (1, 32, 2),  // width_bits 3, count 8, single column
+            (32, 1, 8),  // width_bits 1, count 2, single row
+            (20, 4, 32), // width_bits 0 — exercise the no-bundle path
+            (5, 5, 4),   // width_bits 2, count 4, partial 1, oob indices
+        ];
+
+        let mut seed: u32 = 0x2468_ace0;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+
+        for &(ow_u32, h_u32, table_size) in cases {
+            let mut color_table: Vec<u32> = (0..table_size).map(|_| rng()).collect();
+            // Run the spec subtraction-decode first so the table looks
+            // like a real palette (round-211-safe: caller does the same).
+            inverse_color_table(&mut color_table);
+
+            let width_bits = color_indexing_width_bits(table_size);
+            let count = 1u32 << width_bits;
+            let packed_w = ow_u32.div_ceil(count) as usize;
+            let n = packed_w * (h_u32 as usize);
+            // Random green bytes so every sub-index slot exercises both
+            // in-range and out-of-range cases.
+            let packed: Vec<u32> = (0..n).map(|_| rng() & 0x0000_ff00).collect();
+
+            let expected = reference(&packed, ow_u32, h_u32, &color_table);
+            let got = inverse_color_indexing(&packed, ow_u32, h_u32, &color_table);
+
+            assert_eq!(
+                got, expected,
+                "bundle hoist diverges from per-pixel reference at \
+                 (ow={ow_u32}, h={h_u32}, table_size={table_size}, \
+                  width_bits={width_bits})"
+            );
+        }
     }
 }

@@ -77,3 +77,7 @@ harness = false
 [[bench]]
 name = "inverse_color"
 harness = false
+
+[[bench]]
+name = "inverse_color_indexing"
+harness = false
