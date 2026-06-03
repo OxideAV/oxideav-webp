@@ -1709,8 +1709,32 @@ fn predictor_predict(mode: u8, l: u32, t: u32, tr: u32, tl: u32) -> u32 {
 /// the decoder's `add_pred` (`residual + pred mod 256 = original`),
 /// so re-applying the §4.1 inverse predictor recovers `original`
 /// exactly.
+///
+/// **Round-224 SWAR experiment — closure-of-four body retained.**
+/// The decoder-side `add_pred` was rewritten in round 170 as a
+/// two-pair SWAR (`(x & 0x00ff_00ff).wrapping_add(...)` /
+/// `(x & 0xff00_ff00).wrapping_add(...)`) because addition does not
+/// propagate carry across the zero "guard" bytes when the summand has
+/// its high bit masked out. Subtraction is asymmetric: a borrow at the
+/// low byte of a lane DOES propagate through the zero guard byte and
+/// corrupts the adjacent lane, so the mirror rewrite needs to bias
+/// the minuend with a `0x0100` guard per lane (`(orig & 0x00ff_00ff)
+/// | 0x0100_0100`) to suppress underflow before the subtract, with a
+/// final `& 0x00ff_00ff` mask to clear the guard. We measured both
+/// forms in round 224 against the new `predictor_subtract_256x256`
+/// bench: **34.1 µs (closure-of-four) → 40.5 µs (biased SWAR), a
+/// +18.4% regression.** AArch64 NEON auto-vectorisation of the four
+/// sequential per-byte `wrapping_sub` calls is tighter than the
+/// explicit biased-SWAR pattern at this call site. Same shape as the
+/// round-194 BENCHMARKS footnote that recorded a regression for a
+/// `clamp_add_subtract_*` (mode 12) per-channel `to_le_bytes()` +
+/// `i16` byte-loop attempt — the closure-of-four `i32` body remains
+/// the right starting point on this target until a true 16-byte
+/// `std::simd` formulation can amortise the lane-bias cost across
+/// multiple pixels per iteration (mirroring the `to_rgba_simd`
+/// precedent under the `simd` feature).
 #[inline]
-fn predictor_subtract(original: u32, pred: u32) -> u32 {
+pub fn predictor_subtract(original: u32, pred: u32) -> u32 {
     let a = ((original >> 24) & 0xff).wrapping_sub((pred >> 24) & 0xff) & 0xff;
     let r = ((original >> 16) & 0xff).wrapping_sub((pred >> 16) & 0xff) & 0xff;
     let g = ((original >> 8) & 0xff).wrapping_sub((pred >> 8) & 0xff) & 0xff;
@@ -6471,6 +6495,62 @@ mod tests {
     }
 
     // ---- round 146: §4.1 spatial-predictor forward transform ----
+
+    /// Round-224 cross-check (kept after the SWAR-form regression
+    /// finding documented on the function itself): the public
+    /// `predictor_subtract` body must remain bit-identical to the
+    /// per-channel `wrapping_sub` semantics. Sweep 1 024 deterministic
+    /// LCG `(original, pred)` pairs plus six hand-picked boundary
+    /// pairs (every-channel underflow, every-channel positive,
+    /// all-zero, all-0xff, mixed) against a verbatim copy of the
+    /// closure-of-four reference. Acts as a regression guard so any
+    /// future re-attempt at a SWAR / `std::simd` rewrite of this
+    /// function can re-use this test to pin the new body against the
+    /// reference semantics.
+    #[test]
+    fn predictor_subtract_matches_per_byte_reference_random() {
+        // Verbatim copy of the closure-of-four reference body. The
+        // published function must be bit-identical to this for every
+        // input — this is a cross-check, not a baseline measurement.
+        fn reference(original: u32, pred: u32) -> u32 {
+            let a = ((original >> 24) & 0xff).wrapping_sub((pred >> 24) & 0xff) & 0xff;
+            let r = ((original >> 16) & 0xff).wrapping_sub((pred >> 16) & 0xff) & 0xff;
+            let g = ((original >> 8) & 0xff).wrapping_sub((pred >> 8) & 0xff) & 0xff;
+            let b = (original & 0xff).wrapping_sub(pred & 0xff) & 0xff;
+            (a << 24) | (r << 16) | (g << 8) | b
+        }
+        // Boundary cases: every-channel underflow, no-underflow, mixed.
+        for &(orig, pred) in &[
+            (0x0000_0000u32, 0x0000_0000u32),
+            (0xffff_ffffu32, 0xffff_ffffu32),
+            (0x0000_0000u32, 0xffff_ffffu32), // every channel underflows
+            (0xffff_ffffu32, 0x0000_0000u32), // every channel saturates positive
+            (0x10_20_30_40u32, 0x05_30_20_50u32), // mixed: r,b underflow; a,g positive
+            (0x80_80_80_80u32, 0x80_80_80_80u32), // zero residual
+        ] {
+            assert_eq!(
+                predictor_subtract(orig, pred),
+                reference(orig, pred),
+                "predictor_subtract diverges from per-byte reference at \
+                 orig=0x{orig:08x} pred=0x{pred:08x}"
+            );
+        }
+        let mut seed: u32 = 0xcafe_d00d;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+        for _ in 0..1_024 {
+            let orig = rng();
+            let pred = rng();
+            assert_eq!(
+                predictor_subtract(orig, pred),
+                reference(orig, pred),
+                "predictor_subtract diverges from per-byte reference at \
+                 orig=0x{orig:08x} pred=0x{pred:08x}"
+            );
+        }
+    }
 
     /// `predictor_subtract` is the per-channel mod-256 inverse of the
     /// decoder's `add_pred`: re-adding the same prediction recovers

@@ -6,6 +6,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/predictor_subtract.rs`: criterion bench for the encoder-side
+  `vp8l_encode::predictor_subtract` — the §4.1 per-channel mod-256
+  residual builder that mirrors the decoder's `add_pred`. Drives one
+  call per pixel over a 256×256 ARGB buffer (deterministic LCG fill,
+  matching the §4.x decoder-side bench shape so per-pass numbers are
+  visually comparable) and aggregates the residual XOR so the loop
+  body cannot be folded away. Closes the encoder-side inventory gap:
+  the round-170 profile attributed the #1 encoder self-time slot to
+  the predictor + residual path, but `predictor_subtract` itself was
+  unmeasured at the per-pass level until now. Round-224 baseline:
+  ~36 µs (range 35.9–38.3 µs across three consecutive `--quick` runs).
+  A biased-SWAR rewrite was tried this round and measured +18.4% vs.
+  the closure-of-four body — see `BENCHMARKS.md` for the lane-bias
+  underflow-prevention details and the reason the SWAR form regresses
+  on AArch64 NEON auto-vectorisation. The function body is left in
+  its pre-r224 form; the new bench is the A/B reference any future
+  `std::simd` rewrite of `predictor_subtract` (mirroring the
+  `to_rgba_simd` precedent under the `simd` feature) must measure
+  against.
+- `vp8l_encode::predictor_subtract` is now `pub fn` (previously
+  private). The function semantics are unchanged; raising visibility
+  lets the new `predictor_subtract_256x256` criterion bench reach it
+  from `benches/` and lets out-of-crate `simd`-feature consumers
+  experiment with their own SWAR / vector formulations against the
+  same `predictor_subtract_matches_per_byte_reference_random` cross-
+  check semantics (1 024 deterministic LCG `(original, pred)` pairs
+  plus six hand-picked boundary pairs covering every-channel
+  underflow, every-channel positive, all-zero, all-`0xff`, and a
+  mixed underflow / positive case, asserted against a verbatim copy
+  of the closure-of-four reference body).
 - `benches/inverse_subtract_green.rs`: criterion bench for the §4.3
   `inverse_subtract_green` inverse transform on a 256×256 ARGB buffer.
   Closes the per-pass bench inventory gap (§4.1 / §4.2 / §4.4 all had

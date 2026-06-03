@@ -31,6 +31,7 @@ the medians are still stable to a few percent.
 | `benches/inverse_color.rs` | `inverse_color_256x256_sbN` | §4.2 inverse color transform on a 256×256 buffer, parameterised over `size_bits` (N ∈ {0, 3, 5, 7}) |
 | `benches/inverse_color_indexing.rs` | `inverse_color_indexing_256x256_paletteN` | §4.4 inverse color-indexing transform on a 256×256 output buffer, parameterised over palette size (N ∈ {2, 4, 16, 256}) which selects all four `width_bits` bundling levels |
 | `benches/inverse_subtract_green.rs` | `inverse_subtract_green_256x256` | §4.3 subtract-green inverse transform on a 256×256 ARGB buffer (deterministic LCG fill) |
+| `benches/predictor_subtract.rs` | `predictor_subtract_256x256` | Encoder-side §4.1 per-channel mod-256 residual builder (mirror of decoder's `add_pred`) over a 256×256 ARGB buffer (deterministic LCG fill) |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -392,6 +393,88 @@ that touch `inverse_subtract_green` (e.g. a `std::simd` lane-parallel
 pass for the `simd` feature, mirroring the `to_rgba_simd` precedent)
 now have a documented baseline to A/B against. No algorithm change
 landed this round.
+
+## Round-224 (2026-06-04) — `predictor_subtract` bench + SWAR experiment
+
+The §4.x inverse-transform inventory has had per-pass benches for every
+decoder transform since round 217 closed `inverse_subtract_green`. The
+**encoder** side still had only the end-to-end `lossless_encode_*`
+benches at the public-API level — the round-170 profile attributed the
+#1 encoder self-time slot to the predictor + residual path, but the
+residual builder `predictor_subtract` itself was unmeasured at the
+per-pass level. Round 224 closes that inventory gap.
+
+### New bench: `predictor_subtract`
+
+`benches/predictor_subtract.rs` drives `predictor_subtract` once per
+pixel over a 256×256 ARGB buffer with the same deterministic LCG fill
+shape used by the §4.x decoder benches so the per-pass numbers are
+visually comparable. The bench accumulates the per-pixel residual into
+a `u32` XOR so the loop body cannot be folded away by the optimizer.
+
+`predictor_subtract` is now `pub fn` (previously private) to make it
+reachable from `benches/`. Its semantics — the per-channel mod-256
+inverse of the decoder's `add_pred` — are unchanged from prior rounds
+and are pinned bit-identically against the closure-of-four reference
+body by the new
+`predictor_subtract_matches_per_byte_reference_random` test (1 024
+deterministic LCG `(original, pred)` pairs plus six hand-picked
+boundary pairs covering every-channel underflow, every-channel
+positive, all-zero, all-`0xff`, and a mixed underflow / positive case).
+
+| Bench | Round-224 (median) |
+|---|---:|
+| `predictor_subtract_256x256` | **~36 µs** |
+
+(Range across three consecutive `--quick` runs on the same host:
+35.9–38.3 µs; criterion `--quick` is sensitive to system load on the
+M-series machine.)
+
+For the comparable 256×256 surfaces, that sits between the §4.3
+`inverse_subtract_green_256x256` (13.7 µs, the cheapest per-pixel
+work — a single masked add) and the §4.4
+`inverse_color_indexing_256x256_palette256` (18.6 µs, the cheapest
+unbundled path); twice the cost of either is expected because
+`predictor_subtract` does four sequential per-channel mod-256
+subtracts plus a four-byte reassembly per pixel.
+
+### SWAR-mirror experiment (regressed, body retained)
+
+The decoder-side `add_pred` was rewritten in round 170 as a two-pair
+SWAR (`(x & 0x00ff_00ff).wrapping_add(...)` / `(x & 0xff00_ff00)
+.wrapping_add(...)`) because addition does not propagate carry across
+the zero "guard" bytes when the summand has its high bit masked out.
+Round 224 attempted the symmetric subtraction rewrite. Subtraction is
+asymmetric: a borrow at the low byte of a lane DOES propagate through
+the zero guard byte and corrupt the adjacent lane, so the mirror
+rewrite biases the minuend with a `0x0100` guard per lane
+(`(orig & 0x00ff_00ff) | 0x0100_0100`) to suppress underflow before
+the subtract, with a final `& 0x00ff_00ff` mask to clear the guard.
+The high pair is brought into the same low-of-pair layout with a
+`>> 8` and re-positioned with `<< 8` after masking.
+
+| Form | Median |
+|---|---:|
+| Closure-of-four (kept) | 34.1 µs |
+| Biased-SWAR (tried, reverted) | 40.5 µs (**+18.4%**) |
+
+AArch64 NEON auto-vectorisation across the four sequential per-byte
+`wrapping_sub` calls in the closure body is tighter than the explicit
+biased-SWAR pattern at this call site — the lane-bias `| 0x0100_0100`
+and the final mask `& 0x00ff_00ff` are extra micro-ops that don't
+amortise across a single-pixel call. Same shape as the round-194
+BENCHMARKS footnote that recorded a regression for a
+`clamp_add_subtract_*` (mode 12) per-channel `to_le_bytes()` + `i16`
+byte-loop attempt — the closure-of-four `i32` body remains the right
+starting point on this target.
+
+The function body is left in its pre-r224 form. The randomised cross-
+check test stays in place as a regression guard so any future
+`std::simd` rewrite of `predictor_subtract` (the next plausible
+attempt, mirroring the `to_rgba_simd` precedent under the `simd`
+feature where the 16-byte vector load amortises the lane-bias cost
+across four pixels per iteration) can re-use this test and this bench
+as the A/B reference.
 
 ## Reproducing
 

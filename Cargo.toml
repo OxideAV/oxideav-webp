@@ -85,3 +85,7 @@ harness = false
 [[bench]]
 name = "inverse_subtract_green"
 harness = false
+
+[[bench]]
+name = "predictor_subtract"
+harness = false
