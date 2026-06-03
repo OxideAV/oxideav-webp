@@ -4,6 +4,19 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `benches/inverse_subtract_green.rs`: criterion bench for the §4.3
+  `inverse_subtract_green` inverse transform on a 256×256 ARGB buffer.
+  Closes the per-pass bench inventory gap (§4.1 / §4.2 / §4.4 all had
+  per-pass benches landed in earlier rounds; §4.3 had only the
+  end-to-end `lossless_decode_argb_256` coverage). One fixed-size run
+  on a deterministic LCG fill: the §4.3 transform has no tunable
+  parameters, so a single benchmark captures its full surface.
+  Round-217 baseline: 13.7 µs. No algorithm change in this round;
+  future SWAR / `std::simd` passes on `inverse_subtract_green` now
+  have an A/B reference number to measure against.
+
 ### Optimized
 
 - §4.4 `inverse_color_indexing` bundled path: hoist the per-pixel

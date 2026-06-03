@@ -30,6 +30,7 @@ the medians are still stable to a few percent.
 | `benches/inverse_predictor.rs` | `inverse_predictor_modeN_256x256` | §4.1 inverse predictor on a 256×256 buffer, mode-pinned (N ∈ {11, 12, 13}) |
 | `benches/inverse_color.rs` | `inverse_color_256x256_sbN` | §4.2 inverse color transform on a 256×256 buffer, parameterised over `size_bits` (N ∈ {0, 3, 5, 7}) |
 | `benches/inverse_color_indexing.rs` | `inverse_color_indexing_256x256_paletteN` | §4.4 inverse color-indexing transform on a 256×256 output buffer, parameterised over palette size (N ∈ {2, 4, 16, 256}) which selects all four `width_bits` bundling levels |
+| `benches/inverse_subtract_green.rs` | `inverse_subtract_green_256x256` | §4.3 subtract-green inverse transform on a 256×256 ARGB buffer (deterministic LCG fill) |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -359,6 +360,38 @@ the 256×256 LCG gradient fixture happens not to elect the §4.4
 transform on the encoder's mode chooser; the win shows up on
 small-palette images (icons, logos, screenshots with limited color
 counts) whose encoder selected color-indexing with `width_bits = 3`.
+
+## Round-217 (2026-06-03) — `inverse_subtract_green` bench coverage
+
+The §4.x transform inventory now exposes a per-pass bench for the only
+one that was still un-measured: §4.3 `inverse_subtract_green`. The
+round-170 SWAR rewrite collapsed the per-pixel `r += g; b += g` to one
+masked add (broadcast `(g << 16) | g` into `(p & 0x00ff_00ff)`, mask
+back, OR with `p & 0xff00_ff00`), but no bench was committed at the
+time, so subsequent rounds couldn't A/B-test further changes against a
+fixed baseline. This round closes that inventory gap.
+
+`benches/inverse_subtract_green.rs` drives `inverse_subtract_green`
+on a 256×256 ARGB buffer with the same deterministic LCG fill shape
+used by `inverse_color` and `inverse_color_indexing` so the per-pass
+numbers are comparable. The §4.3 transform has no tunable parameters
+(unlike `inverse_predictor`'s `mode` or `inverse_color`'s `size_bits`),
+so one fixed-size run captures its full surface.
+
+| Bench | Round-217 (median) |
+|---|---:|
+| `inverse_subtract_green_256x256` | **13.7 µs** |
+
+For the comparable 256×256 surfaces, that sits between the §4.4
+`inverse_color_indexing_256x256_palette256` (18.6 µs, the simplest
+unbundled path) and the §4.2 `inverse_color_256x256_sb5/sb7` numbers
+(~23 µs). The round-170 SWAR mask + OR pattern is already as tight as
+the spec allows for the spec-prescribed per-pixel work (extract green,
+broadcast into r + b lanes, masked add); future optimization rounds
+that touch `inverse_subtract_green` (e.g. a `std::simd` lane-parallel
+pass for the `simd` feature, mirroring the `to_rgba_simd` precedent)
+now have a documented baseline to A/B against. No algorithm change
+landed this round.
 
 ## Reproducing
 

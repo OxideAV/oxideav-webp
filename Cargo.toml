@@ -81,3 +81,7 @@ harness = false
 [[bench]]
 name = "inverse_color_indexing"
 harness = false
+
+[[bench]]
+name = "inverse_subtract_green"
+harness = false
