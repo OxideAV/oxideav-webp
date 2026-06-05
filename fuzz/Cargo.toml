@@ -19,16 +19,23 @@ cargo-fuzz = true
 # is a layered walk: outer RIFF chunk loop, §2.7.1 feature-flag octet,
 # per-chunk header validation, §3 VP8L image-header + prefix-coded
 # entropy stream, §4 transform stack. Every byte along that path comes
-# from an attacker-controlled file. Two of the three harnesses below
+# from an attacker-controlled file. Two of the four harnesses below
 # feed arbitrary bytes straight into the public single-shot entry points
 # (`decode_webp` and `extract_metadata`) and assert the only contract is
 # "always returns a `Result`" — no panic, no debug-build
 # integer overflow, no out-of-bounds index, no allocation sized by a
 # header field the limits did not bound. The third harness is a
-# round-trip oracle on the lossless encode path: fuzz-controlled RGBA
-# bytes + dimensions go through `encode_webp_lossless`; the output bytes
-# are decoded through `decode_webp`; pixel-for-pixel equality is
-# asserted. Round-trip exactness is the §3 lossless contract.
+# round-trip oracle on the still-image lossless encode path:
+# fuzz-controlled RGBA bytes + dimensions go through
+# `encode_webp_lossless`; the output bytes are decoded through
+# `decode_webp`; pixel-for-pixel equality is asserted. The fourth
+# harness widens that round-trip oracle across the §2.7.1.1 animation
+# layer: a fuzz-controlled 1..8-frame animation built by
+# `build_animated_webp` is decoded back through `decode_webp` and the
+# frame count + per-frame dimensions + per-frame duration + per-frame
+# pixels are asserted byte-identical. Round-trip exactness is the §3
+# lossless contract; preservation of the §2.7.1.1 carrier fields is
+# the ANIM / ANMF chunk contract.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -62,6 +69,13 @@ bench = false
 [[bin]]
 name = "roundtrip_lossless"
 path = "fuzz_targets/roundtrip_lossless.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_animated"
+path = "fuzz_targets/roundtrip_animated.rs"
 test = false
 doc = false
 bench = false

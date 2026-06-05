@@ -6,6 +6,31 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/roundtrip_animated.rs`: fourth `cargo-fuzz`
+  harness, a structured round-trip oracle on the §2.7.1.1 animation
+  carrier. The fuzzer drives the canvas dimensions (≤ 32 × 32), the
+  frame count (1..8), every per-frame `duration_ms`, and every byte
+  of every frame's RGBA buffer; the resulting `AnimFrame` set goes
+  through `build_animated_webp` → `decode_webp`, and the harness
+  asserts the frame count, every per-frame width / height, every
+  per-frame `duration_ms`, and every per-frame RGBA byte survive the
+  round trip identically. Closes the fuzz inventory gap: the
+  pre-r238 `roundtrip_lossless` target covered only the still-image
+  encoder + decoder pair (`encode_webp_lossless` → `decode_webp`),
+  leaving the entire ANIM / ANMF chunk-walk + canvas-compositing
+  decode + per-frame VP8L encode loop without a fuzz oracle. Bounded
+  per-iteration cost (`8 * 32 * 32 * 4 = 32 KiB` worst-case RGBA
+  working set) lets libFuzzer sustain ~50 exec/s on a release build;
+  a 90 s local run on aarch64-apple-darwin produced 4 998 runs, no
+  crashes / panics / assertion failures, coverage 2 603 / features
+  8 239 / corpus 358 entries — the harness reaches the multi-frame
+  path (libFuzzer-promoted input length 8 bytes feeds the 3-byte
+  header + 5 bytes of per-frame data covering up to 2 frames after
+  the prologue cycle-fill). The libFuzzer dictionary autoderived the
+  RIFF chunk fourcc shapes `UP8L` and `GPLA` from the encoder output
+  (byte-shifted views of `VP8L` / `ALPH`), evidence the oracle is
+  exercising the full container walk on the decode side. Numbers and
+  per-target run instructions are in `README.md` § Fuzzing.
 - `benches/predictor_subtract.rs`: criterion bench for the encoder-side
   `vp8l_encode::predictor_subtract` — the §4.1 per-channel mod-256
   residual builder that mirrors the decoder's `add_pred`. Drives one
