@@ -109,3 +109,7 @@ harness = false
 [[bench]]
 name = "read_lz77_value"
 harness = false
+
+[[bench]]
+name = "color_cache_hash"
+harness = false

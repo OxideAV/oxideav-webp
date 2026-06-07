@@ -6,6 +6,45 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/color_cache_hash.rs`: criterion bench for the decoder-side
+  §3.6.2.3 `vp8l_decode::ColorCache::hash` color-cache multiplicative-
+  hash slot-index function — the per-pixel index function that turns
+  an emitted ARGB color into a §3.6.2.3 cache slot via RFC 9649
+  §3.6.2.3's verbatim `(0x1e35a7bd * color) >> (32 -
+  color_cache_code_bits)`. Called twice per emitted pixel when the
+  §3.6.2.3 cache is enabled (once for `ColorCache::insert` on every
+  emitted literal / LZ77-copied / cache-resolved pixel per §3.6.2.3
+  "the state of the color cache is maintained by inserting every
+  pixel ... into the cache in the order they appear in the stream"
+  and once more inside the encoder-side mirror), so per-call cost
+  scales linearly with the per-image pixel count whenever the
+  §3.6.2.3 cache is active — the common case for natural-image VP8L
+  payloads. Parameterised across the §3.6.2.3 `code_bits` allowed
+  range `[1..11]`: *minimum* (`code_bits = 1`, 2-slot cache, shift
+  `>> 31`), *small-cache regime* (`code_bits = 4`, 16-slot cache,
+  shift `>> 28`, palette / line-art common), *natural-image regime*
+  (`code_bits = 8`, 256-slot cache, shift `>> 24`) and *maximum*
+  (`code_bits = 11`, 2048-slot cache, shift `>> 21`, the §3.6.2.3
+  hard upper bound). Four bench cells total. The per-call work is a
+  single `u32` multiply plus a right-shift plus a `usize` cast, so
+  the bench amortises Criterion's per-iteration overhead by running
+  an inner loop of 1024 calls per `b.iter` body over a pre-allocated
+  deterministic LCG-filled `u32` ARGB stream, accumulating every
+  slot index through a wrapping XOR so the optimiser cannot drop any
+  individual call. The ARGB input stream and the loop count are
+  identical across every cell, so cross-cell deltas come exclusively
+  from the §3.6.2.3 hash body cost. The LCG constants match the rest
+  of the §3.x / §4.x per-pass bench inventory so cross-pass numbers
+  are reproducible and visually comparable. The function body is
+  unchanged this round; the deliverable is the A/B reference for a
+  future const-folding / inlining rewrite at the call site (where
+  `code_bits` is often known statically per decode group). Quick-
+  mode measurements at all four cells land within ~5 % of each
+  other, confirming the §3.6.2.3 spec's expected flat per-call cost
+  across `code_bits`. Closes the §3.6.2.3 color-cache slot-index
+  entry in the §3 decode per-pass inventory alongside the round-252
+  §3.6.2.2 `read_lz77_value` LZ77 prefix-value bench and the round-
+  250 / round-251 §3.7.2 encoder-builder benches.
 - `benches/read_lz77_value.rs`: criterion bench for the decoder-side
   §3.6.2.2 `vp8l_decode::read_lz77_value` LZ77 prefix-code-to-value
   expansion — the per-symbol second half of the §3.6.2.2 length /
