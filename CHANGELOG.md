@@ -6,6 +6,42 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/decode_alph.rs`: cargo-fuzz harness on the
+  §2.7.1.2 ALPH standalone entry point
+  `oxideav_webp::alph::decode_alpha`. The §2 RIFF walk in `decode_webp`
+  only reaches `decode_alpha` with `(width, height)` taken from a
+  validated §2.7.1 VP8X / §2.5 VP8 keyframe header, so the
+  cross-product reachable through the existing `decode.rs` harness is
+  bounded by what a chunk-header validator already accepted. The new
+  harness drives the public standalone surface directly — the function
+  is documented as the per-frame §2.7.1.1 ANMF entry point downstream
+  callers invoke against ANMF frame dimensions — pairing
+  fuzz-controlled `(width, height) ∈ [1, 64]²` with a fuzz-controlled
+  ALPH chunk payload (info byte + alpha bitstream) so the four §2.7.1.2
+  filter methods (none / horizontal / vertical / gradient) and the two
+  §2.7.1.2 compression methods (raw + headerless §3 VP8L) reachable
+  through that surface get battered against arbitrary inputs. The
+  decoder-side contract under test: every call must return a `Result` —
+  no panic, no debug-build integer overflow on the `width * height`
+  arithmetic, no out-of-bounds index, no allocation sized by the
+  attacker-controlled dimensions before the `checked_mul` rejects them.
+  On success, the §2.7.1.2 carrier-field invariant
+  `plane.len() == width * height` is asserted — that equality is the
+  RFC 9649 §2.7.1.2 contract ("a byte sequence of length =
+  width * height") and any other length is a real carrier violation.
+  The 64 × 64 canvas cap keeps the method-1 §3 VP8L sub-decode bounded
+  (worst-case plane = 4 KiB, worst-case method-1 intermediate ARGB =
+  16 KiB) so a single fuzz iteration stays in the millisecond range
+  even when the alpha bitstream is a §3 VP8L stream. Joins
+  `decode.rs` / `extract_metadata.rs` (always-returns-Result oracles on
+  the public single-shot entry points), `roundtrip_lossless.rs`
+  (still-image §3 VP8L encode + decode round-trip) and
+  `roundtrip_animated.rs` (§2.7.1.1 ANIM / ANMF carrier + per-frame
+  pixel + per-frame duration round-trip): 5 cargo-fuzz harnesses total,
+  with `decode_alph` widening surface coverage onto the standalone
+  ALPH entry point the previous four harnesses only reached
+  transitively through a complete §2 RIFF walk.
+
 - `benches/value_to_prefix.rs`: criterion bench for the encoder-side
   §5.2.2 `vp8l_encode::value_to_prefix` LZ77 length-or-distance value-
   to-prefix split — the exact inverse of the decoder-side §3.6.2.2
