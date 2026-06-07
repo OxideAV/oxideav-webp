@@ -93,3 +93,7 @@ harness = false
 [[bench]]
 name = "apply_subtract_green"
 harness = false
+
+[[bench]]
+name = "inverse_color_table"
+harness = false

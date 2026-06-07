@@ -6,6 +6,35 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/inverse_color_table.rs`: criterion bench for the §4.4
+  `inverse_color_table` palette subtraction-decode pass (the
+  cumulative-delta loop that recovers final ARGB palette entries by
+  adding the previous entry's four lanes into the current entry's
+  four lanes mod 256, per the §4.4 spec text). Parameterised over
+  palette sizes 2 / 16 / 256, which cover the §4.4 bundling-tier
+  boundaries (minimum length, mid-tier near the `width_bits = 1 → 0`
+  boundary, and maximum length). The deterministic LCG fill uses
+  the same seed + multiplier + increment as the rest of the §4.x
+  bench inventory so per-lane wrap paths are reproducibly exercised
+  across runs and cross-pass numbers are visually comparable. The
+  bench clones the palette into a fresh working buffer each
+  iteration so the in-place pass starts from the same input every
+  time and a future SWAR / `std::simd` rewrite cannot win simply by
+  caching deltas across iterations. Round-249 baseline on
+  aarch64-apple-darwin (`--quick`): 10.16 ns / 44.43 ns / 1.273 µs
+  for palette 2 / 16 / 256 — scaling roughly linearly in palette
+  length as expected for a per-entry sequential dependency. Closes
+  the last per-pass §4.x bench inventory gap: `inverse_color_table`
+  was the only remaining `pub fn` in `vp8l_transform` without a
+  per-pass bench (decoder-side §4.1 / §4.2 / §4.3 / §4.4 indexing
+  benches landed in rounds 194 / 207 / 217 / 210; encoder-side
+  §4.1 / §4.3 mirrors landed in rounds 224 / 248). The function
+  body is unchanged this round; the deliverable is the A/B reference
+  with the existing
+  `forward_color_table_round_trips_with_decoder_inverse` roundtrip
+  test as the byte-exact regression guard. See `BENCHMARKS.md
+  § Round-249` for the per-size numbers and the per-iteration
+  dependency-chain reasoning that bounds the per-iteration cost.
 - `benches/apply_subtract_green.rs`: criterion bench for the
   encoder-side `vp8l_encode::apply_subtract_green` — the §4.3 forward
   subtract-green transform that walks an in-place ARGB buffer and

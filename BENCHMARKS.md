@@ -33,6 +33,7 @@ the medians are still stable to a few percent.
 | `benches/inverse_subtract_green.rs` | `inverse_subtract_green_256x256` | §4.3 subtract-green inverse transform on a 256×256 ARGB buffer (deterministic LCG fill) |
 | `benches/predictor_subtract.rs` | `predictor_subtract_256x256` | Encoder-side §4.1 per-channel mod-256 residual builder (mirror of decoder's `add_pred`) over a 256×256 ARGB buffer (deterministic LCG fill) |
 | `benches/apply_subtract_green.rs` | `apply_subtract_green_256x256` | Encoder-side §4.3 forward subtract-green transform (mirror of decoder's `inverse_subtract_green`) over a 256×256 ARGB buffer (deterministic LCG fill) |
+| `benches/inverse_color_table.rs` | `inverse_color_table_paletteN` | §4.4 palette subtraction-decode (cumulative-delta) pass over a `N`-entry palette, parameterised over `N ∈ {2, 16, 256}` to cover the bundling-tier boundaries (smallest, mid-tier, max palette length) |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -521,6 +522,73 @@ experiment for `predictor_subtract` and the `to_rgba_simd` precedent
 under the `simd` feature) can use this bench as the A/B reference,
 with the existing `apply_subtract_green_is_inverse_of_inverse_subtract_green`
 roundtrip test as the byte-exact regression guard.
+
+## Round-249: §4.4 palette subtraction-decode bench
+
+`benches/inverse_color_table.rs` adds a criterion harness for
+`vp8l_transform::inverse_color_table` — the §4.4 palette
+subtraction-decode pass. Per the §4.4 spec text, the color table is
+stored subtraction-coded, and every final color is recovered by
+adding the previous color's ARGB components into the current entry's
+ARGB components mod 256. The implementation walks the palette in
+place and, for `i` in `1..len`, performs four byte-wise wrapping
+adds (one per A / R / G / B lane) against the previous entry.
+
+This was the last `pub fn` in `vp8l_transform` that had no per-pass
+bench. The rest of the §4.x inventory has been covered since round
+217 (`inverse_subtract_green`) / round 207 (`inverse_color`) /
+round 210 (`inverse_color_indexing`) / round 194
+(`inverse_predictor` per-mode) on the decoder side, and rounds
+224 / 248 added the encoder-side mirrors for §4.1 / §4.3.
+`inverse_color_table` closes the decoder-side §4.4 sub-step gap.
+
+The bench parameterises three palette sizes:
+
+* `palette2` — `width_bits = 3` tier, minimum length (one pass
+  iteration). The pass is dominated by call overhead at this size.
+* `palette16` — boundary between the `width_bits = 1` (1..16) and
+  `width_bits = 0` (17..256) bundling tiers.
+* `palette256` — `width_bits = 0` tier, the §4.4 maximum length.
+
+The §4.4 subtraction-decode itself walks every palette entry the
+same way regardless of which bundling tier the indexing pass will
+later use — the per-tier widths above are sampled here only as a
+representative cross-section of palette lengths.
+
+The palette is filled with a deterministic LCG (same constants as
+the rest of the §4.x bench inventory) so per-lane wrap paths are
+exercised across runs. The bench clones the palette into a fresh
+working buffer each iteration so the in-place pass starts from the
+same input every time and a future SWAR / `std::simd` rewrite
+cannot win simply by caching deltas across iterations.
+
+`inverse_color_table` was already `pub fn` (since round-170's
+decoder hot-path coverage). No visibility change was required this
+round.
+
+### Round-249 measurement
+
+| Bench | Median |
+|---|---|
+| `inverse_color_table_palette2`   | **10.16 ns** |
+| `inverse_color_table_palette16`  | **44.43 ns** |
+| `inverse_color_table_palette256` | **1.273 µs** |
+
+The numbers scale roughly linearly in palette length, as expected
+for a per-entry sequential dependency: each iteration adds the
+previous entry's four lanes into the current entry's four lanes,
+so the body is bounded by the latency of those wrapping-add
+dependency chains. A future byte-wise SIMD rewrite that processed
+four lanes in parallel within a single 32-bit word (or even a
+cross-iteration look-ahead with a per-iteration carry) would have
+this bench available as an A/B reference.
+
+The function body is left unchanged; this round's deliverable is
+the A/B reference, not an optimization. The existing test coverage
+in `vp8l_transform::tests` (`inverse_color_table` round-trips with
+`vp8l_encode::forward_color_table` per
+`forward_color_table_round_trips_with_decoder_inverse`) is the
+byte-exact regression guard any future rewrite must hold.
 
 ## Reproducing
 
