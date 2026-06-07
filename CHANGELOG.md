@@ -6,6 +6,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/read_lz77_value.rs`: criterion bench for the decoder-side
+  §3.6.2.2 `vp8l_decode::read_lz77_value` LZ77 prefix-code-to-value
+  expansion — the per-symbol second half of the §3.6.2.2 length /
+  distance decode path that turns a §3.6.2.2 prefix code `[0..40)`
+  into the decoded length-or-distance value by either folding the
+  prefix code (fast path: `prefix_code < 4`) or by reading
+  `extra_bits = (prefix_code - 2) >> 1` bits and folding them with
+  the §3.6.2.2 offset formula `offset = (2 + (prefix_code & 1)) <<
+  extra_bits`. Invoked twice per LZ77 match inside
+  `decode_one_symbol` (length prefix + distance prefix), so per-call
+  cost scales linearly with the per-image backward-reference run
+  count. Parameterised across the four §3.6.2.2 Table 4 regimes:
+  *fast path* (`prefix_code = 2`, value range `1..=4`, reader
+  untouched), *short extra* (`prefix_code = 10`, `extra_bits = 4`,
+  value range `34..=49`), *long extra* (`prefix_code = 30`,
+  `extra_bits = 14`, value range `32769..=49152`, distance-only) and
+  *max extra* (`prefix_code = 39`, `extra_bits = 18`, value range
+  `786433..=1048576`, the §3.6.2.2 hard upper bound, distance-only).
+  Four bench cells total. The bit slice is a 32 KiB LCG-filled
+  buffer built once outside `b.iter`; the `BitReader<'_>` is
+  reconstructed per iteration to keep the per-call cursor stable
+  across the inner sample window. The reader-construction cost is
+  the same across every cell, so cross-cell deltas come exclusively
+  from the §3.6.2.2 body work. The LCG constants match the rest of
+  the §3.x / §4.x per-pass bench inventory so cross-pass numbers are
+  reproducible and visually comparable. The function body is
+  unchanged this round; the deliverable is the A/B reference for a
+  future branchless rewrite or §3.6.2.2-table-driven
+  offset/extra-bits lookup. Closes the per-LZ77-call entry in the §3
+  decode per-pass inventory alongside the round-250 / round-251 §3.7
+  encoder builder benches.
 - `benches/canonical_codes.rs`: criterion bench for the encoder-side
   §3.7.2 `vp8l_encode::canonical_codes` canonical-code-value
   assignment pass — the second per-symbol pass in the §3.7.2
