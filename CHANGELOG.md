@@ -6,6 +6,32 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/build_code_lengths.rs`: criterion bench for the encoder-side
+  §3.7.2 `vp8l_encode::build_code_lengths` Huffman code-length builder
+  — the per-symbol length-assignment pass invoked once per §3.7.1
+  prefix-code-group channel (GREEN+length, RED, BLUE, ALPHA, DISTANCE)
+  plus the §3.7.2.1.2 normal-form code-length-of-code-lengths sub-pass.
+  Parameterised across (a) every realistic §3.7.1 alphabet size —
+  DISTANCE = 40, RED / BLUE / ALPHA = 256 (8-bit channel literals),
+  GREEN = 281 (smallest §3.6.2.3 color cache, `cache_bits = 0`) and
+  GREEN = 2328 (largest §3.6.2.3 color cache, `cache_bits = 11`) — and
+  (b) two frequency-table regimes that the builder hits in practice:
+  *dense* (every symbol live, LCG-fill 1..=255) modelling a natural-
+  image meta-prefix code-group's literal channels, and *sparse*
+  (`sqrt(N)` live symbols, 1/(k+1) Zipf shape scattered across the
+  alphabet via a second LCG stream) modelling a DISTANCE table where
+  few prefix codes fire or a GREEN table whose §3.6.2.3 color cache
+  code range is barely populated. Eight bench cells total. The LCG
+  constants match the rest of the §4.x bench inventory so cross-pass
+  numbers are reproducible and comparable. The function body is
+  unchanged this round; the deliverable is the A/B reference for a
+  future heap-replacement rewrite — the round-170 encoder profile
+  attributed rank 4 of self-time to the surrounding closure body
+  through `canonical_codes`, and the §3.7.2 builder's heap-pop /
+  heap-push loop running `n - 1` times per call is the natural target
+  for a radix-bucket replacement. Closes the §3 entropy per-pass
+  inventory gap the §4.x transform inventory had carried through
+  round 249.
 - `benches/inverse_color_table.rs`: criterion bench for the §4.4
   `inverse_color_table` palette subtraction-decode pass (the
   cumulative-delta loop that recovers final ARGB palette entries by

@@ -97,3 +97,7 @@ harness = false
 [[bench]]
 name = "inverse_color_table"
 harness = false
+
+[[bench]]
+name = "build_code_lengths"
+harness = false

@@ -34,6 +34,7 @@ the medians are still stable to a few percent.
 | `benches/predictor_subtract.rs` | `predictor_subtract_256x256` | Encoder-side §4.1 per-channel mod-256 residual builder (mirror of decoder's `add_pred`) over a 256×256 ARGB buffer (deterministic LCG fill) |
 | `benches/apply_subtract_green.rs` | `apply_subtract_green_256x256` | Encoder-side §4.3 forward subtract-green transform (mirror of decoder's `inverse_subtract_green`) over a 256×256 ARGB buffer (deterministic LCG fill) |
 | `benches/inverse_color_table.rs` | `inverse_color_table_paletteN` | §4.4 palette subtraction-decode (cumulative-delta) pass over a `N`-entry palette, parameterised over `N ∈ {2, 16, 256}` to cover the bundling-tier boundaries (smallest, mid-tier, max palette length) |
+| `benches/build_code_lengths.rs` | `build_code_lengths_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 Huffman code-length builder over a single §3.7.1 prefix-code-group alphabet, parameterised over (a) alphabet size — DISTANCE = 40, RED/BLUE/ALPHA = 256, GREEN at smallest color-cache (281) and largest color-cache (2328) — and (b) frequency-table regime: *dense* (every symbol live, LCG-fill 1..=255) or *sparse* (`sqrt(N)` live symbols, 1/(k+1) Zipf shape). Eight cells total |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -589,6 +590,92 @@ in `vp8l_transform::tests` (`inverse_color_table` round-trips with
 `vp8l_encode::forward_color_table` per
 `forward_color_table_round_trips_with_decoder_inverse`) is the
 byte-exact regression guard any future rewrite must hold.
+
+## Round-250: §3.7.2 Huffman code-length builder bench
+
+`benches/build_code_lengths.rs` adds a criterion harness for
+`vp8l_encode::build_code_lengths` — the per-symbol Huffman
+length-assignment pass invoked once per §3.7.1 prefix-code-group
+channel (GREEN + length, RED, BLUE, ALPHA, DISTANCE) plus the
+§3.7.2.1.2 normal-form *code-length-of-code-lengths* sub-pass. The
+implementation is a textbook min-heap Huffman build followed by an
+optional `MAX_CODE_LENGTH`-cap rebalancing pass; on every call it
+allocates the parent / node-frequency vectors fresh and walks the
+heap-pop / heap-push loop `used.len() - 1` times.
+
+This is the first per-pass bench from the §3 entropy domain. The
+§4.x transform inventory has been complete since round 249; the
+§3.7.2 builder was the natural next pick because the round-170
+encoder profile attributed rank 4 of self-time to the surrounding
+closure body through `canonical_codes`, and `build_code_lengths`
+runs ahead of `canonical_codes` on the same length tables.
+
+The bench parameterises two axes:
+
+* **Alphabet size**: the four §3.7.1 alphabets that occur:
+  * `distance40`  — DISTANCE alphabet (§3.6.2.2).
+  * `literal256`  — 8-bit channel literal alphabet (RED / BLUE / ALPHA).
+  * `green281`    — GREEN with the smallest §3.6.2.3 color cache
+    (`cache_bits = 0` ⇒ `cache_size = 1` ⇒ `256 + 24 + 1`).
+  * `green2328`   — GREEN with the largest §3.6.2.3 color cache
+    (`cache_bits = 11` ⇒ `cache_size = 2048` ⇒ `256 + 24 + 2048`).
+* **Frequency regime**: the two distribution shapes the builder
+  hits in practice:
+  * `dense`  — every symbol live, LCG-fill `1..=255`. Models a
+    natural-image meta prefix code group's literal channels.
+  * `sparse` — `sqrt(N)` live symbols, frequencies shaped `1/(k+1)`
+    Zipf-style and scattered across the alphabet via a second LCG
+    stream. Models a DISTANCE table where few prefix codes fire or
+    a GREEN table whose §3.6.2.3 color cache code range is barely
+    populated.
+
+The LCG constants match the rest of the §4.x bench inventory so
+cross-pass numbers are reproducible and cross-bench comparable.
+Each `b.iter` call hands the same `&[u32]` frequency slice to
+`build_code_lengths`; the function's own per-call allocations
+(parent / node-frequency vectors, the heap, the returned
+`Vec<u8>`) are inside the measured interval. No fixture lookup or
+shared mutable state crosses iterations.
+
+### Round-250 measurement
+
+| Bench | Median |
+|---|---|
+| `build_code_lengths_dense_distance40`   | **2.15 µs** |
+| `build_code_lengths_sparse_distance40`  | **272.6 ns** |
+| `build_code_lengths_dense_literal256`   | **15.33 µs** |
+| `build_code_lengths_sparse_literal256`  | **833.0 ns** |
+| `build_code_lengths_dense_green281`     | **17.50 µs** |
+| `build_code_lengths_sparse_green281`    | **867.1 ns** |
+| `build_code_lengths_dense_green2328`    | **417.8 µs** |
+| `build_code_lengths_sparse_green2328`   | **4.96 µs** |
+
+Observations:
+
+* The dense-regime cost scales roughly `N · log N` from
+  `distance40` to `literal256` to `green2328`, consistent with the
+  textbook `O(N log N)` heap-build + heap-pop loop. The sparse-
+  regime cost scales with the active-symbol count
+  (`sqrt(N) · log sqrt(N)`), which is why `sparse_green2328` at
+  ~`sqrt(2328) ≈ 48` live symbols stays well under
+  `dense_literal256`'s ~256 live symbols.
+* The dense / sparse ratio inside each alphabet (e.g. 18× for
+  `literal256`, 20× for `green281`, 84× for `green2328`) shows the
+  active-symbol count, not the nominal alphabet size, dominates
+  the per-call cost. A future radix-bucket replacement for the
+  heap would target the dense path (large active-symbol count) most
+  effectively.
+* `dense_green2328` at 417 µs is by far the heaviest bench in the
+  per-pass inventory and the single most attractive future
+  optimization target — a 5× speedup there would visibly move
+  `lossless_encode_natural_128` end-to-end.
+
+The function body is left unchanged this round; the deliverable is
+the A/B reference. The existing `vp8l_encode::tests` coverage —
+`code_lengths_kraft_sum_is_one`,
+`code_lengths_single_symbol_is_length_one`,
+`code_lengths_two_symbols_length_one_each` — is the byte-exact
+regression guard any future rewrite must hold.
 
 ## Reproducing
 
