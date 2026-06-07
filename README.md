@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships fifteen criterion benches under `benches/`: the
+The crate ships sixteen criterion benches under `benches/`: the
 original four end-to-end / hot-loop targets (`lossless_decode`,
 `lossless_encode`, `lz77_match`, `argb_to_rgba`); the four §4.x
 decoder-side inverse-transform per-pass benches added across rounds
@@ -52,10 +52,15 @@ benches added in rounds 250 / 251 (`build_code_lengths`,
 sparse frequency regimes; the round-252 decoder-side §3.6.2.2 LZ77
 prefix-code-to-value per-call bench (`read_lz77_value`) covering
 the fast-path / short-extra / long-extra / max-extra regimes from
-§3.6.2.2 Table 4; and the round-253 decoder-side §3.6.2.3 color-
+§3.6.2.2 Table 4; the round-253 decoder-side §3.6.2.3 color-
 cache hash slot-index per-call bench (`color_cache_hash`) covering
 the §3.6.2.3 `code_bits` allowed range `[1..11]` at four
-representative points (1 / 4 / 8 / 11). Numbers, profile findings, and the
+representative points (1 / 4 / 8 / 11); and the round-254 encoder-
+side §5.2.2 LZ77 value-to-prefix-split per-call bench
+(`value_to_prefix`, mirror of the round-252 decoder-side cell
+layout) covering the same fast-path / short-extra / long-extra /
+max-extra regimes at value-side samples (3 / 40 / 40_000 / 900_000).
+Numbers, profile findings, and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
 with:
 

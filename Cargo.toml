@@ -113,3 +113,7 @@ harness = false
 [[bench]]
 name = "color_cache_hash"
 harness = false
+
+[[bench]]
+name = "value_to_prefix"
+harness = false

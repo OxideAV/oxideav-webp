@@ -6,6 +6,54 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/value_to_prefix.rs`: criterion bench for the encoder-side
+  §5.2.2 `vp8l_encode::value_to_prefix` LZ77 length-or-distance value-
+  to-prefix split — the exact inverse of the decoder-side §3.6.2.2
+  `read_lz77_value` benched at round 252. Given a 1-based length-or-
+  distance `value` (≥ 1), the function returns the `(prefix_code,
+  extra_bits, extra_value)` triple needed to emit the symbol; the
+  §5.2.2 emit sequence then writes the prefix code through the GREEN
+  (length) or DISTANCE (distance) Huffman code and the `extra_value`
+  as `extra_bits` raw LSB-first bits. Invoked twice per emitted LZ77
+  match inside `encode_argb_literals` (length prefix + distance
+  prefix) plus once more during cost estimation in the `try_lz77_at`
+  cost-model path when the encoder is choosing between candidate
+  match lengths, so per-call cost scales linearly with the per-image
+  match count (multiples-of-three the match count for a match-heavy
+  encode, not just twice it). Parameterised across the four §5.2.2
+  regimes that mirror the round-252 decoder-side cell layout exactly
+  so the two benches' numbers are directly comparable cell-for-cell:
+  *fast path* (`value = 3`, `value ∈ [1, 4]`, returns `(value - 1,
+  0, 0)` without touching the `leading_zeros` / shift chain, mirrors
+  the decode-side `prefix_code = 2` cell which decodes to value 3),
+  *short extra* (`value = 40`, `extra_bits = 4`, `prefix_code = 10`,
+  mirrors the decode-side `prefix_code = 10` cell which decodes to
+  values `34..=49`), *long extra* (`value = 40_000`, `extra_bits =
+  14`, `prefix_code = 30`, mirrors the decode-side `prefix_code = 30`
+  cell which decodes to values `32769..=49152`, distance-only) and
+  *max extra* (`value = 900_000`, `extra_bits = 18`, `prefix_code =
+  39`, mirrors the decode-side `prefix_code = 39` cell which decodes
+  to values `786433..=1048576`, the §5.2.2 hard upper bound on
+  encodable values, distance-only). Four bench cells total. The bench
+  amortises Criterion's per-iteration overhead by running an inner
+  loop of 1024 calls per `b.iter` body over the cell's representative
+  `value`, XOR-accumulating every returned `(prefix, extra_bits,
+  extra_value)` triple so the optimiser cannot drop any individual
+  call. `black_box` on both the input value and the accumulator
+  guards against constant-folding and dead-store elimination. The
+  per-iteration value count and the inner loop body are identical
+  across every cell, so cross-cell deltas come exclusively from the
+  §5.2.2 body cost at the cell's `value`. The function body is
+  unchanged this round; the deliverable is the A/B reference for a
+  future branchless rewrite or §5.2.2-table-driven `(prefix,
+  extra_bits, offset)` lookup for the small-value range. Quick-mode
+  measurements separate cleanly: the fast-path cell at ~0.32 ns per
+  call, every extra-bits regime flat at ~0.63 ns per call across the
+  three §5.2.2 magnitude bands — confirming the spec's expected
+  shape (fast path elides `leading_zeros` + shift + multiply; the
+  three extra-bits regimes share an identical body cost). Closes the
+  encoder-side §5.2.2 prefix-split entry in the §5 encode per-pass
+  inventory alongside the round-252 decoder-side mirror.
 - `benches/color_cache_hash.rs`: criterion bench for the decoder-side
   §3.6.2.3 `vp8l_decode::ColorCache::hash` color-cache multiplicative-
   hash slot-index function — the per-pixel index function that turns
