@@ -35,6 +35,7 @@ the medians are still stable to a few percent.
 | `benches/apply_subtract_green.rs` | `apply_subtract_green_256x256` | Encoder-side §4.3 forward subtract-green transform (mirror of decoder's `inverse_subtract_green`) over a 256×256 ARGB buffer (deterministic LCG fill) |
 | `benches/inverse_color_table.rs` | `inverse_color_table_paletteN` | §4.4 palette subtraction-decode (cumulative-delta) pass over a `N`-entry palette, parameterised over `N ∈ {2, 16, 256}` to cover the bundling-tier boundaries (smallest, mid-tier, max palette length) |
 | `benches/build_code_lengths.rs` | `build_code_lengths_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 Huffman code-length builder over a single §3.7.1 prefix-code-group alphabet, parameterised over (a) alphabet size — DISTANCE = 40, RED/BLUE/ALPHA = 256, GREEN at smallest color-cache (281) and largest color-cache (2328) — and (b) frequency-table regime: *dense* (every symbol live, LCG-fill 1..=255) or *sparse* (`sqrt(N)` live symbols, 1/(k+1) Zipf shape). Eight cells total |
+| `benches/canonical_codes.rs` | `canonical_codes_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 canonical-code-value assignment over the same four §3.7.1 prefix-code-group alphabets and the same two dense / sparse frequency regimes as `build_code_lengths`, sampling only the per-symbol code-value pass (the `build_code_lengths` call that produces the length table is outside the measured interval). Eight cells total |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -676,6 +677,105 @@ the A/B reference. The existing `vp8l_encode::tests` coverage —
 `code_lengths_single_symbol_is_length_one`,
 `code_lengths_two_symbols_length_one_each` — is the byte-exact
 regression guard any future rewrite must hold.
+
+## Round-251: §3.7.2 canonical-code-value bench
+
+`benches/canonical_codes.rs` adds a criterion harness for
+`vp8l_encode::canonical_codes` — the second per-symbol pass in the
+§3.7.2 length-then-code Huffman build. Given the per-symbol code
+lengths produced by `build_code_lengths` (sampled by the round-250
+bench), `canonical_codes` returns the canonical code values that
+the decoder's `vp8l_prefix::PrefixCode` reconstructs from those same
+lengths (symbols ordered by `(length, value)`, codes assigned
+sequentially, read most-significant-bit-first within a code).
+
+`canonical_codes` is the encode-profile rank-4 self-time symbol
+attributed by the round-170 trace (40 / 2 700 samples on the
+`encode_webp_lossless` driver). With `build_code_lengths` covered
+by round 250, this pass closes the per-prefix-code-group encode
+inner loop in the §3 entropy domain: every per-prefix-code-group
+call now has a stand-alone bench on the same four alphabets and
+the same two frequency regimes.
+
+The implementation walks `1..=MAX_CODE_LENGTH` outer and the full
+`lengths` slice inner — an explicit `O(MAX_CODE_LENGTH · N)` pass
+that, unlike the §3.7.2 length builder, ignores the active-symbol
+count (the inner loop runs over every slot regardless of whether the
+length is zero). So the dense / sparse ratio inside each alphabet is
+expected to be much *smaller* than for `build_code_lengths`, and the
+four alphabet sizes are the dominant axis. The bench samples both
+regimes anyway, so a future single-pass bucket-sort-by-length rewrite
+that skips zero-length symbols would show up as a sparse-side
+speedup.
+
+The bench parameterises the same two axes as
+`benches/build_code_lengths.rs`:
+
+* **Alphabet size**: the four §3.7.1 alphabets that occur:
+  * `distance40`  — DISTANCE alphabet (§3.6.2.2).
+  * `literal256`  — 8-bit channel literal alphabet (RED / BLUE / ALPHA).
+  * `green281`    — GREEN with the smallest §3.6.2.3 color cache
+    (`cache_bits = 0` ⇒ `cache_size = 1` ⇒ `256 + 24 + 1`).
+  * `green2328`   — GREEN with the largest §3.6.2.3 color cache
+    (`cache_bits = 11` ⇒ `cache_size = 2048` ⇒ `256 + 24 + 2048`).
+* **Frequency regime**: the same two distribution shapes used in the
+  round-250 length bench. The length tables are produced by feeding
+  those dense / sparse frequency tables through `build_code_lengths`
+  once at bench setup, so each `b.iter` body sees the *exact* length
+  table a real per-prefix-code-group call would. The
+  `build_code_lengths` call itself is outside the measured interval.
+
+The LCG constants match the rest of the per-pass bench inventory so
+the length tables are reproducible across runs and hosts and
+cross-pass comparable to the round-250 numbers. The function's own
+per-call allocations (`bl_count`, `next_code`, the returned
+`Vec<u32>`) are inside the measured interval.
+
+### Round-251 measurement
+
+| Bench | Median |
+|---|---|
+| `canonical_codes_dense_distance40`   | **251 ns** |
+| `canonical_codes_sparse_distance40`  | **204 ns** |
+| `canonical_codes_dense_literal256`   | **1.80 µs** |
+| `canonical_codes_sparse_literal256`  | **1.36 µs** |
+| `canonical_codes_dense_green281`     | **1.83 µs** |
+| `canonical_codes_sparse_green281`    | **1.40 µs** |
+| `canonical_codes_dense_green2328`    | **15.70 µs** |
+| `canonical_codes_sparse_green2328`   | **9.98 µs** |
+
+Observations:
+
+* Cost scales linearly with the alphabet size on both regimes
+  (40 → 256 → 281 → 2328 ≈ 1× → 7× → 7× → 63× on the dense path),
+  consistent with the explicit `O(MAX_CODE_LENGTH · N)` two-loop
+  shape that runs `15 · N` index checks per call.
+* The dense / sparse ratio inside each alphabet is roughly 1.2× —
+  *much* smaller than `build_code_lengths`'s 18×–84× ratio. As
+  expected: the inner loop runs over every slot whether or not the
+  length is zero, so the active-symbol count enters only via a
+  small constant-factor branch-prediction effect.
+* Compared to round 250's `build_code_lengths` numbers,
+  `canonical_codes` is ~9× cheaper on the dense path
+  (`green2328`: 417.8 µs vs 15.70 µs) and ~2× cheaper on the sparse
+  path (`green2328`: 4.96 µs vs 9.98 µs). The crossover happens
+  because the sparse path is cheap for the length builder (small
+  heap) but unchanged for `canonical_codes` (the outer loop still
+  runs 15 times over the whole alphabet).
+* A bucket-sort-by-length rewrite would target the sparse path
+  most effectively (currently dominated by the redundant
+  zero-length scans) and would, in aggregate, more than pay for
+  itself across the per-prefix-code-group call mix where most
+  channels see a mostly-active alphabet but DISTANCE and the
+  color-cache range of GREEN both run sparse.
+
+The function body is left unchanged this round; the deliverable is
+the A/B reference. The existing `vp8l_encode::tests` round-trip
+coverage — `chooser_round_trips_through_decoder_on_both_branches`,
+`round_trip_solid_color_uses_single_leaf_codes`,
+`round_trip_larger_random_like`, and the `round_trip_*` family that
+re-decodes every encoder bit against `decode_webp` — is the
+byte-exact regression guard any future rewrite must hold.
 
 ## Reproducing
 

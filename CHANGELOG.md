@@ -6,6 +6,31 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/canonical_codes.rs`: criterion bench for the encoder-side
+  §3.7.2 `vp8l_encode::canonical_codes` canonical-code-value
+  assignment pass — the second per-symbol pass in the §3.7.2
+  length-then-code Huffman build, returning the canonical code values
+  the decoder's `vp8l_prefix::PrefixCode` reconstructs from the same
+  length table. Parameterised over the same two axes as the round-250
+  `build_code_lengths` bench: (a) the four §3.7.1 prefix-code-group
+  alphabets — DISTANCE = 40, RED / BLUE / ALPHA = 256, GREEN = 281
+  (smallest §3.6.2.3 color cache) and GREEN = 2328 (largest §3.6.2.3
+  color cache) — and (b) two frequency-table regimes (*dense* every
+  symbol live, *sparse* `sqrt(N)` live symbols / Zipf shape), with
+  the length tables produced by feeding those frequencies through
+  `build_code_lengths` once at bench setup so each `b.iter` body
+  sees the exact length table a real per-prefix-code-group call
+  would. Eight bench cells total. The LCG constants match the
+  round-250 length-builder bench so cross-pass numbers are
+  reproducible and visually comparable. The function body is
+  unchanged this round; the deliverable is the A/B reference for a
+  future bucket-sort-by-length rewrite — `canonical_codes` is the
+  rank-4 encode self-time symbol per the round-170 profile, and the
+  current `O(MAX_CODE_LENGTH · N)` two-loop walk runs the inner
+  pass over every slot whether or not the length is zero, so the
+  sparse path is the natural target. Closes the per-prefix-code-group
+  encode inner loop in the §3 entropy domain alongside the
+  `build_code_lengths` bench landed in round 250.
 - `benches/build_code_lengths.rs`: criterion bench for the encoder-side
   §3.7.2 `vp8l_encode::build_code_lengths` Huffman code-length builder
   — the per-symbol length-assignment pass invoked once per §3.7.1

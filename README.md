@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twelve criterion benches under `benches/`: the
+The crate ships thirteen criterion benches under `benches/`: the
 original four end-to-end / hot-loop targets (`lossless_decode`,
 `lossless_encode`, `lz77_match`, `argb_to_rgba`); the four §4.x
 decoder-side inverse-transform per-pass benches added across rounds
@@ -45,12 +45,13 @@ decoder-side inverse-transform per-pass benches added across rounds
 §4.4 palette subtraction-decode bench (`inverse_color_table`); the
 two encoder-side §4.1 / §4.3 forward-transform per-pass benches
 added in rounds 224 / 248 (`predictor_subtract`,
-`apply_subtract_green`); and the round-250 encoder-side §3.7.2
-Huffman code-length builder bench (`build_code_lengths`) covering
-each §3.7.1 prefix-code-group alphabet (distance-40, literal-256,
-green-281, green-2328) in both dense and sparse frequency regimes.
-Numbers, profile findings, and the optimization log live in
-[`BENCHMARKS.md`](./BENCHMARKS.md). Run with:
+`apply_subtract_green`); and the two encoder-side §3.7.2 per-pass
+benches added in rounds 250 / 251 (`build_code_lengths`,
+`canonical_codes`) covering each §3.7.1 prefix-code-group alphabet
+(distance-40, literal-256, green-281, green-2328) in both dense and
+sparse frequency regimes. Numbers, profile findings, and the
+optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
+with:
 
 ```text
 CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \

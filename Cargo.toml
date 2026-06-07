@@ -101,3 +101,7 @@ harness = false
 [[bench]]
 name = "build_code_lengths"
 harness = false
+
+[[bench]]
+name = "canonical_codes"
+harness = false
