@@ -6,6 +6,33 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/apply_subtract_green.rs`: criterion bench for the
+  encoder-side `vp8l_encode::apply_subtract_green` — the §4.3 forward
+  subtract-green transform that walks an in-place ARGB buffer and
+  replaces every red / blue lane with the mod-256 difference against
+  that pixel's green lane (alpha and green pass through untouched).
+  Mirrors the decoder-side `inverse_subtract_green` bench landed in
+  round 217 and uses the same 256×256 deterministic LCG-filled ARGB
+  buffer (identical seed + multiplier + increment to the §4.x decoder-
+  side benches and the round-224 encoder-side `predictor_subtract`
+  bench) so cross-pass numbers across the four §4.x decoder-side
+  inverse-transform benches and the two encoder-side §4.1 / §4.3
+  forward-transform benches are directly comparable. The bench clones
+  the input buffer into a fresh working buffer each iteration so the
+  in-place pass starts from the same input every time and a future
+  SWAR / `std::simd` rewrite cannot win simply by caching residuals
+  across iterations. Round-248 baseline: ~13.3–13.7 µs (three
+  consecutive `--quick` runs on aarch64-apple-darwin: 13.72 µs /
+  13.60 µs / 13.28 µs). The function body is left unchanged this
+  round; the deliverable is the A/B reference, with the existing
+  `apply_subtract_green_is_inverse_of_inverse_subtract_green`
+  roundtrip test as the byte-exact regression guard. Closes the
+  encoder-side §4.3 inventory gap: the decoder-side mirror has had a
+  per-pass bench since round 217, but the encoder-side forward pass
+  was unmeasured at the per-pass level until now. See
+  `BENCHMARKS.md § Round-248` for the calibration note against the
+  decoder-side §4.3 bench and the reasoning that the two passes share
+  the same byte-traffic and arithmetic complexity.
 - `fuzz/fuzz_targets/roundtrip_animated.rs`: fourth `cargo-fuzz`
   harness, a structured round-trip oracle on the §2.7.1.1 animation
   carrier. The fuzzer drives the canvas dimensions (≤ 32 × 32), the

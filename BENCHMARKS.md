@@ -32,6 +32,7 @@ the medians are still stable to a few percent.
 | `benches/inverse_color_indexing.rs` | `inverse_color_indexing_256x256_paletteN` | §4.4 inverse color-indexing transform on a 256×256 output buffer, parameterised over palette size (N ∈ {2, 4, 16, 256}) which selects all four `width_bits` bundling levels |
 | `benches/inverse_subtract_green.rs` | `inverse_subtract_green_256x256` | §4.3 subtract-green inverse transform on a 256×256 ARGB buffer (deterministic LCG fill) |
 | `benches/predictor_subtract.rs` | `predictor_subtract_256x256` | Encoder-side §4.1 per-channel mod-256 residual builder (mirror of decoder's `add_pred`) over a 256×256 ARGB buffer (deterministic LCG fill) |
+| `benches/apply_subtract_green.rs` | `apply_subtract_green_256x256` | Encoder-side §4.3 forward subtract-green transform (mirror of decoder's `inverse_subtract_green`) over a 256×256 ARGB buffer (deterministic LCG fill) |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -475,6 +476,51 @@ attempt, mirroring the `to_rgba_simd` precedent under the `simd`
 feature where the 16-byte vector load amortises the lane-bias cost
 across four pixels per iteration) can re-use this test and this bench
 as the A/B reference.
+
+## Round-248 (2026-06-07) — `apply_subtract_green` bench
+
+Closes the encoder-side §4.3 inventory gap. The decoder-side mirror
+(`vp8l_transform::inverse_subtract_green`) has had its own
+per-pass criterion bench since round 217; the encoder-side forward
+pass `vp8l_encode::apply_subtract_green` was unmeasured at the
+per-pass level until this round.
+
+### New bench: `apply_subtract_green`
+
+`benches/apply_subtract_green.rs` builds a 256×256 deterministic
+LCG-filled ARGB buffer (identical seed + multiplier + increment to
+the §4.x decoder-side benches and the round-224 encoder-side
+`predictor_subtract` bench) and runs `apply_subtract_green` once per
+iteration over a fresh clone of that buffer. The clone is intentional:
+`apply_subtract_green` mutates in place, so the bench must start from
+the same input each iteration so a future SWAR / `std::simd` rewrite
+cannot win by caching residuals across iterations.
+
+`apply_subtract_green` was already `pub fn` (since round-170's encode
+hot-path coverage). No visibility change was required this round.
+
+### Round-248 measurement
+
+| Bench | Median |
+|---|---|
+| `apply_subtract_green_256x256` | **~13.3–13.7 µs** (three consecutive `--quick` runs: 13.72 µs / 13.60 µs / 13.28 µs) |
+
+Calibration against the matching §4.3 decoder pass: the round-217
+`inverse_subtract_green_256x256` bench measures the same shape of work
+(read one ARGB lane, write one ARGB lane, two per-pixel mod-256 adds
+on R and B, A and G untouched) over the same 256×256 deterministic
+LCG-filled buffer. The two passes share the same byte-traffic and
+arithmetic complexity, so reading similar numbers is the expected
+shape — the encoder-side forward pass and the decoder-side inverse
+pass are symmetric.
+
+The function body is left unchanged; this round's deliverable is the
+A/B reference, not an optimization. Any future SWAR / `std::simd`
+rewrite of the forward §4.3 pass (mirroring the round-224 SWAR
+experiment for `predictor_subtract` and the `to_rgba_simd` precedent
+under the `simd` feature) can use this bench as the A/B reference,
+with the existing `apply_subtract_green_is_inverse_of_inverse_subtract_green`
+roundtrip test as the byte-exact regression guard.
 
 ## Reproducing
 

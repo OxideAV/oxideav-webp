@@ -36,10 +36,16 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships four criterion benches under `benches/` (decode +
-encode + LZ77 matcher + `argb→rgba` repack). Numbers, profile
-findings, and the optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md).
-Run with:
+The crate ships ten criterion benches under `benches/`: the original
+four end-to-end / hot-loop targets (`lossless_decode`,
+`lossless_encode`, `lz77_match`, `argb_to_rgba`); the four §4.x
+decoder-side inverse-transform per-pass benches added across rounds
+194 / 207 / 210 / 217 (`inverse_predictor`, `inverse_color`,
+`inverse_color_indexing`, `inverse_subtract_green`); and the two
+encoder-side §4.1 / §4.3 forward-transform per-pass benches added in
+rounds 224 / 248 (`predictor_subtract`, `apply_subtract_green`).
+Numbers, profile findings, and the optimization log live in
+[`BENCHMARKS.md`](./BENCHMARKS.md). Run with:
 
 ```text
 CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
