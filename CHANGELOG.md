@@ -6,6 +6,59 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/parse_anim.rs`: cargo-fuzz harness on the
+  §2.7.1.1 ANIM chunk parser standalone entry point
+  `oxideav_webp::anim::AnimHeader::parse`. The §2 RIFF walk in
+  `decode_webp` only reaches `AnimHeader::parse` with payload slices
+  the container layer has already validated as `ANIM` chunk bodies,
+  so the cross-product reachable through the existing `decode.rs` /
+  `extract_metadata.rs` / `roundtrip_animated.rs` harnesses exercises
+  this parser only along the "well-formed RIFF" code path. The new
+  harness drives the public standalone surface directly — exported
+  through `pub mod anim` and the convenience wrapper
+  `oxideav_webp::parse_anim_header`, the function is the documented
+  entry point for downstream callers that obtained an `ANIM` payload
+  candidate from a different demuxer or an attacker-controlled buffer
+  of arbitrary length. The arbitrary fuzz buffer is forwarded verbatim
+  as the §2.7.1.1 ANIM payload candidate; inputs shorter or longer
+  than 6 bytes hit the `BadPayloadLength` refusal path while 6-byte
+  inputs cover the full §2.7.1.1 Figure 8 BGRA × loop-count
+  cross-product (4 × 8-bit background channels + 1 × 16-bit loop
+  count = 2^48 distinct payloads, all bit-patterns legal). Every
+  branch of the §2.7.1.1 contract is cross-checked on the way out:
+  `Ok(hdr)` implies `data.len() == 6`, every BGRA channel equals the
+  matching `payload[0..4]` byte verbatim (Blue at byte 0, Green at
+  byte 1, Red at byte 2, Alpha at byte 3 per the §2.7.1.1 carrier),
+  `background_color.as_u32_le()` equals the little-endian `u32`
+  reload of bytes 0..4 (pinning the §2.7.1.1 "uint32 stored in BGRA
+  byte order" carrier), `loop_count` equals
+  `u16::from_le_bytes([data[4], data[5]])` (the §2.3 multi-byte
+  little-endian convention), and `loops_forever()` matches
+  `loop_count == 0` exactly (the §2.7.1.1 "0 = infinite playback"
+  semantic). The single error branch is cross-checked too:
+  `Err(BadPayloadLength { got })` implies `got == data.len()` and
+  `got != 6`. The contract under test: every call must return a
+  `Result` — no panic, no debug-build integer overflow on the
+  `as_u32_le` BGRA pack, no out-of-bounds index when the payload is
+  shorter or longer than the 6-byte fixed-length header. The parser
+  is a fixed-cost branch chain (one length test) plus four `u8` reads
+  plus one 2-byte little-endian `u16` reload (no allocation, no loop
+  sized by the input, no recursion), so a single fuzz iteration is
+  microseconds regardless of input length and the harness can attempt
+  arbitrary payload sizes without iteration-cost concerns. Joins
+  `decode.rs` / `extract_metadata.rs` (always-returns-Result oracles
+  on the public single-shot entry points), `roundtrip_lossless.rs`
+  (still-image §3 VP8L encode + decode round-trip),
+  `roundtrip_animated.rs` (§2.7.1.1 ANIM / ANMF carrier + per-frame
+  pixel + per-frame duration round-trip), `decode_alph.rs`
+  (§2.7.1.2 ALPH standalone entry point), `parse_vp8x.rs` (§2.7.1
+  VP8X chunk parser standalone entry point), and `parse_anmf.rs`
+  (§2.7.1.1 ANMF chunk header parser standalone entry point):
+  8 cargo-fuzz harnesses total, with `parse_anim` widening surface
+  coverage onto the §2.7.1.1 ANIM chunk parser the previous seven
+  harnesses only reached transitively through a complete §2 RIFF walk
+  plus an ANIM chunk wrapper.
+
 - `fuzz/fuzz_targets/parse_anmf.rs`: cargo-fuzz harness on the
   §2.7.1.1 ANMF chunk header parser standalone entry point
   `oxideav_webp::anmf::AnmfHeader::parse`. The §2 RIFF walk in

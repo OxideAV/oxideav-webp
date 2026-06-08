@@ -61,12 +61,24 @@ cargo-fuzz = true
 # extraction at bits 7..2 / 1 / 0, and the fixed `frame_data_offset
 # == 16`), and the `PayloadTooShort` branch cross-checked against the
 # §2.7.1.1 16-byte minimum (got equals the slice length and is < 16).
-# Round-trip exactness is the §3 lossless contract; preservation of
-# the §2.7.1.1 carrier fields is the ANIM / ANMF chunk contract; the
-# §2.7.1.2 ALPH plane length is the ALPH chunk contract; the §2.7.1
-# VP8X field-by-field redecode is the §2.7.1 Figure 7 byte-layout
-# contract; the §2.7.1.1 ANMF field-by-field redecode is the §2.7.1.1
-# Figure 9 byte-layout contract.
+# The eighth harness drives the §2.7.1.1 ANIM chunk parser standalone
+# entry point `anim::AnimHeader::parse` directly: an arbitrary fuzz
+# buffer is forwarded verbatim as the §2.7.1.1 ANIM payload candidate,
+# with every successfully-decoded field cross-checked against the bytes
+# the parser observed (BGRA byte-order of `Background Color` at bytes
+# 0..4 with the `as_u32_le` helper matching the little-endian `u32`
+# reload, `Loop Count` as the little-endian `u16` at bytes 4..6, and
+# the `loops_forever()` predicate matching `loop_count == 0`), and the
+# `BadPayloadLength` branch cross-checked against the §2.7.1.1
+# Figure 8 fixed 6-byte length (got equals the slice length and is
+# not 6). Round-trip exactness is the §3 lossless contract;
+# preservation of the §2.7.1.1 carrier fields is the ANIM / ANMF chunk
+# contract; the §2.7.1.2 ALPH plane length is the ALPH chunk contract;
+# the §2.7.1 VP8X field-by-field redecode is the §2.7.1 Figure 7
+# byte-layout contract; the §2.7.1.1 ANMF field-by-field redecode is
+# the §2.7.1.1 Figure 9 byte-layout contract; the §2.7.1.1 ANIM
+# field-by-field redecode is the §2.7.1.1 Figure 8 byte-layout
+# contract.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -128,6 +140,13 @@ bench = false
 [[bin]]
 name = "parse_anmf"
 path = "fuzz_targets/parse_anmf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_anim"
+path = "fuzz_targets/parse_anim.rs"
 test = false
 doc = false
 bench = false
