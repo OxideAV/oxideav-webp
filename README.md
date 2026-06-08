@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Four [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Six [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -83,14 +83,26 @@ contract across the §2.7.1.1 animation carrier — a fuzz-controlled
 1..8-frame animation (canvas ≤ 32 × 32) goes through
 `build_animated_webp` → `decode_webp` and the frame count + per-frame
 width/height + per-frame `duration_ms` + per-frame RGBA bytes are
-asserted byte-identical. Run any one with (nightly + `cargo-fuzz`
-installed):
+asserted byte-identical; `decode_alph` (round 255) drives the
+§2.7.1.2 ALPH standalone entry point `alph::decode_alpha` directly
+across the four filter methods (none / horizontal / vertical /
+gradient) and the two compression methods (raw + headerless §3 VP8L)
+with `plane.len() == width * height` asserted on success;
+`parse_vp8x` (round 256) drives the §2.7.1 VP8X chunk parser
+standalone entry point `vp8x::Vp8xHeader::parse` directly across the
+full §2.7.1 Figure 7 flag-octet / reserved-field / canvas-dimension
+cross-product with every successfully-decoded field cross-checked
+against the input bytes the parser observed and every error branch
+cross-checked against the §2.7.1 refusal triggers. Run any one with
+(nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run extract_metadata     --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run roundtrip_lossless   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run roundtrip_animated   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_alph          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_vp8x           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

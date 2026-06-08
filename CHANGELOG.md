@@ -6,6 +6,58 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/parse_vp8x.rs`: cargo-fuzz harness on the §2.7.1
+  VP8X chunk parser standalone entry point
+  `oxideav_webp::vp8x::Vp8xHeader::parse`. The §2 RIFF walk in
+  `decode_webp` only reaches `Vp8xHeader::parse` with a payload slice
+  the container layer has already validated as a `VP8X` chunk body,
+  so the cross-product reachable through the existing `decode.rs` /
+  `extract_metadata.rs` harnesses exercises this parser only along
+  the "well-formed RIFF" code path. The new harness drives the public
+  standalone surface directly — exported through `pub mod vp8x` and
+  the convenience wrapper `oxideav_webp::parse_vp8x_header`, the
+  function is the documented entry point for downstream callers that
+  obtained a `VP8X` payload candidate from a different demuxer or an
+  attacker-controlled buffer of arbitrary length. The arbitrary fuzz
+  buffer is forwarded verbatim as the §2.7.1 VP8X payload candidate;
+  inputs shorter or longer than 10 bytes hit the `BadPayloadLength`
+  refusal path while 10-byte inputs cover the full §2.7.1 Figure 7
+  flag-octet / reserved-field / canvas-dimension cross-product. Every
+  branch of the §2.7.1 contract is cross-checked on the way out:
+  `Ok(hdr)` implies `data.len() == 10`, both canvas dimensions land
+  in `[1, 2^24]` (the 24-bit "Minus One" `+ 1` range), the explicit
+  `canvas_width as u64 * canvas_height as u64 <= u32::MAX as u64`
+  product cap holds, every named feature-flag bool (`has_iccp` /
+  `has_alpha` / `has_exif` / `has_xmp` / `has_animation`) matches the
+  §2.7.1 byte-0 bit position the module docstring assigns it (I=5,
+  L=4, E=3, X=2, A=1), `has_unknown` matches the disjunction over
+  every §2.7.1 reserved position (the 2-bit `Rsv` pair at byte 0 bits
+  7..6, the `R` bit at byte 0 bit 0, and the 24-bit reserved field at
+  bytes 1..4), and both canvas dimensions equal `Minus One + 1`
+  re-derived from the little-endian 24-bit fields at bytes 4..7 /
+  bytes 7..10. The two error branches are cross-checked too:
+  `Err(BadPayloadLength { got })` implies `got == data.len()` and
+  `got != 10`, and `Err(CanvasTooLarge { canvas_width, canvas_height
+  })` implies `data.len() == 10` plus the cross-checked product
+  strictly exceeds `u32::MAX`. The contract under test: every call
+  must return a `Result` — no panic, no debug-build integer overflow
+  on the `(canvas_width as u64) * (canvas_height as u64)` product cap
+  check, no out-of-bounds index when the payload is shorter or longer
+  than the §2.7.1 Figure 7 ten bytes. The parser is a fixed-cost
+  branch chain plus a single `u64` multiply (no allocation, no loop
+  sized by the input, no recursion), so a single fuzz iteration is
+  microseconds regardless of input length and the harness can attempt
+  arbitrary payload sizes without iteration-cost concerns. Joins
+  `decode.rs` / `extract_metadata.rs` (always-returns-Result oracles
+  on the public single-shot entry points), `roundtrip_lossless.rs`
+  (still-image §3 VP8L encode + decode round-trip),
+  `roundtrip_animated.rs` (§2.7.1.1 ANIM / ANMF carrier + per-frame
+  pixel + per-frame duration round-trip) and `decode_alph.rs`
+  (§2.7.1.2 ALPH standalone entry point): 6 cargo-fuzz harnesses
+  total, with `parse_vp8x` widening surface coverage onto the §2.7.1
+  VP8X chunk parser the previous five harnesses only reached
+  transitively through a complete §2 RIFF walk.
+
 - `fuzz/fuzz_targets/decode_alph.rs`: cargo-fuzz harness on the
   §2.7.1.2 ALPH standalone entry point
   `oxideav_webp::alph::decode_alpha`. The §2 RIFF walk in `decode_webp`

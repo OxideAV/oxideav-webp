@@ -19,7 +19,7 @@ cargo-fuzz = true
 # is a layered walk: outer RIFF chunk loop, §2.7.1 feature-flag octet,
 # per-chunk header validation, §3 VP8L image-header + prefix-coded
 # entropy stream, §4 transform stack. Every byte along that path comes
-# from an attacker-controlled file. Two of the five harnesses below
+# from an attacker-controlled file. Two of the six harnesses below
 # feed arbitrary bytes straight into the public single-shot entry points
 # (`decode_webp` and `extract_metadata`) and assert the only contract is
 # "always returns a `Result`" — no panic, no debug-build
@@ -40,10 +40,22 @@ cargo-fuzz = true
 # §2.7.1.2 filter methods (none / horizontal / vertical / gradient)
 # and the two compression methods (raw + headerless §3 VP8L) the
 # function dispatches between, with `plane.len() == width * height`
-# asserted on success per the §2.7.1.2 carrier-field invariant.
-# Round-trip exactness is the §3 lossless contract; preservation of
-# the §2.7.1.1 carrier fields is the ANIM / ANMF chunk contract; the
-# §2.7.1.2 ALPH plane length is the ALPH chunk contract.
+# asserted on success per the §2.7.1.2 carrier-field invariant. The
+# sixth harness drives the §2.7.1 VP8X chunk parser standalone entry
+# point `vp8x::Vp8xHeader::parse` directly: an arbitrary fuzz buffer
+# is forwarded verbatim as the §2.7.1 VP8X payload candidate, with
+# every successfully-decoded field cross-checked against the bytes
+# the parser observed (canvas-dimension bounds in [1, 2^24] + product
+# cap ≤ 2^32 - 1 + bit-by-bit flag-octet decode against the §2.7.1
+# Figure 7 I/L/E/X/A/R/Rsv positions + reserved-bit `has_unknown`
+# summary), and every error branch cross-checked against the §2.7.1
+# refusal triggers (BadPayloadLength.got equals the slice length and
+# is not 10; CanvasTooLarge implies the cross-checked product strictly
+# exceeded 2^32 - 1). Round-trip exactness is the §3 lossless
+# contract; preservation of the §2.7.1.1 carrier fields is the ANIM /
+# ANMF chunk contract; the §2.7.1.2 ALPH plane length is the ALPH
+# chunk contract; the §2.7.1 VP8X field-by-field redecode is the
+# §2.7.1 Figure 7 byte-layout contract.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -91,6 +103,13 @@ bench = false
 [[bin]]
 name = "decode_alph"
 path = "fuzz_targets/decode_alph.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_vp8x"
+path = "fuzz_targets/parse_vp8x.rs"
 test = false
 doc = false
 bench = false
