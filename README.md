@@ -116,7 +116,18 @@ typed-variant mapping for the `C` / `F` / `P` enums including the
 `Reserved(_)` variants on undefined 2 / 3, fixed `bitstream_offset
 == 1`) with the `EmptyPayload` branch cross-checked against the
 §2.7.1.2 requirement that the payload carry at minimum the one info
-byte. Run any one with (nightly + `cargo-fuzz` installed):
+byte; `parse_transform_list` (round 260) drives the §4 VP8L
+transform-list reader standalone entry point
+`vp8l_stream::TransformList::read` directly across the full §4
+transform-presence loop (per-type fixed fields, duplicate-detection
+refusal, deferred §5 entropy-body boundary) with `Ok(list)` cross-checked
+against `transforms().len() <= 4`, no repeated `TransformType` across
+entries, §4.1 / §4.2 `size_bits ∈ [2, 9]`, §4.4 `color_table_size ∈
+[1, 256]` plus the threshold-table `width_bits` derivation, the
+`body_bit_position()` within the slice's bit length, and the
+`stopped_at_entropy_body()` flag consistent with the last entry's
+`has_entropy_body()`. Run any one with (nightly + `cargo-fuzz`
+installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -128,6 +139,7 @@ cargo +nightly fuzz run parse_vp8x           --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run parse_anmf           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_anim           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_alph           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_transform_list --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

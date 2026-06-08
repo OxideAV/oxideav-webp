@@ -91,7 +91,22 @@ cargo-fuzz = true
 # the §2.7.1.1 Figure 9 byte-layout contract; the §2.7.1.1 ANIM
 # field-by-field redecode is the §2.7.1.1 Figure 8 byte-layout
 # contract; the §2.7.1.2 ALPH info-byte field-by-field redecode is
-# the §2.7.1.2 Figure 10 bitfield contract.
+# the §2.7.1.2 Figure 10 bitfield contract; the §4 VP8L
+# transform-list field-by-field redecode is the §4
+# transform-presence loop contract. The tenth harness drives the
+# §4 VP8L transform-list reader standalone entry point
+# `vp8l_stream::TransformList::read` directly: an arbitrary fuzz
+# buffer feeds a zero-positioned `BitReader` (no §3 image-header
+# skip), with every successfully-decoded list cross-checked against
+# the §4 carrier rules (`transforms().len() <= 4`, no repeated
+# `TransformType`, §4.1 / §4.2 `size_bits ∈ [2, 9]`, §4.4
+# `color_table_size ∈ [1, 256]` plus the threshold-table `width_bits`
+# derivation, `body_bit_position` within the slice's bit length,
+# `stopped_at_entropy_body` consistent with the last entry's
+# `has_entropy_body()`), and every refusal branch cross-checked
+# against the §4 trigger (BitReaderEof's `bit_pos + available`
+# in-range with `wanted > available`; DuplicateTransform's variant
+# being one of the four §4 `TransformType` values).
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -167,6 +182,13 @@ bench = false
 [[bin]]
 name = "parse_alph"
 path = "fuzz_targets/parse_alph.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_transform_list"
+path = "fuzz_targets/parse_transform_list.rs"
 test = false
 doc = false
 bench = false

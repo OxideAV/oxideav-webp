@@ -6,6 +6,49 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/parse_transform_list.rs`: cargo-fuzz harness on
+  the §4 VP8L transform-list reader standalone entry point
+  `oxideav_webp::vp8l_stream::TransformList::read`. The §3 image-header
+  peek lands the §2.6 lossless bitstream at the start of the §4
+  transform-presence loop (`while (ReadBits(1)) { ReadBits(2);
+  ... }`); the reader decodes each present transform's §4 leading
+  fixed fields (§4.1 / §4.2 `size_bits = ReadBits(3) + 2`, §4.3
+  SUBTRACT_GREEN with no data, §4.4 `color_table_size = ReadBits(8)
+  + 1` plus the derived pixel-bundling `width_bits`), stopping
+  either at the terminating `0` presence bit or at the §5 entropy-body
+  boundary. §4 also says "each transform is allowed to be used only
+  once" — a repeat of any `TransformType` raises `DuplicateTransform`.
+  The function is a public standalone surface exported through
+  `pub mod vp8l_stream` (and the convenience wrapper
+  `oxideav_webp::read_vp8l_transform_list`) that downstream callers can
+  invoke against any byte slice they obtained from a different demuxer
+  or an attacker-controlled buffer of arbitrary length, including the
+  empty slice. The new harness drives that direct entry point with a
+  zero-positioned `BitReader` (no §3 image-header skip): the arbitrary
+  fuzz buffer is forwarded verbatim as a §4 transform-list candidate.
+  Every branch of the §4 contract is cross-checked on the way out —
+  `Ok(list)` implies `list.transforms().len() <= 4`, no repeated
+  `TransformType` across the entries, every entry's
+  `transform_type()` tag matches its variant, §4.1 / §4.2 `size_bits`
+  lies in `[2, 9]`, §4.4 `color_table_size` lies in `[1, 256]`, §4.4
+  `width_bits` follows the threshold table (3 for `<= 2`, 2 for `<=
+  4`, 1 for `<= 16`, 0 otherwise), `body_bit_position()` does not
+  exceed the slice's total bit length, and `stopped_at_entropy_body()`
+  is consistent with the last entry's `has_entropy_body()` (the parser
+  stopped *at* a §5 body iff the last entry carries one). `Err`
+  branches are likewise cross-checked: `Eof` carries a `bit_pos +
+  available <= total_bits` coordinate with `wanted > available`, and
+  `DuplicateTransform` carries one of the four §4 `TransformType`
+  values. Sibling fuzz harnesses already cover the orthogonal parsers
+  — `parse_vp8x` (§2.7.1 Figure 7), `parse_anmf` (§2.7.1.1 Figure 9),
+  `parse_anim` (§2.7.1.1 Figure 8), `parse_alph` (§2.7.1.2 Figure 10),
+  `decode_alph` (§2.7.1.2 alpha plane), `extract_metadata` (§2 RIFF
+  ICCP/EXIF/XMP walk), `decode` (full single-shot entry), and
+  `roundtrip_animated` / `roundtrip_lossless` (encode→decode equality
+  oracles). The new harness extends fuzz coverage from the §2.7 RIFF
+  container layer down into the §4 VP8L transform-presence loop, the
+  first bit-level decode stage the §2.6 lossless bitstream walks
+  through after the §3.4 image-header.
 - `fuzz/fuzz_targets/parse_alph.rs`: cargo-fuzz harness on the
   §2.7.1.2 ALPH info-byte parser standalone entry point
   `oxideav_webp::alph::AlphHeader::parse`. The §2 RIFF walk in
