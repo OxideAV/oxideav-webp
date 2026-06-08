@@ -6,6 +6,65 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/parse_container.rs`: cargo-fuzz harness on the
+  §2.3 / §2.4 RIFF/WEBP chunk-walker standalone entry point
+  `oxideav_webp::container::parse`. `container::parse` is the
+  structural layer beneath every other WebP entry point — it walks the
+  12-byte §2.4 file header (`RIFF` + LE uint32 `File Size` + `WEBP`)
+  and then the §2.3 chunk stream (4-byte FourCC + LE uint32 `Size` +
+  payload + optional 1-byte pad when `Size` is odd) and returns the
+  ordered chunk list any §2.5 / §2.6 / §2.7 decode path consumes
+  downstream. The walker is non-recovering: it surfaces the first
+  structural problem it sees and stops. Every byte fed to the walker
+  is attacker-controlled — the `File Size` field at bytes 4..8 and
+  every per-chunk `Size` field at offsets `+4..+8` relative to its
+  header. The harness forwards the entire fuzz buffer verbatim and
+  cross-checks every successfully-decoded chunk against the bytes
+  the walker observed: `riff_file_size` against the LE uint32 at
+  `buf[4..8]`, per-chunk FourCC against `buf[header_offset..+4]`,
+  per-chunk `Size` against the LE uint32 at `buf[header_offset +
+  4..+8]`, `payload_end - payload_start == size as usize`,
+  `payload_end <= buf.len()` and `payload_end <= 8 + riff_file_size`,
+  the on-disk order invariant
+  `chunks[i+1].header_offset == chunks[i].payload_end + (size & 1)`,
+  the `is_extended()` / `is_vp8_lossy()` / `is_vp8_lossless()`
+  predicates as pure functions of FourCC, and the
+  `chunks_with_fourcc` / `first_chunk_with_fourcc` iterator helpers
+  against a manual filter across nine common FourCCs (VP8X / VP8 /
+  VP8L / ALPH / ANIM / ANMF / ICCP / EXIF / XMP ). Every error
+  variant is likewise cross-checked against its §2.3 / §2.4 refusal
+  trigger: `TooShortForHeader { got }` (`got == buf.len()` and < 12);
+  `NotRiff { got }` (`got == buf[0..4]` and != 'RIFF'); `NotWebp {
+  got }` (`got == buf[8..12]` and != 'WEBP' with `buf[0..4] ==
+  'RIFF'`); `RiffSizeOverflowsBuffer { declared, buffer_len }`
+  (`declared` == LE uint32 at `buf[4..8]`, `buffer_len == buf.len()`,
+  `8 + declared > buffer_len`); `TruncatedChunkHeader { offset }`
+  (`offset >= 12` inside the declared RIFF window with < 8 bytes
+  remaining for the FourCC + Size); `ChunkPayloadOverflowsRiff {
+  offset, declared, available }` (`offset >= 12`, 8-byte header
+  fitting in the RIFF window, `declared` == LE uint32 at the chunk
+  header, `available == declared_end - (offset + 8)`, `declared >
+  available`); `MissingPadByte { offset }` (`offset >= 12`, declared
+  `Size` odd, chunk payload itself fitting in the declared window,
+  pad byte at `payload_end + 1` lying outside the declared window).
+  The pre-existing `decode` and `extract_metadata` harnesses both
+  wrap this walker but flatten its granular §2.3 / §2.4 refusal
+  modes into a coarser `WebpError` envelope and never cross-check
+  the on-disk `(payload_start, payload_end)` ranges against the
+  original buffer; this twelfth harness widens fuzz coverage onto
+  the structural surface itself, the lowest-level layer every other
+  path is built atop. The single fuzz iteration is bounded by the
+  chunk loop, which advances by `8 + size + (size & 1)` per
+  iteration with `size` clamped by the §2.4 declared payload
+  window; libFuzzer's default per-iteration size keeps each call
+  to microseconds and the 64 KiB cap to milliseconds. Twelfth
+  fuzz target after `decode` / `extract_metadata` /
+  `roundtrip_lossless` / `roundtrip_animated` (round 238) /
+  `decode_alph` (round 255) / `parse_vp8x` (round 256) /
+  `parse_anmf` (round 257) / `parse_anim` (round 258) /
+  `parse_alph` (round 259) / `parse_transform_list` (round 260) /
+  `parse_meta_prefix` (round 261).
+
 - `fuzz/fuzz_targets/parse_meta_prefix.rs`: cargo-fuzz harness on the
   §5.2.3 color-cache info + §6.2.2 meta-prefix + §6.2 5-prefix-code-group
   reader standalone entry point

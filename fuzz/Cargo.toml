@@ -124,7 +124,30 @@ cargo-fuzz = true
 # (BitReaderEof's `bit_pos + available` in-range with
 # `wanted > available`; InvalidColorCacheCodeBits's `value` being `0`
 # or above the `[1, 11]` window; Prefix surfacing the §6.2.1 refusal
-# cleanly).
+# cleanly). The twelfth harness drives the §2.3 / §2.4 RIFF/WEBP
+# chunk-walker standalone entry point `container::parse` directly:
+# every byte of an arbitrary fuzz buffer is forwarded verbatim as a
+# candidate `RIFF/WEBP` file with attacker-controlled chunk-`Size`
+# fields, with every successfully-decoded chunk cross-checked against
+# the bytes the walker observed (FourCC at `buf[header_offset..+4]`,
+# LE uint32 `Size` at `buf[header_offset + 4..+8]`, `payload_end -
+# payload_start == size as usize`, `payload_end` inside both the
+# buffer length and the §2.4 declared RIFF window, on-disk order with
+# `chunks[i+1].header_offset == chunks[i].payload_end + (size & 1)`,
+# the `is_extended()` / `is_vp8_lossy()` / `is_vp8_lossless()`
+# predicates pure functions of FourCC, and the `chunks_with_fourcc`
+# / `first_chunk_with_fourcc` helpers matching a manual filter), and
+# every error variant cross-checked against the §2.3 / §2.4 refusal
+# trigger (TooShortForHeader.got == buf.len() < 12; NotRiff.got
+# == buf[0..4] != 'RIFF'; NotWebp.got == buf[8..12] != 'WEBP' with
+# buf[0..4] == 'RIFF'; RiffSizeOverflowsBuffer.declared ==
+# LE uint32 at buf[4..8] with 8 + declared > buffer_len;
+# TruncatedChunkHeader.offset >= 12 inside declared window with
+# < 8 bytes remaining; ChunkPayloadOverflowsRiff.offset >= 12 with
+# 8-byte header fitting, declared == LE uint32 at chunk header,
+# available == declared_end - (offset + 8), declared > available;
+# MissingPadByte.offset >= 12 with declared Size odd, payload itself
+# fitting, and pad byte at payload_end + 1 outside declared window).
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -214,6 +237,13 @@ bench = false
 [[bin]]
 name = "parse_meta_prefix"
 path = "fuzz_targets/parse_meta_prefix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_container"
+path = "fuzz_targets/parse_container.rs"
 test = false
 doc = false
 bench = false

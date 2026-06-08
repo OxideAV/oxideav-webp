@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Eleven [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twelve [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -143,7 +143,34 @@ absent for sub-images), the `EntropyImagePending` branch's
 width/height matching the recorded values, and the
 `entropy_image_bit_position` within the slice's bit length;
 `Err(InvalidColorCacheCodeBits)` cross-checked against the
-`value ∈ {0} ∪ [12, 15]` rejection-window. Run any one with
+`value ∈ {0} ∪ [12, 15]` rejection-window;
+`parse_container` (round 262) drives the §2.3 / §2.4 RIFF/WEBP
+chunk-walker standalone entry point `container::parse` directly
+with every byte of the fuzz buffer attacker-controlled (including
+the §2.4 `File Size` field at bytes 4..8 and every per-chunk `Size`
+field at offsets `+4..+8` relative to its header) with `Ok(container)`
+cross-checked against the §2.3 + §2.4 carrier rules (`riff_file_size`
+== LE uint32 at `buf[4..8]`, every recorded `WebpChunk` cross-checked
+byte-for-byte against the buffer it points into — FourCC at
+`buf[header_offset..+4]`, LE uint32 `Size` at
+`buf[header_offset + 4..+8]`, `payload_end - payload_start ==
+size as usize`, `payload_end` inside both the buffer length and the
+§2.4 declared RIFF window, on-disk order with
+`chunks[i+1].header_offset == chunks[i].payload_end + (size & 1)`, the
+`is_extended()` / `is_vp8_lossy()` / `is_vp8_lossless()` predicates
+pure functions of FourCC, the `chunks_with_fourcc` /
+`first_chunk_with_fourcc` helpers matching a manual filter) and every
+error variant cross-checked against the §2.3 / §2.4 refusal trigger
+(TooShortForHeader.got == buf.len() < 12; NotRiff.got == buf[0..4]
+!= 'RIFF'; NotWebp.got == buf[8..12] != 'WEBP' with buf[0..4] ==
+'RIFF'; RiffSizeOverflowsBuffer.declared == LE uint32 at buf[4..8]
+with 8 + declared > buffer_len; TruncatedChunkHeader.offset >= 12
+inside declared window with < 8 bytes remaining;
+ChunkPayloadOverflowsRiff.offset >= 12 with 8-byte header fitting,
+declared == LE uint32 at chunk header, available == declared_end
+- (offset + 8), declared > available; MissingPadByte.offset >= 12
+with declared Size odd, payload itself fitting, and pad byte at
+payload_end + 1 outside declared window). Run any one with
 (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -158,6 +185,7 @@ cargo +nightly fuzz run parse_anim           --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run parse_alph           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_transform_list --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_meta_prefix    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_container      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)
