@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Six [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Seven [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -93,8 +93,16 @@ standalone entry point `vp8x::Vp8xHeader::parse` directly across the
 full §2.7.1 Figure 7 flag-octet / reserved-field / canvas-dimension
 cross-product with every successfully-decoded field cross-checked
 against the input bytes the parser observed and every error branch
-cross-checked against the §2.7.1 refusal triggers. Run any one with
-(nightly + `cargo-fuzz` installed):
+cross-checked against the §2.7.1 refusal triggers; `parse_anmf`
+(round 257) drives the §2.7.1.1 ANMF chunk header parser standalone
+entry point `anmf::AnmfHeader::parse` directly across the full
+§2.7.1.1 Figure 9 5 × uint24 + info-byte cross-product (Frame X * 2
+doubling, Frame W/H Minus One + 1 resolution, uint24 LE duration,
+info-byte Reserved / B / D extraction at bits 7..2 / 1 / 0) with
+every successfully-decoded field cross-checked against the input
+bytes the parser observed and the `PayloadTooShort` branch
+cross-checked against the §2.7.1.1 16-byte minimum. Run any one
+with (nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -103,6 +111,7 @@ cargo +nightly fuzz run roundtrip_lossless   --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run roundtrip_animated   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_alph          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_vp8x           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_anmf           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

@@ -51,11 +51,22 @@ cargo-fuzz = true
 # summary), and every error branch cross-checked against the §2.7.1
 # refusal triggers (BadPayloadLength.got equals the slice length and
 # is not 10; CanvasTooLarge implies the cross-checked product strictly
-# exceeded 2^32 - 1). Round-trip exactness is the §3 lossless
-# contract; preservation of the §2.7.1.1 carrier fields is the ANIM /
-# ANMF chunk contract; the §2.7.1.2 ALPH plane length is the ALPH
-# chunk contract; the §2.7.1 VP8X field-by-field redecode is the
-# §2.7.1 Figure 7 byte-layout contract.
+# exceeded 2^32 - 1). The seventh harness drives the §2.7.1.1 ANMF
+# chunk header parser standalone entry point `anmf::AnmfHeader::parse`
+# directly: an arbitrary fuzz buffer is forwarded verbatim as the
+# §2.7.1.1 ANMF payload candidate, with every successfully-decoded
+# field cross-checked against the bytes the parser observed (the
+# `Frame X * 2` doubling, the `Frame W/H Minus One + 1` resolution,
+# the literal uint24 duration, the info-byte Reserved / B / D
+# extraction at bits 7..2 / 1 / 0, and the fixed `frame_data_offset
+# == 16`), and the `PayloadTooShort` branch cross-checked against the
+# §2.7.1.1 16-byte minimum (got equals the slice length and is < 16).
+# Round-trip exactness is the §3 lossless contract; preservation of
+# the §2.7.1.1 carrier fields is the ANIM / ANMF chunk contract; the
+# §2.7.1.2 ALPH plane length is the ALPH chunk contract; the §2.7.1
+# VP8X field-by-field redecode is the §2.7.1 Figure 7 byte-layout
+# contract; the §2.7.1.1 ANMF field-by-field redecode is the §2.7.1.1
+# Figure 9 byte-layout contract.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -110,6 +121,13 @@ bench = false
 [[bin]]
 name = "parse_vp8x"
 path = "fuzz_targets/parse_vp8x.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_anmf"
+path = "fuzz_targets/parse_anmf.rs"
 test = false
 doc = false
 bench = false

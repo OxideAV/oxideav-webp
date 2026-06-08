@@ -6,6 +6,60 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/parse_anmf.rs`: cargo-fuzz harness on the
+  §2.7.1.1 ANMF chunk header parser standalone entry point
+  `oxideav_webp::anmf::AnmfHeader::parse`. The §2 RIFF walk in
+  `decode_webp` only reaches `AnmfHeader::parse` with payload slices
+  the container layer has already validated as `ANMF` chunk bodies,
+  so the cross-product reachable through the existing `decode.rs` /
+  `extract_metadata.rs` / `roundtrip_animated.rs` harnesses exercises
+  this parser only along the "well-formed RIFF" code path. The new
+  harness drives the public standalone surface directly — exported
+  through `pub mod anmf`, the function is the documented entry point
+  for downstream callers that obtained an `ANMF` payload candidate
+  from a different demuxer or an attacker-controlled buffer of
+  arbitrary length. The arbitrary fuzz buffer is forwarded verbatim
+  as the §2.7.1.1 ANMF payload candidate; inputs shorter than 16
+  bytes hit the `PayloadTooShort` refusal path while inputs ≥ 16
+  bytes cover the full §2.7.1.1 Figure 9 5 × uint24 + info-byte
+  cross-product (with the surplus bytes after byte 15 being the
+  §2.7.1.1 Frame Data sub-RIFF the header parser does not touch).
+  Every branch of the §2.7.1.1 contract is cross-checked on the way
+  out: `Ok(hdr)` implies `data.len() >= 16`, both width and height
+  land in `[1, 2^24]` (the 24-bit "Minus One" `+ 1` range), both
+  `x` and `y` land in `[0, (2^24-1)*2]` (the §2.7.1.1 `Frame X * 2`
+  doubling, with the bound proving `u32` arithmetic did not
+  overflow), `duration_ms` lands in `[0, 2^24 - 1]` (the uint24 LE
+  literal), `frame_data_offset() == 16` (the §2.7.1.1 fixed-header
+  length), every field equals the re-derived value from the original
+  bytes (Frame X / Y from bytes 0..3 / 3..6 little-endian uint24,
+  Frame W-1 / H-1 from bytes 6..9 / 9..12, Duration from bytes
+  12..15, info_byte from byte 15), and the info-byte sub-fields
+  decode to the §2.7.1.1 Figure 9 bit positions (Reserved at bits
+  7..2, B at bit 1, D at bit 0). The single error branch is
+  cross-checked too: `Err(PayloadTooShort { got })` implies
+  `got == data.len()` and `got < 16`. The contract under test: every
+  call must return a `Result` — no panic, no debug-build integer
+  overflow on the `Frame X * 2` doubling or the `Frame W/H Minus
+  One + 1` resolution, no out-of-bounds index when the payload is
+  shorter or longer than the 16-byte header. The parser is a
+  fixed-cost branch chain plus five 3-byte little-endian uint24
+  reads plus three `u8` bit-extracts plus two `u32` arithmetic ops
+  (no allocation, no loop sized by the input, no recursion), so a
+  single fuzz iteration is microseconds regardless of input length
+  and the harness can attempt arbitrary payload sizes without
+  iteration-cost concerns. Joins `decode.rs` / `extract_metadata.rs`
+  (always-returns-Result oracles on the public single-shot entry
+  points), `roundtrip_lossless.rs` (still-image §3 VP8L encode +
+  decode round-trip), `roundtrip_animated.rs` (§2.7.1.1 ANIM / ANMF
+  carrier + per-frame pixel + per-frame duration round-trip),
+  `decode_alph.rs` (§2.7.1.2 ALPH standalone entry point) and
+  `parse_vp8x.rs` (§2.7.1 VP8X chunk parser standalone entry point):
+  7 cargo-fuzz harnesses total, with `parse_anmf` widening surface
+  coverage onto the §2.7.1.1 ANMF chunk header parser the previous
+  six harnesses only reached transitively through a complete §2 RIFF
+  walk plus an ANMF chunk wrapper.
+
 - `fuzz/fuzz_targets/parse_vp8x.rs`: cargo-fuzz harness on the §2.7.1
   VP8X chunk parser standalone entry point
   `oxideav_webp::vp8x::Vp8xHeader::parse`. The §2 RIFF walk in
