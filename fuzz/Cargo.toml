@@ -148,6 +148,22 @@ cargo-fuzz = true
 # available == declared_end - (offset + 8), declared > available;
 # MissingPadByte.offset >= 12 with declared Size odd, payload itself
 # fitting, and pad byte at payload_end + 1 outside declared window).
+# The thirteenth harness drives the §5.2.2 distance-code-to-pixel-
+# distance pure-function lookup standalone entry point
+# `vp8l_decode::distance_code_to_pixel_distance` directly: every byte
+# of an arbitrary fuzz buffer is forwarded verbatim as a series of
+# `(image_width, distance_code)` u32 LE pairs (the first 4 bytes
+# masked to the §3.4 14-bit image-width ceiling, every subsequent
+# 4-byte word floored at 1 to honour the §5.2.2 wire-encoded
+# `distance_code >= 1` precondition), with every returned `D` cross-
+# checked against the §5.2.2 spec formula (`D == max(1, xi + yi *
+# image_width)` for codes `1..=120` via the 120-entry `DISTANCE_MAP`,
+# `D == distance_code - 120` for codes `> 120`) and the §5.2.2 clamp
+# guarantee (`D >= 1` always — either from the §5.2.2 clamp on the
+# neighborhood-lookup branch or from the smallest reachable raw scan-
+# line distance of `121 - 120 = 1` on the reservation branch); also
+# pure-function determinism asserted by calling the lookup twice and
+# checking the two results are equal.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -244,6 +260,13 @@ bench = false
 [[bin]]
 name = "parse_container"
 path = "fuzz_targets/parse_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "distance_code"
+path = "fuzz_targets/distance_code.rs"
 test = false
 doc = false
 bench = false

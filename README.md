@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twelve [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Thirteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -170,8 +170,22 @@ ChunkPayloadOverflowsRiff.offset >= 12 with 8-byte header fitting,
 declared == LE uint32 at chunk header, available == declared_end
 - (offset + 8), declared > available; MissingPadByte.offset >= 12
 with declared Size odd, payload itself fitting, and pad byte at
-payload_end + 1 outside declared window). Run any one with
-(nightly + `cargo-fuzz` installed):
+payload_end + 1 outside declared window); `distance_code` (round 263)
+drives the §5.2.2 distance-code-to-pixel-distance pure-function
+lookup standalone entry point
+`vp8l_decode::distance_code_to_pixel_distance` directly across the
+full attacker-reachable `(distance_code, image_width)` cross-product
+(a series of `(image_width, distance_code)` u32 LE pairs sliced
+out of the fuzz buffer, with the §3.4 14-bit image-width ceiling
+applied and the §5.2.2 `distance_code >= 1` precondition honoured)
+with every returned `D` cross-checked against the §5.2.2 spec
+formula (`max(1, xi + yi * image_width)` for codes `1..=120` via
+the 120-entry `DISTANCE_MAP`, `distance_code - 120` for codes
+`> 120`) and the §5.2.2 clamp guarantee (`D >= 1` always — either
+from the clamp on the neighborhood-lookup branch or from the
+smallest reachable raw scan-line distance of `121 - 120 = 1`),
+plus pure-function determinism asserted via a double-call equality
+check. Run any one with (nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -186,6 +200,7 @@ cargo +nightly fuzz run parse_alph           --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run parse_transform_list --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_meta_prefix    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_container      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run distance_code        --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

@@ -6,6 +6,56 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/distance_code.rs`: cargo-fuzz harness on the
+  §5.2.2 distance-code-to-pixel-distance pure-function lookup
+  standalone entry point
+  `oxideav_webp::vp8l_decode::distance_code_to_pixel_distance`. Every
+  backward reference in a VP8L §5.2 LZ77 stream resolves through
+  exactly this function — the LZ77 length / distance prefix-code pair
+  decodes to a `(length, distance_code)` pair, and the `distance_code`
+  is then mapped to the actual scan-line pixel distance `D` either
+  through the §5.2.2 distance map (codes `1..=120`, a 120-entry
+  `(xi, yi)` neighborhood lookup table evaluated as
+  `xi + yi * image_width`) or by subtracting the §5.2.2 reservation
+  offset (codes `> 120` denote a raw scan-line distance of
+  `code - 120`). A clamp of `D = max(D, 1)` prevents the §5.2.2
+  negative-offset neighbors (the "left side" of the neighborhood —
+  `(-1, 1)`, `(-2, 1)`, etc.) from yielding a zero or negative
+  distance on the leftmost column of a 1-pixel-wide row. Every byte
+  feeding the function is attacker-controlled: the `distance_code`
+  comes off the entropy stream directly (only the prefix-code envelope
+  is symbol-table-clamped, not the payload value), and the
+  `image_width` comes from the §3.4 14-bit `width-1` field at the
+  start of the §2.6 VP8L bitstream. The harness slices the fuzz buffer
+  into `(image_width, distance_code)` u32 LE pairs (the first 4 bytes
+  masked to the §3.4 14-bit image-width ceiling then bumped to a
+  minimum of 1, every subsequent 4-byte word floored at 1 to honour
+  the §5.2.2 wire-encoded `distance_code >= 1` precondition) and
+  forwards each pair verbatim. Every returned `D` is cross-checked
+  against the §5.2.2 spec formula (`max(1, xi + yi * image_width)`
+  for codes `1..=120` via the public 120-entry `DISTANCE_MAP`,
+  `distance_code - 120` for codes `> 120`) and the §5.2.2 clamp
+  guarantee (`D >= 1` always — either from the clamp on the
+  neighborhood-lookup branch or from the smallest reachable raw
+  scan-line distance of `121 - 120 = 1` on the reservation branch).
+  Pure-function determinism is asserted by calling the lookup twice
+  and checking the two results are equal. Sibling harnesses cover
+  every layer above this primitive (`parse_meta_prefix` for the §5.2
+  preamble, `parse_transform_list` for §4, `parse_container` for the
+  §2.3 / §2.4 RIFF walker, `decode` for the full §2 + §3..§5 entry,
+  `roundtrip_lossless` for the encode→decode equality oracle) but
+  none of them reaches `distance_code_to_pixel_distance` directly —
+  they reach it through whichever §5.2 LZ77 length/distance pair the
+  upstream prefix code produces, which means the actual
+  `distance_code` values visited per iteration are bounded by the
+  entropy stream the upstream reader produces. This thirteenth
+  harness widens fuzz coverage onto the §5.2.2 pure-function
+  distance lookup itself across the full attacker-reachable
+  `distance_code ∈ [1, u32::MAX]` × `image_width ∈ [1, 0x3FFF]`
+  cross-product, with no upstream throttling. Wired into the
+  fuzz package as a thirteenth `[[bin]]` and surfaced in the
+  README "Fuzzing" section bumped from twelve to thirteen targets.
+
 - `fuzz/fuzz_targets/parse_container.rs`: cargo-fuzz harness on the
   §2.3 / §2.4 RIFF/WEBP chunk-walker standalone entry point
   `oxideav_webp::container::parse`. `container::parse` is the
