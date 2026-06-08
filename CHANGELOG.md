@@ -6,6 +6,81 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/parse_alph.rs`: cargo-fuzz harness on the
+  §2.7.1.2 ALPH info-byte parser standalone entry point
+  `oxideav_webp::alph::AlphHeader::parse`. The §2 RIFF walk in
+  `decode_webp` only reaches `AlphHeader::parse` with payload slices
+  the container layer has already validated as `ALPH` chunk bodies,
+  and the existing `decode_alph` harness drives the full §2.7.1.2
+  decode (`alph::decode_alpha`) with constrained
+  `(width, height) ∈ [1, 64]²` so its alpha-bitstream traversal
+  stays bounded. The new harness drives the public standalone surface
+  directly — exported through `pub mod alph` and the convenience
+  wrapper `oxideav_webp::parse_alph_header`, the function is the
+  documented entry point for downstream callers that obtained an
+  `ALPH` payload candidate from a different demuxer or an
+  attacker-controlled buffer of arbitrary length (including the
+  empty slice). The arbitrary fuzz buffer is forwarded verbatim as
+  the §2.7.1.2 ALPH payload candidate; the empty slice hits the
+  `EmptyPayload` refusal path while every other length lets
+  `payload[0]` cover the full §2.7.1.2 Figure 10 Rsv × P × F × C
+  cross-product (4 × 4 × 4 × 4 = 256 distinct info bytes, every
+  bit-pattern legal: the spec mandates readers IGNORE `Rsv`, and the
+  "undefined" values of the `C` and `P` fields are surfaced through
+  their `Reserved(_)` variants rather than raising an error at this
+  layer). Every branch of the §2.7.1.2 contract is cross-checked on
+  the way out: `Ok(hdr)` implies `!data.is_empty()`,
+  `hdr.info_byte == payload[0]` verbatim, `hdr.reserved` equals
+  `(payload[0] >> 6) & 0b11` (the §2.7.1.2 MSB-first `Rsv` field at
+  bits 7..6), the typed `preprocessing` variant decodes the
+  `(payload[0] >> 4) & 0b11` `P` bits (0 → `None`, 1 →
+  `LevelReduction`, 2 | 3 → `Reserved(v)` with the inner value
+  matching the raw bits), the typed `filtering` variant decodes the
+  `(payload[0] >> 2) & 0b11` `F` bits (0 → `None`, 1 → `Horizontal`,
+  2 → `Vertical`, 3 → `Gradient`), the typed `compression` variant
+  decodes the `payload[0] & 0b11` `C` bits (0 → `None`, 1 →
+  `Lossless`, 2 | 3 → `Reserved(v)` with the inner value matching
+  the raw bits), and `hdr.bitstream_offset() == 1` (§2.7.1.2 fixes
+  the info byte at position 0 and the alpha bitstream immediately
+  after, so the offset is a per-spec constant). The single
+  info-byte-parser error branch is cross-checked too:
+  `Err(EmptyPayload)` implies `data.is_empty()`; any other
+  `AlphError` variant (`DimensionsOverflow` / `RawLengthMismatch` /
+  `UnsupportedCompression` / `Vp8l`) escaping the parser is a
+  contract violation surfaced as an explicit panic — those variants
+  are produced exclusively by `decode_alpha`'s downstream
+  bitstream-decode stages, never by `AlphHeader::parse`. The contract
+  under test: every call must return a `Result` — no panic, no
+  debug-build integer overflow, no out-of-bounds index when the
+  payload is empty or arbitrarily long; the §2.7.1.2 info byte is a
+  single octet so the parser only ever inspects `payload[0]` and any
+  extra bytes after byte 0 are the "Alpha bitstream" §2.7.1.2
+  describes which `AlphHeader::parse` deliberately ignores (its job
+  is bitfield decomposition only). The parser is a fixed-cost branch
+  chain (one length test) plus four 2-bit field extracts from a
+  single byte (no allocation, no loop sized by the input, no
+  recursion), so a single fuzz iteration is microseconds regardless
+  of input length and the harness can attempt arbitrary payload
+  sizes (including the empty slice and slices longer than any
+  conceivable §2.7.1.2 ALPH chunk) without iteration-cost concerns.
+  Joins `decode.rs` / `extract_metadata.rs` (always-returns-Result
+  oracles on the public single-shot entry points),
+  `roundtrip_lossless.rs` (still-image §3 VP8L encode + decode
+  round-trip), `roundtrip_animated.rs` (§2.7.1.1 ANIM / ANMF carrier
+  + per-frame pixel + per-frame duration round-trip), `decode_alph.rs`
+  (§2.7.1.2 ALPH standalone entry point including the alpha
+  bitstream), `parse_vp8x.rs` (§2.7.1 VP8X chunk parser standalone
+  entry point), `parse_anmf.rs` (§2.7.1.1 ANMF chunk header parser
+  standalone entry point), and `parse_anim.rs` (§2.7.1.1 ANIM chunk
+  parser standalone entry point): 9 cargo-fuzz harnesses total, with
+  `parse_alph` widening surface coverage onto the §2.7.1.2 ALPH
+  info-byte parser the previous eight harnesses only reached through
+  paths that imposed either RIFF-container framing (the always-Result
+  oracles plus the round-trip oracles) or dimension constraints (the
+  `decode_alph` full-bitstream oracle), without exercising the
+  info-byte-only direct entry point against unconstrained byte
+  payloads.
+
 - `fuzz/fuzz_targets/parse_anim.rs`: cargo-fuzz harness on the
   §2.7.1.1 ANIM chunk parser standalone entry point
   `oxideav_webp::anim::AnimHeader::parse`. The §2 RIFF walk in

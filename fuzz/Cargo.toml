@@ -19,7 +19,7 @@ cargo-fuzz = true
 # is a layered walk: outer RIFF chunk loop, §2.7.1 feature-flag octet,
 # per-chunk header validation, §3 VP8L image-header + prefix-coded
 # entropy stream, §4 transform stack. Every byte along that path comes
-# from an attacker-controlled file. Two of the six harnesses below
+# from an attacker-controlled file. Two of the nine harnesses below
 # feed arbitrary bytes straight into the public single-shot entry points
 # (`decode_webp` and `extract_metadata`) and assert the only contract is
 # "always returns a `Result`" — no panic, no debug-build
@@ -71,14 +71,27 @@ cargo-fuzz = true
 # the `loops_forever()` predicate matching `loop_count == 0`), and the
 # `BadPayloadLength` branch cross-checked against the §2.7.1.1
 # Figure 8 fixed 6-byte length (got equals the slice length and is
-# not 6). Round-trip exactness is the §3 lossless contract;
+# not 6). The ninth harness drives the §2.7.1.2 ALPH info-byte parser
+# standalone entry point `alph::AlphHeader::parse` directly: an
+# arbitrary fuzz buffer is forwarded verbatim as the §2.7.1.2 ALPH
+# payload candidate, with every successfully-decoded field
+# cross-checked against the bytes the parser observed (the MSB-first
+# `Rsv|P|F|C` 2-bit field decomposition of the info byte at bits 7..6
+# / 5..4 / 3..2 / 1..0, the `info_byte` raw echo of `payload[0]`, the
+# typed-variant mapping for the `C` / `F` / `P` enums including the
+# `Reserved(_)` variants for the undefined 2 / 3 values §2.7.1.2
+# leaves unnamed, and the fixed `bitstream_offset == 1`), and the
+# `EmptyPayload` branch cross-checked against the §2.7.1.2 requirement
+# that at minimum one info byte be present (raised iff the payload
+# slice is empty). Round-trip exactness is the §3 lossless contract;
 # preservation of the §2.7.1.1 carrier fields is the ANIM / ANMF chunk
 # contract; the §2.7.1.2 ALPH plane length is the ALPH chunk contract;
 # the §2.7.1 VP8X field-by-field redecode is the §2.7.1 Figure 7
 # byte-layout contract; the §2.7.1.1 ANMF field-by-field redecode is
 # the §2.7.1.1 Figure 9 byte-layout contract; the §2.7.1.1 ANIM
 # field-by-field redecode is the §2.7.1.1 Figure 8 byte-layout
-# contract.
+# contract; the §2.7.1.2 ALPH info-byte field-by-field redecode is
+# the §2.7.1.2 Figure 10 bitfield contract.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -147,6 +160,13 @@ bench = false
 [[bin]]
 name = "parse_anim"
 path = "fuzz_targets/parse_anim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_alph"
+path = "fuzz_targets/parse_alph.rs"
 test = false
 doc = false
 bench = false

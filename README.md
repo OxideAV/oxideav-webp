@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Seven [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Nine [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -101,8 +101,22 @@ doubling, Frame W/H Minus One + 1 resolution, uint24 LE duration,
 info-byte Reserved / B / D extraction at bits 7..2 / 1 / 0) with
 every successfully-decoded field cross-checked against the input
 bytes the parser observed and the `PayloadTooShort` branch
-cross-checked against the §2.7.1.1 16-byte minimum. Run any one
-with (nightly + `cargo-fuzz` installed):
+cross-checked against the §2.7.1.1 16-byte minimum; `parse_anim`
+(round 258) drives the §2.7.1.1 ANIM chunk parser standalone entry
+point `anim::AnimHeader::parse` directly across the full §2.7.1.1
+Figure 8 BGRA × loop-count cross-product (BGRA byte-order
+background, `as_u32_le()` matching the LE u32 reload, LE u16 loop
+count, `loops_forever()` predicate) with the `BadPayloadLength`
+branch cross-checked against the §2.7.1.1 fixed 6-byte length;
+`parse_alph` (round 259) drives the §2.7.1.2 ALPH info-byte parser
+standalone entry point `alph::AlphHeader::parse` directly across the
+full §2.7.1.2 Figure 10 `Rsv|P|F|C` 2-bit-field cross-product
+(MSB-first bit decomposition at bits 7..6 / 5..4 / 3..2 / 1..0,
+typed-variant mapping for the `C` / `F` / `P` enums including the
+`Reserved(_)` variants on undefined 2 / 3, fixed `bitstream_offset
+== 1`) with the `EmptyPayload` branch cross-checked against the
+§2.7.1.2 requirement that the payload carry at minimum the one info
+byte. Run any one with (nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -112,6 +126,8 @@ cargo +nightly fuzz run roundtrip_animated   --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run decode_alph          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_vp8x           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_anmf           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_anim           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_alph           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)
