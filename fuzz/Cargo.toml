@@ -106,7 +106,25 @@ cargo-fuzz = true
 # `has_entropy_body()`), and every refusal branch cross-checked
 # against the §4 trigger (BitReaderEof's `bit_pos + available`
 # in-range with `wanted > available`; DuplicateTransform's variant
-# being one of the four §4 `TransformType` values).
+# being one of the four §4 `TransformType` values). The eleventh
+# harness drives the §5.2.3 color-cache info + §6.2.2 meta-prefix +
+# §6.2 5-prefix-code-group reader standalone entry point
+# `meta_prefix::MetaPrefixHeader::read` directly: an arbitrary fuzz
+# buffer feeds a zero-positioned `BitReader` (no §3 image-header skip),
+# with the §6.2.2 `ImageRole` and the entropy-image dimension inputs
+# both fuzz-derived. Every successfully-decoded header is cross-checked
+# against the §5.2.3 + §6.2.2 carrier rules (`code_bits` is `0` or in
+# `[1, 11]`, `is_enabled()` matches `code_bits != 0`, `size()` is `0` /
+# `1 << code_bits`, the `EntropyCoded` role never reaches
+# `EntropyImagePending`, the `EntropyImagePending` branch's
+# `prefix_bits` is in `[2, 9]` with `image_width` / `image_height`
+# matching the §6.2.2 `DIV_ROUND_UP(caller_dim, 1 << prefix_bits)`
+# derivation and `entropy_image_bit_position` within the slice's bit
+# length); every refusal branch is cross-checked against the trigger
+# (BitReaderEof's `bit_pos + available` in-range with
+# `wanted > available`; InvalidColorCacheCodeBits's `value` being `0`
+# or above the `[1, 11]` window; Prefix surfacing the §6.2.1 refusal
+# cleanly).
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -189,6 +207,13 @@ bench = false
 [[bin]]
 name = "parse_transform_list"
 path = "fuzz_targets/parse_transform_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_meta_prefix"
+path = "fuzz_targets/parse_meta_prefix.rs"
 test = false
 doc = false
 bench = false

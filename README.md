@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Nine [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Eleven [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -126,8 +126,25 @@ entries, §4.1 / §4.2 `size_bits ∈ [2, 9]`, §4.4 `color_table_size ∈
 [1, 256]` plus the threshold-table `width_bits` derivation, the
 `body_bit_position()` within the slice's bit length, and the
 `stopped_at_entropy_body()` flag consistent with the last entry's
-`has_entropy_body()`. Run any one with (nightly + `cargo-fuzz`
-installed):
+`has_entropy_body()`; `parse_meta_prefix` (round 261) drives the
+§5.2.3 color-cache info + §6.2.2 meta-prefix + §6.2
+5-prefix-code-group reader standalone entry point
+`meta_prefix::MetaPrefixHeader::read` directly across the full
+§5.2.3 + §6.2.2 preamble cross-product (color-cache enable bit +
+4-bit `color_cache_code_bits` range gate, §6.2.2 `ImageRole`
+dispatch, `EntropyImagePending` `prefix_bits = ReadBits(3) + 2`
+range, and the §6.2.2 `DIV_ROUND_UP(image_dim, 1 << prefix_bits)`
+entropy-image dimension derivation) with `Ok(header)` cross-checked
+against the §5.2.3 `code_bits ∈ {0} ∪ [1, 11]` range, the
+`is_enabled()` / `size()` derivations, the `EntropyCoded` role
+never reaching `EntropyImagePending` (the meta-prefix bit is
+absent for sub-images), the `EntropyImagePending` branch's
+`prefix_bits ∈ [2, 9]`, the recomputed entropy-image
+width/height matching the recorded values, and the
+`entropy_image_bit_position` within the slice's bit length;
+`Err(InvalidColorCacheCodeBits)` cross-checked against the
+`value ∈ {0} ∪ [12, 15]` rejection-window. Run any one with
+(nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -140,6 +157,7 @@ cargo +nightly fuzz run parse_anmf           --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run parse_anim           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_alph           --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_transform_list --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_meta_prefix    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

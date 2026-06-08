@@ -6,6 +6,53 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/parse_meta_prefix.rs`: cargo-fuzz harness on the
+  §5.2.3 color-cache info + §6.2.2 meta-prefix + §6.2 5-prefix-code-group
+  reader standalone entry point
+  `oxideav_webp::meta_prefix::MetaPrefixHeader::read`. The §3 image-
+  header peek lands the §2.6 lossless bitstream at the start of the
+  §5.2.3 `color-cache-info` field; `MetaPrefixHeader::read` then walks
+  `color-cache-info` (single bit + optional 4-bit `color_cache_code_bits`
+  range-gated to `[1, 11]` per §5.2.3), `meta-prefix` (single bit, ARGB
+  role only per §6.2.2), and either the §6.2 5-prefix-code group (the
+  `Single` branch) or the §6.2.2 `prefix_bits = ReadBits(3) + 2` field
+  plus the `DIV_ROUND_UP(image_dim, 1 << prefix_bits)` entropy-image
+  dimension derivation (the `EntropyImagePending` branch, which records
+  the boundary and returns for the next §5.2 reader to resume).
+  The function is a public standalone surface exported through
+  `pub mod meta_prefix` that downstream callers can invoke against any
+  byte slice with an attacker-controlled `(image_width, image_height)`
+  pair and `ImageRole`. The new harness drives that direct entry
+  point with a zero-positioned `BitReader` (no §3 image-header skip):
+  byte 0 picks the `ImageRole` (bit 0) and seeds the upper byte of
+  `image_width` (bits 1..8); byte 1 seeds the upper byte of
+  `image_height`; bytes 2.. feed the §5.2.3 + §6.2.2 + §6.2 bit
+  sequence. Every branch of the §5.2.3 + §6.2.2 + §6.2 contract is
+  cross-checked on the way out — `Ok(header)` implies §5.2.3
+  `code_bits ∈ {0} ∪ [1, 11]`, `is_enabled() == (code_bits != 0)`,
+  `size()` matching the `0` / `1 << code_bits` derivation, the
+  `EntropyCoded` role never producing `EntropyImagePending` (sub-images
+  carry no meta-prefix bit), and on the `EntropyImagePending` branch
+  §6.2.2 `prefix_bits ∈ [2, 9]`, the recorded entropy-image
+  `image_width` / `image_height` matching the §6.2.2
+  `DIV_ROUND_UP(caller_dim, 1 << prefix_bits)` recomputation, and
+  `entropy_image_bit_position` within the slice's bit length. `Err`
+  branches are likewise cross-checked: `Eof` carries an in-range
+  `bit_pos + available <= total_bits` coordinate with
+  `wanted > available`; `InvalidColorCacheCodeBits` carries a `value`
+  in the 4-bit field's `[0, 15]` window minus the §5.2.3 compliant
+  `[1, 11]` (i.e. either `0` or in `[12, 15]`); `Prefix` surfaces a
+  §6.2.1 refusal cleanly. The single fuzz iteration is bounded by the
+  §6.2 5-prefix-code-group read (`Single` branch) or a fixed 3-bit
+  read (`EntropyImagePending` branch). Eleventh fuzz target after
+  `decode` / `extract_metadata` / `roundtrip_lossless` /
+  `roundtrip_animated` (round 238) / `decode_alph` (round 255) /
+  `parse_vp8x` (round 256) / `parse_anmf` (round 257) / `parse_anim`
+  (round 258) / `parse_alph` (round 259) / `parse_transform_list`
+  (round 260). README's `### Fuzzing` count now reads `Eleven`
+  (the pre-r261 prose still said `Nine` despite the actual ten
+  targets — fixed in the same commit).
+
 - `fuzz/fuzz_targets/parse_transform_list.rs`: cargo-fuzz harness on
   the §4 VP8L transform-list reader standalone entry point
   `oxideav_webp::vp8l_stream::TransformList::read`. The §3 image-header
