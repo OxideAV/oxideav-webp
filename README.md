@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Fourteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Fifteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -204,8 +204,39 @@ initialization invariant cross-checked on a fresh cache (`size() ==
 1 << code_bits`, every slot reads as `Some(0)`, `lookup(size())`
 reads as `None`), and pure-function determinism asserted on the
 insert sequence by rebuilding a replay cache from the same fuzz
-bytes and verifying every slot agrees with the primary cache. Run
-any one with (nightly + `cargo-fuzz` installed):
+bytes and verifying every slot agrees with the primary cache;
+`inverse_predictor_color` (round 265) drives the §4.1 inverse-predictor
++ §4.2 inverse-color in-place transform passes standalone entry
+points `vp8l_transform::inverse_predictor` +
+`vp8l_transform::inverse_color` directly across the full
+attacker-reachable `(width, height, size_bits, residual_pixels,
+sub_resolution_image)` cross-product (the first three fuzz bytes
+fix the §4.1 / §4.2 `(width, height, size_bits)` carrier triple with
+`width` / `height` masked into `[1, 32]` for iteration cost and
+`size_bits` remapped into `[0, 9]` to cover the full §4.1 / §4.2
+`ReadBits(3) + 2` window plus the `size_bits == 0` hoist branch;
+every subsequent 4-byte little-endian word is forwarded verbatim as
+a fuzz-controlled ARGB residual pixel and, after `width * height`
+words, as a fuzz-controlled sub-resolution predictor / color image
+pixel) with the §4.1 left-topmost rule cross-checked against the
+spec text (`pred_pixels[0] == residual[0] + 0xff000000` per channel
+mod 256), the §4.1 single-column left-column rule cross-checked
+against the §4.1 "all pixels on the leftmost column are T-pixel"
+spec text (every `(0, y)` for `y >= 1` equals `residual + T` per
+channel mod 256), the §4.1 single-row top-row rule cross-checked
+against the §4.1 "all pixels on the top row are L-pixel" spec text
+(every `(x, 0)` for `x >= 1` equals `residual + L` per channel mod
+256), the §4.2 alpha-and-green preservation invariant cross-checked
+against the §4.2 spec text ("The alpha and green channels are left
+as is"), the §4.2 zero-CTE no-op invariant cross-checked by
+re-running the pass against an all-zero sub-resolution image (every
+per-pixel output equals the input), the §4.2 per-block constancy
+invariant cross-checked against the §4.2 block structure (two
+same-block pixels with equal pre-pass RGB produce equal post-pass
+red + blue), and both passes' early-return contract cross-checked
+against the §4.1 / §4.2 `(width == 0 || height == 0)` no-op (the
+pixel buffer is byte-identical to the pre-call snapshot). Run any
+one with (nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -222,6 +253,7 @@ cargo +nightly fuzz run parse_meta_prefix    --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run parse_container      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run distance_code        --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run color_cache          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run inverse_predictor_color --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

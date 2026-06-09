@@ -6,6 +6,60 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/inverse_predictor_color.rs`: cargo-fuzz harness on
+  the §4.1 inverse-predictor + §4.2 inverse-color in-place transform
+  passes standalone entry points
+  `oxideav_webp::vp8l_transform::{inverse_predictor, inverse_color}`.
+  After the §5 entropy stream has emitted the raw §5.1 ARGB residual
+  buffer, every §4 transform in the read-order list runs in reverse
+  against that buffer. The two arithmetic transforms — §4.1 Predictor
+  (reads a sub-resolution "predictor image" whose green channel encodes
+  the per-block prediction mode and applies one of 14 §4.1 Table 2
+  predictors against the already-reconstructed TL / T / TR / L
+  neighbours, then per-channel-adds the prediction into the residual)
+  and §4.2 Color (reads a sub-resolution "color image" whose pixels
+  encode `ColorTransformElement` values and per-channel-adds
+  `ColorTransformDelta` derivations into the red and blue channels
+  while leaving alpha and green untouched) — walk the main `width *
+  height` ARGB buffer applying the inverse derivation in place. The
+  harness fixes the §4.1 / §4.2 `(width, height, size_bits)` carrier
+  triple from the first three fuzz bytes (`width` / `height` masked
+  into `[1, 32]` for iteration cost; `size_bits` remapped into
+  `[0, 9]` to cover the full §4.1 / §4.2 `ReadBits(3) + 2` window plus
+  the `size_bits == 0` hoist branch), then forwards every subsequent
+  4-byte little-endian word verbatim as a fuzz-controlled ARGB
+  residual pixel and (after `width * height` words) as a
+  fuzz-controlled sub-resolution predictor / color image pixel. Both
+  transforms then run on independent clones of the residual against
+  the same sub-resolution image. The §4.1 left-topmost rule is
+  cross-checked against the spec text (`pred_pixels[0] == residual[0]
+  + 0xff000000` per channel mod 256); the §4.1 1×H left-column rule is
+  cross-checked against the §4.1 "all pixels on the leftmost column
+  are T-pixel" spec text (every `(0, y)` for `y >= 1` equals
+  `residual + T` per channel mod 256); the §4.1 W×1 top-row rule is
+  cross-checked against the §4.1 "all pixels on the top row are
+  L-pixel" spec text (every `(x, 0)` for `x >= 1` equals `residual +
+  L` per channel mod 256); the §4.2 alpha-and-green preservation
+  invariant is cross-checked against the §4.2 spec text ("The alpha
+  and green channels are left as is"); the §4.2 zero-CTE no-op
+  invariant is cross-checked by re-running the pass against an
+  all-zero sub-resolution image (every per-pixel output equals the
+  input); the §4.2 per-block constancy invariant is cross-checked
+  against the §4.2 block structure (two same-block pixels with equal
+  pre-pass RGB produce equal post-pass red + blue); both passes'
+  early-return contract is cross-checked against the §4.1 / §4.2
+  `(width == 0 || height == 0)` no-op (the pixel buffer is
+  byte-identical to the pre-call snapshot). The smoke pass on round-265
+  dispatch cleared 200K runs in 45 seconds with no crashes (175 edges,
+  111 corpus seeds reached). Brings the §3 lossless decoder's fuzz
+  coverage to 15 standalone harnesses: the full §2 RIFF + §3 / §4 / §5
+  VP8L decode path is now reachable both end-to-end (`decode` +
+  `roundtrip_lossless` + `roundtrip_animated` + `extract_metadata` +
+  `decode_alph`) and at the nine standalone primitive surfaces (§2.3 /
+  §2.4 RIFF container walker, §2.7.1 VP8X header, §2.7.1.1 ANIM + ANMF
+  headers, §2.7.1.2 ALPH info byte, §4 transform list, §5.2.3 +
+  §6.2.2 meta-prefix preamble, §5.2.2 distance code, §5.2.3 color
+  cache, §4.1 + §4.2 inverse-transform passes).
 - `fuzz/fuzz_targets/color_cache.rs`: cargo-fuzz harness on the
   §5.2.3 lossless-color-cache primitives standalone entry point
   `oxideav_webp::vp8l_decode::ColorCache`. Every VP8L §5.2 GREEN
