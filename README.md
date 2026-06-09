@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Fifteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Sixteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -235,7 +235,44 @@ invariant cross-checked against the §4.2 block structure (two
 same-block pixels with equal pre-pass RGB produce equal post-pass
 red + blue), and both passes' early-return contract cross-checked
 against the §4.1 / §4.2 `(width == 0 || height == 0)` no-op (the
-pixel buffer is byte-identical to the pre-call snapshot). Run any
+pixel buffer is byte-identical to the pre-call snapshot);
+`inverse_subtract_green_indexing` (round 266) drives the §4.3
+inverse-subtract-green + §4.4 inverse-color-table + §4.4
+inverse-color-indexing transform passes standalone entry points
+`vp8l_transform::{inverse_subtract_green, inverse_color_table,
+inverse_color_indexing}` directly across their full
+attacker-reachable input cross-products (the first three fuzz bytes
+fix the §4.3 / §4.4 `(orig_width, height, table_size)` carrier triple
+with `orig_width` / `height` masked into `[1, 32]` for iteration cost
+and `table_size` mapped into the §4.4 wire window `[1, 256]`; every
+subsequent 4-byte little-endian word is forwarded verbatim first as a
+fuzz-controlled ARGB §4.3 input pixel, then as a fuzz-controlled §4.4
+color-table delta entry, then as a fuzz-controlled §4.4 packed-index
+ARGB pixel) with the §4.3 alpha-and-green preservation invariant
+cross-checked against the spec text (every pixel's red byte equals
+input red + input green mod 256, every pixel's blue byte equals input
+blue + input green mod 256, alpha + green bytes byte-identical), the
+§4.3 per-pixel locality invariant cross-checked by running the pass
+on single-pixel inputs at the first eight positions and asserting the
+solo output matches the multi-pixel output, the §4.3 zero-green-byte
+no-op cross-checked against the `(red + 0) = red` reduction, the §4.4
+color-table seed preservation cross-checked against the spec text
+(`table[0]` is left untouched), the §4.4 color-table running-sum
+invariant cross-checked against the §4.4 "adding the previous color
+component values by each ARGB component separately and storing the
+least significant 8 bits of the result" spec text (every `i >= 1`
+entry is the per-channel running sum mod 256 of the original input
+bytes), the §4.4 color-indexing output-length cross-checked against
+the `orig_width * height` carrier contract, the §4.4 color-indexing
+palette-lookup cross-checked against the §4.4 spec formula (output
+pixel `(x, y)` is `color_table[((packed_green >> ((x % count) *
+bits)) & mask) as usize]` with `width_bits` derived from the table
+size via the §4.4 threshold table, falling back to transparent black
+`0x00000000` when the index is out of range), and the §4.4
+color-indexing empty-table edge case cross-checked against the §4.4
+"unused indices map to transparent black" rule; the §4.3 empty-buffer
+and §4.4 single-element-table degenerate no-op branches are
+cross-checked unconditionally on every iteration. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -254,6 +291,7 @@ cargo +nightly fuzz run parse_container      --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run distance_code        --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run color_cache          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run inverse_predictor_color --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run inverse_subtract_green_indexing --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

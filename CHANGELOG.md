@@ -6,6 +6,75 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/inverse_subtract_green_indexing.rs`: cargo-fuzz
+  harness on the §4.3 inverse-subtract-green + §4.4
+  inverse-color-table + §4.4 inverse-color-indexing transform passes
+  standalone entry points
+  `oxideav_webp::vp8l_transform::{inverse_subtract_green,
+  inverse_color_table, inverse_color_indexing}`. The fifteenth harness
+  (`inverse_predictor_color`) covers the two §4 *arithmetic*
+  transforms — §4.1 Predictor and §4.2 Color — that read a
+  sub-resolution image and walk the main buffer per-pixel. This
+  sixteenth harness covers the remaining three §4 primitives that
+  have no sub-resolution image: the §4.3 per-pixel `red += green`
+  / `blue += green` (mod 256) in-place pass that leaves alpha + green
+  untouched; the §4.4 color-table subtraction-decode in-place pass
+  that leaves `table[0]` untouched and reconstructs every later entry
+  as the per-channel running sum (mod 256) of the original input
+  bytes; and the §4.4 color-indexing pass that walks a sub-sampled
+  packed image whose green channel carries (possibly bundled)
+  palette indices and emits a fresh `orig_width * height` ARGB buffer
+  per the §4.4 threshold-table-driven `width_bits` derivation
+  (1..=2 colors → width_bits 3 / count 8 / 1 bit per index; 3..=4 →
+  2 / 4 / 2; 5..=16 → 1 / 2 / 4; ≥17 → 0 / no bundling), falling
+  back to transparent black `0x00000000` when the wire index is out
+  of range. The harness fixes the §4.3 / §4.4 `(orig_width, height,
+  table_size)` carrier triple from the first three fuzz bytes
+  (`orig_width` / `height` masked into `[1, 32]` for iteration cost;
+  `table_size` mapped into the §4.4 wire window `[1, 256]` via
+  `data[2] + 1`), then forwards every subsequent 4-byte little-endian
+  word verbatim first as a fuzz-controlled ARGB §4.3 input pixel,
+  then as a fuzz-controlled §4.4 color-table delta entry, then as a
+  fuzz-controlled §4.4 packed-index ARGB pixel. The §4.3
+  alpha-and-green preservation invariant is cross-checked against
+  the spec text (alpha + green bytes byte-identical to the pre-pass
+  input; red byte equals input red + input green mod 256; blue byte
+  equals input blue + input green mod 256); the §4.3 per-pixel
+  locality invariant is cross-checked by running the pass on
+  single-pixel inputs at the first eight positions and asserting the
+  solo output matches the multi-pixel output; the §4.3 zero-green
+  no-op is cross-checked against the `(red + 0) = red` reduction; the
+  §4.4 color-table seed-preservation invariant is cross-checked
+  against the §4.4 spec text (`table[0]` is left untouched); the
+  §4.4 color-table running-sum invariant is cross-checked against
+  the §4.4 "adding the previous color component values by each ARGB
+  component separately and storing the least significant 8 bits of
+  the result" spec text; the §4.4 color-table determinism invariant
+  is cross-checked across replay; the §4.4 color-indexing
+  output-length invariant is cross-checked against the
+  `orig_width * height` carrier contract; the §4.4 color-indexing
+  palette-lookup invariant is cross-checked against the §4.4 spec
+  formula (output pixel `(x, y)` is `color_table[((packed_green >>
+  ((x % count) * bits)) & mask) as usize]` with `width_bits` derived
+  from the table size via the §4.4 threshold table, falling back to
+  transparent black when the index is out of range); the §4.4
+  color-indexing determinism invariant is cross-checked across
+  replay; the §4.4 color-indexing empty-table edge case is
+  cross-checked against the §4.4 "unused indices map to transparent
+  black" rule; the §4.3 empty-buffer and §4.4 single-element-table
+  degenerate no-op branches are cross-checked unconditionally on
+  every iteration. The smoke pass on round-266 dispatch cleared 200K
+  runs in 2 seconds with no crashes (266 edges, 810 features, 80
+  corpus seeds reached). Brings the §3 lossless decoder's fuzz
+  coverage to 16 standalone harnesses: the full §2 RIFF + §3 / §4 / §5 VP8L
+  decode path is now reachable both end-to-end (`decode` +
+  `roundtrip_lossless` + `roundtrip_animated` + `extract_metadata` +
+  `decode_alph`) and at the ten standalone primitive surfaces (§2.3
+  / §2.4 RIFF container walker, §2.7.1 VP8X header, §2.7.1.1 ANIM +
+  ANMF headers, §2.7.1.2 ALPH info byte, §4 transform list, §5.2.3
+  + §6.2.2 meta-prefix preamble, §5.2.2 distance code, §5.2.3 color
+  cache, §4.1 + §4.2 inverse-transform passes, §4.3 + §4.4
+  inverse-transform passes).
 - `fuzz/fuzz_targets/inverse_predictor_color.rs`: cargo-fuzz harness on
   the §4.1 inverse-predictor + §4.2 inverse-color in-place transform
   passes standalone entry points
