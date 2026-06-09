@@ -6,6 +6,50 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/color_cache.rs`: cargo-fuzz harness on the
+  §5.2.3 lossless-color-cache primitives standalone entry point
+  `oxideav_webp::vp8l_decode::ColorCache`. Every VP8L §5.2 GREEN
+  symbol whose value is `>= 256 + 24` is a color-cache code — the
+  resolved index `S - (256 + 24)` is fed to the cache's `lookup`,
+  the returned ARGB is emitted as the pixel, and that pixel is then
+  re-inserted into the cache. Every literal pixel and every
+  backward-reference pixel is also inserted as it is emitted. The
+  cache itself is a `1 << code_bits` array of ARGB entries; the slot
+  of any color is `(0x1e35a7bd * argb) >> (32 - code_bits)`. The
+  §5.2.3 spec text is explicit: "Only one lookup is done in a color
+  cache; there is no conflict resolution" — two colors that collide
+  on the hash overwrite each other in slot order, with the
+  most-recently-inserted winning. The harness fixes `code_bits` from
+  the first fuzz byte (remapped into the §5.2.3 permitted window
+  `[1, 11]` to honour the spec's "compliant decoders MUST indicate a
+  corrupted bitstream for other values" rule) then slices the rest of
+  the buffer into 4-byte ARGB words and forwards each verbatim into
+  `ColorCache::insert`. Every hash is cross-checked against the
+  §5.2.3 spec formula `(0x1e35a7bd * argb) >> (32 - code_bits)`;
+  every insert/lookup round trip is cross-checked against the §5.2.3
+  single-slot single-write contract; every per-slot lookup is
+  cross-checked against a parallel shadow model that records the
+  §5.2.3 most-recently-inserted-wins overwrite behaviour (this
+  catches any §5.2.3 violation where the insert touched a slot other
+  than the hashed one — e.g. an open-addressing probe, explicitly
+  forbidden by "Only one lookup is done; there is no conflict
+  resolution"). The §5.2.3 cache initialization invariant is
+  cross-checked on a fresh `ColorCache::new(code_bits)`: `size() ==
+  1 << code_bits`, every slot reads as `Some(0)` per "all entries in
+  all color cache values are set to zero", `lookup(size())` reads as
+  `None`, and `lookup(usize::MAX)` reads as `None`. Pure-function
+  determinism is asserted on the full insert sequence by rebuilding
+  a replay cache from the same fuzz bytes and verifying every slot
+  agrees with the primary cache. The smoke pass on round-264 dispatch
+  cleared 200K runs in ~3 seconds with no crashes. Brings the §3
+  lossless decoder's fuzz coverage to 14 standalone harnesses: the
+  full §2 RIFF + §3 / §4 / §5 VP8L decode path is now reachable both
+  end-to-end (`decode` + `roundtrip_lossless` + `roundtrip_animated`
+  + `extract_metadata` + `decode_alph`) and at the eight standalone
+  primitive surfaces (§2.3 / §2.4 RIFF container walker, §2.7.1 VP8X
+  header, §2.7.1.1 ANIM + ANMF headers, §2.7.1.2 ALPH info byte, §4
+  transform list, §5.2.3 + §6.2.2 meta-prefix preamble, §5.2.2
+  distance code, §5.2.3 color cache).
 - `fuzz/fuzz_targets/distance_code.rs`: cargo-fuzz harness on the
   §5.2.2 distance-code-to-pixel-distance pure-function lookup
   standalone entry point

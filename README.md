@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Thirteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Fourteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -185,7 +185,27 @@ the 120-entry `DISTANCE_MAP`, `distance_code - 120` for codes
 from the clamp on the neighborhood-lookup branch or from the
 smallest reachable raw scan-line distance of `121 - 120 = 1`),
 plus pure-function determinism asserted via a double-call equality
-check. Run any one with (nightly + `cargo-fuzz` installed):
+check; `color_cache` (round 264) drives the §5.2.3
+lossless-color-cache primitives standalone entry point
+`vp8l_decode::ColorCache` directly across the full attacker-reachable
+`code_bits ∈ [1, 11]` × `argb ∈ [0, u32::MAX]` cross-product (the
+first fuzz byte fixes the §5.2.3 `code_bits` remapped into the
+permitted window per the §5.2.3 "compliant decoders MUST indicate a
+corrupted bitstream for other values" rule, every subsequent 4-byte
+word is forwarded verbatim as a fuzz-controlled ARGB color into
+`ColorCache::insert`) with every hash cross-checked against the
+§5.2.3 spec formula `(0x1e35a7bd * argb) >> (32 - code_bits)`, every
+insert/lookup round trip cross-checked against the §5.2.3 single-slot
+single-write spec text ("Only one lookup is done in a color cache;
+there is no conflict resolution"), every per-slot lookup cross-checked
+against a parallel shadow model that records the §5.2.3
+most-recently-inserted-wins overwrite behaviour, the §5.2.3 cache
+initialization invariant cross-checked on a fresh cache (`size() ==
+1 << code_bits`, every slot reads as `Some(0)`, `lookup(size())`
+reads as `None`), and pure-function determinism asserted on the
+insert sequence by rebuilding a replay cache from the same fuzz
+bytes and verifying every slot agrees with the primary cache. Run
+any one with (nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -201,6 +221,7 @@ cargo +nightly fuzz run parse_transform_list --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run parse_meta_prefix    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run parse_container      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run distance_code        --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run color_cache          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

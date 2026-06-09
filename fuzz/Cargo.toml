@@ -163,7 +163,26 @@ cargo-fuzz = true
 # neighborhood-lookup branch or from the smallest reachable raw scan-
 # line distance of `121 - 120 = 1` on the reservation branch); also
 # pure-function determinism asserted by calling the lookup twice and
-# checking the two results are equal.
+# checking the two results are equal. The fourteenth harness drives
+# the §5.2.3 lossless-color-cache primitives standalone entry point
+# `vp8l_decode::ColorCache` directly: the first fuzz byte fixes the
+# §5.2.3 `code_bits` (remapped into the [1, 11] permitted window per
+# the §5.2.3 "compliant decoders MUST indicate a corrupted bitstream
+# for other values" rule), every subsequent 4-byte word is forwarded
+# verbatim as a fuzz-controlled ARGB color into `ColorCache::insert`,
+# with every hash cross-checked against the §5.2.3 spec formula
+# `(0x1e35a7bd * argb) >> (32 - code_bits)`, every insert/lookup
+# round trip cross-checked against the §5.2.3 single-slot single-write
+# spec text ("Only one lookup is done in a color cache; there is no
+# conflict resolution"), every per-slot lookup cross-checked against
+# a parallel shadow model that records the §5.2.3 most-recently-
+# inserted-wins overwrite behaviour, the §5.2.3 cache initialization
+# invariant cross-checked on a fresh cache (`size() == 1 << code_bits`,
+# every slot reads as `Some(0)`, `lookup(size())` reads as `None`),
+# `lookup(usize::MAX)` cross-checked as `None`, and pure-function
+# determinism asserted on the insert sequence by rebuilding a replay
+# cache from the same fuzz bytes and verifying every slot agrees with
+# the primary cache.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -267,6 +286,13 @@ bench = false
 [[bin]]
 name = "distance_code"
 path = "fuzz_targets/distance_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "color_cache"
+path = "fuzz_targets/color_cache.rs"
 test = false
 doc = false
 bench = false
