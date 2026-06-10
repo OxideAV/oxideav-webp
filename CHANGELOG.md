@@ -6,6 +6,56 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/decode_entropy_image.rs`: cargo-fuzz harness — the
+  nineteenth — driving the §6.2.2 *entropy image* decode path standalone
+  entry point `oxideav_webp::vp8l_decode::decode_entropy_image`
+  directly. When a §5.1 ARGB image sets the §6.2.2 meta-prefix bit the
+  decoder reads `prefix_bits = ReadBits(3) + 2`, derives a
+  `DIV_ROUND_UP`-sized block grid, and decodes the §6.2.2 entropy image
+  — itself a §7.3 `entropy-coded-image` of one pixel per block — folding
+  each entropy pixel's red+green channels into one 16-bit meta-prefix
+  code (`(entropy_pixel >> 8) & 0xffff`). The fuzz buffer fixes the
+  §6.2.2 `(prefix_bits, prefix_image_width, prefix_image_height)` carrier
+  triple from the first three bytes (`prefix_bits` masked to `[0, 15]`
+  since `decode_entropy_image` records it as an opaque carrier without
+  re-deriving a block size; the block dimensions modulo 9 so the §7.3
+  sub-image decode stays bounded and 0 reaches the §6.2.2
+  degenerate-dimension refusal) and feeds the remaining bytes through a
+  zero-positioned `BitReader` as the §7.3 entropy-coded-image bit
+  sequence. Every `Ok` index is cross-checked against the §6.2.2 + §7.3
+  carrier rules: the accessors echo the carrier triple (`prefix_bits()`,
+  `block_width() == prefix_image_width`, `block_height() ==
+  prefix_image_height`); §7.3 one meta-code per block
+  (`meta_codes().len() == prefix_image_width * prefix_image_height`);
+  §6.2.2 `num_prefix_groups() == max(meta_codes) + 1`; the §6.2.2 fold
+  cross-checked against an **independent** decode of the same bytes
+  through the public sibling `vp8l_decode::decode_entropy_coded_image`
+  (the harness refolds that decode's raw ARGB pixels via `pixels()` and
+  asserts byte-equality with the meta-codes `decode_entropy_image`
+  produced, plus both readers advancing to the same `bit_position()`);
+  the §6.2.2 carrier asymmetry where rebuilding through the validated
+  constructor `MetaPrefixIndex::from_parts` reproduces the index iff
+  `prefix_bits ∈ [2, 9]` (the wire window) and is refused with
+  `InvalidPrefixBits` echoing the recorded value otherwise; and
+  determinism by replaying the same bytes + carrier triple and asserting
+  an identical index advanced to an identical bit position. The §6.2.2
+  degenerate-dimension refusal is pinned to the `EmptyEntropyImage`
+  variant echoing the carrier dimensions iff at least one is zero; every
+  other bitstream-level refusal (truncation, prefix-code parse failure,
+  out-of-range green symbol, color-cache or backward-reference fault) is
+  required only to return a `Result` rather than panic — the granular
+  §5.2 / §6.2 refusal modes are cross-checked by the sibling `decode` /
+  `parse_meta_prefix` harnesses through their own entry points. A 30 s
+  smoke pass cleared 8.9 M runs with no crashes, reaching the §5.2
+  `read_lz77_value` / `apply_backward_reference` /
+  `distance_code_to_pixel_distance` core through the entropy-coded
+  sub-image. This brings the §3 lossless decoder's fuzz coverage to 19
+  standalone harnesses, with the §6.2.2 entropy-image decode now
+  exercised both through the full `decode` path and at its own
+  standalone surface, complementing the round-268 `meta_prefix_index`
+  harness (which drives the validated constructor + per-pixel selector
+  on already-decoded meta-codes) by driving the bitstream-level producer
+  of that same `MetaPrefixIndex` table.
 - `vp8l_transform::color_indexing_width_bits`: the §4.4 pixel-bundling
   `width_bits` threshold-table accessor ("Color Table Size to Bundled
   Pixel Bit Width Mapping": `1..=2 → 3`, `3..=4 → 2`, `5..=16 → 1`,

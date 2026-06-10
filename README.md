@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Eighteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Nineteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -318,7 +318,35 @@ prefix-bits gate passed; `CodeCountMismatch` ⇔ count off the
 expectation with both earlier gates passed, `expected` / `got`
 echoing the call), and constructor determinism cross-checked by
 rebuilding from the same parts plus round-tripping the index's own
-accessors back through `from_parts`. Run any
+accessors back through `from_parts`; `decode_entropy_image`
+(round 270) drives the §6.2.2 *entropy image* decode path standalone
+entry point `vp8l_decode::decode_entropy_image` directly across the
+`(prefix_bits, prefix_image_width, prefix_image_height, bitstream)`
+cross-product (the first three fuzz bytes fix the §6.2.2 carrier triple
+— `prefix_bits` masked to `[0, 15]` since the function records it as an
+opaque carrier without re-deriving a block size, the block dimensions
+modulo 9 so the §7.3 sub-image decode stays bounded and 0 reaches the
+§6.2.2 degenerate-dimension refusal; the remaining bytes feed a
+zero-positioned `BitReader` the §7.3 `entropy-coded-image` bit
+sequence) with every `Ok` index cross-checked against the §6.2.2 +
+§7.3 carrier rules (accessors echo the carrier triple; §7.3 one
+meta-code per block `meta_codes().len() == prefix_image_width *
+prefix_image_height`; §6.2.2 `num_prefix_groups() == max(meta_codes) +
+1`; the §6.2.2 fold `meta_prefix_code == (entropy_pixel >> 8) & 0xffff`
+cross-checked against an independent decode of the same bytes through
+the public sibling `decode_entropy_coded_image` — the harness refolds
+that decode's raw ARGB pixels and asserts byte-equality with the
+meta-codes plus both readers advancing to the same bit position; the
+§6.2.2 carrier asymmetry where `from_parts` reproduces the index iff
+`prefix_bits ∈ [2, 9]` and refuses with `InvalidPrefixBits` otherwise;
+and determinism by replaying the same bytes + carrier triple), the
+§6.2.2 degenerate-dimension refusal pinned to the `EmptyEntropyImage`
+variant echoing the carrier dimensions iff at least one is zero, and
+every other bitstream-level refusal required only to return a `Result`
+rather than panic. A 30 s smoke pass cleared 8.9 M runs with no
+crashes (reaching the §5.2 `read_lz77_value` / `apply_backward_reference`
+/ `distance_code_to_pixel_distance` core through the entropy-coded
+sub-image). Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -340,6 +368,7 @@ cargo +nightly fuzz run inverse_predictor_color --manifest-path crates/oxideav-w
 cargo +nightly fuzz run inverse_subtract_green_indexing --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run backward_reference   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run meta_prefix_index    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_entropy_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

@@ -274,7 +274,57 @@ cargo-fuzz = true
 # length > total_pixels` with the underflow guard having passed,
 # fields echo the call, buffer byte-identical), and pure-function
 # determinism cross-checked by replaying a successful run from the
-# same pre-fill and asserting an identical buffer + range.
+# same pre-fill and asserting an identical buffer + range. The
+# eighteenth harness drives the §6.2.2 meta-prefix block-lookup table
+# standalone constructor + selector entry points
+# `vp8l_decode::MetaPrefixIndex::{from_parts, meta_code_for}` directly:
+# the first three fuzz bytes fix a `(prefix_bits, block_width,
+# block_height)` carrier triple (prefix_bits masked to [0, 15] so the
+# §6.2.2 [2, 9] window and its rejection are both reached; the grid
+# masked into [0, 32]² with 0 reaching the degenerate-grid refusal), a
+# skew byte shifts the supplied code count off `block_width *
+# block_height` by [-2, +2], and the remaining 2-byte LE words supply
+# the meta-prefix codes verbatim, with every Ok index cross-checked
+# against the §6.2.2 carrier rules (accessors echo the parts,
+# `num_prefix_groups() == max(entropy image) + 1`, and `meta_code_for`
+# at all four corners of every block's `(1 << prefix_bits)`-pixel-square
+# covered area matching the §6.2.2 position formula), every error
+# variant cross-checked against its §6.2.2 refusal trigger in
+# precedence order (`InvalidPrefixBits` ⇔ prefix_bits ∉ [2, 9];
+# `EmptyIndex` ⇔ zero-block grid with the prefix-bits gate passed;
+# `CodeCountMismatch` ⇔ count off the expectation with both earlier
+# gates passed), and constructor determinism cross-checked by
+# rebuilding from the same parts plus round-tripping the index's own
+# accessors back through `from_parts`. The nineteenth harness drives
+# the §6.2.2 *entropy image* decode path standalone entry point
+# `vp8l_decode::decode_entropy_image` directly: the first three fuzz
+# bytes fix the `(prefix_bits, prefix_image_width, prefix_image_height)`
+# §6.2.2 carrier triple (prefix_bits masked to [0, 15]; the block
+# dimensions modulo 9 so the §7.3 sub-image decode stays bounded and 0
+# reaches the §6.2.2 degenerate-dimension `EmptyEntropyImage` refusal),
+# and the remaining bytes feed a zero-positioned `BitReader` the §7.3
+# `entropy-coded-image` bit sequence. Every Ok index is cross-checked
+# against the §6.2.2 + §7.3 carrier rules: the accessors echo the
+# carrier triple (`prefix_bits()`, `block_width() ==
+# prefix_image_width`, `block_height() == prefix_image_height`); §7.3
+# carries one meta-code per block (`meta_codes().len() ==
+# prefix_image_width * prefix_image_height`); §6.2.2 `num_prefix_groups()
+# == max(meta_codes) + 1`; and the §6.2.2 fold (`meta_prefix_code ==
+# (entropy_pixel >> 8) & 0xffff`) cross-checked against an independent
+# decode of the same bytes through the public sibling
+# `decode_entropy_coded_image` — the harness refolds that decode's raw
+# ARGB pixels and asserts byte-equality with the meta-codes
+# `decode_entropy_image` produced plus both readers advancing to the
+# same bit position. The §6.2.2 position-formula round-trip is
+# cross-checked by rebuilding the index through `from_parts` from its
+# own accessors; determinism by replaying the same bytes + carrier
+# triple and asserting an identical index advanced to an identical bit
+# position. The §6.2.2 degenerate-dimension refusal is pinned to the
+# `EmptyEntropyImage` variant echoing the carrier dimensions iff at
+# least one is zero; every other refusal is required only to return a
+# `Result` rather than panic (the granular §5.2 / §6.2 refusal modes
+# are cross-checked by the sibling `decode` / `parse_meta_prefix`
+# harnesses through their own entry points).
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -413,6 +463,13 @@ bench = false
 [[bin]]
 name = "meta_prefix_index"
 path = "fuzz_targets/meta_prefix_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_entropy_image"
+path = "fuzz_targets/decode_entropy_image.rs"
 test = false
 doc = false
 bench = false
