@@ -24,6 +24,32 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `benches/prefix_from_code_lengths.rs`: criterion bench — the
+  seventeenth — for the decoder-side §6.2.1 canonical-table build
+  `vp8l_prefix::PrefixCode::from_code_lengths`, the decode mirror of
+  the §3.7.2 length-then-code encoder pair benched in rounds 250
+  (`build_code_lengths`) and 251 (`canonical_codes`) and the
+  round-170 decode-profile rank-4 symbol (~2% of decode self-time).
+  Parameterised over the same four §3.7.1 prefix-code-group alphabets
+  (distance-40, literal-256, green-281, green-2328) and the same two
+  dense / sparse frequency regimes with identical LCG constants, so
+  every cell is directly comparable to its encoder-mirror
+  counterpart; the length tables are produced by `build_code_lengths`
+  at setup and the per-iteration `Vec` clone (the function takes the
+  table by value) is excluded from the measured interval via
+  `iter_batched`. Medians: 187.7 ns / 100.7 ns (dense/sparse
+  distance-40), 918.0 ns / 546.3 ns (literal-256), 1.006 µs /
+  623.2 ns (green-281), 7.300 µs / 5.249 µs (green-2328) — linear in
+  alphabet size, dense/sparse ratio ~1.4–1.9× (between
+  `canonical_codes`'s regime-blind ~1.2× and `build_code_lengths`'s
+  18×–84×, matching the body's one-full-rescan-per-used-length
+  shape), and the cheapest link in the `green2328` dense
+  length-then-code chain (417.8 µs builder ≫ 15.70 µs encoder codes >
+  7.30 µs decoder table). Function body unchanged; the bench is the
+  A/B reference for a future single-rescan bucket-sort rewrite, with
+  the round-275 `prefix_code` differential fuzz harness as the
+  byte-exact regression guard. Full analysis in `BENCHMARKS.md`
+  (round-276 section).
 - `fuzz/fuzz_targets/prefix_code.rs`: cargo-fuzz harness — the
   twenty-fourth — driving the §6.2.1 *single canonical prefix-code* reader
   standalone entry point `oxideav_webp::vp8l_prefix::PrefixCode::read`

@@ -117,3 +117,10 @@ harness = false
 [[bench]]
 name = "value_to_prefix"
 harness = false
+
+# Round-276: decoder-side §6.2.1 canonical-table build
+# (`PrefixCode::from_code_lengths`) — the decode mirror of the
+# round-250/251 `build_code_lengths` / `canonical_codes` benches.
+[[bench]]
+name = "prefix_from_code_lengths"
+harness = false

@@ -35,6 +35,7 @@ the medians are still stable to a few percent.
 | `benches/apply_subtract_green.rs` | `apply_subtract_green_256x256` | Encoder-side §4.3 forward subtract-green transform (mirror of decoder's `inverse_subtract_green`) over a 256×256 ARGB buffer (deterministic LCG fill) |
 | `benches/inverse_color_table.rs` | `inverse_color_table_paletteN` | §4.4 palette subtraction-decode (cumulative-delta) pass over a `N`-entry palette, parameterised over `N ∈ {2, 16, 256}` to cover the bundling-tier boundaries (smallest, mid-tier, max palette length) |
 | `benches/build_code_lengths.rs` | `build_code_lengths_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 Huffman code-length builder over a single §3.7.1 prefix-code-group alphabet, parameterised over (a) alphabet size — DISTANCE = 40, RED/BLUE/ALPHA = 256, GREEN at smallest color-cache (281) and largest color-cache (2328) — and (b) frequency-table regime: *dense* (every symbol live, LCG-fill 1..=255) or *sparse* (`sqrt(N)` live symbols, 1/(k+1) Zipf shape). Eight cells total |
+| `benches/prefix_from_code_lengths.rs` | `prefix_from_code_lengths_{dense,sparse}_{distance40,literal256,green281,green2328}` | Decoder-side §6.2.1 canonical-table build (`PrefixCode::from_code_lengths`) over the same four §3.7.1 prefix-code-group alphabets and the same two dense / sparse frequency regimes as `build_code_lengths` / `canonical_codes`, with length tables produced by `build_code_lengths` at setup. The per-iteration `Vec` clone (the function takes the table by value) is excluded via `iter_batched` setup. Eight cells total |
 | `benches/canonical_codes.rs` | `canonical_codes_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 canonical-code-value assignment over the same four §3.7.1 prefix-code-group alphabets and the same two dense / sparse frequency regimes as `build_code_lengths`, sampling only the per-symbol code-value pass (the `build_code_lengths` call that produces the length table is outside the measured interval). Eight cells total |
 
 ## Round-170 baseline (pre-optimization)
@@ -776,6 +777,85 @@ coverage — `chooser_round_trips_through_decoder_on_both_branches`,
 `round_trip_larger_random_like`, and the `round_trip_*` family that
 re-decodes every encoder bit against `decode_webp` — is the
 byte-exact regression guard any future rewrite must hold.
+
+## Round-276 (2026-06-11): §6.2.1 decoder canonical-table build bench
+
+`benches/prefix_from_code_lengths.rs` adds a criterion harness for
+`vp8l_prefix::PrefixCode::from_code_lengths` — the decoder-side
+§6.2.1 canonical-table build. It is the decode mirror of the
+§3.7.2 length-then-code encoder pair sampled in rounds 250 / 251:
+given the per-symbol code lengths recovered from the bitstream, it
+counts symbols per length, validates the §6.2.1 Kraft completeness
+rule (`sum 2^-len == 1`, single-leaf-node exception), assigns
+canonical code values in `(length, value)` order, and materialises
+the per-length decode rows `read_symbol` walks.
+
+`from_code_lengths` is the round-170 decode-profile rank-4 symbol
+(`vp8l_prefix::PrefixCode::from_code_lengths`, ~50 / 2 700 samples,
+~2% of decode self-time). Like its encoder mirrors it runs once per
+prefix code per §6.2 prefix code group (five codes per group) plus
+once for the inner code-length code of every normal-form §6.2.1
+read, so its self-time scales with the per-image meta-prefix
+code-group count. It was the last pass in the §3.7.2 / §6.2.1
+length-then-code chain with no per-pass bench.
+
+The bench parameterises the same two axes as rounds 250 / 251 — the
+four §3.7.1 alphabets (`distance40` / `literal256` / `green281` /
+`green2328`) and the two dense / sparse frequency regimes — with the
+same LCG constants, so each cell is directly comparable to its
+`build_code_lengths` / `canonical_codes` counterpart: the length
+tables fed to `from_code_lengths` here are byte-for-byte the tables
+those benches build / consume. `build_code_lengths` runs once per
+cell at setup; the per-iteration `Vec<u8>` clone (the function takes
+the length table by value) lives in `iter_batched` setup, outside
+the measured interval — only the canonical-table build itself is
+sampled.
+
+### Round-276 measurement
+
+| Bench | Median |
+|---|---:|
+| `prefix_from_code_lengths_dense_distance40`   | **187.7 ns** |
+| `prefix_from_code_lengths_sparse_distance40`  | **100.7 ns** |
+| `prefix_from_code_lengths_dense_literal256`   | **918.0 ns** |
+| `prefix_from_code_lengths_sparse_literal256`  | **546.3 ns** |
+| `prefix_from_code_lengths_dense_green281`     | **1.006 µs** |
+| `prefix_from_code_lengths_sparse_green281`    | **623.2 ns** |
+| `prefix_from_code_lengths_dense_green2328`    | **7.300 µs** |
+| `prefix_from_code_lengths_sparse_green2328`   | **5.249 µs** |
+
+(A second consecutive `--quick` run reproduced every cell within
+~5%; medians above are from the first run.)
+
+Observations:
+
+* Cost scales linearly with alphabet size on both regimes
+  (40 → 256 → 281 → 2328 ≈ 1× → 4.9× → 5.4× → 39× dense), as
+  expected for a body whose assignment loop rescans the full
+  `code_lengths` slice once per *used* length: the used-length
+  count saturates well below `MAX_CODE_LENGTH`, leaving `N` as the
+  dominant axis.
+* The dense / sparse ratio sits at ~1.4–1.9× per alphabet — between
+  `canonical_codes`'s ~1.2× (fixed 15-pass rescan, regime-blind)
+  and `build_code_lengths`'s 18×–84× (heap scales with the
+  active-symbol count). That matches the per-used-length rescan
+  shape: sparse tables use fewer distinct lengths (fewer rescans)
+  but each rescan still walks all `N` slots.
+* Cell-for-cell against the encoder mirrors at `green2328` dense:
+  `build_code_lengths` 417.8 µs ≫ `canonical_codes` 15.70 µs >
+  `from_code_lengths` 7.30 µs. The decoder build is the cheapest
+  link in the length-then-code chain, consistent with the §6.2.1
+  spec shape (the decoder never sees frequencies — only lengths).
+* A future single-rescan bucket-sort rewrite (one pass appending
+  each used symbol to its length bucket, instead of one full rescan
+  per used length) would target the dense cells first; this bench
+  is its A/B reference.
+
+The function body is left unchanged this round; the deliverable is
+the A/B reference. The existing `vp8l_prefix::tests` coverage plus
+the round-275 `fuzz/fuzz_targets/prefix_code.rs` differential
+harness (rebuild-from-`code_lengths()` reproduces every decode) are
+the byte-exact regression guards any future rewrite must hold.
 
 ## Reproducing
 
