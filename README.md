@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty-three [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty-four [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -443,7 +443,29 @@ slice bit length, and replaying the same bytes + cache size yields an
 equal group at an identical bit position; the §5.2.3
 `InvalidColorCacheCodeBits` variant is asserted unreachable (the cache
 size is caller-supplied, never read here). A 41 s smoke pass cleared
-4.97 M runs with no crashes. Run any
+4.97 M runs with no crashes. `prefix_code` (round 275) drops one layer
+further to the §6.2.1 *single canonical prefix-code* reader standalone
+entry point `vp8l_prefix::PrefixCode::read` directly — the surface
+`PrefixCodeGroup::read` calls five times in green/red/blue/alpha/distance
+order. It reads one code's lengths off the wire (the §6.2.1 simple/normal
+`read_code_lengths` dispatch) and builds the canonical decoder via
+`from_code_lengths` with its Kraft completeness gate and single-leaf
+exception, isolated across an attacker-controlled `(alphabet_size,
+bitstream)` cross-product where the first fuzz byte selects one of the
+wire-reachable §6.2.3 alphabets — `40` (distance), `256` (red/blue/alpha),
+or the green `256 + 24 + color_cache_size` for the full
+`color_cache_size ∈ {0} ∪ {2, …, 2048}` range — and the remaining bytes
+feed a zero-positioned `BitReader`. Every `Ok(code)` is cross-checked
+against the §6.2.3 / §6.2.1 carrier rules: `code_lengths().len()` equals
+the selected alphabet, every nonzero length is `<= 15`, `single_symbol()`
+is `Some(s)` iff exactly one nonzero entry (at `s`) and `None` iff two or
+more, `read_symbol` against an all-zero reader resolves an in-range symbol
+index, rebuilding from the returned length table through
+`from_code_lengths` reproduces an equal code (the §6.2.1 `sum 2^-len == 1`
+completeness invariant), the reader never advances past the slice bit
+length, and replaying the same bytes + alphabet yields an equal code at an
+identical bit position. A 14 s smoke pass cleared 2.00 M runs with no
+crashes. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -470,6 +492,7 @@ cargo +nightly fuzz run decode_entropy_coded_image --manifest-path crates/oxidea
 cargo +nightly fuzz run decode_argb          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_lossless      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run prefix_code_group    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run prefix_code          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

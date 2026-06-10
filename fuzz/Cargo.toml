@@ -552,3 +552,10 @@ path = "fuzz_targets/prefix_code_group.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "prefix_code"
+path = "fuzz_targets/prefix_code.rs"
+test = false
+doc = false
+bench = false

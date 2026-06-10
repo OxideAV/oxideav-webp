@@ -24,6 +24,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/prefix_code.rs`: cargo-fuzz harness — the
+  twenty-fourth — driving the §6.2.1 *single canonical prefix-code* reader
+  standalone entry point `oxideav_webp::vp8l_prefix::PrefixCode::read`
+  directly across an `(alphabet_size, bitstream)` cross-product. This is
+  the surface immediately *below* the round-274 `prefix_code_group`
+  harness: `PrefixCodeGroup::read` calls `PrefixCode::read` five times in
+  green/red/blue/alpha/distance order, and this harness isolates one such
+  call. `PrefixCode::read` reads one code's lengths off the wire — the
+  §6.2.1 simple/normal `read_code_lengths` dispatch — and builds the
+  canonical decoder via `from_code_lengths` with its §6.2.1 Kraft
+  completeness gate and single-leaf-node exception. No prior harness drove
+  the single code standalone or across a free alphabet sweep:
+  `prefix_code_group` (round 274) only ever drives the five reads as a unit
+  at the fixed `{40, 256, green}` alphabet sizes. The first input byte
+  selects one of the wire-reachable §6.2.3 alphabets — `40` (distance),
+  `256` (red/blue/alpha), or the green `256 + 24 + color_cache_size` for
+  the full `color_cache_size ∈ {0} ∪ {2, …, 2048}` range — and the
+  remaining bytes feed a zero-positioned `BitReader`. Every `Ok(code)` is
+  cross-checked against the §6.2.3 / §6.2.1 carrier rules:
+  `code_lengths().len()` equals the selected alphabet, every nonzero length
+  is `<= 15` (the `MAX_CODE_LENGTH` ceiling), `single_symbol()` is `Some(s)`
+  iff the length table has exactly one nonzero entry (at `s`) and `None`
+  iff two or more, `read_symbol` against an all-zero reader resolves an
+  in-range symbol index, rebuilding from the returned length table through
+  `from_code_lengths` reproduces an equal code (the §6.2.1 `sum 2^-len == 1`
+  completeness invariant a built code satisfies), the reader never advances
+  past the slice bit length, and replaying the same bytes + alphabet yields
+  an equal code at an identical bit position. A 14 s smoke pass cleared
+  2.00 M runs with no crashes. Run with `cargo +nightly fuzz run
+  prefix_code --manifest-path crates/oxideav-webp/fuzz/Cargo.toml`.
 - `fuzz/fuzz_targets/prefix_code_group.rs`: cargo-fuzz harness — the
   twenty-third — driving the §6.2 / §6.2.1 *prefix-code-group* reader
   standalone entry point `oxideav_webp::meta_prefix::PrefixCodeGroup::read`
