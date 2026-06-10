@@ -3255,30 +3255,6 @@ fn encode_with_color_transform(
 /// range is `1..=256` unique ARGB colors.
 const MAX_PALETTE_SIZE: usize = 256;
 
-/// §4.4 `width_bits` from the color-table size, matching the decoder's
-/// [`crate::vp8l_transform`] threshold table exactly:
-///
-/// | `color_table_size` | `width_bits` | indices per packed byte |
-/// |--------------------|--------------|-------------------------|
-/// | `1..=2`            | `3`          | `8` (1 bit each)        |
-/// | `3..=4`            | `2`          | `4` (2 bits each)       |
-/// | `5..=16`           | `1`          | `2` (4 bits each)       |
-/// | `17..=256`         | `0`          | `1` (8 bits each)       |
-///
-/// The kept-local copy avoids a `pub(crate)` import dance with the
-/// decoder module, which marks its helper file-private.
-fn encoder_color_indexing_width_bits(color_table_size: usize) -> u8 {
-    if color_table_size <= 2 {
-        3
-    } else if color_table_size <= 4 {
-        2
-    } else if color_table_size <= 16 {
-        1
-    } else {
-        0
-    }
-}
-
 /// Scan `pixels` for unique ARGB values and, if the count is below
 /// [`MAX_PALETTE_SIZE`], return a `(palette, index_of)` pair:
 ///
@@ -3345,8 +3321,9 @@ fn forward_color_table(color_table: &mut [u32]) {
 /// are zeroed (alpha 0, red 0, blue 0) — the decoder reads only the
 /// green channel via `inverse_color_indexing`.
 ///
-/// `width_bits` is the value [`encoder_color_indexing_width_bits`]
-/// returns for the palette size. `packed_width = DIV_ROUND_UP(width,
+/// `width_bits` is the value the shared §4.4 threshold table
+/// [`crate::vp8l_transform::color_indexing_width_bits`] returns for
+/// the palette size. `packed_width = DIV_ROUND_UP(width,
 /// 1 << width_bits)` — the new image width fed to the §3 image
 /// stream.
 ///
@@ -3422,7 +3399,8 @@ fn encode_with_color_indexing(
         return None;
     }
 
-    let width_bits = encoder_color_indexing_width_bits(palette.len());
+    // §4.4 threshold table — single shared copy.
+    let width_bits = crate::vp8l_transform::color_indexing_width_bits(palette.len());
     let (packed_image, packed_width) =
         pack_indices_into_bundled_image(pixels, &index_of, width, height, width_bits);
 
@@ -7480,18 +7458,47 @@ mod tests {
 
     // ---- round 150: §4.4 color-indexing transform encoder ----
 
-    /// `encoder_color_indexing_width_bits` matches the §4.4 spec
-    /// thresholds: 1..=2 → 3, 3..=4 → 2, 5..=16 → 1, 17..=256 → 0.
+    /// The §4.4 color-indexing encoder derives its bundling from the
+    /// shared threshold table: at each boundary palette size of the
+    /// spec's "Color Table Size to Bundled Pixel Bit Width Mapping",
+    /// the emitted bitstream's transform header parses back (via the
+    /// §4 transform-list reader) to the expected on-wire
+    /// `color_table_size` and the shared accessor's `width_bits`.
     #[test]
-    fn encoder_color_indexing_width_bits_matches_spec_table() {
-        assert_eq!(encoder_color_indexing_width_bits(1), 3);
-        assert_eq!(encoder_color_indexing_width_bits(2), 3);
-        assert_eq!(encoder_color_indexing_width_bits(3), 2);
-        assert_eq!(encoder_color_indexing_width_bits(4), 2);
-        assert_eq!(encoder_color_indexing_width_bits(5), 1);
-        assert_eq!(encoder_color_indexing_width_bits(16), 1);
-        assert_eq!(encoder_color_indexing_width_bits(17), 0);
-        assert_eq!(encoder_color_indexing_width_bits(256), 0);
+    fn encoder_color_indexing_header_matches_shared_width_bits_table() {
+        for (n_colors, expected_bits) in [
+            (1usize, 3u8),
+            (2, 3),
+            (3, 2),
+            (4, 2),
+            (5, 1),
+            (16, 1),
+            (17, 0),
+            (256, 0),
+        ] {
+            // `n_colors` distinct grays, one pixel per color.
+            let pixels: Vec<u32> = (0..n_colors as u32)
+                .map(|i| 0xff00_0000 | (i << 16) | (i << 8) | i)
+                .collect();
+            let bytes = encode_with_color_indexing(&pixels, n_colors as u32, 1, None)
+                .expect("palette path applies to <= 256 unique colors");
+            let mut r = crate::vp8l_stream::BitReader::new(&bytes);
+            let list = crate::vp8l_stream::TransformList::read(&mut r).unwrap();
+            assert_eq!(
+                list.transforms(),
+                &[crate::vp8l_stream::Transform::ColorIndexing {
+                    color_table_size: n_colors as u16,
+                    width_bits: expected_bits,
+                }],
+                "{n_colors} colors"
+            );
+            assert!(list.stopped_at_entropy_body());
+            assert_eq!(
+                expected_bits,
+                crate::vp8l_transform::color_indexing_width_bits(n_colors),
+                "boundary expectation drifted from the shared accessor"
+            );
+        }
     }
 
     /// `forward_color_table` is the bit-exact inverse of the decoder's

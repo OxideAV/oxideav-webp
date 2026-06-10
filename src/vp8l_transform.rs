@@ -497,9 +497,33 @@ pub fn inverse_color_table(color_table: &mut [u32]) {
     }
 }
 
-/// §4.4 `width_bits` from a color-table size, per the spec's threshold
-/// table.
-fn color_indexing_width_bits(color_table_size: usize) -> u8 {
+/// §4.4 pixel-bundling `width_bits` from the color-table size, per the
+/// spec's "Color Table Size to Bundled Pixel Bit Width Mapping"
+/// threshold table:
+///
+/// | `color_table_size` | `width_bits` | indices per packed byte |
+/// |--------------------|--------------|-------------------------|
+/// | `1..=2`            | `3`          | `8` (1 bit each)        |
+/// | `3..=4`            | `2`          | `4` (2 bits each)       |
+/// | `5..=16`           | `1`          | `2` (4 bits each)       |
+/// | `17..=256`         | `0`          | `1` (8 bits each)       |
+///
+/// `width_bits = 0` indicates no pixel bundling; values 1 / 2 / 3
+/// combine 2 / 4 / 8 palette indices into one green byte (§4.4).
+/// After the transform is read, the image width is subsampled to
+/// `DIV_ROUND_UP(image_width, 1 << width_bits)` per §4.4.
+///
+/// The on-wire field is `color_table_size = ReadBits(8) + 1`, so only
+/// `[1, 256]` is bitstream-reachable. The comparisons are total over
+/// `usize` — 0 falls in the first threshold window and sizes above
+/// 256 in the last — so out-of-window callers get the nearest
+/// window's value rather than a panic.
+///
+/// This is the single shared copy of the §4.4 threshold table: the
+/// §4 transform-list reader ([`crate::vp8l_stream`]) and the §4.4
+/// forward color-indexing encoder ([`crate::vp8l_encode`]) both
+/// delegate here, as does [`inverse_color_indexing`] below.
+pub fn color_indexing_width_bits(color_table_size: usize) -> u8 {
     if color_table_size <= 2 {
         3
     } else if color_table_size <= 4 {
@@ -1318,6 +1342,27 @@ mod tests {
         assert_eq!(color_indexing_width_bits(16), 1);
         assert_eq!(color_indexing_width_bits(17), 0);
         assert_eq!(color_indexing_width_bits(256), 0);
+    }
+
+    /// §4.4 threshold-table sweep over the entire on-wire window:
+    /// `color_table_size = ReadBits(8) + 1` ranges over `[1, 256]`,
+    /// and every size must map to the spec's "Color Table Size to
+    /// Bundled Pixel Bit Width Mapping" row it falls in.
+    #[test]
+    fn width_bits_exhaustive_over_wire_window() {
+        for size in 1usize..=256 {
+            let expected = match size {
+                1..=2 => 3u8,
+                3..=4 => 2,
+                5..=16 => 1,
+                _ => 0,
+            };
+            assert_eq!(
+                color_indexing_width_bits(size),
+                expected,
+                "color_table_size {size}"
+            );
+        }
     }
 
     #[test]

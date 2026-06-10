@@ -243,7 +243,8 @@ pub enum Transform {
         /// `ReadBits(8) + 1`, range `1..=256`.
         color_table_size: u16,
         /// §4.4 pixel-bundling width: 0 (≥17 colors), 1 (≤16), 2 (≤4),
-        /// 3 (≤2). Derived from `color_table_size`.
+        /// 3 (≤2). Derived from `color_table_size` via
+        /// [`crate::vp8l_transform::color_indexing_width_bits`].
         width_bits: u8,
     },
 }
@@ -264,20 +265,6 @@ impl Transform {
     /// the only transform with no body.
     pub fn has_entropy_body(&self) -> bool {
         !matches!(self, Self::SubtractGreen)
-    }
-}
-
-/// §4.4: derive the pixel-bundling `width_bits` from a color table
-/// size, per the spec's threshold table.
-fn color_indexing_width_bits(color_table_size: u16) -> u8 {
-    if color_table_size <= 2 {
-        3
-    } else if color_table_size <= 4 {
-        2
-    } else if color_table_size <= 16 {
-        1
-    } else {
-        0
     }
 }
 
@@ -381,7 +368,10 @@ impl TransformList {
                     let color_table_size = (reader.read_bits(8)? + 1) as u16;
                     Transform::ColorIndexing {
                         color_table_size,
-                        width_bits: color_indexing_width_bits(color_table_size),
+                        // §4.4 threshold table — single shared copy.
+                        width_bits: crate::vp8l_transform::color_indexing_width_bits(
+                            color_table_size as usize,
+                        ),
                     }
                 }
             };
@@ -540,16 +530,38 @@ mod tests {
     }
 
     #[test]
-    fn color_indexing_width_bits_thresholds() {
-        // §4.4 threshold table.
-        assert_eq!(color_indexing_width_bits(1), 3);
-        assert_eq!(color_indexing_width_bits(2), 3);
-        assert_eq!(color_indexing_width_bits(3), 2);
-        assert_eq!(color_indexing_width_bits(4), 2);
-        assert_eq!(color_indexing_width_bits(5), 1);
-        assert_eq!(color_indexing_width_bits(16), 1);
-        assert_eq!(color_indexing_width_bits(17), 0);
-        assert_eq!(color_indexing_width_bits(256), 0);
+    fn color_indexing_width_bits_wire_boundaries() {
+        // §4.4 threshold table driven through the on-wire field: each
+        // boundary size of the spec's "Color Table Size to Bundled
+        // Pixel Bit Width Mapping" is written as its `ReadBits(8) + 1`
+        // encoding and the decoded `Transform::ColorIndexing` entry
+        // must carry the shared accessor's `width_bits` derivation.
+        for (size, expected) in [
+            (1u32, 3u8),
+            (2, 3),
+            (3, 2),
+            (4, 2),
+            (5, 1),
+            (16, 1),
+            (17, 0),
+            (256, 0),
+        ] {
+            let mut w = BitWriter::new();
+            w.write_bits(1, 1); // transform present
+            w.write_bits(3, 2); // COLOR_INDEXING
+            w.write_bits(size - 1, 8); // color_table_size - 1
+            let data = w.into_bytes();
+            let mut r = BitReader::new(&data);
+            let list = TransformList::read(&mut r).unwrap();
+            assert_eq!(
+                list.transforms(),
+                &[Transform::ColorIndexing {
+                    color_table_size: size as u16,
+                    width_bits: expected,
+                }],
+                "color_table_size {size}"
+            );
+        }
     }
 
     // ---- TransformList ----

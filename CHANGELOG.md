@@ -6,6 +6,29 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `vp8l_transform::color_indexing_width_bits`: the §4.4 pixel-bundling
+  `width_bits` threshold-table accessor ("Color Table Size to Bundled
+  Pixel Bit Width Mapping": `1..=2 → 3`, `3..=4 → 2`, `5..=16 → 1`,
+  `17..=256 → 0`) is now public. It was file-private, and the same
+  four-row table existed as three independent private copies — the §4.4
+  inverse path (`vp8l_transform`), the §4 transform-list reader
+  (`vp8l_stream`, whose own doc noted the duplication was a visibility
+  workaround), and the §4.4 forward encoder (`vp8l_encode`). The
+  `vp8l_transform` copy is now the single shared, spec-cited source;
+  the other two modules delegate to it, so the encoder and the two
+  decoder-side readers can no longer drift apart on the §4.4
+  derivation. The function is total over `usize` (documented: only
+  `ReadBits(8) + 1 ∈ [1, 256]` is bitstream-reachable; 0 falls in the
+  first threshold window, sizes above 256 in the last). Test delta,
+  net +1: a new exhaustive sweep pins all 256 wire-reachable sizes
+  against the spec table; the `vp8l_stream` duplicate-table test is
+  replaced by a stronger on-wire test (each boundary size written as
+  its `ReadBits(8) + 1` encoding and read back through
+  `TransformList::read`); the `vp8l_encode` duplicate-table test is
+  replaced by a stronger wiring test (each boundary palette size
+  encoded via the §4.4 color-indexing path and the emitted transform
+  header parsed back through the §4 transform-list reader, asserting
+  the on-wire `color_table_size` + shared-accessor `width_bits`).
 - `vp8l_decode::MetaPrefixIndex::from_parts`: standalone validated
   constructor for the §6.2.2 meta-prefix block-lookup table.
   `decode_entropy_image` builds the index off a bitstream; this
