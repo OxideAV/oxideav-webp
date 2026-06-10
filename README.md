@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty-one [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty-two [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -394,7 +394,31 @@ parse failure, entropy-image fault, prefix-code parse failure,
 out-of-range green symbol, color-cache or backward-reference fault, or a
 meta-prefix code beyond `num_prefix_groups`) required only to return a
 `Result` rather than panic. A 30 s smoke pass cleared 2.66 M runs with
-no crashes (476 cov / 1690 features over a 269-input corpus). Run any
+no crashes (476 cov / 1690 features over a 269-input corpus);
+`decode_lossless` (round 273) drives the §4 transform-list + main-image
+full lossless-bitstream decode path standalone entry points
+`vp8l_transform::{decode_lossless, decode_lossless_headerless}` directly
+— the layer immediately above the round-272 §6.2.2 `decode_argb`: it
+walks the §4 / §7.2 optional-transform loop (per-transform §4.x fixed
+fields + §5-encoded body via the §7.3 `decode_entropy_coded_image`, the
+§4 once-each duplicate refusal, the §4.4 `color_table_size` /
+`width_bits` width subsampling), decodes the main §5.1 ARGB image at the
+subsampled width, then applies the §4 inverse-transform chain in reverse
+read order ("last one first"); `decode_lossless_headerless` is the
+§2.7.1.2 / §3 `ALPH` twin reading the same bytes from bit 0 (no §3.4
+5-byte image-header skip). The first two fuzz bytes fix the
+`(width, height)` carrier each clamped into `[1, 8]` (so the success
+contract holds and the decode stays ≤ 64 pixels); the remaining bytes are
+the VP8L chunk-payload bits, with every `Ok` image cross-checked against
+the §4 / §6.2.2 carrier rules (`width()` / `height()` echo the carrier
+even after a §4.4 color-indexing transform un-bundles the internal width
+back to the canvas width, `pixels().len() == width * height`) plus
+replay determinism, and every refusal required only to return a `Result`
+rather than panic. This harness surfaced (on its first run) and the round
+fixed a `BitReader::bits_remaining` `usize` underflow that let a
+sub-5-byte VP8L chunk payload index out of bounds past the §3.4
+image-header skip — now `saturating_sub`. A 40 s smoke pass cleared
+3.62 M runs with no crashes after the fix. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -419,6 +443,7 @@ cargo +nightly fuzz run meta_prefix_index    --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run decode_entropy_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_entropy_coded_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_argb          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_lossless      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

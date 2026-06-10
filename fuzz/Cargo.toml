@@ -350,7 +350,32 @@ cargo-fuzz = true
 # every other refusal is required only to return a `Result` rather than
 # panic (the granular §5.2 / §6.2 refusal modes are cross-checked by
 # the sibling `parse_meta_prefix` / `distance_code` / `color_cache` /
-# `backward_reference` harnesses through their own entry points).
+# `backward_reference` harnesses through their own entry points). The
+# twenty-second harness drives the §4 transform-list + main-image driver
+# standalone entry points `vp8l_transform::{decode_lossless,
+# decode_lossless_headerless}` directly — the layer immediately above the
+# round-272 §6.2.2 `decode_argb`: the first two fuzz bytes fix the §4 /
+# §6.2.2 `(width, height)` carrier (each clamped into [1, 8] so the
+# success contract holds and the decode stays ≤ 64 pixels), and the
+# remaining bytes are the VP8L chunk-payload bits, read by
+# `decode_lossless` past the §3.4 5-byte image-header (transform list at
+# bit 40) and by `decode_lossless_headerless` from bit 0 (the §2.7.1.2
+# ALPH form, no header skip). Each entry point walks the §4 / §7.2
+# optional-transform loop (per-transform §4.x fixed fields + §5-encoded
+# body via the §7.3 `decode_entropy_coded_image`, the §4 once-each
+# refusal, the §4.4 `color_table_size` / `width_bits` width subsampling),
+# decodes the main §5.1 ARGB image at the subsampled width, and applies
+# the §4 inverse-transform chain in reverse read order ("last one
+# first"). Every Ok image is cross-checked against the §4 / §6.2.2
+# carrier rules (`width()` / `height()` echo the carrier even after a
+# §4.4 color-indexing transform un-bundles the internal width back to the
+# canvas width, `pixels().len() == width * height`), with pure-function
+# determinism cross-checked by replaying the same bytes + dimensions for a
+# byte-identical pixel buffer; every refusal is required only to return a
+# `Result` rather than panic (the granular §4 / §5 / §6 refusal modes are
+# cross-checked by the sibling `parse_transform_list` /
+# `inverse_predictor_color` / `inverse_subtract_green_indexing` /
+# `decode_argb` harnesses through their own entry points).
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -510,6 +535,13 @@ bench = false
 [[bin]]
 name = "decode_argb"
 path = "fuzz_targets/decode_argb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_lossless"
+path = "fuzz_targets/decode_lossless.rs"
 test = false
 doc = false
 bench = false

@@ -4,7 +4,72 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `vp8l_stream::BitReader::bits_remaining` underflowed when the cursor sat
+  *past* the end of the slice. `BitReader::new_after_image_header` places
+  the cursor at bit 40 (past the §3.4 5-byte image-header) before any
+  bytes are read, so a VP8L chunk payload shorter than that header — an
+  empty or truncated chunk — left `bit_pos > data.len() * 8`. The
+  `data.len() * 8 - bit_pos` subtraction then wrapped in `usize`, the
+  `n > available` EOF guard in `read_bits` passed against the wrapped
+  count, and `read_bits` indexed `data[bit_pos >> 3]` out of bounds — a
+  debug-build panic and a release-build out-of-bounds read reachable from
+  `decode_webp` whenever a VP8L chunk payload is shorter than 5 bytes. The
+  count is now `saturating_sub`, so a past-the-end cursor reports `0` bits
+  remaining and `read_bits` cleanly returns the typed `BitReaderEof`.
+  Found by the round-273 `decode_lossless` fuzz harness; regression test
+  `vp8l_stream::tests::bits_remaining_saturates_when_cursor_past_end`
+  pins both the empty- and short-payload cases.
+
 ### Added
+
+- `fuzz/fuzz_targets/decode_lossless.rs`: cargo-fuzz harness — the
+  twenty-second — driving the §4 transform-list + main-image full
+  lossless-bitstream decode path standalone entry points
+  `oxideav_webp::vp8l_transform::{decode_lossless,
+  decode_lossless_headerless}` directly. `decode_lossless` is the layer
+  immediately *above* the round-272 §6.2.2 `vp8l_decode::decode_argb`: it
+  walks the §4 / §7.2 optional-transform loop (per-transform §4.x fixed
+  fields plus its §5-encoded body via the §7.3
+  `decode_entropy_coded_image`, the §4 "allowed to be used only once"
+  duplicate refusal, the §4.4 `color_table_size` / `width_bits` width
+  subsampling), decodes the main §5.1 ARGB image at the possibly-
+  subsampled width, then applies the §4 inverse-transform chain in
+  reverse read order (§4: "last one first").
+  `decode_lossless_headerless` is the §2.7.1.2 / §3 twin used by the
+  compressed `ALPH` alpha bitstream — identical save that the 5-byte
+  §3.4 image-header is not skipped (the `BitReader` starts at bit 0). No
+  prior harness drove this assembled surface: `parse_transform_list`
+  (round 260) reads the §4 transform-presence loop's *header* fields but
+  stops at the §5 entropy body; `inverse_predictor_color` (round 265) and
+  `inverse_subtract_green_indexing` (round 266) drive the four §4.x
+  inverse passes in isolation over synthesised buffers, never out of a §4
+  transform-list bitstream nor in reverse read order; `decode_argb`
+  (round 272) drives only the main §5.1 ARGB image, *after* the transform
+  list is consumed; `decode` / `roundtrip_lossless` reach
+  `decode_lossless` only through a complete §2 RIFF + §3.4 image-header
+  walk with the `(width, height)` pair bounded by an upstream §3.4 field
+  and the bitstream constrained to round-trip from the encoder. The fuzz
+  buffer fixes the §4 / §6.2.2 carrier dimensions from the first two bytes
+  (`width` / `height` each clamped into `[1, 8]` — always nonempty,
+  mirroring the §3.4-validated dimensions the driver is reachable with,
+  and small so the §4 / §5 / §6 decode loop stays bounded at ≤ 64 pixels)
+  and feeds the remaining bytes to both entry points: `decode_lossless`
+  reads them past the §3.4 5-byte image-header (transform list at bit 40),
+  `decode_lossless_headerless` reads the same bytes from bit 0. Every
+  `Ok` image is cross-checked against the §4 / §6.2.2 carrier rules
+  (`width()` / `height()` echo the carrier even after a §4.4
+  color-indexing transform un-bundles the internal width back to the
+  canvas width, `pixels().len() == width * height`), with pure-function
+  determinism cross-checked by replaying the same bytes + dimensions for a
+  byte-identical pixel buffer; every refusal is required only to return a
+  `Result` rather than panic (the granular §4 / §5 / §6 refusal modes are
+  cross-checked by the sibling `parse_transform_list` /
+  `inverse_predictor_color` / `inverse_subtract_green_indexing` /
+  `decode_argb` harnesses through their own entry points). A 40 s smoke
+  pass cleared 3.62 M runs with no crashes after the `bits_remaining`
+  underflow fix above (which the harness surfaced on its first run).
 
 - `fuzz/fuzz_targets/decode_argb.rs`: cargo-fuzz harness — the
   twenty-first — driving the §6.2.2 top-level VP8L ARGB main-image decode

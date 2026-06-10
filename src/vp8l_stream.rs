@@ -145,8 +145,18 @@ impl<'a> BitReader<'a> {
     }
 
     /// Bits remaining from the cursor to the end of the slice.
+    ///
+    /// Saturating: when the cursor sits *past* the end of the slice the
+    /// count is `0`, never a wrapped `usize`. This matters for
+    /// [`new_after_image_header`](Self::new_after_image_header), which
+    /// places the cursor at bit 40 (past the §3.4 5-byte image-header)
+    /// before any bytes are read — a payload shorter than that header
+    /// (an empty or truncated VP8L chunk) leaves `bit_pos` beyond
+    /// `data.len() * 8`, so a non-saturating subtraction would wrap and
+    /// let a subsequent [`read_bits`](Self::read_bits) index out of
+    /// bounds instead of cleanly raising [`BitReaderEof`].
     pub fn bits_remaining(&self) -> usize {
-        self.data.len() * 8 - self.bit_pos
+        (self.data.len() * 8).saturating_sub(self.bit_pos)
     }
 
     /// Read `n` bits (0 ≤ `n` ≤ 32) least-significant-bit-first and
@@ -517,6 +527,30 @@ mod tests {
             crate::vp8l_chunk::VP8L_IMAGE_HEADER_LEN * 8
         );
         assert_eq!(r.bit_position(), 40);
+    }
+
+    #[test]
+    fn bits_remaining_saturates_when_cursor_past_end() {
+        // A VP8L chunk payload shorter than the §3.4 5-byte image-header
+        // (here: empty) leaves `new_after_image_header`'s cursor at
+        // bit 40, *past* the slice. `bits_remaining` must report 0, not a
+        // wrapped `usize`, so the subsequent `read_bits` raises a clean
+        // EOF instead of indexing out of bounds.
+        let empty: [u8; 0] = [];
+        let mut r = BitReader::new_after_image_header(&empty);
+        assert_eq!(r.bit_position(), 40);
+        assert_eq!(r.bits_remaining(), 0);
+        // The transform-presence bit `decode_lossless` reads first must
+        // surface a typed EOF, never panic.
+        assert!(r.read_bit().is_err());
+        assert_eq!(r.bit_position(), 40);
+
+        // Same guard for a payload that is non-empty but still shorter
+        // than the header (3 of the 5 header bytes present).
+        let short = [0u8; 3];
+        let mut r = BitReader::new_after_image_header(&short);
+        assert_eq!(r.bits_remaining(), 0);
+        assert!(r.read_bits(1).is_err());
     }
 
     // ---- TransformType ----
