@@ -252,7 +252,29 @@ cargo-fuzz = true
 # §4.4 "unused indices map to transparent black" rule (every output
 # pixel is `0x00000000` when the table is zero-length). The §4.3
 # empty-buffer and §4.4 single-element-table degenerate no-op
-# branches are cross-checked unconditionally on every iteration.
+# branches are cross-checked unconditionally on every iteration. The
+# seventeenth harness drives the §5.2.2 backward-reference assembler
+# standalone entry point `vp8l_decode::apply_backward_reference`
+# directly: the fuzz buffer fixes a `(prefill_len, length, dist,
+# total_pixels)` carrier tuple (prefill_len masked to [0, 4096];
+# total_pixels alternated between `prefill_len + length + headroom`
+# and a shrunk value below `prefill_len + length` so both the
+# success / exact-fit path and the §5.2.2 overflow refusal are
+# routinely reached) plus a stream of fuzz-controlled ARGB pre-fill
+# pixels, with every Ok outcome cross-checked against the §5.2.2 copy
+# contract (the returned range equals `position..position + length`,
+# exactly `length` pixels are appended, the already-decoded prefix is
+# byte-identical, and every appended pixel matches a parallel
+# reference LZ77 walk `out[position + i] == out[position + i - dist]`
+# read after the preceding writes — the overlapping `dist < length`
+# self-repeat included), the §5.2.2 underflow refusal cross-checked
+# against its trigger (`dist > position`, fields echo the call,
+# buffer byte-identical to its pre-call snapshot), the §5.2.2
+# overflow refusal cross-checked against its trigger (`position +
+# length > total_pixels` with the underflow guard having passed,
+# fields echo the call, buffer byte-identical), and pure-function
+# determinism cross-checked by replaying a successful run from the
+# same pre-fill and asserting an identical buffer + range.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -377,6 +399,13 @@ bench = false
 [[bin]]
 name = "inverse_subtract_green_indexing"
 path = "fuzz_targets/inverse_subtract_green_indexing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backward_reference"
+path = "fuzz_targets/backward_reference.rs"
 test = false
 doc = false
 bench = false

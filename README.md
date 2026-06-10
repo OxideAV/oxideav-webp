@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Sixteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Seventeen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -272,7 +272,29 @@ size via the §4.4 threshold table, falling back to transparent black
 color-indexing empty-table edge case cross-checked against the §4.4
 "unused indices map to transparent black" rule; the §4.3 empty-buffer
 and §4.4 single-element-table degenerate no-op branches are
-cross-checked unconditionally on every iteration. Run any
+cross-checked unconditionally on every iteration. `backward_reference`
+(round 267) drives the §5.2.2 backward-reference assembler standalone
+entry point `vp8l_decode::apply_backward_reference` directly: the fuzz
+buffer fixes a `(prefill_len, length, dist, total_pixels)` carrier
+tuple (`prefill_len` masked to `[0, 4096]`; `dist` floored at 1 to
+honour the §5.2.2 `D >= 1` precondition the
+`distance_code_to_pixel_distance` clamp guarantees; `total_pixels`
+alternated between `prefill_len + length + headroom` and a shrunk
+value below `prefill_len + length` so both the success / exact-fit
+path and the §5.2.2 overflow refusal are routinely reached) plus a
+stream of fuzz-controlled ARGB pre-fill pixels, with every `Ok`
+outcome cross-checked against the §5.2.2 copy contract (returned range
+equals `position..position + length`, exactly `length` pixels
+appended, the already-decoded prefix byte-identical, every appended
+pixel matching a parallel reference LZ77 walk `out[position + i] ==
+out[position + i - dist]` read after the preceding writes — the
+overlapping `dist < length` self-repeat included), the §5.2.2
+underflow refusal cross-checked against its `dist > position` trigger
+(fields echo the call, buffer byte-identical to its pre-call
+snapshot), the §5.2.2 overflow refusal cross-checked against its
+`position + length > total_pixels` trigger (with the underflow guard
+having passed), and pure-function determinism cross-checked by
+replaying a successful run from the same pre-fill. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -292,6 +314,7 @@ cargo +nightly fuzz run distance_code        --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run color_cache          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run inverse_predictor_color --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run inverse_subtract_green_indexing --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run backward_reference   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

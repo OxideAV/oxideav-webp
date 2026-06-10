@@ -6,6 +6,49 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `vp8l_decode::apply_backward_reference`: extracted the §5.2.2 LZ77
+  backward-reference copy from the inline `decode_one_symbol` length-
+  prefix arm into a standalone, pure-by-buffer entry point. Given the
+  growing scan-line ARGB buffer, a copy `length` `L`, a scan-line pixel
+  distance `dist` `D`, and the image's `total_pixels`, it enforces the
+  two §5.2.2 carrier invariants *before* writing any byte (underflow
+  `D > position` and overflow `position + L > total_pixels`, each
+  leaving the buffer untouched on refusal), then performs the standard
+  byte-for-byte LZ77 walk — an overlapping run (`D < L`) repeats the
+  pixels it is itself emitting because each source index is read after
+  the preceding appends. Returns the `position..position + L` range of
+  freshly-appended pixels so the caller can replay them into the
+  §5.2.3 color cache in stream order. `decode_one_symbol` now delegates
+  to it with no behaviour change. Precondition (documented): `dist >=
+  1`, which `distance_code_to_pixel_distance` always guarantees via the
+  §5.2.2 clamp.
+- `fuzz/fuzz_targets/backward_reference.rs`: cargo-fuzz harness — the
+  seventeenth — driving the §5.2.2 backward-reference assembler
+  standalone entry point `oxideav_webp::vp8l_decode::apply_backward_reference`
+  directly. The fuzz buffer fixes a `(prefill_len, length, dist,
+  total_pixels)` carrier tuple (`prefill_len` masked to `[0, 4096]`;
+  `dist` floored at 1 to honour the §5.2.2 `D >= 1` precondition;
+  `total_pixels` alternated between `prefill_len + length + headroom`
+  and a shrunk value below `prefill_len + length` so both the success /
+  exact-fit path and the §5.2.2 overflow refusal are routinely reached)
+  plus a stream of fuzz-controlled ARGB pre-fill pixels. Every `Ok`
+  outcome is cross-checked against the §5.2.2 copy contract (returned
+  range equals `position..position + length`; exactly `length` pixels
+  appended; the already-decoded prefix byte-identical; every appended
+  pixel matches a parallel reference LZ77 walk `out[position + i] ==
+  out[position + i - dist]` read after the preceding writes, the
+  overlapping self-repeat included). The §5.2.2 underflow refusal is
+  cross-checked against its `dist > position` trigger (fields echo the
+  call, buffer byte-identical to its pre-call snapshot); the §5.2.2
+  overflow refusal against its `position + length > total_pixels`
+  trigger (with the underflow guard having passed, fields echo the
+  call, buffer byte-identical); and pure-function determinism by
+  replaying a successful run from the same pre-fill and asserting an
+  identical buffer + range. A 30 s smoke pass cleared 1.5 M runs with
+  no crashes. Brings the §3 lossless decoder's fuzz coverage to 17
+  standalone harnesses, with the §5.2.2 backward-reference copy now
+  exercised both through the full `decode` path and at its own
+  standalone surface.
 - `fuzz/fuzz_targets/inverse_subtract_green_indexing.rs`: cargo-fuzz
   harness on the §4.3 inverse-subtract-green + §4.4
   inverse-color-table + §4.4 inverse-color-indexing transform passes

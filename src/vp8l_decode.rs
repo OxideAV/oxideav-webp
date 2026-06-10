@@ -565,6 +565,71 @@ pub fn distance_code_to_pixel_distance(distance_code: u32, image_width: u32) -> 
     }
 }
 
+/// §5.2.2: assemble a single backward-reference run into the decoded
+/// pixel buffer.
+///
+/// `pixels` holds the already-emitted scan-line-order ARGB pixels; the
+/// run starts at `position == pixels.len()`. `length` is the §5.2.2
+/// length `L` and `dist` is the §5.2.2 scan-line pixel distance `D`
+/// (as produced by [`distance_code_to_pixel_distance`]). `total_pixels`
+/// is the image's pixel count, used for the overrun guard.
+///
+/// Two §5.2.2 carrier invariants are enforced **before** any byte is
+/// written, so a refused run leaves `pixels` untouched:
+///
+/// * **Underflow** (`dist > position`): the copy source `position -
+///   dist` would reach back past the start of the decoded pixels.
+///   Refused with [`DecodeError::BackwardReferenceUnderflow`].
+/// * **Overflow** (`position + length > total_pixels`): the run would
+///   write more pixels than the image holds. Refused with
+///   [`DecodeError::BackwardReferenceOverflow`].
+///
+/// # Precondition
+///
+/// `dist` must be `>= 1`. Per §5.2.2 the scan-line pixel distance `D`
+/// is always positive — [`distance_code_to_pixel_distance`] applies the
+/// §5.2.2 `if (dist < 1) dist = 1` clamp before this function is reached
+/// — so a real §5.2 decode never passes `dist == 0`. A `dist` of `0`
+/// would attempt to read the not-yet-written pixel at `position` and
+/// panic; the underflow guard (`dist > position`) does not cover it.
+///
+/// On success exactly `length` pixels are appended. The copy is the
+/// standard byte-for-byte LZ77 walk: a run with `dist < length`
+/// overlaps the pixels it is itself emitting, so the just-copied
+/// pixels repeat — each source index is read *after* the preceding
+/// appends, never from a pre-snapshot. The indices of the newly
+/// appended pixels are returned as `position..position + length` so the
+/// caller can replay them into the §5.2.3 color cache in stream order
+/// (every emitted pixel — including a back-reference copy — is
+/// re-inserted per §5.2.3).
+pub fn apply_backward_reference(
+    pixels: &mut Vec<u32>,
+    length: usize,
+    dist: usize,
+    total_pixels: usize,
+) -> Result<core::ops::Range<usize>, DecodeError> {
+    let position = pixels.len();
+    if dist > position {
+        return Err(DecodeError::BackwardReferenceUnderflow {
+            position,
+            distance: dist,
+        });
+    }
+    if position + length > total_pixels {
+        return Err(DecodeError::BackwardReferenceOverflow {
+            position,
+            length,
+            total_pixels,
+        });
+    }
+    let src_start = position - dist;
+    for i in 0..length {
+        let argb = pixels[src_start + i];
+        pixels.push(argb);
+    }
+    Ok(position..position + length)
+}
+
 /// Assemble an ARGB pixel from its four channels (§6.2.3 / §5.2.1):
 /// `(alpha << 24) | (red << 16) | (green << 8) | blue`.
 fn pack_argb(green: u8, red: u8, blue: u8, alpha: u8) -> u32 {
@@ -617,30 +682,16 @@ fn decode_one_symbol(
             let dist_prefix = group.distance.read_symbol(reader)? as u32;
             let distance_code = read_lz77_value(reader, dist_prefix)?;
             let dist = distance_code_to_pixel_distance(distance_code, width);
-            let position = pixels.len();
-            if dist > position {
-                return Err(DecodeError::BackwardReferenceUnderflow {
-                    position,
-                    distance: dist,
-                });
-            }
-            if position + length > total_pixels {
-                return Err(DecodeError::BackwardReferenceOverflow {
-                    position,
-                    length,
-                    total_pixels,
-                });
-            }
-            // §5.2.2: copy L pixels from `position - dist`. The copy is
-            // byte-for-byte scan-line, and overlapping copies (dist <
-            // length) repeat the just-copied pixels, which is the
-            // standard LZ77 behaviour.
-            let src_start = position - dist;
-            for i in 0..length {
-                let argb = pixels[src_start + i];
-                pixels.push(argb);
-                if let Some(cache) = color_cache.as_mut() {
-                    cache.insert(argb);
+            // §5.2.2: copy L pixels from `position - dist` (bounds checked
+            // inside). The copy is byte-for-byte scan-line, and
+            // overlapping copies (dist < length) repeat the just-copied
+            // pixels, which is the standard LZ77 behaviour.
+            let emitted = apply_backward_reference(pixels, length, dist, total_pixels)?;
+            if let Some(cache) = color_cache.as_mut() {
+                // §5.2.3: every emitted pixel (even a back-reference copy)
+                // is re-inserted in stream order.
+                for i in emitted {
+                    cache.insert(pixels[i]);
                 }
             }
         }
@@ -1188,6 +1239,101 @@ mod tests {
         // distance_code 4 maps to (-1, 1).
         assert_eq!(DISTANCE_MAP[3], (-1, 1));
         assert_eq!(distance_code_to_pixel_distance(4, 1), 1);
+    }
+
+    // ---- §5.2.2 backward-reference assembler ----
+
+    #[test]
+    fn backward_reference_simple_copy() {
+        // Copy 3 pixels from distance 3 (no overlap): the run reproduces
+        // the three source pixels verbatim, in order.
+        let mut pixels = vec![0xAA, 0xBB, 0xCC];
+        let r = apply_backward_reference(&mut pixels, 3, 3, 10).unwrap();
+        assert_eq!(r, 3..6);
+        assert_eq!(pixels, vec![0xAA, 0xBB, 0xCC, 0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn backward_reference_overlapping_run_repeats() {
+        // dist=1, length=4: the LZ77 self-overlap repeats the single
+        // source pixel — each read happens after the preceding push.
+        let mut pixels = vec![0x11];
+        let r = apply_backward_reference(&mut pixels, 4, 1, 10).unwrap();
+        assert_eq!(r, 1..5);
+        assert_eq!(pixels, vec![0x11, 0x11, 0x11, 0x11, 0x11]);
+    }
+
+    #[test]
+    fn backward_reference_overlapping_dist_two() {
+        // dist=2, length=4 over [A, B]: produces A B A B (each new pixel
+        // read from two-back, including the freshly-appended ones).
+        let mut pixels = vec![0xA, 0xB];
+        apply_backward_reference(&mut pixels, 4, 2, 10).unwrap();
+        assert_eq!(pixels, vec![0xA, 0xB, 0xA, 0xB, 0xA, 0xB]);
+    }
+
+    #[test]
+    fn backward_reference_underflow_leaves_buffer_untouched() {
+        // dist > position: the source would reach before pixel 0.
+        let mut pixels = vec![0x1, 0x2];
+        let err = apply_backward_reference(&mut pixels, 1, 3, 10).unwrap_err();
+        match err {
+            DecodeError::BackwardReferenceUnderflow { position, distance } => {
+                assert_eq!(position, 2);
+                assert_eq!(distance, 3);
+            }
+            other => panic!("expected underflow, got {other:?}"),
+        }
+        // No partial write: the buffer is exactly as it was.
+        assert_eq!(pixels, vec![0x1, 0x2]);
+    }
+
+    #[test]
+    fn backward_reference_overflow_leaves_buffer_untouched() {
+        // position(2) + length(5) = 7 > total_pixels(4).
+        let mut pixels = vec![0x1, 0x2];
+        let err = apply_backward_reference(&mut pixels, 5, 1, 4).unwrap_err();
+        match err {
+            DecodeError::BackwardReferenceOverflow {
+                position,
+                length,
+                total_pixels,
+            } => {
+                assert_eq!(position, 2);
+                assert_eq!(length, 5);
+                assert_eq!(total_pixels, 4);
+            }
+            other => panic!("expected overflow, got {other:?}"),
+        }
+        assert_eq!(pixels, vec![0x1, 0x2]);
+    }
+
+    #[test]
+    fn backward_reference_dist_equal_position_is_allowed() {
+        // dist == position copies from index 0 forward — the boundary
+        // case (dist > position underflows, dist == position is fine).
+        let mut pixels = vec![0x7, 0x8];
+        let r = apply_backward_reference(&mut pixels, 2, 2, 10).unwrap();
+        assert_eq!(r, 2..4);
+        assert_eq!(pixels, vec![0x7, 0x8, 0x7, 0x8]);
+    }
+
+    #[test]
+    fn backward_reference_zero_length_appends_nothing() {
+        // A zero-length run is a no-op that still passes the guards.
+        let mut pixels = vec![0x5];
+        let r = apply_backward_reference(&mut pixels, 0, 1, 10).unwrap();
+        assert_eq!(r, 1..1);
+        assert_eq!(pixels, vec![0x5]);
+    }
+
+    #[test]
+    fn backward_reference_fill_to_exact_capacity() {
+        // position + length == total_pixels is the exact-fit boundary
+        // and must succeed (overflow guard is strict `>`).
+        let mut pixels = vec![0xF0, 0xF1];
+        apply_backward_reference(&mut pixels, 2, 2, 4).unwrap();
+        assert_eq!(pixels.len(), 4);
     }
 
     // ---- §6.2.3 GREEN symbol classification ----
