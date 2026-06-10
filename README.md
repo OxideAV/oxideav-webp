@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty-one [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -368,7 +368,33 @@ determinism cross-checked by replaying the same bytes + dimensions for
 a byte-identical pixel buffer at an identical bit position; the §7.3
 degenerate-dimension refusal pinned to the `EmptyEntropyImage` variant
 echoing the carrier dimensions iff at least one is zero and every other
-refusal required only to return a `Result` rather than panic. Run any
+refusal required only to return a `Result` rather than panic;
+`decode_argb` (round 272) drives the §6.2.2 top-level VP8L ARGB
+main-image decode path standalone entry point
+`vp8l_decode::decode_argb` directly — the §5.1 `spatially-coded-image`
+ARGB-role decoder one layer above the round-270 / round-271 entropy-image
+harnesses, reading the §5.2.3 `color-cache-info` bit + §6.2.2
+meta-prefix bit, dispatching the single-group (one §6.2 prefix-code
+group everywhere) vs multi-group (§6.2.2 entropy image →
+`num_prefix_groups = max + 1` groups → per-pixel-block group selection
+via `meta_code_for`, single §5.2.3 color cache in stream order) paths,
+and running the §6.2.3 decode loop — across the `(width, height,
+bitstream)` cross-product (the first two fuzz bytes fix the carrier
+dimensions each clamped into `[1, 8]` so the success contract holds —
+mirroring the §3.4-validated dimensions `decode_argb` is reachable with
+— and the image stays ≤ 64 pixels; the remaining bytes feed a
+zero-positioned `BitReader` the §6.2.2 ARGB image bit sequence) with
+every `Ok` image cross-checked against the §6.2.2 carrier rules
+(`width()` / `height()` echo the carrier, `pixels().len() == width *
+height`, the reader never advancing past the slice's bit length), plus
+pure-function determinism cross-checked by replaying the same bytes +
+dimensions for a byte-identical pixel buffer at an identical bit
+position, and every refusal (truncation, meta-prefix/color-cache-info
+parse failure, entropy-image fault, prefix-code parse failure,
+out-of-range green symbol, color-cache or backward-reference fault, or a
+meta-prefix code beyond `num_prefix_groups`) required only to return a
+`Result` rather than panic. A 30 s smoke pass cleared 2.66 M runs with
+no crashes (476 cov / 1690 features over a 269-input corpus). Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -392,6 +418,7 @@ cargo +nightly fuzz run backward_reference   --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run meta_prefix_index    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_entropy_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_entropy_coded_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_argb          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

@@ -6,6 +6,59 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/decode_argb.rs`: cargo-fuzz harness — the
+  twenty-first — driving the §6.2.2 top-level VP8L ARGB main-image decode
+  path standalone entry point `oxideav_webp::vp8l_decode::decode_argb`
+  directly. `decode_argb` is the §5.1 `spatially-coded-image` ARGB-role
+  decoder — the layer immediately *above* the round-270 §6.2.2
+  `decode_entropy_image` and the round-271 §7.3
+  `decode_entropy_coded_image`. It reads the round-106 `MetaPrefixHeader`
+  for `ImageRole::Argb` (the §5.2.3 `color-cache-info` bit, then the
+  §6.2.2 meta-prefix bit) and dispatches between the single-group path
+  (one §6.2 prefix-code group drives the §6.2.3 decode loop everywhere)
+  and the multi-group path (the §6.2.2 entropy image is decoded,
+  `num_prefix_groups = max(entropy image) + 1` groups are read, and the
+  §6.2.3 loop selects a group per pixel block via
+  `MetaPrefixIndex::meta_code_for`, with a single §5.2.3 color cache
+  maintained in stream order across the whole image). No prior harness
+  drove this assembled surface: `parse_meta_prefix` (round 261) stops at
+  the §5.2 entropy body without decoding a pixel or reading the per-group
+  prefix-code groups; `decode_entropy_image` (round 270) and
+  `decode_entropy_coded_image` (round 271) drive only the §6.2.2 entropy
+  sub-image and the §7.3 building block beneath it, never the §5.2.3 +
+  §6.2.2 ARGB preamble, the single-vs-multi-group dispatch, the per-group
+  reads, nor the per-pixel-block group selection `decode_argb` assembles
+  on top of them; `decode` / `roundtrip_lossless` reach `decode_argb`
+  only through a complete §2 RIFF + §3 image-header walk with the
+  `(width, height)` pair bounded by an upstream §3.4 field and the
+  bitstream constrained to round-trip from the encoder. The fuzz buffer
+  fixes the §6.2.2 carrier dimensions from the first two bytes (`width` /
+  `height` each clamped into `[1, 8]` — always nonempty, mirroring the
+  §3.4-validated dimensions `decode_argb` is reachable with, and small so
+  the §6.2.3 decode loop stays bounded at ≤ 64 pixels) and feeds the
+  remaining bytes through a zero-positioned `BitReader` as the §6.2.2 ARGB
+  image bit sequence (color-cache-info bit, meta-prefix bit, then the
+  dispatched body). Every `Ok` image is cross-checked against the §6.2.2
+  carrier rules: `width()` / `height()` echo the carrier;
+  `pixels().len() == width as usize * height as usize` (§6.2.2 emits
+  exactly one pixel per position); and the reader never advances past the
+  slice's bit length. Pure-function determinism is cross-checked by
+  replaying the same bytes + `(width, height)` and asserting a
+  byte-identical pixel buffer at an identical bit position. Every `Err`
+  (truncation, meta-prefix/color-cache-info parse failure, entropy-image
+  fault, prefix-code parse failure, out-of-range green symbol, color-cache
+  or backward-reference fault, or a meta-prefix code beyond
+  `num_prefix_groups`) is required only to return a `Result` rather than
+  panic — the granular §5.2 / §6.2 refusal modes are cross-checked by the
+  sibling `parse_meta_prefix` / `decode_entropy_image` /
+  `decode_entropy_coded_image` / `distance_code` / `color_cache` /
+  `backward_reference` / `meta_prefix_index` harnesses through their own
+  entry points. This brings the §3 lossless decoder's fuzz coverage to 21
+  standalone harnesses, with the §6.2.2 ARGB main-image decode now
+  exercised both through the full `decode` path and at its own standalone
+  surface — the cap of the round-255→271 bottom-up walk that previously
+  fuzzed every layer beneath it. A 30 s smoke pass cleared 2.66 M runs
+  with no crashes (476 cov / 1690 features over a 269-input corpus).
 - `fuzz/fuzz_targets/decode_entropy_coded_image.rs`: cargo-fuzz harness —
   the twentieth — driving the §7.3 *entropy-coded-image* decode path
   standalone entry point
