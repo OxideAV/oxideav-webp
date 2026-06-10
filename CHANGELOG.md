@@ -4,6 +4,42 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Optimized
+
+- The §3.7.2 / §6.2.1 length-then-code canonical build chain — the
+  dense-cell optimization target flagged by the round-250 / round-276
+  benches — was rewritten bit-identically on both sides, verified by an
+  FNV digest of every length table and built decoder table over the
+  full bench input set plus 600 randomized frequency tables (including
+  length-limit-triggering exponential skews): the digest is unchanged
+  from the previous implementation, and the round-275 `prefix_code`
+  differential fuzz harness ran 13.6 M execs clean on the rewrite.
+  - Encoder `vp8l_encode::build_code_lengths`: the hand-rolled binary
+    min-heap is replaced by a sorted-leaf + internal-FIFO two-queue
+    merge (leaves sorted once by a packed `(freq, symbol)` `u64` key;
+    internal nodes are created with nondecreasing frequencies, so a
+    plain FIFO stays sorted and each merge step compares the two queue
+    fronts in O(1), preferring the leaf on a frequency tie exactly as
+    the old `(freq, order)` heap key did). Leaf depths are now
+    recovered with a single reverse pass over the internal nodes
+    instead of one parent-chain walk per leaf, and the
+    `limit_code_lengths` re-balancing pass updates its Kraft sum
+    incrementally instead of recomputing the O(n) sum after every
+    single-leaf adjustment. Dense-cell medians: distance-40
+    2.09 µs → 408 ns, literal-256 15.07 µs → 2.07 µs, green-281
+    17.66 µs → 2.37 µs, and the headline green-2328 dense cell
+    382.0 µs → 113.5 µs (3.4× same-session; 3.7× against the recorded
+    round-250 417.8 µs). Sparse cells improve 2.1×–3.5×.
+  - Decoder `vp8l_prefix::PrefixCode::from_code_lengths`: the
+    `(length, value)` symbol ordering is now a single-rescan counting
+    sort — `bl_count` prefix sums fix every length bucket's start
+    index up front and ONE pass over `code_lengths` drops each used
+    symbol at its bucket cursor — replacing the one-full-rescan-per-
+    used-length assignment loop. Dense green-2328 7.44 µs → 4.63 µs
+    (1.6×), sparse green-2328 5.84 µs → 1.81 µs (3.2×), the other
+    cells 1.1×–2.4×. Full before/after tables in `BENCHMARKS.md`
+    (round-277 section).
+
 ### Fixed
 
 - `vp8l_stream::BitReader::bits_remaining` underflowed when the cursor sat

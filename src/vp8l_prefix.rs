@@ -263,28 +263,36 @@ impl PrefixCode {
         }
 
         // Assign codes in (length, value) order and record per-length
-        // decode rows.
-        let mut sorted_symbols: Vec<u16> = Vec::with_capacity(used);
+        // decode rows. The `(length, value)` sort is a counting sort:
+        // `bl_count` already gives each length's bucket size, so prefix
+        // sums fix every bucket's start index up front and ONE rescan of
+        // `code_lengths` drops each used symbol at its bucket cursor —
+        // symbols are visited in ascending value order, so each bucket
+        // stays value-sorted internally. (Previously this rescanned the
+        // full table once per used length.)
         let mut length_rows: Vec<LengthRow> = Vec::new();
-        let mut assign = next_code;
+        let mut cursor = [0usize; MAX_CODE_LENGTH + 1];
+        let mut first_symbol_index = 0usize;
         for len in 1..=MAX_CODE_LENGTH {
             if bl_count[len] == 0 {
                 continue;
             }
-            let first_code = assign[len];
-            let first_symbol_index = sorted_symbols.len();
-            for (sym, &slen) in code_lengths.iter().enumerate() {
-                if slen as usize == len {
-                    sorted_symbols.push(sym as u16);
-                    assign[len] += 1;
-                }
-            }
+            cursor[len] = first_symbol_index;
             length_rows.push(LengthRow {
                 length: len as u8,
-                first_code,
+                first_code: next_code[len],
                 first_symbol_index,
                 count: bl_count[len],
             });
+            first_symbol_index += bl_count[len];
+        }
+        let mut sorted_symbols: Vec<u16> = vec![0; used];
+        for (sym, &slen) in code_lengths.iter().enumerate() {
+            if slen != 0 {
+                let slot = &mut cursor[slen as usize];
+                sorted_symbols[*slot] = sym as u16;
+                *slot += 1;
+            }
         }
 
         Ok(Self {

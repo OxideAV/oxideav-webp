@@ -63,7 +63,12 @@ max-extra regimes at value-side samples (3 / 40 / 40_000 / 900_000);
 and the round-276 decoder-side §6.2.1 canonical-table build bench
 (`prefix_from_code_lengths`, decode mirror of the round-250/251
 encoder pair) covering the same four §3.7.1 alphabets in both dense
-and sparse frequency regimes.
+and sparse frequency regimes. Round 277 rewrote both sides of that
+length-then-code chain bit-identically — a sorted-leaf two-queue
+merge replacing the encoder's Huffman heap (dense `green2328`
+382.0 µs → 113.5 µs) and a single-rescan counting sort replacing the
+decoder's per-used-length rescan (dense `green2328`
+7.44 µs → 4.63 µs).
 Numbers, profile findings, and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
 with:

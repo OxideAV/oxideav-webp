@@ -366,12 +366,26 @@ impl BitWriter {
 /// produces the §3.7.2.1.2 single-leaf form (one symbol at length 1) for an
 /// input with exactly one used symbol.
 ///
-/// The algorithm is a textbook Huffman build over a min-heap of
-/// `(frequency, node)` pairs, followed by a length-limiting pass that caps
-/// any over-long code at [`MAX_CODE_LENGTH`] while re-balancing so the
-/// Kraft sum stays exactly 1. For the small alphabets and pixel counts this
-/// encoder targets, the cap is rarely hit; the pass is correctness
-/// insurance, not an optimization.
+/// The algorithm is a textbook Huffman build, followed by a
+/// length-limiting pass that caps any over-long code at
+/// [`MAX_CODE_LENGTH`] while re-balancing so the Kraft sum stays at
+/// exactly one. For the small alphabets and pixel counts this encoder
+/// targets, the cap is rarely hit; the pass is correctness insurance,
+/// not an optimization.
+///
+/// The merge loop exploits the classic two-queue property instead of a
+/// heap: with the leaves sorted ascending by `(frequency, symbol)` once
+/// up front, every internal node is created with a frequency no smaller
+/// than any previously created one, so a plain FIFO of internal nodes
+/// stays sorted by `(frequency, creation order)` for free. Each merge
+/// step then takes the two smallest nodes by comparing the two queue
+/// fronts in O(1) — preferring the leaf on a frequency tie, because the
+/// tie-break order ranks every leaf (ascending symbol) before every
+/// internal node (creation order). This reproduces, merge for merge, the
+/// exact `(freq, order)` pop sequence the previous min-heap build used,
+/// so the emitted length tables are bit-identical; only the cost drops
+/// (O(n log n) sort + O(n) merge, versus 3(n-1) heap operations of
+/// O(log n) swaps each).
 pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     let n = freqs.len();
     let mut lengths = vec![0u8; n];
@@ -388,111 +402,80 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
         _ => {}
     }
 
-    // Huffman build. Nodes 0..n are leaves; internal nodes are appended.
-    // We track each node's frequency and, via a parent array, recover the
-    // depth (= code length) of each leaf.
-    #[derive(Clone, Copy)]
-    struct HeapItem {
-        freq: u64,
-        node: usize,
-        // Tie-breaker for deterministic, canonical-friendly ordering.
-        order: u64,
-    }
+    // Huffman build. Nodes 0..n are leaves; internal nodes n.. are
+    // appended in creation order. A parent array recovers the depth
+    // (= code length) of each leaf afterwards.
+    let m = used.len();
 
-    let mut parent: Vec<isize> = vec![-1; n];
-    let mut node_freq: Vec<u64> = (0..n).map(|s| freqs[s] as u64).collect();
+    // Leaf queue: `(freq << 32) | symbol` keys, sorted ascending. The
+    // packed key makes the sort a single-u64 comparison while encoding
+    // exactly the `(freq, ascending symbol)` tie-break the merge needs
+    // (`freq` is `u32`, so the shift is exact, and a symbol index always
+    // fits the low half).
+    let mut leaves: Vec<u64> = used
+        .iter()
+        .map(|&s| ((freqs[s] as u64) << 32) | s as u64)
+        .collect();
+    leaves.sort_unstable();
 
-    // A simple binary min-heap keyed on (freq, order).
-    let mut heap: Vec<HeapItem> = Vec::with_capacity(used.len());
-    let mut order_counter: u64 = 0;
-    for &s in &used {
-        heap.push(HeapItem {
-            freq: freqs[s] as u64,
-            node: s,
-            order: order_counter,
-        });
-        order_counter += 1;
-    }
-    fn heap_less(a: &HeapItem, b: &HeapItem) -> bool {
-        (a.freq, a.order) < (b.freq, b.order)
-    }
-    fn sift_up(heap: &mut [HeapItem], mut i: usize) {
-        while i > 0 {
-            let p = (i - 1) / 2;
-            if heap_less(&heap[i], &heap[p]) {
-                heap.swap(i, p);
-                i = p;
-            } else {
-                break;
-            }
+    // Internal-node FIFO: frequencies only; internal node `i` has node
+    // index `n + i`. `u32::MAX` marks "no parent yet" (only the root
+    // keeps it, and the root's slot is never read back).
+    let mut inode_freq: Vec<u64> = Vec::with_capacity(m - 1);
+    let mut parent: Vec<u32> = vec![u32::MAX; n + m - 1];
+
+    /// Take the smallest remaining node by `(freq, tie-break order)`:
+    /// the front leaf wins ties because leaves rank before internal
+    /// nodes in the tie-break order.
+    fn take_min(
+        leaves: &[u64],
+        li: &mut usize,
+        inode_freq: &[u64],
+        ii: &mut usize,
+        n: usize,
+    ) -> (usize, u64) {
+        let use_leaf = if *li < leaves.len() {
+            *ii >= inode_freq.len() || (leaves[*li] >> 32) <= inode_freq[*ii]
+        } else {
+            false
+        };
+        if use_leaf {
+            let key = leaves[*li];
+            *li += 1;
+            ((key & 0xffff_ffff) as usize, key >> 32)
+        } else {
+            let node = n + *ii;
+            let freq = inode_freq[*ii];
+            *ii += 1;
+            (node, freq)
         }
     }
-    fn sift_down(heap: &mut [HeapItem], mut i: usize) {
-        let len = heap.len();
-        loop {
-            let l = 2 * i + 1;
-            let r = 2 * i + 2;
-            let mut smallest = i;
-            if l < len && heap_less(&heap[l], &heap[smallest]) {
-                smallest = l;
-            }
-            if r < len && heap_less(&heap[r], &heap[smallest]) {
-                smallest = r;
-            }
-            if smallest == i {
-                break;
-            }
-            heap.swap(i, smallest);
-            i = smallest;
-        }
-    }
-    fn heap_push(heap: &mut Vec<HeapItem>, item: HeapItem) {
-        heap.push(item);
-        let last = heap.len() - 1;
-        sift_up(heap, last);
-    }
-    fn heap_pop(heap: &mut Vec<HeapItem>) -> HeapItem {
-        let top = heap[0];
-        let last = heap.pop().unwrap();
-        if !heap.is_empty() {
-            heap[0] = last;
-            sift_down(heap, 0);
-        }
-        top
-    }
-    // Re-heapify the initial array.
-    for i in (0..heap.len() / 2).rev() {
-        sift_down(&mut heap, i);
+
+    let mut li = 0usize; // leaf cursor
+    let mut ii = 0usize; // internal-node cursor
+    for _ in 0..m - 1 {
+        let (a_node, a_freq) = take_min(&leaves, &mut li, &inode_freq, &mut ii, n);
+        let (b_node, b_freq) = take_min(&leaves, &mut li, &inode_freq, &mut ii, n);
+        let new_node = n + inode_freq.len();
+        parent[a_node] = new_node as u32;
+        parent[b_node] = new_node as u32;
+        inode_freq.push(a_freq + b_freq);
     }
 
-    while heap.len() > 1 {
-        let a = heap_pop(&mut heap);
-        let b = heap_pop(&mut heap);
-        let new_node = node_freq.len();
-        node_freq.push(a.freq + b.freq);
-        parent.push(-1);
-        parent[a.node] = new_node as isize;
-        parent[b.node] = new_node as isize;
-        heap_push(
-            &mut heap,
-            HeapItem {
-                freq: a.freq + b.freq,
-                node: new_node,
-                order: order_counter,
-            },
-        );
-        order_counter += 1;
+    // Recover each leaf's depth top-down: an internal node's parent is
+    // always created later (larger index), so a single reverse pass over
+    // the internal nodes settles every internal depth, and each leaf is
+    // then one deeper than its (always internal) parent.
+    let mut internal_depth = vec![0u32; m - 1];
+    for i in (0..m - 1).rev() {
+        let p = parent[n + i];
+        if p != u32::MAX {
+            internal_depth[i] = internal_depth[p as usize - n] + 1;
+        }
     }
-
-    // Recover each leaf's depth.
     let mut max_len = 0usize;
     for &s in &used {
-        let mut depth = 0usize;
-        let mut cur = s as isize;
-        while parent[cur as usize] != -1 {
-            cur = parent[cur as usize];
-            depth += 1;
-        }
+        let depth = internal_depth[parent[s] as usize - n] as usize + 1;
         // A single internal-node tree (two leaves) gives depth 1; never 0
         // here because used.len() >= 2.
         lengths[s] = depth as u8;
@@ -552,8 +535,13 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
         }
         match target {
             Some(s) => {
+                // Lengthening `s` from `l` to `l + 1` swaps its Kraft term
+                // `2^(MAX-l)` for `2^(MAX-l-1)`, i.e. removes exactly
+                // `2^(MAX-l-1)` — same integer `k` a full recompute would
+                // give, without the O(n) rescan per step.
+                let l = lengths[s] as usize;
                 lengths[s] += 1;
-                k = kraft(lengths);
+                k -= 1i64 << (MAX_CODE_LENGTH - l - 1);
             }
             None => break,
         }
@@ -572,8 +560,12 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
         }
         match target {
             Some(s) => {
+                // Shortening `s` from `l` to `l - 1` swaps `2^(MAX-l)` for
+                // `2^(MAX-l+1)`, i.e. adds exactly `2^(MAX-l)` — again the
+                // same integer a full recompute would give.
+                let l = lengths[s] as usize;
                 lengths[s] -= 1;
-                k = kraft(lengths);
+                k += 1i64 << (MAX_CODE_LENGTH - l);
             }
             None => break,
         }

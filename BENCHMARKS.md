@@ -857,6 +857,105 @@ the round-275 `fuzz/fuzz_targets/prefix_code.rs` differential
 harness (rebuild-from-`code_lengths()` reproduces every decode) are
 the byte-exact regression guards any future rewrite must hold.
 
+## Round-277 (2026-06-11): length-then-code dense-cell rewrite
+
+The dense-cell rewrite the round-250 / round-276 observations
+flagged landed this round, on both sides of the §3.7.2 / §6.2.1
+length-then-code chain. Output is **bit-identical** — verified by an
+FNV digest over every length table and built decoder table for the
+full 8-cell bench input set plus 600 randomized frequency tables
+(varied alphabet sizes, zero densities, tie-heavy and exponential
+skews that trip the length-limit pass): the digest matches the
+previous implementation exactly. The round-275 `prefix_code`
+differential fuzz harness ran 13.6 M execs clean on the rewrite
+(plus 5.0 M on `prefix_code_group`), and the full test suite (11
+test binaries) passes unchanged.
+
+What changed:
+
+* **Encoder `build_code_lengths`** — the hand-rolled binary min-heap
+  is gone. The leaves are sorted once by a packed `(freq, symbol)`
+  `u64` key; the merge loop then exploits the two-queue property
+  (each internal node is created with a frequency no smaller than
+  any earlier one, so a plain FIFO of internal nodes stays sorted
+  for free) and takes the two smallest nodes per step by comparing
+  the two queue fronts in O(1), preferring the leaf on a frequency
+  tie exactly as the old `(freq, order)` heap key did — merge for
+  merge the same pop sequence, hence identical trees. Leaf depths
+  are recovered with one reverse pass over the internal nodes
+  (a node's parent always has a larger index) instead of one
+  parent-chain walk per leaf, and `limit_code_lengths` updates its
+  Kraft sum incrementally (`±2^(MAX-len)` exact-integer steps)
+  instead of recomputing the O(n) sum after every adjustment.
+* **Decoder `PrefixCode::from_code_lengths`** — the `(length,
+  value)` ordering is now the single-rescan counting sort the
+  round-276 observations sketched: `bl_count` prefix sums fix every
+  length bucket's start index, and ONE pass over `code_lengths`
+  drops each used symbol at its bucket cursor (symbols are visited
+  in ascending value order, so each bucket stays value-sorted),
+  replacing the one-full-rescan-per-used-length assignment loop.
+
+### Round-277 measurement
+
+Before columns are a same-session re-run of the round-250 /
+round-276 benches on the pre-rewrite code (`--quick`, same host);
+the recorded round-250 `dense_green2328` median was 417.8 µs.
+
+`build_code_lengths`:
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `build_code_lengths_dense_distance40`   | 2.093 µs | **408.4 ns** | 5.1× |
+| `build_code_lengths_sparse_distance40`  | 252.5 ns | **118.4 ns** | 2.1× |
+| `build_code_lengths_dense_literal256`   | 15.07 µs | **2.072 µs** | 7.3× |
+| `build_code_lengths_sparse_literal256`  | 839.8 ns | **286.0 ns** | 2.9× |
+| `build_code_lengths_dense_green281`     | 17.66 µs | **2.372 µs** | 7.4× |
+| `build_code_lengths_sparse_green281`    | 867.9 ns | **302.9 ns** | 2.9× |
+| `build_code_lengths_dense_green2328`    | 382.0 µs | **113.5 µs** | 3.4× |
+| `build_code_lengths_sparse_green2328`   | 4.875 µs | **1.404 µs** | 3.5× |
+
+`prefix_from_code_lengths`:
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `prefix_from_code_lengths_dense_distance40`   | 194.7 ns | **178.0 ns** | 1.1× |
+| `prefix_from_code_lengths_sparse_distance40`  | 106.7 ns | **73.8 ns**  | 1.4× |
+| `prefix_from_code_lengths_dense_literal256`   | 1.011 µs | **582.0 ns** | 1.7× |
+| `prefix_from_code_lengths_sparse_literal256`  | 588.8 ns | **255.6 ns** | 2.3× |
+| `prefix_from_code_lengths_dense_green281`     | 1.025 µs | **634.6 ns** | 1.6× |
+| `prefix_from_code_lengths_sparse_green281`    | 645.7 ns | **269.3 ns** | 2.4× |
+| `prefix_from_code_lengths_dense_green2328`    | 7.435 µs | **4.629 µs** | 1.6× |
+| `prefix_from_code_lengths_sparse_green2328`   | 5.840 µs | **1.806 µs** | 3.2× |
+
+Observations:
+
+* The builder's mid-size dense cells gain the most (7.3–7.4× at
+  256 / 281): the heap's cache-hostile sift swaps are replaced by
+  one branch-predictable `u64` sort plus a linear merge.
+* `dense_green2328` lands at 113.5 µs rather than the ~25 µs a pure
+  `N log N` extrapolation from `green281` would predict because this
+  input genuinely tripped the §3.7.2 length cap all along (2 328
+  leaves with 1..=255 frequencies push the deepest leaves past 15
+  bits): the remaining time is dominated by `limit_code_lengths`'s
+  per-adjustment O(n) *target-selection* rescan, which the
+  incremental-Kraft change already halved but did not remove. That
+  rescan is the next optimization target if the cell is flagged
+  again — a bucket-by-length selection structure could make each
+  adjustment O(1) — but it is correctness-insurance code that only
+  fires on capped inputs, so it was left structurally untouched this
+  round.
+* The decoder's sparse cells gain more than its dense cells (3.2× vs
+  1.6× at green-2328): the old loop's per-used-length rescan cost
+  scaled with `used_lengths · N`, but its *useful* work scaled with
+  the used-symbol count, so the sparse tables were proportionally
+  the most rescan-bound. Dense cells now sit at the two-pass
+  (count/validate + place) floor.
+* End-to-end encode impact is bounded: at ~170 ms for
+  `lossless_encode_natural_128` the builder is a small slice of
+  total encode time; the per-pass wins matter most for many-group
+  images (high meta-prefix granularity) where the chain runs
+  hundreds of times.
+
 ## Reproducing
 
 ```bash
