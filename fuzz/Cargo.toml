@@ -545,3 +545,10 @@ path = "fuzz_targets/decode_lossless.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "prefix_code_group"
+path = "fuzz_targets/prefix_code_group.rs"
+test = false
+doc = false
+bench = false

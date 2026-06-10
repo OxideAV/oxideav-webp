@@ -24,6 +24,40 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/prefix_code_group.rs`: cargo-fuzz harness — the
+  twenty-third — driving the §6.2 / §6.2.1 *prefix-code-group* reader
+  standalone entry point `oxideav_webp::meta_prefix::PrefixCodeGroup::read`
+  directly across a `(color_cache_size, bitstream)` cross-product. A §6.2
+  group is the five canonical §6.2.1 prefix codes every VP8L pixel is
+  decoded with — green + backref-length + color-cache (alphabet `256 + 24 +
+  color_cache_size` per §6.2.3), red/blue/alpha (each `256`), and backref
+  distance (`40`) — read in that order via `PrefixCode::read` and the
+  §6.2.1 simple/normal `read_code_lengths` + canonical `from_code_lengths`
+  Kraft completeness build. This is the surface immediately *below* the
+  round-271 `vp8l_decode::decode_entropy_coded_image` (§7.3), which reads a
+  §5.2.3 color-cache-info bit then exactly one `PrefixCodeGroup::read`
+  before the §5.2 pixel loop. No prior harness drove the group standalone:
+  `parse_meta_prefix` (round 261) reaches it only through the §5.2.3 +
+  §6.2.2 preamble (so the cache size is whatever the 4-bit
+  `color_cache_code_bits` produced, never the cache-disabled `0` and a wide
+  enabled size in one corpus), and `decode_entropy_coded_image` /
+  `decode_argb` consume the group's symbols in the same call so a parse
+  failure inside it is indistinguishable from a later §5.2 refusal. The
+  first input byte selects the §5.2.3 cache size from `{0}` (disabled) or
+  `1 << code_bits` for `code_bits ∈ [1, 11]` (`{2, 4, …, 2048}`), sizing
+  the §6.2.3 green alphabet; the remaining bytes feed a zero-positioned
+  `BitReader`. Every `Ok(group)` is cross-checked against the §6.2.3 /
+  §6.2.1 carrier rules: each of the five codes' `code_lengths().len()`
+  equals its alphabet, every nonzero length is `<= 15` (the `MAX_CODE_LENGTH`
+  ceiling), `single_symbol()` is `Some(s)` iff the length table has exactly
+  one nonzero entry (at `s`) and `None` iff it has two or more, `read_symbol`
+  against an all-zero reader resolves an in-range symbol index, the reader
+  never advances past the slice bit length, and replaying the same bytes +
+  cache size yields an equal group at an identical bit position; the §5.2.3
+  `InvalidColorCacheCodeBits` variant is asserted unreachable (the cache
+  size is caller-supplied, never read here). A 41 s smoke pass cleared
+  4.97 M runs with no crashes. Run with `cargo +nightly fuzz run
+  prefix_code_group --manifest-path crates/oxideav-webp/fuzz/Cargo.toml`.
 - `fuzz/fuzz_targets/decode_lossless.rs`: cargo-fuzz harness — the
   twenty-second — driving the §4 transform-list + main-image full
   lossless-bitstream decode path standalone entry points

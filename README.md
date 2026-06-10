@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty-two [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty-three [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -418,7 +418,32 @@ rather than panic. This harness surfaced (on its first run) and the round
 fixed a `BitReader::bits_remaining` `usize` underflow that let a
 sub-5-byte VP8L chunk payload index out of bounds past the §3.4
 image-header skip — now `saturating_sub`. A 40 s smoke pass cleared
-3.62 M runs with no crashes after the fix. Run any
+3.62 M runs with no crashes after the fix; `prefix_code_group`
+(round 274) drives the §6.2 / §6.2.1 *prefix-code-group* reader
+standalone entry point `meta_prefix::PrefixCodeGroup::read` directly —
+the surface immediately below the round-271 §7.3
+`decode_entropy_coded_image`, which reads a §5.2.3 color-cache-info bit
+then exactly one `PrefixCodeGroup::read` before the §5.2 pixel loop. A
+§6.2 group is the five canonical §6.2.1 prefix codes every VP8L pixel is
+decoded with: green + backref-length + color-cache (alphabet `256 + 24 +
+color_cache_size` per §6.2.3), red/blue/alpha (each `256`), and backref
+distance (`40`), each read via `PrefixCode::read` then the §6.2.1
+simple/normal `read_code_lengths` dispatch and the §6.2.1 canonical
+`from_code_lengths` Kraft completeness build. The first fuzz byte selects
+the §5.2.3 cache size from `{0}` (disabled) or `1 << code_bits` for
+`code_bits ∈ [1, 11]` (`{2, 4, …, 2048}`), sizing the §6.2.3 green
+alphabet; the remaining bytes feed a zero-positioned `BitReader`. Every
+`Ok(group)` is cross-checked against the §6.2.3 / §6.2.1 carrier rules:
+each of the five codes' `code_lengths().len()` equals its alphabet, every
+nonzero length is `<= 15` (the `MAX_CODE_LENGTH` ceiling), `single_symbol()`
+is `Some(s)` iff the length table has exactly one nonzero entry (at `s`)
+and `None` iff two or more, `read_symbol` against an all-zero reader
+resolves an in-range symbol index, the reader never advances past the
+slice bit length, and replaying the same bytes + cache size yields an
+equal group at an identical bit position; the §5.2.3
+`InvalidColorCacheCodeBits` variant is asserted unreachable (the cache
+size is caller-supplied, never read here). A 41 s smoke pass cleared
+4.97 M runs with no crashes. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -444,6 +469,7 @@ cargo +nightly fuzz run decode_entropy_image --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run decode_entropy_coded_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_argb          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_lossless      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run prefix_code_group    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)
