@@ -87,6 +87,7 @@
 
 use crate::meta_prefix::{
     ImageRole, MetaPrefixCodes, MetaPrefixError, MetaPrefixHeader, PrefixCodeGroup,
+    PREFIX_BITS_MAX, PREFIX_BITS_MIN,
 };
 use crate::vp8l_prefix::PrefixError;
 use crate::vp8l_stream::{BitReader, BitReaderEof};
@@ -763,6 +764,71 @@ pub fn decode_image(
     })
 }
 
+/// Errors raised by [`MetaPrefixIndex::from_parts`] when the supplied
+/// parts cannot describe a §6.2.2 entropy-image index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetaPrefixIndexError {
+    /// §6.2.2: `prefix_bits` is outside `[2, 9]`. The on-wire field is
+    /// `prefix_bits = ReadBits(3) + 2`, so a 3-bit read can only reach
+    /// that window.
+    InvalidPrefixBits {
+        /// The rejected `prefix_bits` value.
+        prefix_bits: u8,
+    },
+    /// §6.2.2: the index covers zero blocks (`block_width` or
+    /// `block_height` is zero). The dimensions derive from
+    /// `DIV_ROUND_UP(image_dim, 1 << prefix_bits)` of an ARGB image
+    /// whose dimensions are at least 1, so each is always at least 1.
+    EmptyIndex {
+        /// The rejected block-grid width.
+        block_width: u32,
+        /// The rejected block-grid height.
+        block_height: u32,
+    },
+    /// §6.2.2: `meta_codes` does not hold exactly `block_width *
+    /// block_height` entries — one meta-prefix code per entropy-image
+    /// block, in scan-line order.
+    CodeCountMismatch {
+        /// The block-grid width.
+        block_width: u32,
+        /// The block-grid height.
+        block_height: u32,
+        /// `block_width * block_height`.
+        expected: u64,
+        /// `meta_codes.len()`.
+        got: usize,
+    },
+}
+
+impl core::fmt::Display for MetaPrefixIndexError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidPrefixBits { prefix_bits } => write!(
+                f,
+                "VP8L §6.2.2 meta-prefix index: prefix_bits = {prefix_bits} is outside the [{PREFIX_BITS_MIN}..{PREFIX_BITS_MAX}] window of `ReadBits(3) + 2`"
+            ),
+            Self::EmptyIndex {
+                block_width,
+                block_height,
+            } => write!(
+                f,
+                "VP8L §6.2.2 meta-prefix index: degenerate {block_width}x{block_height} block grid covers zero blocks"
+            ),
+            Self::CodeCountMismatch {
+                block_width,
+                block_height,
+                expected,
+                got,
+            } => write!(
+                f,
+                "VP8L §6.2.2 meta-prefix index: {got} meta-prefix code(s) supplied for a {block_width}x{block_height} block grid ({expected} expected)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetaPrefixIndexError {}
+
 /// §6.2.2 per-pixel meta-prefix index: the decoded entropy image folded
 /// into the one number each pixel block needs — its meta-prefix code,
 /// i.e. the index into the array of [`PrefixCodeGroup`]s.
@@ -787,6 +853,67 @@ pub struct MetaPrefixIndex {
 }
 
 impl MetaPrefixIndex {
+    /// Build a §6.2.2 meta-prefix index directly from its parts.
+    ///
+    /// [`decode_entropy_image`] produces this index by decoding the
+    /// §6.2.2 entropy image off a bitstream; this constructor is the
+    /// standalone equivalent for callers that already hold the decoded
+    /// per-block meta-prefix codes (`meta_codes` in scan-line order,
+    /// each entry the `(entropy_pixel >> 8) & 0xffff` red+green fold of
+    /// one entropy-image pixel). It validates the §6.2.2 carrier
+    /// invariants the bitstream path establishes by construction, in
+    /// this order (the first violated invariant is reported):
+    ///
+    /// 1. `prefix_bits ∈ [2, 9]` — the on-wire field is
+    ///    `prefix_bits = ReadBits(3) + 2` (§6.2.2), so only that window
+    ///    is reachable from a bitstream.
+    /// 2. `block_width >= 1 && block_height >= 1` — §6.2.2 derives the
+    ///    entropy-image dimensions as
+    ///    `DIV_ROUND_UP(image_width, 1 << prefix_bits)` (resp. height)
+    ///    of an ARGB image whose dimensions are at least 1, so a
+    ///    zero-block grid cannot arise.
+    /// 3. `meta_codes.len() == block_width * block_height` — one
+    ///    meta-prefix code per entropy-image block.
+    ///
+    /// On success, [`MetaPrefixIndex::meta_code_for`] resolves the
+    /// §6.2.2 group selection for any pixel `(x, y)` of an image whose
+    /// dimensions satisfy the `DIV_ROUND_UP` derivation above — i.e.
+    /// `x < block_width << prefix_bits` and
+    /// `y < block_height << prefix_bits`. Querying outside that covered
+    /// area is a caller logic error (the §6.2.2 position formula only
+    /// defines blocks inside the grid).
+    pub fn from_parts(
+        prefix_bits: u8,
+        block_width: u32,
+        block_height: u32,
+        meta_codes: Vec<u16>,
+    ) -> Result<Self, MetaPrefixIndexError> {
+        if !(PREFIX_BITS_MIN..=PREFIX_BITS_MAX).contains(&(prefix_bits as u32)) {
+            return Err(MetaPrefixIndexError::InvalidPrefixBits { prefix_bits });
+        }
+        if block_width == 0 || block_height == 0 {
+            return Err(MetaPrefixIndexError::EmptyIndex {
+                block_width,
+                block_height,
+            });
+        }
+        let expected = block_width as u64 * block_height as u64;
+        if meta_codes.len() as u64 != expected {
+            return Err(MetaPrefixIndexError::CodeCountMismatch {
+                block_width,
+                block_height,
+                expected,
+                got: meta_codes.len(),
+            });
+        }
+        Ok(Self {
+            prefix_bits,
+            block_width,
+            block_height,
+            meta_codes,
+        })
+    }
+
     /// §6.2.2 `prefix_bits`.
     pub fn prefix_bits(&self) -> u8 {
         self.prefix_bits
@@ -1716,6 +1843,130 @@ mod tests {
             meta_codes: vec![0, 5],
         };
         assert_eq!(index.num_prefix_groups(), 6);
+    }
+
+    #[test]
+    fn meta_prefix_index_from_parts_accepts_valid_parts() {
+        // 2x3 block grid at prefix_bits 4 (16-pixel blocks), 6 codes in
+        // scan-line order.
+        let index = MetaPrefixIndex::from_parts(4, 2, 3, vec![0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(index.prefix_bits(), 4);
+        assert_eq!(index.block_width(), 2);
+        assert_eq!(index.block_height(), 3);
+        assert_eq!(index.meta_codes(), &[0, 1, 2, 3, 4, 5]);
+        // §6.2.2 num_prefix_groups = max(entropy image) + 1.
+        assert_eq!(index.num_prefix_groups(), 6);
+        // §6.2.2 selection: position = (y>>4)*2 + (x>>4). Pixel (17, 33)
+        // → block (1, 2) → position 5.
+        assert_eq!(index.meta_code_for(17, 33), 5);
+        // It equals the literally-constructed value (the bitstream path
+        // builds the same struct).
+        assert_eq!(
+            index,
+            MetaPrefixIndex {
+                prefix_bits: 4,
+                block_width: 2,
+                block_height: 3,
+                meta_codes: vec![0, 1, 2, 3, 4, 5],
+            }
+        );
+    }
+
+    #[test]
+    fn meta_prefix_index_from_parts_accepts_prefix_bits_window_ends() {
+        // §6.2.2 `prefix_bits = ReadBits(3) + 2` → [2, 9] inclusive.
+        for pb in 2u8..=9 {
+            assert!(MetaPrefixIndex::from_parts(pb, 1, 1, vec![0]).is_ok());
+        }
+    }
+
+    #[test]
+    fn meta_prefix_index_from_parts_rejects_prefix_bits_out_of_window() {
+        // Just outside the §6.2.2 `ReadBits(3) + 2` window on each side.
+        for pb in [0u8, 1, 10, 255] {
+            match MetaPrefixIndex::from_parts(pb, 1, 1, vec![0]) {
+                Err(MetaPrefixIndexError::InvalidPrefixBits { prefix_bits }) => {
+                    assert_eq!(prefix_bits, pb);
+                }
+                other => panic!("expected InvalidPrefixBits for {pb}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn meta_prefix_index_from_parts_rejects_zero_block_grid() {
+        for (bw, bh) in [(0u32, 1u32), (1, 0), (0, 0)] {
+            match MetaPrefixIndex::from_parts(2, bw, bh, vec![]) {
+                Err(MetaPrefixIndexError::EmptyIndex {
+                    block_width,
+                    block_height,
+                }) => {
+                    assert_eq!((block_width, block_height), (bw, bh));
+                }
+                other => panic!("expected EmptyIndex for {bw}x{bh}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn meta_prefix_index_from_parts_rejects_code_count_mismatch() {
+        // 2x2 grid wants 4 codes; supply 3 and 5.
+        for got in [3usize, 5] {
+            match MetaPrefixIndex::from_parts(2, 2, 2, vec![0; got]) {
+                Err(MetaPrefixIndexError::CodeCountMismatch {
+                    block_width,
+                    block_height,
+                    expected,
+                    got: g,
+                }) => {
+                    assert_eq!((block_width, block_height), (2, 2));
+                    assert_eq!(expected, 4);
+                    assert_eq!(g, got);
+                }
+                other => panic!("expected CodeCountMismatch for {got} codes, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn meta_prefix_index_from_parts_invariant_order() {
+        // The §6.2.2 checks run prefix_bits → grid → count: a part set
+        // violating all three reports InvalidPrefixBits, and one
+        // violating grid + count reports EmptyIndex.
+        assert!(matches!(
+            MetaPrefixIndex::from_parts(1, 0, 0, vec![0]),
+            Err(MetaPrefixIndexError::InvalidPrefixBits { prefix_bits: 1 })
+        ));
+        assert!(matches!(
+            MetaPrefixIndex::from_parts(2, 0, 1, vec![0]),
+            Err(MetaPrefixIndexError::EmptyIndex { .. })
+        ));
+    }
+
+    #[test]
+    fn meta_prefix_index_from_parts_round_trips_decoded_index() {
+        // Rebuilding from the accessors of a bitstream-decoded index
+        // reproduces it exactly.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // entropy-image color-cache-info = disabled
+        w.write_simple_two_symbols(0, 1); // GREEN: 0 → bit 0, 1 → bit 1
+        w.write_simple_single_symbol(0); // RED  = 0
+        w.write_simple_single_symbol(0); // BLUE = 0
+        w.write_simple_single_symbol(0); // ALPHA= 0
+        w.write_simple_single_symbol(0); // DIST = 0
+        w.write_bits(0, 1); // entropy pixel 0 GREEN = 0
+        w.write_bits(1, 1); // entropy pixel 1 GREEN = 1
+        let data = w.into_bytes();
+        let mut r = BitReader::new(&data);
+        let index = decode_entropy_image(&mut r, 2, 2, 1).unwrap();
+        let rebuilt = MetaPrefixIndex::from_parts(
+            index.prefix_bits(),
+            index.block_width(),
+            index.block_height(),
+            index.meta_codes().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, index);
     }
 
     #[test]

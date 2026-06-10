@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Seventeen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Eighteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -294,7 +294,31 @@ underflow refusal cross-checked against its `dist > position` trigger
 snapshot), the §5.2.2 overflow refusal cross-checked against its
 `position + length > total_pixels` trigger (with the underflow guard
 having passed), and pure-function determinism cross-checked by
-replaying a successful run from the same pre-fill. Run any
+replaying a successful run from the same pre-fill;
+`meta_prefix_index` (round 268) drives the §6.2.2 meta-prefix
+block-lookup table standalone entry points
+`vp8l_decode::MetaPrefixIndex::{from_parts, meta_code_for}` directly
+across the full `(prefix_bits, block_width, block_height,
+meta_codes)` cross-product (the first fuzz byte fixes `prefix_bits`
+masked to `[0, 15]` so the §6.2.2 `ReadBits(3) + 2` window `[2, 9]`
+and its rejection are both routinely reached; the next two bytes fix
+the block grid in `[0, 32]²` with 0 reaching the degenerate-grid
+refusal; a skew byte shifts the supplied code count off the
+`block_width * block_height` expectation by `[-2, +2]`; every
+remaining 2-byte LE word is forwarded verbatim as a meta-prefix code)
+with every `Ok` index cross-checked against the §6.2.2 carrier rules
+(accessors echo the parts, `num_prefix_groups() == max(entropy image)
++ 1`, and `meta_code_for(x, y)` at all four corners of every block's
+`(1 << prefix_bits)`-pixel-square covered area matching the §6.2.2
+position formula `meta_codes[(y >> prefix_bits) * block_width + (x >>
+prefix_bits)]`), every error variant cross-checked against its §6.2.2
+refusal trigger in precedence order (`InvalidPrefixBits` ⇔
+`prefix_bits ∉ [2, 9]`; `EmptyIndex` ⇔ zero-block grid with the
+prefix-bits gate passed; `CodeCountMismatch` ⇔ count off the
+expectation with both earlier gates passed, `expected` / `got`
+echoing the call), and constructor determinism cross-checked by
+rebuilding from the same parts plus round-tripping the index's own
+accessors back through `from_parts`. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -315,6 +339,7 @@ cargo +nightly fuzz run color_cache          --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run inverse_predictor_color --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run inverse_subtract_green_indexing --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run backward_reference   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run meta_prefix_index    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

@@ -6,6 +6,53 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `vp8l_decode::MetaPrefixIndex::from_parts`: standalone validated
+  constructor for the §6.2.2 meta-prefix block-lookup table.
+  `decode_entropy_image` builds the index off a bitstream; this
+  constructor is the standalone equivalent for callers that already
+  hold the decoded per-block meta-prefix codes (each entry the
+  `(entropy_pixel >> 8) & 0xffff` red+green fold of one entropy-image
+  pixel, scan-line order). It enforces the three §6.2.2 carrier
+  invariants the bitstream path establishes by construction, in
+  documented precedence order: `prefix_bits ∈ [2, 9]` (the on-wire
+  field is `ReadBits(3) + 2`, so only that window is
+  bitstream-reachable), a nonempty block grid (the §6.2.2
+  `DIV_ROUND_UP` derivation of an ≥1×≥1 ARGB image never yields zero
+  blocks), and exactly `block_width * block_height` codes (the product
+  computed in u64 so the check itself cannot overflow). Refusals are
+  reported through the new dedicated
+  `vp8l_decode::MetaPrefixIndexError` enum (`InvalidPrefixBits` /
+  `EmptyIndex` / `CodeCountMismatch`, each echoing the offending
+  parts) — an additive type; no existing error enum changed. On
+  success `meta_code_for(x, y)` resolves the §6.2.2 group selection
+  for any pixel of an image whose dimensions satisfy the
+  `DIV_ROUND_UP` derivation. Seven new unit tests pin the window ends
+  (`[2, 9]` inclusive), each refusal trigger, the precedence order,
+  the §6.2.2 position-formula selection on a 2×3 grid, and an accessor
+  round-trip against a bitstream-decoded index.
+- `fuzz/fuzz_targets/meta_prefix_index.rs`: cargo-fuzz harness — the
+  eighteenth — driving the §6.2.2 meta-prefix block-lookup table
+  standalone entry points
+  `oxideav_webp::vp8l_decode::MetaPrefixIndex::{from_parts,
+  meta_code_for}` directly. The fuzz buffer fixes a `(prefix_bits,
+  block_width, block_height, count_skew)` carrier tuple (`prefix_bits`
+  masked to `[0, 15]` so the §6.2.2 `[2, 9]` window and its rejection
+  are both routinely reached; the grid masked into `[0, 32]²` with 0
+  reaching the degenerate-grid refusal; the skew shifting the supplied
+  code count off the `block_width * block_height` expectation by
+  `[-2, +2]`) plus a stream of fuzz-controlled 16-bit meta-prefix
+  codes forwarded verbatim. Every `Ok` index is cross-checked against
+  the §6.2.2 carrier rules (accessors echo the parts;
+  `num_prefix_groups() == max(entropy image) + 1` per the §6.2.2
+  "Interpretation of Meta Prefix Codes" rule; `meta_code_for(x, y)` at
+  all four corners of every block's `(1 << prefix_bits)`-pixel-square
+  covered area matching the §6.2.2 position formula `meta_codes[(y >>
+  prefix_bits) * block_width + (x >> prefix_bits)]`); every error
+  variant is cross-checked against its §6.2.2 refusal trigger in
+  precedence order; and constructor determinism is cross-checked by
+  rebuilding from the same parts plus round-tripping the index's own
+  accessors back through `from_parts`. A 30 s smoke pass cleared
+  6.69 M runs with no crashes.
 - `vp8l_decode::apply_backward_reference`: extracted the §5.2.2 LZ77
   backward-reference copy from the inline `decode_one_symbol` length-
   prefix arm into a standalone, pure-by-buffer entry point. Given the

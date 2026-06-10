@@ -409,3 +409,10 @@ path = "fuzz_targets/backward_reference.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "meta_prefix_index"
+path = "fuzz_targets/meta_prefix_index.rs"
+test = false
+doc = false
+bench = false

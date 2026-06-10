@@ -200,7 +200,10 @@ fn check_one(pixels: &mut Vec<u32>, length: usize, dist: usize, total_pixels: us
             assert_eq!(r2, range, "§5.2.2 replay range must match");
             assert_eq!(&replay, pixels, "§5.2.2 replay buffer must match");
         }
-        Err(DecodeError::BackwardReferenceUnderflow { position: p, distance }) => {
+        Err(DecodeError::BackwardReferenceUnderflow {
+            position: p,
+            distance,
+        }) => {
             // §5.2.2 underflow trigger: dist strictly exceeds position.
             assert_eq!(p, position, "§5.2.2 underflow reports the call position");
             assert_eq!(distance, dist, "§5.2.2 underflow reports the call distance");
