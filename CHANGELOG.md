@@ -6,6 +6,57 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `fuzz/fuzz_targets/decode_entropy_coded_image.rs`: cargo-fuzz harness —
+  the twentieth — driving the §7.3 *entropy-coded-image* decode path
+  standalone entry point
+  `oxideav_webp::vp8l_decode::decode_entropy_coded_image` directly. The
+  §7.3 ABNF `entropy-coded-image` is the indivisible building block every
+  VP8L pixel surface is assembled from: a §5.2.3 `color-cache-info` bit, a
+  single §6.2 prefix-code group (no §6.2.2 meta-prefix bit — that bit
+  belongs to the §5.1 `spatially-coded-image` ARGB role only), and the
+  §5.2 LZ77 / literal / color-cache data that emits exactly
+  `width * height` ARGB pixels in scan-line order. It is the function the
+  §4.1 / §4.2 / §4.4 sub-resolution images and the §6.2.2 entropy image
+  are all decoded through; the round-270 `decode_entropy_image` harness
+  *wraps* this function (it calls it, then folds each pixel's red+green
+  channels into a per-block meta-code) and already used it as a
+  cross-check sibling, but no harness drove §7.3 standalone across an
+  attacker-controlled `(width, height, bitstream)` cross-product. The
+  fuzz buffer fixes the §7.3 carrier dimensions from the first two bytes
+  (`width` / `height` each modulo 9 so the §5.2 / §6.2 decode loop stays
+  bounded — at most 8×8 = 64 pixels — and 0 reaches the §7.3
+  degenerate-dimension `EmptyEntropyImage` refusal) and feeds the
+  remaining bytes through a zero-positioned `BitReader` as the §7.3
+  entropy-coded-image bit sequence. Every `Ok` image is cross-checked
+  against the §7.3 carrier rules: `width()` / `height()` echo the carrier;
+  `pixels().len() == width as usize * height as usize` (§7.3 emits exactly
+  one pixel per position); the success path is reachable only with both
+  dimensions ≥ 1 (a zero dimension short-circuits to `EmptyEntropyImage`
+  before any header bit is read); and the reader never advances past the
+  slice's bit length. The §6.2.2 fold consistency with the round-270
+  wrapper is cross-checked by an **independent** `decode_entropy_image`
+  decode of the same bytes (`prefix_bits = 2`, inside the §6.2.2 `[2, 9]`
+  wire window): the harness folds this function's pixels via
+  `(argb >> 8) & 0xffff` and asserts byte-equality with the wrapper's
+  per-block meta-codes plus both readers advancing to the same
+  `bit_position()`, and the wrapper's `block_width()` / `block_height()`
+  echoing the §7.3 dimensions. Pure-function determinism is cross-checked
+  by replaying the same bytes + `(width, height)` and asserting a
+  byte-identical pixel buffer at an identical bit position. The §7.3
+  degenerate-dimension refusal is pinned to the `EmptyEntropyImage`
+  variant echoing the carrier dimensions iff at least one is zero; every
+  other bitstream-level refusal (truncation, prefix-code parse failure,
+  out-of-range green symbol, color-cache or backward-reference fault) is
+  required only to return a `Result` rather than panic — the granular
+  §5.2 / §6.2 refusal modes are cross-checked by the sibling
+  `parse_meta_prefix` / `distance_code` / `color_cache` /
+  `backward_reference` harnesses through their own entry points. This
+  brings the §3 lossless decoder's fuzz coverage to 20 standalone
+  harnesses, with the §7.3 entropy-coded-image decode now exercised both
+  through the full `decode` path and at its own standalone surface,
+  complementing the round-270 `decode_entropy_image` harness (which drives
+  the §6.2.2 fold over this function's output) by driving the §7.3 pixel
+  producer beneath it.
 - `fuzz/fuzz_targets/decode_entropy_image.rs`: cargo-fuzz harness — the
   nineteenth — driving the §6.2.2 *entropy image* decode path standalone
   entry point `oxideav_webp::vp8l_decode::decode_entropy_image`

@@ -324,7 +324,33 @@ cargo-fuzz = true
 # least one is zero; every other refusal is required only to return a
 # `Result` rather than panic (the granular §5.2 / §6.2 refusal modes
 # are cross-checked by the sibling `decode` / `parse_meta_prefix`
-# harnesses through their own entry points).
+# harnesses through their own entry points). The twentieth harness
+# drives the §7.3 *entropy-coded-image* decode path standalone entry
+# point `vp8l_decode::decode_entropy_coded_image` directly — the §7.3
+# ABNF building block beneath the round-270 §6.2.2 entropy image (which
+# wraps this function and folds its pixels) and the §4.1 / §4.2 / §4.4
+# sub-resolution images: the first two fuzz bytes fix the §7.3
+# `(width, height)` carrier (each modulo 9 so the §5.2 / §6.2 decode
+# loop stays bounded and 0 reaches the §7.3 degenerate-dimension
+# `EmptyEntropyImage` refusal), and the remaining bytes feed a
+# zero-positioned `BitReader` the §7.3 `entropy-coded-image` bit
+# sequence (§5.2.3 color-cache-info bit + one §6.2 prefix-code group +
+# §5.2 LZ77 / color-cache data). Every Ok image is cross-checked
+# against the §7.3 carrier rules (`width()` / `height()` echo the
+# carrier, `pixels().len() == width * height`, the success path
+# reachable only with both dimensions ≥ 1, the reader never advancing
+# past the slice's bit length) and against the §6.2.2 wrapper
+# (`decode_entropy_image` over the same bytes reproduces the
+# `(pixel >> 8) & 0xffff` per-pixel fold as its per-block meta-codes
+# and advances the reader identically), with pure-function determinism
+# cross-checked by replaying the same bytes + dimensions and asserting
+# a byte-identical pixel buffer at an identical bit position. The §7.3
+# degenerate-dimension refusal is pinned to the `EmptyEntropyImage`
+# variant echoing the carrier dimensions iff at least one is zero;
+# every other refusal is required only to return a `Result` rather than
+# panic (the granular §5.2 / §6.2 refusal modes are cross-checked by
+# the sibling `parse_meta_prefix` / `distance_code` / `color_cache` /
+# `backward_reference` harnesses through their own entry points).
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -470,6 +496,13 @@ bench = false
 [[bin]]
 name = "decode_entropy_image"
 path = "fuzz_targets/decode_entropy_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_entropy_coded_image"
+path = "fuzz_targets/decode_entropy_coded_image.rs"
 test = false
 doc = false
 bench = false

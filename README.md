@@ -72,7 +72,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Nineteen [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -346,7 +346,29 @@ every other bitstream-level refusal required only to return a `Result`
 rather than panic. A 30 s smoke pass cleared 8.9 M runs with no
 crashes (reaching the §5.2 `read_lz77_value` / `apply_backward_reference`
 / `distance_code_to_pixel_distance` core through the entropy-coded
-sub-image). Run any
+sub-image); `decode_entropy_coded_image` (round 271) drives the §7.3
+*entropy-coded-image* decode path standalone entry point
+`vp8l_decode::decode_entropy_coded_image` directly — the §7.3 ABNF
+building block beneath the round-270 §6.2.2 entropy image (which wraps
+it and folds its pixels) and the §4.1 / §4.2 / §4.4 sub-resolution
+images — across the `(width, height, bitstream)` cross-product (the
+first two fuzz bytes fix the §7.3 carrier dimensions each modulo 9 so
+the §5.2 / §6.2 decode loop stays bounded and 0 reaches the §7.3
+degenerate-dimension `EmptyEntropyImage` refusal; the remaining bytes
+feed a zero-positioned `BitReader` the §5.2.3 color-cache-info bit +
+one §6.2 prefix-code group + §5.2 LZ77 / color-cache data) with every
+`Ok` image cross-checked against the §7.3 carrier rules (`width()` /
+`height()` echo the carrier, `pixels().len() == width * height`, the
+success path reachable only with both dimensions ≥ 1, the reader never
+advancing past the slice's bit length) and against the §6.2.2 wrapper
+(an independent `decode_entropy_image` over the same bytes reproduces
+the `(pixel >> 8) & 0xffff` per-pixel fold as its per-block meta-codes
+and advances the reader to the same bit position), plus pure-function
+determinism cross-checked by replaying the same bytes + dimensions for
+a byte-identical pixel buffer at an identical bit position; the §7.3
+degenerate-dimension refusal pinned to the `EmptyEntropyImage` variant
+echoing the carrier dimensions iff at least one is zero and every other
+refusal required only to return a `Result` rather than panic. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -369,6 +391,7 @@ cargo +nightly fuzz run inverse_subtract_green_indexing --manifest-path crates/o
 cargo +nightly fuzz run backward_reference   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run meta_prefix_index    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_entropy_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_entropy_coded_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)
