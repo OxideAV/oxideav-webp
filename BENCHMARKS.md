@@ -956,6 +956,107 @@ Observations:
   images (high meta-prefix granularity) where the chain runs
   hundreds of times.
 
+## Round-278 (2026-06-11): `limit_code_lengths` O(1)-per-adjustment target selection
+
+The round-277 observations flagged `limit_code_lengths`'s
+per-adjustment O(n) *target-selection* rescan as the next target if
+the length-capped `dense_green2328` cell were flagged again. This
+round profiled it fresh and the flag held, so the rescan is gone.
+
+### Fresh profile (pre-change)
+
+A release driver looping `build_code_lengths` on the
+`dense_green2328` bench input (the one capped cell in the inventory:
+2 328 leaves with 1..=255 frequencies push the deepest leaves past
+15 bits) was sampled for 5 s with `limit_code_lengths` temporarily
+`#[inline(never)]` for attribution:
+
+| Top-of-stack symbol | Samples | Share of in-process |
+|---|---:|---:|
+| `limit_code_lengths` | 3 491 | ~81% |
+| leaf sort (`quicksort` + `small_sort` + pivot) | ~435 | ~10% |
+| `build_code_lengths` body (merge + depth recovery) | 205 | ~5% |
+
+So on capped inputs the §3.7.2 cap pass — correctness-insurance code
+— dominated the entire builder. Hotspot confirmed; optimization
+warranted.
+
+### What changed
+
+The over-subscribed loop's per-step rescan walked all used symbols
+and kept the LAST `used`-order symbol among those sharing the
+largest current length below the cap (the `l >= best_len` comparison
+updates on ties). Two structural facts make that selection
+reproducible without the rescan:
+
+1. One bucket per code length, filled in a single pass over `used`,
+   holds each bucket's symbols in `used` order — the back of the
+   highest non-empty bucket IS the rescan's pick.
+2. Once a pick is lengthened from `l` to `l + 1 < 15` it is strictly
+   the unique deepest eligible leaf, so the rescan re-picked the same
+   symbol every subsequent step until it reached the cap (leaving the
+   eligible set) or the Kraft sum reached 1. Driving the popped
+   symbol upward in place therefore replays the original step
+   sequence exactly, and no eligible bucket ever gains a member while
+   the pass is running.
+
+Each adjustment is now O(1) (bucket pop + in-place drive) instead of
+O(n); the Kraft bookkeeping keeps the round-277 incremental
+`±2^(15-len)` exact-integer updates. The under-subscribed loop is
+untouched: `build_code_lengths`'s post-clamp Kraft sum is always
+strictly over-subscribed (clamping only shortens lengths), so that
+loop only runs in the defensive overshoot case, and the rewritten
+over-subscribed pass hands it a state identical to before because it
+replays the same adjustment sequence.
+
+### Bit-identical proof
+
+* FNV-1a digest over every emitted length table for the 8 bench
+  cells plus 600 randomized frequency tables (varied alphabets
+  2..=2328, zero densities, tie-heavy all-equal tables, Fibonacci
+  and power-of-two cap-tripping skews): `0x0e7252a02fbaa388` before
+  and after — unchanged.
+* Differential fuzz against the *literal pre-change implementation*
+  (the crate at the previous commit built side-by-side as a renamed
+  package): 20 M randomized tables, full length-table equality
+  asserted per input, ~5.8 M of them producing max-length-15 codes
+  (cap-pass candidates). Zero divergence in 2 m 36 s.
+* 5-minute `roundtrip_lossless` fuzz run (encode → decode
+  pixel-exact oracle; 3 405 full round trips, 331 new corpus units)
+  clean; full test suite (433 lib tests + all integration binaries)
+  passes unchanged.
+
+### Round-278 measurement
+
+Before columns re-measured same-session on the pre-change code
+(`--quick`, same host as round 277):
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `build_code_lengths_dense_green2328`    | 111.9 µs | **26.4 µs** | 4.2× |
+| `build_code_lengths_sparse_green2328`   | 1.335 µs | **1.342 µs** | — |
+| `build_code_lengths_dense_distance40`   | 408.9 ns | **414.0 ns** | — |
+| `build_code_lengths_dense_literal256`   | 2.135 µs | **2.093 µs** | — |
+| `build_code_lengths_dense_green281`     | 2.315 µs | **2.268 µs** | — |
+
+Observations:
+
+* `dense_green2328` lands at 26.4 µs — right on the ~25 µs pure
+  `N log N` extrapolation from `green281` that round 277 predicted
+  for a rescan-free cap pass. A post-change re-sample of the same
+  driver shows the leaf sort (~1 691 samples) and the merge/depth
+  body (1 668) now co-dominant; `limit_code_lengths` no longer
+  registers as a separate cost center.
+* Every uncapped cell is within run-to-run noise of its round-277
+  median, as expected: the bucket structure is only built when the
+  post-clamp Kraft sum exceeds 1, so inputs that never trip the
+  §3.7.2 cap don't pay for it.
+* This closes the length-then-code chain's flagged-target backlog:
+  builder (r277), decoder table (r277), cap pass (r278). The chain's
+  remaining cost on capped inputs is the one-time leaf sort, which is
+  shared with the uncapped path and already at the comparison-sort
+  floor for the alphabet sizes §3.7.1 allows.
+
 ## Reproducing
 
 ```bash

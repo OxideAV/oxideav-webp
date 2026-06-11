@@ -6,6 +6,31 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Optimized
 
+- `vp8l_encode::limit_code_lengths` — the §3.7.2 length-cap
+  re-balancing pass that only fires when a pathological frequency
+  distribution would push a code past 15 bits — no longer rescans all
+  used symbols to select each adjustment target. A fresh profile of
+  the length-capped `build_code_lengths_dense_green2328` bench input
+  attributed ~81% of `build_code_lengths` self-time to that rescan
+  (3 491 of ~4 280 in-process samples), confirming the round-277
+  flag. The over-subscribed loop now drains one bucket per code
+  length, filled in used-symbol order so the back of the highest
+  non-empty bucket is exactly the symbol the historical rescan's
+  `l >= best_len` tie-break picked, and drives each popped symbol
+  upward in place (once lengthened it is strictly the unique deepest
+  eligible leaf, so the rescan re-picked it every step until it hit
+  the cap) — the original O(n)-per-adjustment pick sequence,
+  reproduced step for step at O(1) per adjustment. Output is
+  bit-identical: the FNV digest over the 8 bench cells plus 600
+  randomized frequency tables (zero densities, tie-heavy, exponential
+  cap-tripping skews) is unchanged, a 20 M-table differential fuzz
+  against the literal pre-change implementation (~5.8 M of them
+  producing max-length-15 codes) found zero divergence, and a 5-minute
+  `roundtrip_lossless` fuzz run plus the full test suite pass
+  unchanged. `build_code_lengths_dense_green2328` median:
+  111.9 µs → 26.4 µs (4.2×); the cell now sits at the leaf-sort +
+  two-queue-merge floor and uncapped cells are unaffected (within
+  noise). Round-278 section in `BENCHMARKS.md` has the numbers.
 - The §3.7.2 / §6.2.1 length-then-code canonical build chain — the
   dense-cell optimization target flagged by the round-250 / round-276
   benches — was rewritten bit-identically on both sides, verified by an

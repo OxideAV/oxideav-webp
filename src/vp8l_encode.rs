@@ -520,30 +520,54 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
     };
     // If over-subscribed (sum > 1), lengthen the deepest (largest-length,
     // i.e. cheapest-to-lengthen) leaves until the sum drops to 1.
+    //
+    // Selection rule being reproduced: the historical per-step rescan
+    // walked all of `used` and kept the LAST `used`-order symbol among
+    // those sharing the largest current length below the cap (the
+    // `l >= best_len` comparison kept updating on ties). Two facts turn
+    // that O(n)-per-adjustment rescan into an O(1)-per-adjustment bucket
+    // drain with the identical pick sequence:
+    //
+    // 1. A bucket per length, filled in one pass over `used`, holds each
+    //    bucket's symbols in `used` order — so the back of the highest
+    //    non-empty bucket IS the rescan's pick.
+    // 2. Once a pick is lengthened from `l` to `l + 1 < MAX`, it is
+    //    strictly the unique deepest eligible leaf (everything else is
+    //    `<= l`), so the rescan re-picks the same symbol every step
+    //    until it reaches MAX (leaving the eligible set) or the sum
+    //    reaches 1. Driving the popped symbol upward in place therefore
+    //    replays the original step sequence exactly; no eligible bucket
+    //    ever gains a member while the pass is still running.
     let mut k = kraft(lengths);
-    while k > full {
-        // Find a symbol we can lengthen (length < MAX) with the largest
-        // current length, to remove the most "excess" per step.
-        let mut target: Option<usize> = None;
-        let mut best_len = 0u8;
+    if k > full {
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); MAX_CODE_LENGTH];
         for &s in used {
-            let l = lengths[s];
-            if (l as usize) < MAX_CODE_LENGTH && l >= best_len {
-                best_len = l;
-                target = Some(s);
+            let l = lengths[s] as usize;
+            if l < MAX_CODE_LENGTH {
+                buckets[l].push(s);
             }
         }
-        match target {
-            Some(s) => {
-                // Lengthening `s` from `l` to `l + 1` swaps its Kraft term
+        // Bucket 0 is included for parity with the historical rescan,
+        // which treated a (theoretical) zero-length used symbol as
+        // eligible; the §3.7.2 build never produces one for a used
+        // symbol, so the bucket is empty in practice.
+        'over: for l0 in (0..MAX_CODE_LENGTH).rev() {
+            while k > full {
+                let Some(s) = buckets[l0].pop() else { break };
+                // Lengthening from `l` to `l + 1` swaps the Kraft term
                 // `2^(MAX-l)` for `2^(MAX-l-1)`, i.e. removes exactly
-                // `2^(MAX-l-1)` — same integer `k` a full recompute would
-                // give, without the O(n) rescan per step.
-                let l = lengths[s] as usize;
-                lengths[s] += 1;
-                k -= 1i64 << (MAX_CODE_LENGTH - l - 1);
+                // `2^(MAX-l-1)` — same integer a full recompute would
+                // give.
+                let mut l = l0;
+                while k > full && l < MAX_CODE_LENGTH {
+                    l += 1;
+                    lengths[s] = l as u8;
+                    k -= 1i64 << (MAX_CODE_LENGTH - l);
+                }
             }
-            None => break,
+            if k <= full {
+                break 'over;
+            }
         }
     }
     // If under-subscribed (sum < 1), shorten the deepest leaves until the

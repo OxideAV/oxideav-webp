@@ -68,7 +68,11 @@ length-then-code chain bit-identically — a sorted-leaf two-queue
 merge replacing the encoder's Huffman heap (dense `green2328`
 382.0 µs → 113.5 µs) and a single-rescan counting sort replacing the
 decoder's per-used-length rescan (dense `green2328`
-7.44 µs → 4.63 µs).
+7.44 µs → 4.63 µs). Round 278 removed the §3.7.2 length-cap pass's
+per-adjustment O(n) target-selection rescan (bucket-per-length drain
+replaying the identical pick sequence; capped dense `green2328`
+111.9 µs → 26.4 µs, proven bit-identical by FNV digest plus a
+20 M-table differential fuzz against the pre-change implementation).
 Numbers, profile findings, and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
 with:
