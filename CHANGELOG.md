@@ -4,6 +4,24 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- §4.1 encoder block-mode chooser hot path (round-280 profile: the
+  per-pixel `predictor_at` helper was 36% of total encode self-time):
+  the per-block per-mode cost walks (`block_mode_cost`, the L1 pickers
+  `pick_block_mode_with_hint` / `_slack`, and
+  `block_mode_entropy_cost`) now run through a shared block-residual
+  walker that hoists the §4.1 border-rule branch chain and the 14-way
+  predictor-mode dispatch out of the per-pixel inner loop
+  (monomorphised per mode), and prunes worse-than-best modes at
+  block-row granularity instead of per pixel so the interior loop is
+  branch-free. Encoded output is bit-identical (FNV digest over an
+  82-image encode sweep unchanged; pinned by the new
+  `block_walker_matches_predictor_at_reference_random` test against
+  verbatim pre-change reference loops). `lossless_encode_natural_128`
+  −19% to −28%, `lossless_encode_rgba_256` −16% to −21%; see
+  `BENCHMARKS.md` round 280.
+
 ### Added
 
 - Fuzz harness #24 `roundtrip_anim_modes` — a differential oracle on

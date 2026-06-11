@@ -1057,6 +1057,100 @@ Observations:
   shared with the uncapped path and already at the comparison-sort
   floor for the alphabet sizes §3.7.1 allows.
 
+## Round-280 (2026-06-12): §4.1 encoder chooser block-walk despecialisation
+
+### Fresh profile (pre-change)
+
+An 8-second `/usr/bin/sample` of a release driver looping
+`encode_webp_lossless` on the natural 128×128 tile (the
+`lossless_encode_natural_128` bench input) attributed top-of-stack
+self-time as:
+
+| Rank | Symbol | Samples | Share |
+|---:|---|---:|---:|
+| 1 | `vp8l_encode::predictor_at` | 2 197 | ~36% |
+| 2 | `encode_argb_with_predictor_chooser` closure | 1 027 | ~17% |
+| 3 | `encode_with_color_transform` | 547 | ~9% |
+| 4 | `encode_with_predictor_slack` | 425 | ~7% |
+| 5 | `encode_with_predictor_entropy` | 390 | ~6% |
+| 6 | `Lz77Matcher::find` | 303 | ~5% |
+
+`predictor_at` was the round-170 encode-profile rank-1 too and had
+never been optimized. Every §4.1 block-mode chooser pass
+(`pick_block_mode_with_hint`, `pick_block_mode_with_hint_slack`,
+`block_mode_entropy_cost`, plus the `block_mode_cost` tie-break) ran
+it once per pixel **per candidate mode** (14 modes per block, per
+`size_bits` candidate, per cost model), and each call re-ran the
+§4.1 border-rule branch chain (`x == 0 && y == 0` → `y == 0` →
+`x == 0` → `x == w - 1`) plus a 14-way `match mode` dispatch on a
+runtime `mode`, with no inlining into the cost loop.
+
+### What changed
+
+The four chooser cost paths now run through one shared
+block-residual walker (`walk_block_residuals` +
+`for_each_block_residual`):
+
+* **Border rules hoisted** out of the per-pixel loop into per-region
+  loops (top row / left column / interior / right-column TR
+  wraparound) — the same split the round-180 decoder
+  `inverse_predictor` rewrite proved out.
+* **Mode dispatch hoisted**: the 14-way `match mode` runs once per
+  block walk; each arm monomorphises the walker over the §4.1
+  predictor closure for that mode, so the interior loop inlines the
+  predictor body with no per-pixel dispatch.
+* **Row-granular pruning**: the L1 pickers' per-pixel
+  `cost >= best_cost` early-out is now checked at block-row
+  boundaries (`MagnitudeCostSink::row_end`), leaving the interior
+  pixel loop branch-free (auto-vectorisable). Pick-identical: a
+  pruned partial sum is only ever compared `>= cap`, and per-pixel
+  contributions are non-negative, so any prune implies the full sum
+  also compares `>= cap`; full (uncapped) sums are unchanged, so
+  every argmin and every tie-break resolves exactly as before. Cost
+  is at most one extra block row of work on a pruned mode.
+
+`predictor_at` itself is unchanged (still used by
+`apply_forward_predictor`, whose mode varies per block run, and by
+the chooser tests).
+
+### Bit-identical proof
+
+* FNV-1a digest over the full encoded output of an 82-image sweep —
+  the two bench inputs (256×256 gradient, natural 128×128 tile) plus
+  16 shapes from 1×1 to 33×129 × five fill regimes each (uniform
+  random, smooth gradient, 5-color palette, solid, per-row random
+  walk with varying alpha): `0fb035b5e0f085a7` (90 640 encoded
+  bytes) before and after — unchanged.
+* New `block_walker_matches_predictor_at_reference_random` test pins
+  `block_mode_cost`, the `block_mode_entropy_cost` histograms, and
+  both hinted pickers (every hint × slack ∈ {0, 1, 7, 64}) against
+  verbatim copies of the pre-round-280 per-pixel `predictor_at`
+  loops across 13 block/image geometries covering every walker
+  border regime, for modes `0..=13` plus an out-of-range mode.
+* 3-minute `roundtrip_lossless` fuzz run (encode → decode
+  pixel-exact oracle, 1 799 full round trips) clean; full test suite
+  (434 lib tests + all integration binaries) passes unchanged.
+
+### Round-280 measurement
+
+Before is the same-session pre-change `--quick` baseline; two
+consecutive post-change runs are shown (the machine-load spread on
+this host straddles them):
+
+| Bench | Before | After (run 1) | After (run 2) | Δ |
+|---|---:|---:|---:|---:|
+| `lossless_encode_natural_128` | 170.65 ms | 138.10 ms | **123.55 ms** | **−19% to −28%** |
+| `lossless_encode_rgba_256` | 1.5116 s | 1.2684 s | **1.1947 s** | **−16% to −21%** |
+
+A post-change re-sample of the same driver shows the monomorphised
+walker instantiations co-leading with the remaining per-pass bodies;
+the border/dispatch overhead no longer registers, and the remaining
+chooser cost is the inherent 14-mode × per-pixel arithmetic itself.
+Next plausible targets from the post-change profile:
+`encode_with_color_transform` (its `pick_block_cte` per-pixel walk
+is the analogous §4.2 chooser, now rank-2) and the
+`Lz77Matcher::find` chain walk.
+
 ## Reproducing
 
 ```bash

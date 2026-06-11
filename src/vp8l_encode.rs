@@ -1814,6 +1814,197 @@ fn predictor_at(pixels: &[u32], width: usize, x: usize, y: usize, mode: u8) -> u
     predictor_predict(mode, l, t, tr, tl)
 }
 
+/// Per-pixel residual consumer for [`for_each_block_residual`].
+///
+/// `pixel` receives each in-bounds block pixel's §4.1 mod-256
+/// residual in raster order; `row_end` runs after the last pixel of
+/// each block row and returns whether the walk should continue.
+///
+/// Pruning at row granularity (instead of per pixel, as the
+/// pre-round-280 chooser loops did) is pick-identical: a pruned
+/// walk's partial cost is only ever compared `>= cap` by the caller,
+/// and per-pixel contributions are non-negative, so any partial sum
+/// that prunes implies the full sum would also have compared
+/// `>= cap`. Coarsening the prune lets the interior pixel loop run
+/// branch-free (auto-vectorisable) at the cost of at most one block
+/// row of extra work on a pruned mode.
+trait ResidualSink {
+    fn pixel(&mut self, residual: u32);
+    fn row_end(&mut self) -> bool;
+}
+
+/// Walk every in-bounds pixel of the block `[x0, x0+bw) × [y0,
+/// y0+bh)` of the `width × height` image in raster order, feeding
+/// each pixel's §4.1 residual (`predictor_subtract(original,
+/// prediction)`) to `sink`. Interior predictions come from
+/// `predict(l, t, tr, tl)`; border pixels follow the §4.1 border
+/// rules (top-left → solid black, top row → L, left column → T,
+/// rightmost column → the §4.1 TR wraparound) — pixel-for-pixel
+/// identical to a [`predictor_at`] + [`predictor_subtract`] walk,
+/// but with the border branch chain hoisted out of the inner loop
+/// (round-180 decoder precedent) and the predictor monomorphised in
+/// by the caller so the per-pixel 14-way mode dispatch disappears.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn walk_block_residuals<P, S>(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    predict: P,
+    sink: &mut S,
+) where
+    P: Fn(u32, u32, u32, u32) -> u32,
+    S: ResidualSink,
+{
+    let y_end = (y0 + bh).min(height);
+    let x_end = (x0 + bw).min(width);
+    if x0 >= x_end || y0 >= y_end {
+        return;
+    }
+    let mut y = y0;
+    if y == 0 {
+        // Top row: (0, 0) predicts solid black, the rest predict L.
+        let mut x = x0;
+        if x == 0 {
+            sink.pixel(predictor_subtract(pixels[0], 0xff00_0000));
+            x = 1;
+        }
+        while x < x_end {
+            sink.pixel(predictor_subtract(pixels[x], pixels[x - 1]));
+            x += 1;
+        }
+        if !sink.row_end() {
+            return;
+        }
+        y = 1;
+    }
+    // The §4.1 right-column TR wraparound only applies when the block
+    // reaches the image's right edge.
+    let interior_end = if x_end == width { width - 1 } else { x_end };
+    while y < y_end {
+        let row = y * width;
+        let mut x = x0;
+        if x == 0 {
+            // Left column predicts T.
+            sink.pixel(predictor_subtract(pixels[row], pixels[row - width]));
+            x = 1;
+        }
+        while x < interior_end {
+            let idx = row + x;
+            let l = pixels[idx - 1];
+            let t = pixels[idx - width];
+            let tl = pixels[idx - width - 1];
+            let tr = pixels[idx - width + 1];
+            sink.pixel(predictor_subtract(pixels[idx], predict(l, t, tr, tl)));
+            x += 1;
+        }
+        if x < x_end {
+            // x == width - 1: §4.1 TR wraparound.
+            let idx = row + x;
+            let l = pixels[idx - 1];
+            let t = pixels[idx - width];
+            let tl = pixels[idx - width - 1];
+            let tr = pixels[idx - width - (width - 1)];
+            sink.pixel(predictor_subtract(pixels[idx], predict(l, t, tr, tl)));
+        }
+        if !sink.row_end() {
+            return;
+        }
+        y += 1;
+    }
+}
+
+/// Run [`walk_block_residuals`] with the §4.1 predictor for `mode`
+/// monomorphised into the walk, so the mode dispatch runs once per
+/// block instead of once per pixel. Out-of-range modes predict solid
+/// black, matching [`predictor_predict`].
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn for_each_block_residual<S: ResidualSink>(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mode: u8,
+    sink: &mut S,
+) {
+    macro_rules! walk {
+        ($p:expr) => {
+            walk_block_residuals(pixels, width, height, x0, y0, bw, bh, $p, sink)
+        };
+    }
+    match mode {
+        1 => walk!(|l, _, _, _| l),
+        2 => walk!(|_, t, _, _| t),
+        3 => walk!(|_, _, tr, _| tr),
+        4 => walk!(|_, _, _, tl| tl),
+        5 => walk!(|l, t, tr, _| predictor_average2(predictor_average2(l, tr), t)),
+        6 => walk!(|l, _, _, tl| predictor_average2(l, tl)),
+        7 => walk!(|l, t, _, _| predictor_average2(l, t)),
+        8 => walk!(|_, t, _, tl| predictor_average2(tl, t)),
+        9 => walk!(|_, t, tr, _| predictor_average2(t, tr)),
+        10 => walk!(|l, t, tr, tl| predictor_average2(
+            predictor_average2(l, tl),
+            predictor_average2(t, tr)
+        )),
+        11 => walk!(|l, t, _, tl| predictor_select(l, t, tl)),
+        12 => walk!(|l, t, _, tl| predictor_clamp_add_subtract_full(l, t, tl)),
+        13 => walk!(|l, t, _, tl| predictor_clamp_add_subtract_half(predictor_average2(l, t), tl)),
+        // Mode 0 and §4.1-undefined modes both predict solid black.
+        _ => walk!(|_, _, _, _| 0xff00_0000),
+    }
+}
+
+/// [`ResidualSink`] accumulating the folded-L1 [`residual_magnitude`]
+/// cost proxy, pruning at row granularity once the running sum
+/// reaches `cap` (see the trait docs for why row-granular pruning is
+/// pick-identical to the pre-round-280 per-pixel early-out).
+struct MagnitudeCostSink {
+    cost: u64,
+    cap: u64,
+}
+
+impl ResidualSink for MagnitudeCostSink {
+    #[inline]
+    fn pixel(&mut self, residual: u32) {
+        self.cost += residual_magnitude(residual) as u64;
+    }
+    #[inline]
+    fn row_end(&mut self) -> bool {
+        self.cost < self.cap
+    }
+}
+
+/// [`ResidualSink`] filling the per-channel residual byte histograms
+/// [`block_mode_entropy_cost`] feeds its Shannon sum. Never prunes:
+/// the histograms must be complete before the entropy is meaningful.
+struct ResidualHistogramSink {
+    hist: [[u32; 256]; 4],
+    n: u32,
+}
+
+impl ResidualSink for ResidualHistogramSink {
+    #[inline]
+    fn pixel(&mut self, residual: u32) {
+        self.hist[0][((residual >> 24) & 0xff) as usize] += 1;
+        self.hist[1][((residual >> 16) & 0xff) as usize] += 1;
+        self.hist[2][((residual >> 8) & 0xff) as usize] += 1;
+        self.hist[3][(residual & 0xff) as usize] += 1;
+        self.n += 1;
+    }
+    #[inline]
+    fn row_end(&mut self) -> bool {
+        true
+    }
+}
+
 /// Pick the §4.1 mode `0..=13` that minimises the residual cost
 /// proxy over the rectangular block `[x0, x0+bw) × [y0, y0+bh)` of
 /// the `width × height` image. Border rules per
@@ -1861,24 +2052,30 @@ fn block_mode_cost(
     bh: usize,
     mode: u8,
 ) -> u64 {
-    let mut cost: u64 = 0;
-    for dy in 0..bh {
-        let y = y0 + dy;
-        if y >= height {
-            break;
-        }
-        for dx in 0..bw {
-            let x = x0 + dx;
-            if x >= width {
-                break;
-            }
-            let pred = predictor_at(pixels, width, x, y, mode);
-            let original = pixels[y * width + x];
-            let residual = predictor_subtract(original, pred);
-            cost += residual_magnitude(residual) as u64;
-        }
-    }
-    cost
+    block_mode_cost_capped(pixels, width, height, x0, y0, bw, bh, mode, u64::MAX)
+}
+
+/// [`block_mode_cost`] with a pruning `cap`: once the running cost
+/// reaches `cap` at a block-row boundary the walk stops and the
+/// partial sum is returned. Callers only compare a pruned return
+/// value `>= cap` (the residual magnitudes are non-negative, so a
+/// partial sum at or above `cap` proves the full sum is too), which
+/// keeps mode picks identical to an uncapped walk.
+#[allow(clippy::too_many_arguments)]
+fn block_mode_cost_capped(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mode: u8,
+    cap: u64,
+) -> u64 {
+    let mut sink = MagnitudeCostSink { cost: 0, cap };
+    for_each_block_residual(pixels, width, height, x0, y0, bw, bh, mode, &mut sink);
+    sink.cost
 }
 
 /// Hint-aware variant of [`pick_block_mode`]: picks the §4.1 mode
@@ -1916,31 +2113,11 @@ fn pick_block_mode_with_hint(
     let mut best_mode: u8 = 0;
     let mut best_cost = u64::MAX;
     for mode in 0u8..=13 {
-        let mut cost: u64 = 0;
-        for dy in 0..bh {
-            let y = y0 + dy;
-            if y >= height {
-                break;
-            }
-            for dx in 0..bw {
-                let x = x0 + dx;
-                if x >= width {
-                    break;
-                }
-                let pred = predictor_at(pixels, width, x, y, mode);
-                let original = pixels[y * width + x];
-                let residual = predictor_subtract(original, pred);
-                cost += residual_magnitude(residual) as u64;
-                if cost >= best_cost {
-                    // Early-out: this mode is already worse than the
-                    // current best; no need to finish the block.
-                    break;
-                }
-            }
-            if cost >= best_cost {
-                break;
-            }
-        }
+        // The cap prunes modes already worse than the current best at
+        // block-row granularity; a pruned partial sum is `>= best_cost`
+        // so the `cost < best_cost` update below stays pick-identical
+        // to a full walk.
+        let cost = block_mode_cost_capped(pixels, width, height, x0, y0, bw, bh, mode, best_cost);
         if cost < best_cost {
             best_cost = cost;
             best_mode = mode;
@@ -2008,31 +2185,9 @@ fn pick_block_mode_with_hint_slack(
     let mut best_mode: u8 = 0;
     let mut best_cost = u64::MAX;
     for mode in 0u8..=13 {
-        let mut cost: u64 = 0;
-        for dy in 0..bh {
-            let y = y0 + dy;
-            if y >= height {
-                break;
-            }
-            for dx in 0..bw {
-                let x = x0 + dx;
-                if x >= width {
-                    break;
-                }
-                let pred = predictor_at(pixels, width, x, y, mode);
-                let original = pixels[y * width + x];
-                let residual = predictor_subtract(original, pred);
-                cost += residual_magnitude(residual) as u64;
-                if cost >= best_cost {
-                    // Early-out: this mode is already worse than the
-                    // current best; no need to finish the block.
-                    break;
-                }
-            }
-            if cost >= best_cost {
-                break;
-            }
-        }
+        // Row-granular prune against the current best; pick-identical
+        // to a full walk (see `block_mode_cost_capped`).
+        let cost = block_mode_cost_capped(pixels, width, height, x0, y0, bw, bh, mode, best_cost);
         if cost < best_cost {
             best_cost = cost;
             best_mode = mode;
@@ -2205,28 +2360,13 @@ fn block_mode_entropy_cost(
     bh: usize,
     mode: u8,
 ) -> u64 {
-    let mut hist: [[u32; 256]; 4] = [[0u32; 256]; 4];
-    let mut n: u32 = 0;
-    for dy in 0..bh {
-        let y = y0 + dy;
-        if y >= height {
-            break;
-        }
-        for dx in 0..bw {
-            let x = x0 + dx;
-            if x >= width {
-                break;
-            }
-            let pred = predictor_at(pixels, width, x, y, mode);
-            let original = pixels[y * width + x];
-            let residual = predictor_subtract(original, pred);
-            hist[0][((residual >> 24) & 0xff) as usize] += 1;
-            hist[1][((residual >> 16) & 0xff) as usize] += 1;
-            hist[2][((residual >> 8) & 0xff) as usize] += 1;
-            hist[3][(residual & 0xff) as usize] += 1;
-            n += 1;
-        }
-    }
+    let mut sink = ResidualHistogramSink {
+        hist: [[0u32; 256]; 4],
+        n: 0,
+    };
+    for_each_block_residual(pixels, width, height, x0, y0, bw, bh, mode, &mut sink);
+    let hist = sink.hist;
+    let n = sink.n;
     if n == 0 {
         return 0;
     }
@@ -6543,6 +6683,186 @@ mod tests {
                 "predictor_subtract diverges from per-byte reference at \
                  orig=0x{orig:08x} pred=0x{pred:08x}"
             );
+        }
+    }
+
+    /// Round-280 cross-check for the mode-specialised block-residual
+    /// walker: `block_mode_cost`, `block_mode_entropy_cost`, and the
+    /// capped walks driving `pick_block_mode_with_hint` /
+    /// `pick_block_mode_with_hint_slack` must stay bit-identical to a
+    /// verbatim copy of the pre-round-280 per-pixel `predictor_at`
+    /// loops. Sweeps deterministic-LCG images over shapes covering
+    /// every walker boundary regime — 1×N / N×1 (border-only rows and
+    /// columns), 2×2, blocks overlapping the right and bottom edges,
+    /// blocks larger than the image, interior blocks not touching any
+    /// border — for every mode `0..=13` plus an out-of-range mode,
+    /// and pins the hinted pickers (whose row-granular prune must be
+    /// pick-identical to the reference per-pixel early-out) for every
+    /// `prefer_mode` and a slack sweep.
+    #[test]
+    fn block_walker_matches_predictor_at_reference_random() {
+        // Verbatim pre-round-280 `block_mode_cost` body.
+        #[allow(clippy::too_many_arguments)]
+        fn ref_cost(
+            pixels: &[u32],
+            width: usize,
+            height: usize,
+            x0: usize,
+            y0: usize,
+            bw: usize,
+            bh: usize,
+            mode: u8,
+        ) -> u64 {
+            let mut cost: u64 = 0;
+            for dy in 0..bh {
+                let y = y0 + dy;
+                if y >= height {
+                    break;
+                }
+                for dx in 0..bw {
+                    let x = x0 + dx;
+                    if x >= width {
+                        break;
+                    }
+                    let pred = predictor_at(pixels, width, x, y, mode);
+                    let original = pixels[y * width + x];
+                    let residual = predictor_subtract(original, pred);
+                    cost += residual_magnitude(residual) as u64;
+                }
+            }
+            cost
+        }
+        // Verbatim pre-round-280 `block_mode_entropy_cost` histogram
+        // fill (the Shannon sum over it is unchanged, so comparing
+        // the histograms pins the whole function).
+        #[allow(clippy::too_many_arguments)]
+        fn ref_hist(
+            pixels: &[u32],
+            width: usize,
+            height: usize,
+            x0: usize,
+            y0: usize,
+            bw: usize,
+            bh: usize,
+            mode: u8,
+        ) -> ([[u32; 256]; 4], u32) {
+            let mut hist: [[u32; 256]; 4] = [[0u32; 256]; 4];
+            let mut n: u32 = 0;
+            for dy in 0..bh {
+                let y = y0 + dy;
+                if y >= height {
+                    break;
+                }
+                for dx in 0..bw {
+                    let x = x0 + dx;
+                    if x >= width {
+                        break;
+                    }
+                    let pred = predictor_at(pixels, width, x, y, mode);
+                    let original = pixels[y * width + x];
+                    let residual = predictor_subtract(original, pred);
+                    hist[0][((residual >> 24) & 0xff) as usize] += 1;
+                    hist[1][((residual >> 16) & 0xff) as usize] += 1;
+                    hist[2][((residual >> 8) & 0xff) as usize] += 1;
+                    hist[3][(residual & 0xff) as usize] += 1;
+                    n += 1;
+                }
+            }
+            (hist, n)
+        }
+        let mut seed: u32 = 0x2b80_c0de;
+        let mut rng = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+        // (width, height, x0, y0, bw, bh) — every walker regime.
+        let shapes: &[(usize, usize, usize, usize, usize, usize)] = &[
+            (1, 1, 0, 0, 4, 4),   // single pixel, block larger than image
+            (1, 9, 0, 0, 4, 4),   // single column (left-column rule only)
+            (1, 9, 0, 8, 4, 4),   // single column, partial bottom block
+            (9, 1, 0, 0, 4, 4),   // single row (top-row rule only)
+            (9, 1, 4, 0, 4, 4),   // single row, interior-start block
+            (2, 2, 0, 0, 2, 2),   // smallest full-rules image
+            (8, 8, 0, 0, 8, 8),   // block == image (all four borders)
+            (8, 8, 4, 4, 4, 4),   // bottom-right block (TR wraparound)
+            (8, 8, 4, 0, 4, 4),   // top-right block (top row + wraparound)
+            (8, 8, 0, 4, 4, 4),   // bottom-left block (left column)
+            (11, 7, 8, 4, 4, 4),  // overlaps right and bottom edges
+            (16, 16, 4, 4, 4, 4), // pure interior block (no borders)
+            (5, 5, 0, 0, 16, 16), // block much larger than image
+        ];
+        for &(width, height, x0, y0, bw, bh) in shapes {
+            let pixels: Vec<u32> = (0..width * height).map(|_| rng()).collect();
+            // Cost + histogram equivalence for every mode, including
+            // one §4.1-undefined mode (predicts solid black).
+            for mode in 0u8..=14 {
+                assert_eq!(
+                    block_mode_cost(&pixels, width, height, x0, y0, bw, bh, mode),
+                    ref_cost(&pixels, width, height, x0, y0, bw, bh, mode),
+                    "block_mode_cost diverges at {width}x{height} block \
+                     ({x0},{y0},{bw},{bh}) mode {mode}"
+                );
+                let mut sink = ResidualHistogramSink {
+                    hist: [[0u32; 256]; 4],
+                    n: 0,
+                };
+                for_each_block_residual(&pixels, width, height, x0, y0, bw, bh, mode, &mut sink);
+                let (hist, n) = ref_hist(&pixels, width, height, x0, y0, bw, bh, mode);
+                assert_eq!(
+                    (sink.hist, sink.n),
+                    (hist, n),
+                    "residual histogram diverges at {width}x{height} block \
+                     ({x0},{y0},{bw},{bh}) mode {mode}"
+                );
+            }
+            // Pick equivalence: the row-granular capped walk must
+            // select the same mode as a reference full-cost argmin
+            // (lowest mode wins ties) for every hint, and the slack
+            // variant for a slack sweep.
+            let mut ref_best_mode: u8 = 0;
+            let mut ref_best_cost = u64::MAX;
+            for mode in 0u8..=13 {
+                let cost = ref_cost(&pixels, width, height, x0, y0, bw, bh, mode);
+                if cost < ref_best_cost {
+                    ref_best_cost = cost;
+                    ref_best_mode = mode;
+                }
+            }
+            for hint in std::iter::once(None).chain((0u8..=13).map(Some)) {
+                let mut want = ref_best_mode;
+                if let Some(m) = hint {
+                    if m != want
+                        && ref_cost(&pixels, width, height, x0, y0, bw, bh, m) == ref_best_cost
+                    {
+                        want = m;
+                    }
+                }
+                assert_eq!(
+                    pick_block_mode_with_hint(&pixels, width, height, x0, y0, bw, bh, hint),
+                    want,
+                    "hinted pick diverges at {width}x{height} block \
+                     ({x0},{y0},{bw},{bh}) hint {hint:?}"
+                );
+                for slack in [0u64, 1, 7, 64] {
+                    let mut want_slack = ref_best_mode;
+                    if let Some(m) = hint {
+                        if m != want_slack
+                            && ref_cost(&pixels, width, height, x0, y0, bw, bh, m)
+                                <= ref_best_cost.saturating_add(slack)
+                        {
+                            want_slack = m;
+                        }
+                    }
+                    assert_eq!(
+                        pick_block_mode_with_hint_slack(
+                            &pixels, width, height, x0, y0, bw, bh, hint, slack
+                        ),
+                        want_slack,
+                        "slack pick diverges at {width}x{height} block \
+                         ({x0},{y0},{bw},{bh}) hint {hint:?} slack {slack}"
+                    );
+                }
+            }
         }
     }
 
