@@ -315,3 +315,117 @@ fn delta_config_builder_methods_are_exposed() {
     assert_eq!(cfg.auto_inner_threshold_bytes, Some(256));
     assert_eq!(cfg.msssim_downsample_kernel, DownsampleKernel::Gaussian);
 }
+
+/// §2.7.1.1 8-bit alpha-blending formula (round-to-nearest fixed point) —
+/// the independent expectation the decoder's compositor must match.
+fn blend_px(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
+    let sa = u32::from(src[3]);
+    if sa == 255 {
+        return src;
+    }
+    if sa == 0 {
+        return dst;
+    }
+    let da = u32::from(dst[3]);
+    let dst_factor = (da * (255 - sa) + 127) / 255;
+    let out_a = sa + dst_factor;
+    let mut out = [0u8; 4];
+    for c in 0..3 {
+        let v = (u32::from(src[c]) * sa + u32::from(dst[c]) * dst_factor + out_a / 2)
+            .checked_div(out_a)
+            .unwrap_or(0);
+        out[c] = v.min(255) as u8;
+    }
+    out[3] = out_a.min(255) as u8;
+    out
+}
+
+#[test]
+fn delta_frame_with_background_dispose_round_trips() {
+    // Round-279 fuzz regression (roundtrip_anim_modes): a Delta frame with
+    // `dispose == Background` used to be emitted as a dirty-rect sub-frame
+    // with `D` forced to 0 while the encoder's reference canvas applied the
+    // caller's dispose — so the decoder never cleared the rect and every
+    // subsequent delta frame was diffed against a canvas the decoder did
+    // not have. The fix emits Background-disposed Delta/Auto frames as full
+    // keyframes with the caller's flags honoured verbatim.
+    let (w, h) = (6u32, 6u32);
+    let red = [255u8, 0, 0, 255];
+    let f0_px: Vec<u8> = red
+        .iter()
+        .copied()
+        .cycle()
+        .take((w * h * 4) as usize)
+        .collect();
+    // F1: red with one blue pixel — a small change so Delta engages.
+    let mut f1_px = f0_px.clone();
+    f1_px[0..4].copy_from_slice(&[0, 0, 255, 255]);
+    // F2: transparent black except one green pixel. Per §2.7.1.1, F1's
+    // Background dispose clears the canvas to the (transparent black)
+    // background before F2 renders, and F2 overwrites the full canvas, so
+    // the displayed canvas must equal F2's pixels exactly.
+    let mut f2_px = vec![0u8; (w * h * 4) as usize];
+    f2_px[0..4].copy_from_slice(&[0, 255, 0, 255]);
+
+    let mut f0 = AnimFrame::new(w, h, f0_px.clone(), 10);
+    f0.mode = AnimFrameMode::Delta;
+    let mut f1 = AnimFrame::new(w, h, f1_px.clone(), 10);
+    f1.mode = AnimFrameMode::Delta;
+    f1.dispose = DisposalMethod::Background;
+    let mut f2 = AnimFrame::new(w, h, f2_px.clone(), 10);
+    f2.mode = AnimFrameMode::Delta;
+
+    let file = build_animated_webp(&[f0, f1, f2]).expect("build");
+    let img = decode_webp(&file).expect("decode");
+    assert_eq!(img.frames.len(), 3);
+    assert_eq!(img.frames[0].rgba, f0_px, "frame 0 round-trips");
+    assert_eq!(img.frames[1].rgba, f1_px, "frame 1 round-trips");
+    assert_eq!(
+        img.frames[2].rgba, f2_px,
+        "frame 2 must render on the background-cleared canvas"
+    );
+}
+
+#[test]
+fn delta_frame_with_alpha_blend_round_trips() {
+    // Round-279 fuzz regression (roundtrip_anim_modes): a Delta/Auto frame
+    // with `blend == AlphaBlend` used to diff and emit its *raw source*
+    // pixels with `B` forced to overwrite, so semi-transparent pixels
+    // landed on the canvas unblended. The fix diffs and emits the
+    // post-composite drawn canvas, which an overwrite reproduces exactly.
+    let (w, h) = (6u32, 6u32);
+    let red = [255u8, 0, 0, 255];
+    let f0_px: Vec<u8> = red
+        .iter()
+        .copied()
+        .cycle()
+        .take((w * h * 4) as usize)
+        .collect();
+    // F1: same red everywhere except one half-transparent blue pixel that
+    // must be *blended over* the red canvas, not copied.
+    let mut f1_px = f0_px.clone();
+    let semi_blue = [0u8, 0, 255, 128];
+    f1_px[0..4].copy_from_slice(&semi_blue);
+
+    for mode in [AnimFrameMode::Delta, AnimFrameMode::Auto] {
+        let mut f0 = AnimFrame::new(w, h, f0_px.clone(), 10);
+        f0.mode = mode;
+        let mut f1 = AnimFrame::new(w, h, f1_px.clone(), 10);
+        f1.mode = mode;
+        f1.blend = BlendingMethod::AlphaBlend;
+
+        let file = build_animated_webp(&[f0, f1]).expect("build");
+        let img = decode_webp(&file).expect("decode");
+        assert_eq!(img.frames.len(), 2);
+        assert_eq!(img.frames[0].rgba, f0_px, "{mode:?}: frame 0 round-trips");
+
+        // Expected canvas: red everywhere, with the §2.7.1.1 blend of the
+        // semi-transparent blue pixel over red at (0, 0).
+        let mut expected = f0_px.clone();
+        expected[0..4].copy_from_slice(&blend_px(red, semi_blue));
+        assert_eq!(
+            img.frames[1].rgba, expected,
+            "{mode:?}: AlphaBlend delta frame must land blended"
+        );
+    }
+}

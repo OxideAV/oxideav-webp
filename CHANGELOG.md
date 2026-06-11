@@ -4,6 +4,44 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Fuzz harness #24 `roundtrip_anim_modes` — a differential oracle on
+  the §2.7.1.1 animation assembly path `build_animated_webp_with_options`
+  → `decode_webp` with every per-frame carrier field fuzz-driven: even
+  `(x, y)` sub-canvas offsets, mixed `Auto` / `Delta` / `Lossless` frame
+  modes, `None` / `Background` disposal, `Overwrite` / `AlphaBlend`
+  blending, and the `ANIM` loop-count + background-colour options. Every
+  decoded full-canvas frame snapshot is asserted byte-identical to an
+  independent §2.7.1.1 canvas simulation; duration, loop count and
+  background colour are asserted to carry through. The existing
+  `roundtrip_animated` harness only drove `AnimFrame::new` defaults
+  (full-canvas Lossless frames at the origin), leaving the dirty-rect
+  encoder and the dispose/blend carrier semantics unfuzzed.
+
+### Fixed
+
+- `AnimFrameMode::Delta` / `Auto` dirty-rect emission (both found by the
+  new `roundtrip_anim_modes` harness within its first seed pass, each
+  pinned by a regression test in `tests/published_anim_api.rs`):
+  - a delta-emitted frame with `dispose == Background` forced `D = 0`
+    into the stream while the encoder's reference canvas applied the
+    caller's dispose, so the decoder never cleared the rect and every
+    subsequent delta frame was diffed against a canvas state the decoder
+    did not have — the displayed frames diverged from the §2.7.1.1
+    semantics of the supplied frame list. Background-disposed Delta/Auto
+    frames now fall back to a full keyframe with the caller's flags
+    honoured verbatim (a smaller dirty-rect ANMF cannot carry the
+    full-rect clear).
+  - a delta-emitted frame with `blend == AlphaBlend` diffed and emitted
+    its *raw source* pixels with `B` forced to overwrite, so
+    semi-transparent pixels landed on the decoder canvas unblended. The
+    dirty rect is now computed between the post-composite drawn canvas
+    and the previous canvas, and the emitted sub-frame carries the drawn
+    (already-blended) pixels, which a plain overwrite reproduces
+    bit-exactly; the no-diff degenerate 2×2 emission likewise re-writes
+    drawn-canvas pixels instead of raw source pixels.
+
 ### Optimized
 
 - `vp8l_encode::limit_code_lengths` — the §3.7.2 length-cap

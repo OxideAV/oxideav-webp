@@ -375,7 +375,21 @@ cargo-fuzz = true
 # `Result` rather than panic (the granular §4 / §5 / §6 refusal modes are
 # cross-checked by the sibling `parse_transform_list` /
 # `inverse_predictor_color` / `inverse_subtract_green_indexing` /
-# `decode_argb` harnesses through their own entry points).
+# `decode_argb` harnesses through their own entry points). The
+# twenty-fourth harness is a differential oracle on the §2.7.1.1
+# animation *assembly* path `build_animated_webp_with_options` →
+# `decode_webp` with every per-frame carrier field fuzz-driven: even
+# `(x, y)` sub-canvas offsets, mixed `Auto` / `Delta` / `Lossless`
+# frame modes (the dirty-rect sub-frame encoder), `None` / `Background`
+# disposal, `Overwrite` / `AlphaBlend` blending, and the `ANIM`
+# loop-count + background-colour options. Every decoded full-canvas
+# frame snapshot is asserted byte-identical to an independent
+# §2.7.1.1 canvas simulation (bg-filled canvas, previous frame's
+# dispose applied before each render, per-frame blend formula), and
+# duration / loop count / background colour are asserted to carry
+# through — a mismatch is a real §2.7.1.1 contract violation in the
+# dirty-rect diff, the dispose/blend emission, or the decoder's
+# compositor.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -556,6 +570,13 @@ bench = false
 [[bin]]
 name = "prefix_code"
 path = "fuzz_targets/prefix_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_anim_modes"
+path = "fuzz_targets/roundtrip_anim_modes.rs"
 test = false
 doc = false
 bench = false

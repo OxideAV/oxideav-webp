@@ -27,13 +27,19 @@
 //! `B = 1` (overwrite) / `D = 0` (no dispose) ANMF semantics to encode only
 //! the **dirty rectangle** of each frame against the previous canvas:
 //!
-//! * `Delta` always emits the dirty-rect sub-frame (or, for the first frame,
-//!   the full caller-supplied frame — there is no "previous canvas" yet);
-//!   pixels outside the dirty rect remain whatever the previous frame left
-//!   on the canvas, so the §2.7.1.1 disposal/blending rules naturally
-//!   reconstruct the caller's full canvas frame on decode.
+//! * `Delta` always emits the dirty-rect sub-frame; pixels outside the
+//!   dirty rect remain whatever the previous frame left on the canvas, so
+//!   the §2.7.1.1 compositing rules naturally reconstruct the caller's
+//!   intended canvas on decode. The sub-frame carries the **post-composite**
+//!   pixels (the frame as drawn per its `blend` method), which keeps
+//!   `AlphaBlend` frames bit-exact. Two cases fall back to a full keyframe
+//!   with the caller's flags honoured verbatim: the first frame (no
+//!   previous canvas to diff against) and any frame with
+//!   `dispose == Background` (the §2.7.1.1 clear applies to the frame's
+//!   declared rect, which a smaller dirty-rect ANMF cannot express).
 //! * `Auto` evaluates both the dirty-rect sub-frame and the full-canvas
-//!   keyframe and emits whichever produces a smaller VP8L bitstream.
+//!   keyframe and emits whichever produces a smaller VP8L bitstream
+//!   (subject to the same two full-keyframe fallbacks).
 //!
 //! Both modes are **lossless** — every encoded byte round-trips through
 //! [`crate::decode_webp`] to the exact caller-provided pixels, the same as
@@ -239,13 +245,17 @@ pub fn build_animated_webp(frames: &[AnimFrame]) -> Result<Vec<u8>, WebpError> {
 /// `VP8L` chunk via [`crate::vp8l_encode::encode_vp8l_argb_with`] and
 /// wrapped in the `ANMF` "Frame Data" sub-RIFF as-is.
 ///
-/// **Round 127**: [`AnimFrameMode::Delta`] encodes only the dirty rectangle
-/// (the bounding box of pixels that differ from the previous canvas) as the
-/// `ANMF` sub-frame, with `B = 1` (overwrite) and `D = 0` (no dispose). The
-/// first frame, and any frame whose dirty rect happens to span the whole
-/// canvas, fall back to a full keyframe. [`AnimFrameMode::Auto`] evaluates
-/// both candidates and picks the smaller bitstream. Both modes round-trip
-/// byte-for-byte through [`crate::decode_webp`]'s canvas compositor.
+/// **Round 127** (corrected round 279): [`AnimFrameMode::Delta`] encodes
+/// only the dirty rectangle — the bounding box of canvas pixels the frame
+/// actually changes once composited per its `blend` method — as the `ANMF`
+/// sub-frame, carrying the post-composite pixels with `B = 1` (overwrite)
+/// and `D = 0` (no dispose). The first frame, any frame with
+/// `dispose == Background`, and any frame whose dirty rect happens to span
+/// its whole declared rect, fall back to a full keyframe with the caller's
+/// flags honoured verbatim. [`AnimFrameMode::Auto`] evaluates both
+/// candidates and picks the smaller bitstream. Both modes round-trip
+/// byte-for-byte through [`crate::decode_webp`]'s canvas compositor for
+/// every blend/dispose combination.
 ///
 /// An empty `frames` slice, a frame whose `pixels` length disagrees with
 /// `width * height * 4`, or an odd `x` / `y` offset is
@@ -327,8 +337,7 @@ pub fn build_animated_webp_with_options(
         if let Some((px, py, pw, ph, DisposalMethod::Background)) = prev_disposal {
             fill_canvas_rect_in_place(&mut prev_canvas, canvas_width, px, py, pw, ph, bg_rgba);
         }
-        let anmf_payload =
-            build_anmf_payload_with_prev(f, canvas_width, canvas_height, &prev_canvas, idx == 0)?;
+        let anmf_payload = build_anmf_payload_with_prev(f, canvas_width, &prev_canvas, idx == 0)?;
         push(fourcc::ANMF, &anmf_payload)?;
         // Update the canvas tracker with this frame's drawn pixels
         // (matching the decoder's blend method).
@@ -455,18 +464,21 @@ fn composite_frame_onto_canvas(canvas: &mut [u8], canvas_w: u32, f: &AnimFrame) 
     }
 }
 
-/// Dirty-rect (bounding box of changed pixels) of `f.pixels` against the
-/// `prev` canvas, expressed in canvas coordinates. Returns `None` when no
-/// pixel differs — Delta/Auto then emit a degenerate 2×2 transparent rect
+/// Dirty-rect (bounding box of changed pixels) between the post-composite
+/// `drawn` canvas and the `prev` canvas, restricted to `f`'s declared
+/// rect (the only region a frame may touch) and expressed in canvas
+/// coordinates. Diffing the *drawn* state — rather than the raw source
+/// pixels — makes the rect correct for `AlphaBlend` frames, whose drawn
+/// pixels differ from their source pixels. Returns `None` when no canvas
+/// pixel changes — Delta/Auto then emit a degenerate 2×2 same-pixels rect
 /// (the smallest representable ANMF) to preserve duration timing.
 fn dirty_rect_canvas_coords(
     f: &AnimFrame,
     canvas_w: u32,
-    canvas_h: u32,
     prev: &[u8],
+    drawn: &[u8],
 ) -> Option<DirtyRect> {
     let cw = canvas_w as usize;
-    let _ = canvas_h;
     let cw_bytes = cw * 4;
     let fw = f.width as usize;
     let fh = f.height as usize;
@@ -480,10 +492,9 @@ fn dirty_rect_canvas_coords(
     let mut any_diff = false;
 
     for row in 0..fh {
-        let src_row_off = row * fw * 4;
         let dst_row_off = (fy + row) * cw_bytes + fx * 4;
         for col in 0..fw {
-            let s = &f.pixels[src_row_off + col * 4..src_row_off + col * 4 + 4];
+            let s = &drawn[dst_row_off + col * 4..dst_row_off + col * 4 + 4];
             let d = &prev[dst_row_off + col * 4..dst_row_off + col * 4 + 4];
             if s != d {
                 any_diff = true;
@@ -523,22 +534,19 @@ fn dirty_rect_canvas_coords(
     })
 }
 
-/// Extract a sub-rectangle of `f.pixels` covering `rect` (in canvas
-/// coordinates). Returns the flat RGBA buffer the VP8L encoder will
-/// consume. `rect` must lie fully inside the frame `f`.
-fn extract_subrect_from_frame(f: &AnimFrame, rect: DirtyRect) -> Vec<u8> {
-    let fw = f.width as usize;
-    let fx = f.x as usize;
-    let fy = f.y as usize;
+/// Extract a sub-rectangle of a full-canvas RGBA buffer covering `rect`
+/// (in canvas coordinates). Returns the flat RGBA buffer the VP8L encoder
+/// will consume. `rect` must lie fully inside the canvas.
+fn extract_subrect_from_canvas(canvas: &[u8], canvas_w: u32, rect: DirtyRect) -> Vec<u8> {
+    let cw_bytes = (canvas_w as usize) * 4;
     let rx = rect.x as usize;
     let ry = rect.y as usize;
     let rw = rect.w as usize;
     let rh = rect.h as usize;
     let mut out = Vec::with_capacity(rw * rh * 4);
     for row in 0..rh {
-        let src_row = (ry - fy) + row;
-        let src_off = (src_row * fw + (rx - fx)) * 4;
-        out.extend_from_slice(&f.pixels[src_off..src_off + rw * 4]);
+        let src_off = (ry + row) * cw_bytes + rx * 4;
+        out.extend_from_slice(&canvas[src_off..src_off + rw * 4]);
     }
     out
 }
@@ -573,53 +581,68 @@ fn build_anim_payload(opts: &AnimEncoderOptions<'_>) -> Vec<u8> {
 /// keyframe at its declared `(x, y, width, height)` — the caller's
 /// `blend`/`dispose` flags are honoured verbatim.
 ///
-/// For [`AnimFrameMode::Delta`], the dirty rect (bounding box of pixels
-/// differing from `prev`) is encoded as the ANMF sub-frame with
-/// `B = 1` / `D = 0`. On `is_first_frame`, no `prev` to diff against, so
-/// `Delta` falls back to a full-canvas keyframe (same emission as
-/// `Lossless` with the caller's `(x,y,w,h)`).
+/// For [`AnimFrameMode::Delta`], the dirty rect — the bounding box of
+/// canvas pixels the frame actually *changes*, i.e. the diff between the
+/// post-composite canvas (`prev` with the frame drawn per its `blend`
+/// method) and `prev` itself — is encoded as the ANMF sub-frame carrying
+/// the **post-composite** pixels with `B = 1` / `D = 0`. Diffing and
+/// emitting the drawn state (rather than the raw source pixels) is what
+/// keeps an `AlphaBlend` frame bit-exact: the decoder overwrites the rect
+/// with the already-blended pixels and lands on the same canvas the
+/// caller's blend would have produced.
+///
+/// Two cases fall back to a full keyframe with the caller's flags
+/// honoured verbatim (same emission as `Lossless`):
+///
+/// * `is_first_frame` — no `prev` to diff against;
+/// * `dispose == Background` — a dirty-rect sub-frame cannot carry the
+///   §2.7.1.1 "clear the frame's rect to the background colour" rule for
+///   the *caller's* full rect (the emitted rect is smaller), so the
+///   dispose flag must travel on a full-rect ANMF to keep the decoder's
+///   canvas in lockstep with the reference state the next frame is
+///   diffed against.
 ///
 /// For [`AnimFrameMode::Auto`], both candidates are encoded and the
-/// smaller VP8L bitstream wins.
+/// smaller VP8L bitstream wins (subject to the same two fallbacks).
 fn build_anmf_payload_with_prev(
     f: &AnimFrame,
     canvas_w: u32,
-    canvas_h: u32,
     prev: &[u8],
     is_first_frame: bool,
 ) -> Result<Vec<u8>, WebpError> {
     match f.mode {
         AnimFrameMode::Lossless => emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels),
         AnimFrameMode::Delta => {
-            if is_first_frame {
+            if is_first_frame || f.dispose == DisposalMethod::Background {
                 emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)
             } else {
+                let drawn = drawn_canvas(prev, canvas_w, f);
                 let rect =
-                    dirty_rect_canvas_coords(f, canvas_w, canvas_h, prev).unwrap_or(DirtyRect {
-                        // Identical-to-previous: emit a 2×2 transparent
-                        // overwrite at (0,0) — duration is preserved and
-                        // re-applying transparent black over the bg
-                        // pixels is a no-op when bg is transparent black.
-                        // The decoder's compositor sees this as a write
-                        // of the same pixels.
+                    dirty_rect_canvas_coords(f, canvas_w, prev, &drawn).unwrap_or(DirtyRect {
+                        // Identical-to-previous: emit a 2×2 overwrite of
+                        // the (unchanged) drawn-canvas pixels at the
+                        // frame's corner — duration is preserved and
+                        // re-writing the same pixels is a no-op for the
+                        // decoder's compositor.
                         x: f.x,
                         y: f.y,
                         w: 2.min(f.width),
                         h: 2.min(f.height),
                     });
-                let sub_rgba = extract_subrect_from_frame(f, rect);
+                let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, rect);
                 emit_dirty_anmf(f, rect, &sub_rgba)
             }
         }
         AnimFrameMode::Auto => {
             // Always evaluate the full-frame candidate (and use it for the
-            // first frame regardless).
+            // first frame / Background-dispose fallbacks regardless).
             let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)?;
-            if is_first_frame {
+            if is_first_frame || f.dispose == DisposalMethod::Background {
                 return Ok(full);
             }
-            let Some(rect) = dirty_rect_canvas_coords(f, canvas_w, canvas_h, prev) else {
-                // Frame is identical to previous canvas — a 2×2 transparent
+            let drawn = drawn_canvas(prev, canvas_w, f);
+            let Some(rect) = dirty_rect_canvas_coords(f, canvas_w, prev, &drawn) else {
+                // Frame leaves the canvas untouched — a 2×2 same-pixels
                 // delta is smaller than any non-trivial full frame.
                 let degen_rect = DirtyRect {
                     x: f.x,
@@ -627,7 +650,7 @@ fn build_anmf_payload_with_prev(
                     w: 2.min(f.width),
                     h: 2.min(f.height),
                 };
-                let sub_rgba = extract_subrect_from_frame(f, degen_rect);
+                let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, degen_rect);
                 let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba)?;
                 return Ok(if delta.len() < full.len() {
                     delta
@@ -635,12 +658,18 @@ fn build_anmf_payload_with_prev(
                     full
                 });
             };
-            // If the dirty rect covers the whole declared frame rect,
-            // there's no win from a sub-frame.
-            if rect.w == f.width && rect.h == f.height && rect.x == f.x && rect.y == f.y {
+            // If the dirty rect covers the whole declared frame rect and
+            // the frame is plain-overwrite, the full candidate carries the
+            // identical pixels — no win from a sub-frame.
+            if f.blend == BlendingMethod::Overwrite
+                && rect.w == f.width
+                && rect.h == f.height
+                && rect.x == f.x
+                && rect.y == f.y
+            {
                 return Ok(full);
             }
-            let sub_rgba = extract_subrect_from_frame(f, rect);
+            let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, rect);
             let delta = emit_dirty_anmf(f, rect, &sub_rgba)?;
             Ok(if delta.len() < full.len() {
                 delta
@@ -649,6 +678,14 @@ fn build_anmf_payload_with_prev(
             })
         }
     }
+}
+
+/// Clone `prev` and composite `f` onto it per its `blend` method — the
+/// §2.7.1.1 canvas state the decoder must display after this frame.
+fn drawn_canvas(prev: &[u8], canvas_w: u32, f: &AnimFrame) -> Vec<u8> {
+    let mut drawn = prev.to_vec();
+    composite_frame_onto_canvas(&mut drawn, canvas_w, f);
+    drawn
 }
 
 /// Encode `pixels` (`w*h*4` flat RGBA) as a §2.6 `VP8L` chunk wrapped in
@@ -683,9 +720,12 @@ fn emit_full_anmf(
 
 /// Emit an ANMF carrying only the dirty `rect` sub-frame, forced to
 /// `B = 1` (overwrite) and `D = 0` (no dispose) so the decoder's
-/// compositor reconstructs the caller's full-canvas frame bit-exactly.
-/// The caller's `dispose` is overridden to `None` regardless of what they
-/// passed — preserving it would corrupt the next frame's reference state.
+/// compositor reconstructs the caller's intended canvas bit-exactly:
+/// `sub_rgba` is the **post-composite** drawn state, so a plain overwrite
+/// of the rect lands exactly on the canvas the caller's `blend` produces.
+/// Only reached when the caller's `dispose` is `None` (a `Background`
+/// dispose travels on the full-keyframe fallback instead — see
+/// [`build_anmf_payload_with_prev`]), so `D = 0` *is* the caller's flag.
 fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Vec<u8>, WebpError> {
     let argb = rgba_to_argb(sub_rgba);
     let has_alpha = sub_rgba.chunks_exact(4).any(|px| px[3] != 0xff);
@@ -867,13 +907,13 @@ mod tests {
     fn dirty_rect_canvas_coords_covers_only_the_changed_pixels() {
         let w = 8u32;
         let h = 8u32;
-        let mut prev = solid_rgba(w, h, [0, 0, 0, 0]);
-        let _ = &mut prev;
+        let prev = solid_rgba(w, h, [0, 0, 0, 0]);
         let mut pixels = solid_rgba(w, h, [0, 0, 0, 0]);
         pixels[(3 * 8 + 5) * 4] = 0xff;
         pixels[(4 * 8 + 5) * 4 + 1] = 0xee;
         let f = AnimFrame::new(w, h, pixels, 0);
-        let rect = dirty_rect_canvas_coords(&f, w, h, &prev).expect("change exists");
+        let drawn = drawn_canvas(&prev, w, &f);
+        let rect = dirty_rect_canvas_coords(&f, w, &prev, &drawn).expect("change exists");
         // Single-pixel changes at (5,3) and (5,4); after even-alignment of
         // the top-left, the rect spans x ∈ [4, 5], y ∈ [2, 4].
         assert_eq!(rect.x % 2, 0);
@@ -889,7 +929,8 @@ mod tests {
         let pixels = solid_rgba(w, h, [1, 2, 3, 255]);
         let prev = pixels.clone();
         let f = AnimFrame::new(w, h, pixels, 0);
-        assert!(dirty_rect_canvas_coords(&f, w, h, &prev).is_none());
+        let drawn = drawn_canvas(&prev, w, &f);
+        assert!(dirty_rect_canvas_coords(&f, w, &prev, &drawn).is_none());
     }
 
     #[test]
