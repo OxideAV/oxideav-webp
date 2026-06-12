@@ -167,6 +167,66 @@ fn round110_lossy_with_alpha_decodes_full_alpha_plane_via_vp8l() {
 }
 
 #[test]
+fn round284_fixture_corpus_decode_digests_are_pinned() {
+    // §6.2.1 read_symbol lookup-table fast path (round 284): the decoded
+    // output of every decodable in-crate fixture is pinned byte-for-byte
+    // to the output of the pre-r284 per-bit reference walk (the two
+    // implementations were proven digest-identical over this corpus plus
+    // the docs fixture set before the table landed). Any future
+    // entropy-path rewrite must keep every digest below unchanged.
+    //
+    // Digest layout: FNV-1a-64 over `width_le ‖ height_le ‖
+    // (frame_count as u32)_le ‖ frames[..].rgba` — dimensions and frame
+    // count are folded in so a decoder that returns the right bytes at
+    // the wrong geometry cannot collide.
+    let cases: [(&str, &[u8], u64); 8] = [
+        (
+            "animated-with-alpha",
+            ANIMATED_WITH_ALPHA,
+            0x31c0_566b_ec09_d6a0,
+        ),
+        (
+            "extended-with-exif",
+            EXTENDED_WITH_EXIF,
+            0x10bb_4321_d897_9d82,
+        ),
+        (
+            "lossless-128x128-natural",
+            include_bytes!("data/lossless-128x128-natural.webp"),
+            0xf99f_a694_5bbc_f07c,
+        ),
+        ("lossless-1x1", LOSSLESS_1X1, 0x9653_f403_5cc4_a62f),
+        (
+            "lossless-32x32-rgba",
+            LOSSLESS_32X32_RGBA,
+            0xdbfc_b5cc_d1a0_d204,
+        ),
+        (
+            "lossless-color-indexing-paletted",
+            LOSSLESS_COLOR_INDEXING,
+            0xbfc8_1c3b_8ce3_ca04,
+        ),
+        ("lossy-1x1", LOSSY_1X1, 0x9abb_50fd_9e15_d10d),
+        (
+            "lossy-with-alpha-128x128",
+            LOSSY_WITH_ALPHA,
+            0x00a4_e8ba_d528_34bf,
+        ),
+    ];
+    for (name, bytes, want) in cases {
+        let img = decode_webp(bytes).unwrap_or_else(|e| panic!("{name} decodes: {e}"));
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&img.width.to_le_bytes());
+        buf.extend_from_slice(&img.height.to_le_bytes());
+        buf.extend_from_slice(&(img.frames.len() as u32).to_le_bytes());
+        for f in &img.frames {
+            buf.extend_from_slice(&f.rgba);
+        }
+        assert_eq!(fnv1a64(&buf), want, "{name} decoded-output digest");
+    }
+}
+
+#[test]
 fn fixture_animated_with_alpha_all_three_anmf_headers_decode_to_trace_values() {
     // Round-4 surface: walker → typed ANMF. Cross-checks the 16-byte
     // per-frame header decode against `animated-with-alpha/trace.txt`,

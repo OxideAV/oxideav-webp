@@ -66,12 +66,16 @@ grouped by domain:
 Rounds 277 / 278 rewrote the §3.7.2 / §6.2.1 length-then-code chain
 bit-identically (sorted-leaf two-queue merge + single-rescan counting
 sort + O(1)-per-adjustment length cap; capped dense `green2328`
-417.8 µs → 26.4 µs end to end), and rounds 280 / 281 hoisted the
+417.8 µs → 26.4 µs end to end), rounds 280 / 281 hoisted the
 §4.1 / §3.5.2 encoder chooser walks out of their per-pixel loops
-(`lossless_encode_natural_128` ~170 ms → ~120 ms). Numbers, profile
-findings, the full round-283 regression re-run (stable + nightly
-`simd`), and the optimization log live in
-[`BENCHMARKS.md`](./BENCHMARKS.md). Run with:
+(`lossless_encode_natural_128` ~170 ms → ~120 ms), and round 284 gave
+the §6.2.1 `read_symbol` decoder a 256-entry peeked-bits primary
+lookup table (entropy-heavy full-file decodes −37% to −49%,
+bit-identical across the full fixture corpus and pinned in CI by a
+corpus-wide decode digest test). Numbers, profile findings, the full
+round-283 regression re-run (stable + nightly `simd`), and the
+optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
+with:
 
 ```text
 CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \

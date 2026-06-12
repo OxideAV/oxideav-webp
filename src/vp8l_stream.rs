@@ -159,6 +159,39 @@ impl<'a> BitReader<'a> {
         (self.data.len() * 8).saturating_sub(self.bit_pos)
     }
 
+    /// Load up to 64 bits little-endian starting at the byte containing
+    /// the cursor, zero-padded past the end of the slice.
+    ///
+    /// Bit `(bit_pos & 7)` of the returned word is the next bit the §2
+    /// `ReadBits` contract would deliver, so
+    /// `(word >> (bit_pos & 7)) & mask(n)` is exactly the LSB-first
+    /// assembly the per-bit loop used to produce: stream bit `i` of the
+    /// read lands at result bit `i`.
+    #[inline]
+    fn load_word(&self) -> u64 {
+        let byte_idx = self.bit_pos >> 3;
+        if byte_idx + 8 <= self.data.len() {
+            // Fast path: one unaligned 8-byte little-endian load.
+            u64::from_le_bytes(self.data[byte_idx..byte_idx + 8].try_into().unwrap())
+        } else {
+            // Tail (or cursor past the end, e.g. a truncated payload
+            // under `new_after_image_header`): gather the remaining
+            // bytes, zero-padding the rest.
+            let mut word = 0u64;
+            for (i, &b) in self
+                .data
+                .get(byte_idx..)
+                .unwrap_or(&[])
+                .iter()
+                .take(8)
+                .enumerate()
+            {
+                word |= (b as u64) << (8 * i);
+            }
+            word
+        }
+    }
+
     /// Read `n` bits (0 ≤ `n` ≤ 32) least-significant-bit-first and
     /// return them as a `u32` whose bit 0 is the first bit read.
     ///
@@ -177,16 +210,34 @@ impl<'a> BitReader<'a> {
                 available,
             });
         }
-        let mut value: u32 = 0;
-        for i in 0..n {
-            let byte = self.data[self.bit_pos >> 3];
-            let bit_in_byte = self.bit_pos & 7;
-            let bit = (byte >> bit_in_byte) & 1;
-            // First bit read becomes bit 0 of the result.
-            value |= (bit as u32) << i;
-            self.bit_pos += 1;
-        }
-        Ok(value)
+        // One word load + shift + mask replaces the per-bit gather; the
+        // value is identical bit for bit (stream bit i → result bit i).
+        // `n <= 32` and `bit_pos & 7 <= 7` need at most 39 of the 64
+        // loaded bits.
+        let value = (self.load_word() >> (self.bit_pos & 7)) & ((1u64 << n) - 1);
+        self.bit_pos += n;
+        Ok(value as u32)
+    }
+
+    /// Peek `n` bits (1 ≤ `n` ≤ 32) LSB-first without advancing the
+    /// cursor, zero-padding past the end of the slice.
+    ///
+    /// Used by the prefix-code fast path: the caller validates the
+    /// matched code's length against [`bits_remaining`](Self::bits_remaining)
+    /// before consuming, so the zero padding never leaks into a decode.
+    #[inline]
+    pub fn peek_bits(&self, n: usize) -> u32 {
+        debug_assert!((1..=32).contains(&n), "peek_bits supports 1..=32 bits");
+        ((self.load_word() >> (self.bit_pos & 7)) & ((1u64 << n) - 1)) as u32
+    }
+
+    /// Advance the cursor by `n` bits previously inspected via
+    /// [`peek_bits`](Self::peek_bits). The caller must have checked
+    /// `n <= bits_remaining()`.
+    #[inline]
+    pub fn advance_bits(&mut self, n: usize) {
+        debug_assert!(n <= self.bits_remaining());
+        self.bit_pos += n;
     }
 
     /// Read a single bit as a `bool` (LSB-first), used by the §4

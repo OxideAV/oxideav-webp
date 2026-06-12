@@ -1442,6 +1442,130 @@ The §2.7 demux walk (`metadata_walk`, ns-scale) and the §4.x inverse
 transforms (all ≤ 50 µs per 256×256 pass, < 1% of decode self-time)
 need no further dedicated rounds at current workloads.
 
+## Round-284 (2026-06-12): §6.2.1 `read_symbol` primary lookup table
+
+PROFILE-OPT depth round on the round-283 rank-1 candidate: the
+decoder's `PrefixCode::read_symbol` at ~85–89% of decode self-time on
+every entropy-heavy fixture. A fresh pre-change 6 s
+`/usr/bin/sample` of a release driver looping `decode_webp` on the
+`crosscolor` mix fixture reproduced the r283 attribution (2 300
+samples on `read_symbol`, ~90% of decode-side self-time), so the
+flagged optimization was warranted.
+
+### What changed
+
+* **`PrefixCode` primary lookup table.** Codes built from ≥ 32 used
+  symbols now carry a 256-entry table indexed by the next 8 stream
+  bits *in wire order* (first bit read = bit 0, matching the LSB-first
+  §2 `ReadBits` contract; each entry's index set is the canonical code
+  value bit-reversed across its length, stamped over the free high
+  bits). An entry packs `(code_length << 16) | symbol`; the §6.2.1
+  Kraft completeness gate guarantees stamps never collide. The old
+  walk read one bit at a time and linearly re-scanned the per-length
+  decode rows at *every* accumulated length; the new fast path is one
+  peek + one load + one cursor advance for any code ≤ 8 bits.
+* **Long codes (> 8 bits)** consume the 8 peeked bits (their
+  accumulated MSB-first value is the bit-reversal of the peeked
+  wire-order value) and continue the per-bit row walk from length 9 —
+  decisions, bit consumption, and error positions identical to the
+  pre-table loop.
+* **Used-symbol amortization gate (`MIN_LOOKUP_USED = 32`).** The
+  table is an investment (allocation + zero fill + 16 cold cache
+  lines): tiny codes — animation delta frames, sub-resolution
+  transform images, the 19-symbol code-length code — would build it,
+  touch it a handful of times, and throw it away. A first ungated cut
+  regressed `anim_decode_delta_12x128` by ~9% for exactly that reason
+  (the post-change profile showed the header/table region absorbing
+  the loss); below the gate the pre-table per-bit walk runs unchanged,
+  and a code with `used < 32` has codes ≤ 31 bits short by the Kraft
+  equality anyway. Near-EOF reads where the table match could have
+  leaned on the zero padding also replay the per-bit walk, so
+  `PrefixError::Eof` carries the exact pre-table position fields.
+* **`BitReader::read_bits` word-load rewrite.** The §2 `ReadBits(n)`
+  primitive now assembles its result from one zero-padded
+  little-endian `u64` load + shift + mask instead of an `n`-iteration
+  per-bit gather — bit-for-bit the same value (stream bit `i` lands at
+  result bit `i`). New `peek_bits` / `advance_bits` carry the fast
+  path.
+
+### Bit-identical proof
+
+* FNV-1a-64 digest sweep over the decoded output (geometry + every
+  frame's RGBA) of the **full fixture corpus** — all 18
+  `docs/image/webp/fixtures/*/input.webp` (lossless, lossy, animated,
+  metadata, color-cache stress, cross-color active), all 8 in-crate
+  `tests/data/*.webp`, the decoded alpha plane, and the five synthetic
+  256×256 transform-mix fixtures (plus the encoded bytes of those five
+  — the encoder is untouched): every digest identical between the
+  pre-change tree (built from the prior commit in a side worktree) and
+  this round. The alpha-plane digest also re-matches the long-standing
+  `0x42e1_6029_2eb0_d472` validator pin.
+* New CI pin `round284_fixture_corpus_decode_digests_are_pinned`
+  locks all eight in-crate fixture decode digests permanently.
+* Fuzz: `prefix_code` 19.3 M execs / 151 s, `prefix_code_group` 8.9 M
+  / 91 s, `decode_lossless` 4.3 M / 91 s, `roundtrip_lossless`
+  (encode → decode pixel-exact oracle) 1 302 full round trips / 181 s
+  — all clean. Full test suite passes unchanged (434 lib tests + all
+  integration binaries, +1 new pin test).
+
+### Round-284 measurement
+
+Before columns are same-session interleaved re-runs of the prior
+commit in a side worktree (`--quick`, same host, alternating with the
+post-change runs to cancel machine-load drift):
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `lossless_decode_mix_crosscolor_256x256` | 2.947 ms | **1.591 ms** | **−46%** |
+| `lossless_decode_mix_none_256x256` | 1.803 ms | **0.923 ms** | **−49%** |
+| `lossless_decode_mix_subgreen_256x256` | 1.236 ms | **0.778 ms** | **−37%** |
+| `lossless_decode_mix_predictor_256x256` | 253.9 µs | 254.2 µs | within noise |
+| `lossless_decode_mix_colorindex_256x256` | 175.0 µs | 176.2 µs | within noise |
+| `lossless_decode_argb_256` | 647.8 µs | 650.3 µs | within noise |
+| `anim_decode_keyframes_12x128` | 2.167–2.193 ms | 2.070–2.131 ms | −2 to −4% |
+| `anim_decode_delta_12x128` | 374.0–381.9 µs | 383.8 µs | within noise (was +9% before the gate) |
+
+`prefix_from_code_lengths` absorbs the table build on gated-in cells
+(dense d40 / l256 / g281 / g2328: 183 / 638 / 630 ns / 4.66 µs →
+275 / 755 / 766 ns / 4.64 µs — the g2328 build cost is amortized
+inside an already-larger body) while gated-out sparse cells stay at
+baseline (78 / 265 / 278 ns; sparse g2328 sits at 48 used symbols,
+above the gate: 1.84 → 1.99 µs). Each +90–140 ns build pays for
+itself within tens of decoded symbols on the streams that elect it.
+
+The three big movers are exactly the cells the r283 observations
+predicted: entropy-dominated streams whose literals decode through
+dense 8–9-bit prefix codes. The predictor / colorindex / gradient
+cells are bounded by `inverse_predictor`, `argb_to_rgba`, and the
+§4.4 bundling (sub-1 symbol per pixel), so the entropy win does not
+register there.
+
+### Post-change profile and next ranked hotspot
+
+A 6 s re-sample of the same `crosscolor` driver post-change:
+
+| Top-of-stack symbol | Samples | Share of decode-side |
+|---|---:|---:|
+| `vp8l_prefix::PrefixCode::read_symbol` | 4 215 | ~82% |
+| `argb_to_rgba` repack | 364 | ~7% |
+| `vp8l_decode::decode_one_symbol` | 361 | ~7% |
+| `BitReader::read_bits` | 95 | ~2% |
+| `vp8l_transform::inverse_color` | 64 | ~1% |
+
+`read_symbol` remains rank 1 at ~82% of a decode that is now ~1.9×
+faster — its absolute cost roughly halved, and what remains is the
+inherent four-prefix-reads-per-pixel call mix plus the long-code
+(> 8-bit) continuation that dense 256+-symbol alphabets still route
+~half their reads through. **Next ranked candidate:** widen the fast
+path's coverage of 9–11-bit codes — either a second-level spill table
+(the classic two-level layout: the primary entry for a long-code
+prefix points at a sub-table indexed by the next `max_len − 8` bits)
+or an alphabet-size-aware primary width. Both must re-prove the digest
+sweep and re-clear the `prefix_code` differential harness; the
+`crosscolor` / `none` / `subgreen` cells are the A/B references.
+After that, the encoder-side candidates from r283 (chooser residual
+walk SWAR, `Lz77Matcher::find` chain bench) are unchanged.
+
 ## Reproducing
 
 ```bash

@@ -6,6 +6,28 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- §6.2.1 decoder `PrefixCode::read_symbol` fast path (round 284 —
+  the round-283 decode profile's rank-1 symbol at ~85–89% of decode
+  self-time on every entropy-heavy fixture): codes built from 32 or
+  more used symbols now carry a 256-entry primary lookup table keyed
+  on the next 8 peeked stream bits (wire order), resolving any code of
+  length ≤ 8 with one load + one cursor advance; longer codes consume
+  the 8 peeked bits and continue the per-bit row walk from length 9,
+  and codes below the used-symbol gate (tiny delta frames,
+  sub-resolution transform images, the 19-symbol code-length code)
+  keep the pre-table per-bit walk so the table cost is never paid
+  where it cannot amortize. `BitReader::read_bits` now assembles its
+  result from one zero-padded little-endian word load instead of a
+  per-bit gather (same value bit for bit), and grew `peek_bits` /
+  `advance_bits` for the fast path. Decoded output is bit-identical:
+  an FNV-1a-64 digest sweep over the full docs + in-crate fixture
+  corpus plus the five synthetic transform-mix fixtures is unchanged
+  against the pre-change implementation, and the `prefix_code` fuzz
+  harness ran 19.3 M execs clean on the new path. End-to-end decode
+  benches: `lossless_decode_mix_crosscolor` 2.947 ms → 1.591 ms
+  (−46%), `mix_none` 1.803 ms → 0.923 ms (−49%), `mix_subgreen`
+  1.236 ms → 0.778 ms (−37%); see `BENCHMARKS.md` round 284.
+
 - §3.5.2 color-transform-element chooser (`pick_block_cte`, the
   per-pixel-heavy stage of `encode_with_color_transform` — rank 2 at
   ~9% self-time in the round-280 encode profile): the three per-axis
@@ -19,6 +41,13 @@ All notable changes to `oxideav-webp` are recorded here.
   bench harness can drive it directly.
 
 ### Added
+
+- Corpus-wide decoded-output digest pin
+  (`round284_fixture_corpus_decode_digests_are_pinned` in
+  `tests/fixture_walks.rs`): FNV-1a-64 over geometry + every decoded
+  frame's RGBA for all eight in-crate fixtures, locked to the
+  pre-round-284 reference decode so any future entropy-path rewrite
+  has a byte-exact regression gate in CI.
 
 - Three end-to-end criterion benches (round 283, BENCH depth round —
   `src/` untouched), closing the decode-side coverage gaps above the

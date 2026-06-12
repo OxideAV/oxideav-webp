@@ -69,6 +69,32 @@ pub const CODE_LENGTH_CODE_ORDER: [usize; NUM_CODE_LENGTH_CODES] = [
 /// is the hard ceiling.
 pub const MAX_CODE_LENGTH: usize = 15;
 
+/// Width (in bits) of the primary [`PrefixCode::read_symbol`] lookup
+/// table. Codes of length ≤ `LOOKUP_BITS` resolve with one peek + one
+/// table load; longer codes fall back to the per-bit row walk. 8 bits
+/// keeps the table at 1 KiB (one `u32` per entry) — small enough that
+/// building it stays cheap for the per-image table churn (five codes
+/// per §6.2 prefix-code group plus one code-length code per normal
+/// read) while covering the overwhelming share of symbols: a canonical
+/// code assigns its most frequent symbols the shortest codes, so the
+/// ≤ 8-bit slice of the alphabet carries most of the stream.
+const LOOKUP_BITS: usize = 8;
+
+/// Number of entries in the primary lookup table (`1 << LOOKUP_BITS`).
+const LOOKUP_SIZE: usize = 1 << LOOKUP_BITS;
+
+/// Minimum used-symbol count below which
+/// [`PrefixCode::from_code_lengths`] skips building the lookup table.
+/// The table is an investment paid at build time (allocation + zero
+/// fill + stamping) and on first touches (16 cold cache lines): a code
+/// with few used symbols has short codes (≤ `used - 1` bits by the
+/// §6.2.1 Kraft equality) that the per-bit walk already resolves in a
+/// couple of predictable iterations, and such codes are typical of
+/// header-dominated streams (tiny animation delta frames, sub-resolution
+/// transform images, the 19-symbol code-length code) where the table
+/// would be built, touched a handful of times, and thrown away.
+const MIN_LOOKUP_USED: usize = 32;
+
 /// Errors raised while reading or building a §6.2.1 prefix code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixError {
@@ -178,6 +204,17 @@ pub struct PrefixCode {
     /// `true` when the code is the §6.2.1 single-leaf-node tree (exactly
     /// one symbol, at length 1, reading consumes no bits).
     single_symbol: Option<u16>,
+    /// Primary decode table: `LOOKUP_SIZE` entries indexed by the next
+    /// `LOOKUP_BITS` bits of the stream **in wire order** (first bit
+    /// read = bit 0 of the index, matching `BitReader::peek_bits`).
+    /// Each entry packs `(code_length << 16) | symbol` for the unique
+    /// code (of length ≤ `LOOKUP_BITS`) that is a prefix of that bit
+    /// pattern; `0` (impossible length) marks indices whose matching
+    /// code is longer than `LOOKUP_BITS` — those resolve through the
+    /// per-bit slow path. Empty for the single-leaf-node tree and for
+    /// codes below the `MIN_LOOKUP_USED` amortization gate (which
+    /// decode through the per-bit walk, as before the table existed).
+    lookup: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +275,7 @@ impl PrefixCode {
                 length_rows: Vec::new(),
                 sorted_symbols: vec![sym],
                 single_symbol: Some(sym),
+                lookup: Vec::new(),
             });
         }
 
@@ -295,26 +333,118 @@ impl PrefixCode {
             }
         }
 
+        // Primary lookup table (built only past the MIN_LOOKUP_USED
+        // amortization gate). For every code of length `len <=
+        // LOOKUP_BITS` the matching indices are exactly those whose low
+        // `len` bits equal the code's bits *in wire order*. The wire
+        // order is the reverse of the canonical code value: the first
+        // bit read is the code's MSB (the slow path appends each fresh
+        // bit at the low end of the accumulator) but bit 0 of a peeked
+        // index (LSB-first `ReadBits`). So the base index is the
+        // canonical value bit-reversed across `len` bits, and the
+        // remaining `LOOKUP_BITS - len` high index bits are free —
+        // stamped over every `1 << len` stride. Indices left at 0 are
+        // prefixes of longer codes only (the §6.2.1 Kraft completeness
+        // check guarantees the code is prefix-free and complete, so no
+        // two stamps collide).
+        let mut lookup = Vec::new();
+        if used >= MIN_LOOKUP_USED {
+            lookup = vec![0u32; LOOKUP_SIZE];
+            for row in &length_rows {
+                let len = row.length as usize;
+                if len > LOOKUP_BITS {
+                    // Rows are in ascending length order; the rest are
+                    // slow-path codes.
+                    break;
+                }
+                for k in 0..row.count {
+                    let code = row.first_code + k as u32;
+                    let symbol = sorted_symbols[row.first_symbol_index + k];
+                    let base = (code.reverse_bits() >> (32 - len)) as usize;
+                    let entry = ((len as u32) << 16) | symbol as u32;
+                    let mut idx = base;
+                    while idx < LOOKUP_SIZE {
+                        lookup[idx] = entry;
+                        idx += 1 << len;
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             code_lengths,
             length_rows,
             sorted_symbols,
             single_symbol: None,
+            lookup,
         })
     }
 
     /// Read one symbol from `reader` using this code.
     ///
     /// For the single-leaf-node tree this consumes no bits and returns
-    /// the lone symbol. Otherwise it reads one bit at a time
-    /// (MSB-first within the code, matching the canonical assignment)
-    /// until the accumulated value falls inside a length row.
+    /// the lone symbol. Otherwise the next `LOOKUP_BITS` stream bits
+    /// are peeked (zero-padded at EOF, cursor unmoved) and resolved
+    /// through the primary lookup table: one load gives `(symbol,
+    /// code_length)` for any code of length ≤ `LOOKUP_BITS`, and the
+    /// cursor advances by exactly that length. Longer codes — and
+    /// near-EOF reads where the matched length exceeds the bits
+    /// actually remaining (so the match could have leaned on the zero
+    /// padding) — fall back to the per-bit row walk, which reproduces
+    /// the pre-table behaviour bit for bit, including the EOF error's
+    /// position fields.
     pub fn read_symbol(&self, reader: &mut BitReader<'_>) -> Result<u16, PrefixError> {
         if let Some(sym) = self.single_symbol {
             return Ok(sym);
         }
-        let mut code: u32 = 0;
-        let mut len: usize = 0;
+        if self.lookup.is_empty() {
+            // Below the MIN_LOOKUP_USED gate: small codes resolve in a
+            // couple of per-bit iterations.
+            return self.read_symbol_walk(reader);
+        }
+        let peeked = reader.peek_bits(LOOKUP_BITS);
+        let entry = self.lookup[peeked as usize];
+        let len = (entry >> 16) as usize;
+        let available = reader.bits_remaining();
+        if len != 0 {
+            if len <= available {
+                reader.advance_bits(len);
+                return Ok(entry as u16);
+            }
+            // The match leaned on the zero padding past EOF; replay the
+            // per-bit walk so the EOF error carries the exact pre-table
+            // position fields.
+            return self.read_symbol_walk(reader);
+        }
+        if available >= LOOKUP_BITS {
+            // The peeked LOOKUP_BITS bits are all real stream bits and —
+            // by the table's completeness — a strict prefix of a longer
+            // code. Consume them and continue the walk from there: the
+            // accumulated MSB-first code value of the first LOOKUP_BITS
+            // bits is the bit-reversal of the peeked (wire-order) value.
+            let code = peeked.reverse_bits() >> (32 - LOOKUP_BITS);
+            reader.advance_bits(LOOKUP_BITS);
+            return self.read_symbol_long(reader, code);
+        }
+        // Fewer than LOOKUP_BITS real bits remain and none of their
+        // prefixes completes a code (the table entry would have carried
+        // it): the per-bit walk runs the stream dry exactly as before.
+        self.read_symbol_walk(reader)
+    }
+
+    /// Continuation of [`read_symbol`](Self::read_symbol) for codes
+    /// longer than `LOOKUP_BITS`: `code` is the accumulated MSB-first
+    /// value of the `LOOKUP_BITS` bits already consumed (none of whose
+    /// prefixes matched a row — guaranteed by the lookup table), so the
+    /// walk resumes at length `LOOKUP_BITS + 1` with decisions, bit
+    /// consumption, and error positions identical to the pre-table
+    /// per-bit loop.
+    fn read_symbol_long(
+        &self,
+        reader: &mut BitReader<'_>,
+        mut code: u32,
+    ) -> Result<u16, PrefixError> {
+        let mut len = LOOKUP_BITS;
         loop {
             len += 1;
             if len > MAX_CODE_LENGTH {
@@ -325,6 +455,30 @@ impl PrefixCode {
             code = (code << 1) | reader.read_bits(1)?;
             // Is there a row at this length whose code range contains
             // `code`?
+            if let Some(row) = self.length_rows.iter().find(|r| r.length as usize == len) {
+                let offset = code.wrapping_sub(row.first_code);
+                if (offset as usize) < row.count {
+                    return Ok(self.sorted_symbols[row.first_symbol_index + offset as usize]);
+                }
+            }
+        }
+    }
+
+    /// The pre-table per-bit walk, bit for bit: the only decode path
+    /// for codes below the `MIN_LOOKUP_USED` gate (no table built), and
+    /// the fallback for table reads close enough to EOF that the table
+    /// outcome cannot be used — so a raised [`PrefixError::Eof`]
+    /// carries exactly the position / wanted / available fields the
+    /// pre-table implementation produced.
+    fn read_symbol_walk(&self, reader: &mut BitReader<'_>) -> Result<u16, PrefixError> {
+        let mut code: u32 = 0;
+        let mut len: usize = 0;
+        loop {
+            len += 1;
+            if len > MAX_CODE_LENGTH {
+                return Err(PrefixError::NoMatchingSymbol);
+            }
+            code = (code << 1) | reader.read_bits(1)?;
             if let Some(row) = self.length_rows.iter().find(|r| r.length as usize == len) {
                 let offset = code.wrapping_sub(row.first_code);
                 if (offset as usize) < row.count {
