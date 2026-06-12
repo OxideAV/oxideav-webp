@@ -389,7 +389,25 @@ cargo-fuzz = true
 # duration / loop count / background colour are asserted to carry
 # through — a mismatch is a real §2.7.1.1 contract violation in the
 # dirty-rect diff, the dispose/blend emission, or the decoder's
-# compositor.
+# compositor. The twenty-fifth harness is a differential oracle on the
+# §2.7 metadata *write* path: the two independent extended-layout
+# writers `build::build_webp_file_with_metadata` and
+# `encode_vp8l_argb_with_metadata` are driven with fuzz-controlled
+# §2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / `XMP ` payloads (presence,
+# length 0..=255 — odd lengths exercising the §2.3 pad byte — and
+# content), a fuzz-controlled §2.7.1 `L` alpha-hint flag, and
+# fuzz-controlled canvas dimensions + ARGB pixels; every emitted file
+# is cross-checked against the §2.7 documented contract (the §2.3 /
+# §2.4 walker parses it; the chunk sequence is the canonical `VP8X,
+# ICCP?, VP8L, EXIF?, XMP?` order with the §2.7.1.4 "MUST appear
+# before the image data" ICCP rule; each metadata chunk's `Size` +
+# payload bytes round-trip verbatim; the §2.7.1 flag octet declares
+# exactly the supplied features with the canvas dimensions echoed;
+# `extract_metadata` and the `decode_webp` metadata carry agree
+# byte-for-byte; the lossless pixels survive the metadata-bearing
+# layout exactly), the writer-B no-alpha/no-metadata demotion to the
+# §2.6 simple single-`VP8L` layout is pinned, and both writers'
+# metadata walks are asserted identical to each other.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -577,6 +595,13 @@ bench = false
 [[bin]]
 name = "roundtrip_anim_modes"
 path = "fuzz_targets/roundtrip_anim_modes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_metadata"
+path = "fuzz_targets/roundtrip_metadata.rs"
 test = false
 doc = false
 bench = false

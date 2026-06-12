@@ -20,6 +20,23 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Fuzz target `roundtrip_metadata` (round 282) — differential oracle
+  on the §2.7 metadata *write* path: the two independent
+  extended-layout writers (`build::build_webp_file_with_metadata` and
+  `encode_vp8l_argb_with_metadata`) are driven with fuzz-controlled
+  §2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / `XMP ` payloads (presence,
+  length, content — odd lengths exercising the §2.3 pad byte), a
+  fuzz-controlled §2.7.1 `L` alpha-hint flag, and fuzz-controlled
+  canvas dimensions + ARGB pixels, with every emitted file
+  cross-checked against the §2.7 canonical chunk order, the §2.7.1
+  flag-octet derivation, byte-exact metadata round trips through both
+  `extract_metadata` and the `decode_webp` metadata carry, the
+  lossless pixel contract, and the writer-B no-alpha/no-metadata
+  demotion to the §2.6 simple layout. The prior coverage fuzzed the
+  metadata chunks from the read side only (raw bytes into
+  `extract_metadata`), which a coverage-guided mutator almost never
+  grows into a well-formed multi-chunk extended file.
+
 - Criterion bench `pick_block_cte` (`pick_block_cte_walk_256x256`) —
   the §3.5.2 encoder color-transform chooser walk at the
   encoder-default `size_bits = 4` (256 blocks of a 256×256

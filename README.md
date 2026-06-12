@@ -85,7 +85,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty-four [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty-six [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -478,7 +478,37 @@ index, rebuilding from the returned length table through
 completeness invariant), the reader never advances past the slice bit
 length, and replaying the same bytes + alphabet yields an equal code at an
 identical bit position. A 14 s smoke pass cleared 2.00 M runs with no
-crashes. Run any
+crashes. `roundtrip_anim_modes` (round 279) is a differential oracle on
+the §2.7.1.1 animation *assembly* path
+`build_animated_webp_with_options` → `decode_webp` with every per-frame
+carrier field fuzz-driven — even `(x, y)` sub-canvas offsets, mixed
+`Auto` / `Delta` / `Lossless` frame modes (the dirty-rect sub-frame
+encoder), `None` / `Background` disposal, `Overwrite` / `AlphaBlend`
+blending, and the `ANIM` loop-count + background-colour options — with
+every decoded full-canvas frame snapshot asserted byte-identical to an
+independent §2.7.1.1 canvas simulation and duration / loop count /
+background colour asserted to carry through. `roundtrip_metadata`
+(round 282) is a differential oracle on the §2.7 metadata *write* path:
+the two independent extended-layout writers
+`build::build_webp_file_with_metadata` and
+`encode_vp8l_argb_with_metadata` are driven with fuzz-controlled
+§2.7.1.4 `ICCP` / §2.7.1.5 `EXIF` / `XMP ` payloads (presence, length
+0..=255 — odd lengths exercising the §2.3 pad byte — and content), a
+fuzz-controlled §2.7.1 `L` alpha-hint flag, and fuzz-controlled canvas
+dimensions + ARGB pixels; every emitted file is cross-checked against
+the §2.7 documented contract — the §2.3/§2.4 walker parses it, the
+chunk sequence is the canonical `VP8X, ICCP?, VP8L, EXIF?, XMP?` order
+(§2.7.1.4: the color profile "MUST appear before the image data"),
+each metadata chunk's `Size` + payload bytes round-trip verbatim, the
+§2.7.1 flag octet declares exactly the supplied features with the
+canvas dimensions echoed, `extract_metadata` and the `decode_webp`
+metadata carry agree byte-for-byte, and the lossless pixels survive
+the metadata-bearing layout exactly — with the writer-B
+no-alpha/no-metadata demotion to the §2.6 simple single-`VP8L` layout
+pinned and both writers' metadata walks asserted identical to each
+other. A 12-minute ASan pass cleared 30,543 runs with no crashes and
+no assertion failures (3780 cov / 9031 features over a 790-input
+corpus). Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -506,6 +536,8 @@ cargo +nightly fuzz run decode_argb          --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run decode_lossless      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run prefix_code_group    --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run prefix_code          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run roundtrip_anim_modes --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run roundtrip_metadata   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)
