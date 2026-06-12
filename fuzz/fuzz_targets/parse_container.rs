@@ -64,11 +64,12 @@
 //!           helper accessor agrees with the declared length).
 //!         * The convenience predicates `is_vp8_lossy`, `is_vp8_lossless`,
 //!           `is_extended` agree with the FourCC.
-//!     * Chunks are emitted in on-disk order — `chunks[i+1].payload_start
-//!       - 8` is strictly greater than `chunks[i].payload_start - 8`,
-//!       and `chunks[i+1].payload_start - 8 >= chunks[i].payload_end +
-//!       (chunks[i].size & 1) as usize` (the §2.3 pad byte sits between
-//!       successive chunks when the predecessor's `Size` was odd).
+//!     * Chunks are emitted in on-disk order —
+//!       `chunks[i+1].payload_start - 8` is strictly greater than
+//!       `chunks[i].payload_start - 8`, and `chunks[i+1].payload_start -
+//!       8 >= chunks[i].payload_end + (chunks[i].size & 1) as usize`
+//!       (the §2.3 pad byte sits between successive chunks when the
+//!       predecessor's `Size` was odd).
 //!     * `container.is_extended()` matches the first chunk's `is_extended()`.
 //!     * The iterator helpers `chunks_with_fourcc` and
 //!       `first_chunk_with_fourcc` agree with the recorded `chunks` list.
@@ -84,11 +85,11 @@
 //!   `buffer_len` equals the input length, and `8 + declared as usize`
 //!   strictly exceeds `buffer_len` (the §2.4 `File Size` overflow
 //!   refusal).
-//! * If the call returns `Err(TruncatedChunkHeader { offset })`, `offset
-//!   >= 12` (no chunk header begins inside the §2.4 file header), and
-//!   `(8 + riff_file_size as usize) - offset < 8` (fewer than 8 bytes
-//!   remain in the declared RIFF payload window for the FourCC + Size
-//!   field).
+//! * If the call returns `Err(TruncatedChunkHeader { offset })`,
+//!   `offset >= 12` (no chunk header begins inside the §2.4 file
+//!   header), and `(8 + riff_file_size as usize) - offset < 8` (fewer
+//!   than 8 bytes remain in the declared RIFF payload window for the
+//!   FourCC + Size field).
 //! * If the call returns `Err(ChunkPayloadOverflowsRiff { offset,
 //!   declared, available })`, `offset >= 12`, `offset + 8 <= 8 +
 //!   riff_file_size as usize` (the 8-byte header itself fit), `declared`

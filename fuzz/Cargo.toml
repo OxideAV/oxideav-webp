@@ -407,7 +407,25 @@ cargo-fuzz = true
 # byte-for-byte; the lossless pixels survive the metadata-bearing
 # layout exactly), the writer-B no-alpha/no-metadata demotion to the
 # §2.6 simple single-`VP8L` layout is pinned, and both writers'
-# metadata walks are asserted identical to each other.
+# metadata walks are asserted identical to each other. The
+# twenty-seventh harness is a differential oracle on the §6.2.1
+# read-symbol fast path: the round-284 256-entry primary lookup table
+# (plus its > 8-bit continuation walk, near-EOF fallback, and
+# used-symbol amortization gate) is run in lockstep against the crate's
+# own pre-table per-bit row walk (`PrefixCode::read_symbol_reference`)
+# over the same bytes, with the decoded symbol (or typed refusal,
+# including the `Eof` position fields), the cursor position after every
+# symbol, and the alphabet bound asserted identical — the code under
+# test built either off the wire (`PrefixCode::read` at a §6.2.3
+# alphabet) or from a fuzz-shaped length table repaired to an exact
+# §6.2.1 Kraft sum so the mutator steers the used-symbol count and the
+# length profile freely. The twenty-eighth harness re-drives the §4
+# transform-list + main-image lossless decode entry points at carrier
+# dimensions widened into [1, 64] (≤ 4096 pixels) with its corpus
+# seeded from the committed fixture corpus's VP8L chunk payloads, so
+# the §6.2.1 lookup-table fast path and the word-load BitReader run hot
+# inside the assembled pipeline under adversarial mutation; the
+# round-273 carrier/echo/determinism contract is asserted unchanged.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -602,6 +620,20 @@ bench = false
 [[bin]]
 name = "roundtrip_metadata"
 path = "fuzz_targets/roundtrip_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_symbol_lut_diff"
+path = "fuzz_targets/read_symbol_lut_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_lossless_lut"
+path = "fuzz_targets/decode_lossless_lut.rs"
 test = false
 doc = false
 bench = false

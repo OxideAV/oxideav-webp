@@ -54,13 +54,14 @@
 //! via whichever residual buffer the upstream §5 entropy decoder produces
 //! and whichever color-table-delta + packed-index buffers the upstream
 //! sub-image decoders produce, all of which are bounded by the entropy
-//! stream itself. This sixteenth harness drives the §4.3 subtract-green
-//! + §4.4 inverse-color-table + §4.4 inverse-color-indexing transforms
-//! directly across their full attacker-reachable input cross-products
-//! within bounded sizes, with the §4.3 alpha/green preservation contract,
-//! the §4.4 color-table seed-preservation contract, and the §4.4
-//! color-indexing palette-lookup contract cross-checked against the
-//! RFC 9649 §4.3 + §4.4 spec text.
+//! stream itself. This sixteenth harness drives the §4.3
+//! subtract-green + §4.4 inverse-color-table + §4.4
+//! inverse-color-indexing transforms directly across their full
+//! attacker-reachable input cross-products within bounded sizes, with
+//! the §4.3 alpha/green preservation contract, the §4.4 color-table
+//! seed-preservation contract, and the §4.4 color-indexing
+//! palette-lookup contract cross-checked against the RFC 9649 §4.3 +
+//! §4.4 spec text.
 //!
 //! The contract under test, per RFC 9649 §4.3 + §4.4:
 //!
@@ -417,11 +418,7 @@ fuzz_target!(|data: &[u8]| {
     // is out of range. Cross-check by re-deriving the per-pixel index
     // from the packed buffer using the spec-text formula and comparing
     // to the impl's output.
-    let bits_per_index: u32 = if width_bits == 0 {
-        8
-    } else {
-        (8 / count) as u32
-    };
+    let bits_per_index: u32 = if width_bits == 0 { 8 } else { 8 / count };
     for y in 0..(height as usize) {
         for x in 0..(orig_width as usize) {
             let packed_x = x / (count as usize);

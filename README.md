@@ -85,7 +85,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty-six [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty-eight [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -508,7 +508,47 @@ no-alpha/no-metadata demotion to the §2.6 simple single-`VP8L` layout
 pinned and both writers' metadata walks asserted identical to each
 other. A 12-minute ASan pass cleared 30,543 runs with no crashes and
 no assertion failures (3780 cov / 9031 features over a 790-input
-corpus). Run any
+corpus). `read_symbol_lut_diff` (round 285) is a differential oracle
+on the round-284 §6.2.1 read-symbol fast path: `PrefixCode::read_symbol`
+(the 256-entry primary lookup table keyed on the next 8 peeked
+wire-order bits, the > 8-bit continuation walk resuming at length 9,
+the near-EOF per-bit fallback, and the `MIN_LOOKUP_USED` used-symbol
+amortization gate) is run in lockstep against the crate's own
+pre-table per-bit row walk, kept as the `#[doc(hidden)]`
+`PrefixCode::read_symbol_reference` oracle, over the same bytes — with
+the decoded symbol (or typed refusal, including the `PrefixError::Eof`
+`bit_pos` / `wanted` / `available` fields), the cursor bit position
+after *every* symbol, and the alphabet bound asserted identical. The
+code under test is built two ways: *wire mode* reads it off the fuzz
+bytes through `PrefixCode::read` at a fuzz-selected §6.2.3 alphabet
+(`40` / `256` / `256 + 24 + cache_size`) with the rest of the same
+stream as the symbol soup (the on-disk §5 entropy-body layout), and
+*table mode* synthesises the per-symbol lengths from fuzz bytes
+repaired to an exact §6.2.1 Kraft sum (greedy front fill +
+binary-decomposition tail fill), so the mutator steers the used-symbol
+count across the table-build gate and the length profile across the
+≤ 8-bit fast path, the > 8-bit continuation rows, and the 15-bit
+ceiling at will; the §6.2.1 single-leaf-node tree (consumes no bits)
+is compared once instead of looped. A 15-minute ASan campaign cleared
+36.1 M runs with no divergence. `decode_lossless_lut` (round 285)
+re-drives the §4 transform-list + main-image lossless decode entry
+points `vp8l_transform::{decode_lossless, decode_lossless_headerless}`
+at carrier dimensions widened into `[1, 64]` (≤ 4096 pixels — the
+round-273 `decode_lossless` sibling clamps at `[1, 8]`, so its
+accepted streams read only a handful of symbols per prefix code), with
+the corpus seeded from the VP8L chunk payloads of the committed
+fixture corpus plus entropy-heavy reference-encoder-produced streams
+(64×64 noise / gradient / plasma tiles) whose §6.2 groups carry
+100+-symbol codes with 9..15-bit tails — so the round-284 lookup-table
+fast path, its continuation walk, and the word-load
+`BitReader::read_bits` / `peek_bits` / `advance_bits` run hot inside
+the assembled pipeline (transform sub-images, color cache, LZ77,
+inverse-transform chain) under adversarial mutation at every cursor
+phase; the round-273 carrier-echo / pixel-count / replay-determinism
+contract is asserted unchanged. A 15-minute ASan campaign cleared
+16.8 M runs with no crashes; same-session 4-minute regression re-runs
+of `prefix_code` (32.2 M), `decode_lossless` (9.4 M), and
+`prefix_code_group` (24.2 M) also ran clean. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -538,6 +578,8 @@ cargo +nightly fuzz run prefix_code_group    --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run prefix_code          --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run roundtrip_anim_modes --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run roundtrip_metadata   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run read_symbol_lut_diff --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_lossless_lut  --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

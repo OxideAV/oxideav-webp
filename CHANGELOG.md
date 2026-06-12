@@ -4,6 +4,40 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Round-285 fuzz hardening of the round-284 §6.2.1 read-symbol fast
+  path + word-load `BitReader` (depth round, fuzz mode). Two new
+  `cargo-fuzz` harnesses (#27 / #28, total now twenty-eight):
+  `read_symbol_lut_diff` runs `PrefixCode::read_symbol` (256-entry
+  primary lookup table, > 8-bit continuation walk, near-EOF per-bit
+  fallback, used-symbol amortization gate) in lockstep against the
+  crate's own pre-table per-bit row walk — kept as the new
+  `#[doc(hidden)]` `PrefixCode::read_symbol_reference` oracle
+  (behaviour-neutral; delegates to the existing private walk) — over
+  the same bytes, asserting the decoded symbol / typed refusal
+  (including `PrefixError::Eof` position fields), the cursor position
+  after every symbol, and the alphabet bound identical, with the code
+  under test built either off the wire (`PrefixCode::read` at a
+  §6.2.3 alphabet) or from fuzz-shaped lengths repaired to an exact
+  §6.2.1 Kraft sum so the mutator steers the used-symbol count and
+  the length profile freely; `decode_lossless_lut` re-drives
+  `decode_lossless` / `decode_lossless_headerless` at carrier
+  dimensions widened into `[1, 64]`, corpus-seeded from the fixture
+  corpus's VP8L chunk payloads plus entropy-heavy
+  reference-encoder-produced 64×64 noise / gradient tiles, so the
+  lookup-table fast path and continuation rows run hot inside the
+  assembled pipeline under adversarial mutation. Campaigns: 36.1 M
+  execs (`read_symbol_lut_diff`, 15 min ASan) + 16.8 M execs
+  (`decode_lossless_lut`, 15 min ASan) with zero divergences and zero
+  crashes, plus clean 4-minute regression re-runs of `prefix_code`
+  (32.2 M), `decode_lossless` (9.4 M), and `prefix_code_group`
+  (24.2 M); a matching in-tree unit
+  test (`read_symbol_reference_matches_fast_path_on_lut_built_code`)
+  pins the differential on a 256-symbol code mixing ≤ 8-bit and
+  > 8-bit lengths. No findings: the round-284 fast path survived both
+  oracles unchanged.
+
 ### Changed
 
 - §6.2.1 decoder `PrefixCode::read_symbol` fast path (round 284 —

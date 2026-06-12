@@ -1,10 +1,12 @@
 name: Fuzz
 
-# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
-# 30-minute total budget across the 5 targets (~6 min each). The
-# cross-decode harnesses dlopen libwebp at runtime via libloading; the
-# CI runner needs `libwebp-dev` so they actually validate instead of
-# silently skipping.
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The reusable
+# workflow auto-discovers every target under fuzz/fuzz_targets/ and
+# splits the 30-minute total budget evenly across them (twenty-eight
+# targets as of round 285, ~64 s each, corpus persisted across runs via
+# actions/cache). The cross-decode harnesses dlopen libwebp at runtime
+# via libloading; the CI runner needs `libwebp-dev` so they actually
+# validate instead of silently skipping.
 
 on:
   schedule:

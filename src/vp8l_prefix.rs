@@ -464,6 +464,24 @@ impl PrefixCode {
         }
     }
 
+    /// Reference decoder: the pre-table per-bit walk, bypassing the
+    /// primary lookup table entirely (the single-leaf-node tree still
+    /// consumes no bits, as in [`read_symbol`](Self::read_symbol)).
+    ///
+    /// Behaviour-neutral oracle for the `read_symbol_lut_diff` fuzz
+    /// harness and the in-tree differential tests: for every code and
+    /// every bit stream it must produce exactly the symbol sequence,
+    /// cursor positions, and error fields [`read_symbol`](Self::read_symbol)
+    /// produces through the table fast path. Not part of the supported
+    /// API surface.
+    #[doc(hidden)]
+    pub fn read_symbol_reference(&self, reader: &mut BitReader<'_>) -> Result<u16, PrefixError> {
+        if let Some(sym) = self.single_symbol {
+            return Ok(sym);
+        }
+        self.read_symbol_walk(reader)
+    }
+
     /// The pre-table per-bit walk, bit for bit: the only decode path
     /// for codes below the `MIN_LOOKUP_USED` gate (no table built), and
     /// the fallback for table reads close enough to EOF that the table
@@ -1031,6 +1049,54 @@ mod tests {
                 assert_eq!(alphabet_size, 4);
             }
             other => panic!("expected MaxSymbolTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_symbol_reference_matches_fast_path_on_lut_built_code() {
+        // A 256-symbol code well above the MIN_LOOKUP_USED gate mixing
+        // ≤ 8-bit codes (primary-table hits) and > 8-bit codes (the
+        // continuation path). Built programmatically so the Kraft sum
+        // is exactly 2^15: start with every symbol at length 10, then
+        // shorten symbols from the front (each shortening of a len-L
+        // symbol to L-1 adds 2^(15-L) to the sum) until complete —
+        // yielding a front of short codes and a long >8-bit tail.
+        let mut lengths = vec![10u8; 256];
+        let full: u64 = 1 << MAX_CODE_LENGTH;
+        let mut kraft: u64 = 256 << (MAX_CODE_LENGTH - 10);
+        let mut i = 0usize;
+        while kraft < full {
+            let l = lengths[i] as usize;
+            let gain = 1u64 << (MAX_CODE_LENGTH - l);
+            if kraft + gain <= full && l > 1 {
+                lengths[i] -= 1;
+                kraft += gain;
+            } else {
+                i += 1;
+            }
+        }
+        let code = PrefixCode::from_code_lengths(lengths).unwrap();
+
+        // Pseudo-random bit soup (LCG), long enough for hundreds of
+        // symbols, ending mid-code so the EOF arm is compared too.
+        let mut bytes = Vec::with_capacity(257);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..257 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bytes.push((state >> 33) as u8);
+        }
+        let mut fast = BitReader::new(&bytes);
+        let mut reference = BitReader::new(&bytes);
+        loop {
+            let a = code.read_symbol(&mut fast);
+            let b = code.read_symbol_reference(&mut reference);
+            assert_eq!(a, b, "fast path and reference walk diverged");
+            assert_eq!(fast.bit_position(), reference.bit_position());
+            if a.is_err() {
+                break;
+            }
         }
     }
 
