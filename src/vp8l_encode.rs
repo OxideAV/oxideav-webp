@@ -3142,7 +3142,12 @@ fn channel_magnitude(v: u32) -> u32 {
 ///
 /// On ties the candidate appearing earlier in
 /// [`CTE_AXIS_CANDIDATES`] wins, which makes the chooser deterministic.
-fn pick_block_cte(
+///
+/// Public so the `pick_block_cte` criterion bench can drive the
+/// chooser walk directly (same shelf as [`predictor_subtract`] /
+/// [`apply_subtract_green`]); encoder callers go through
+/// `build_color_image`.
+pub fn pick_block_cte(
     pixels: &[u32],
     width: usize,
     height: usize,
@@ -3175,68 +3180,80 @@ fn pick_block_cte(
     }
 
     // Axis 1: green → red. The red residual is
-    // `(red - delta(gtr, green)) & 0xff`, independent of gtr and rtb.
-    let mut best_gtr: u8 = 0;
-    let mut best_red_cost = u64::MAX;
-    for &gtr in &CTE_AXIS_CANDIDATES {
-        let mut cost = 0u64;
-        for &(r, g, _b) in &samples {
-            let residual = (r as i32 - color_xfrm_delta(gtr, g)) as u32;
-            cost += channel_magnitude(residual) as u64;
-            if cost >= best_red_cost {
-                break;
-            }
-        }
-        if cost < best_red_cost {
-            best_red_cost = cost;
-            best_gtr = gtr;
-        }
-    }
+    // `(red - delta(gtr, green)) & 0xff`, independent of gtb and rtb.
+    let best_gtr = sweep_cte_axis(&samples, |gtr, r, g, _b| {
+        channel_magnitude((r as i32 - color_xfrm_delta(gtr, g)) as u32)
+    });
 
     // Axis 2: green → blue. The intermediate blue residual is
     // `(blue - delta(gtb, green)) & 0xff`, independent of rtb. We
     // evaluate the GREEN→BLUE contribution alone here; the joint
     // (gtb, rtb) choice is exact because the red-to-blue delta is
     // additive in `rtb` and depends only on the original red.
-    let mut best_gtb: u8 = 0;
-    let mut best_blue_pre_cost = u64::MAX;
-    for &gtb in &CTE_AXIS_CANDIDATES {
-        let mut cost = 0u64;
-        for &(_r, g, b) in &samples {
-            let residual = (b as i32 - color_xfrm_delta(gtb, g)) as u32;
-            cost += channel_magnitude(residual) as u64;
-            if cost >= best_blue_pre_cost {
-                break;
-            }
-        }
-        if cost < best_blue_pre_cost {
-            best_blue_pre_cost = cost;
-            best_gtb = gtb;
-        }
-    }
+    let best_gtb = sweep_cte_axis(&samples, |gtb, _r, g, b| {
+        channel_magnitude((b as i32 - color_xfrm_delta(gtb, g)) as u32)
+    });
 
     // Axis 3: red → blue. Fold the now-fixed green→blue delta into
     // each pixel's intermediate blue, then sweep rtb.
-    let mut best_rtb: u8 = 0;
-    let mut best_blue_cost = u64::MAX;
-    for &rtb in &CTE_AXIS_CANDIDATES {
-        let mut cost = 0u64;
-        for &(r, g, b) in &samples {
-            let inter = b as i32 - color_xfrm_delta(best_gtb, g);
-            let residual = (inter - color_xfrm_delta(rtb, r)) as u32;
-            cost += channel_magnitude(residual) as u64;
-            if cost >= best_blue_cost {
-                break;
-            }
-        }
-        if cost < best_blue_cost {
-            best_blue_cost = cost;
-            best_rtb = rtb;
-        }
-    }
+    let best_rtb = sweep_cte_axis(&samples, |rtb, r, g, b| {
+        let inter = b as i32 - color_xfrm_delta(best_gtb, g);
+        channel_magnitude((inter - color_xfrm_delta(rtb, r)) as u32)
+    });
 
     (best_gtr, best_gtb, best_rtb)
 }
+
+/// One per-axis greedy sweep of [`pick_block_cte`]: evaluate every
+/// [`CTE_AXIS_CANDIDATES`] entry's summed per-sample cost and return
+/// the candidate with the smallest sum (earliest entry wins ties).
+///
+/// The prune that used to run per sample (`cost >= best` → abandon
+/// the candidate) is checked at [`CTE_PRUNE_CHUNK`]-sample
+/// granularity instead, the same despecialisation the round-280
+/// §4.1 chooser walker applied at block-row granularity: the
+/// interior chunk loop carries no data-dependent exit, so the
+/// monomorphised `cost` closure body auto-vectorises. Pick-identical
+/// by the round-280 argument — per-sample contributions are
+/// non-negative, so a partial sum reaching `>= best` implies the
+/// full sum also compares `>= best`, and a candidate that now runs
+/// to completion instead of pruning yields its exact full sum, which
+/// is still `>= best` and therefore still loses; completed sums and
+/// the strict-`<` tie-break are unchanged. Worst case is one extra
+/// chunk of work per pruned candidate.
+///
+/// The per-chunk partial fits `u32`: each [`channel_magnitude`] is
+/// `<= 128`, so a chunk sums to `<= 128 * CTE_PRUNE_CHUNK`.
+#[inline]
+fn sweep_cte_axis(samples: &[(u8, u8, u8)], cost_of: impl Fn(u8, u8, u8, u8) -> u32) -> u8 {
+    let mut best: u8 = 0;
+    let mut best_cost = u64::MAX;
+    for &cand in &CTE_AXIS_CANDIDATES {
+        let mut cost = 0u64;
+        for chunk in samples.chunks(CTE_PRUNE_CHUNK) {
+            let mut partial = 0u32;
+            for &(r, g, b) in chunk {
+                partial += cost_of(cand, r, g, b);
+            }
+            cost += partial as u64;
+            if cost >= best_cost {
+                break;
+            }
+        }
+        if cost < best_cost {
+            best_cost = cost;
+            best = cand;
+        }
+    }
+    best
+}
+
+/// Sample granularity of the [`sweep_cte_axis`] prune check. 32
+/// samples is two 16-pixel block rows at the encoder-default
+/// `size_bits = 4` — small enough that a hopeless candidate is
+/// abandoned after ~12% of a 16×16 block, large enough for the
+/// branch-free interior loop to amortise the check.
+const CTE_PRUNE_CHUNK: usize = 32;
 
 /// Build the §3.5.2 sub-resolution *color image*: one ARGB pixel per
 /// `(1 << size_bits)`-pixel-square block of the main image, with the

@@ -1151,6 +1151,91 @@ Next plausible targets from the post-change profile:
 is the analogous §4.2 chooser, now rank-2) and the
 `Lz77Matcher::find` chain walk.
 
+## Round-281 (2026-06-12): §3.5.2 CTE chooser bench + chunk-granular prune
+
+### New bench: `pick_block_cte_walk_256x256`
+
+Round 280's post-change profile named `encode_with_color_transform`
+(rank 2, ~9% self-time) as the next target, with its `pick_block_cte`
+walk being the per-pixel-heavy stage — the §3.5.2 analogue of the
+§4.1 predictor chooser round 280 despecialised. No bench covered it
+(the bench shelf had every §4.x *decoder* transform plus the encoder
+predictor-residual and LZ77 paths, but nothing on the color-transform
+chooser), so this round adds `benches/pick_block_cte.rs`.
+
+The scenario drives the exact walk `build_color_image` performs at
+the encoder-default `size_bits = 4`: 256 `pick_block_cte` calls (a
+16×16 grid of 16×16-pixel blocks over a 256×256 ARGB image), each a
+per-axis greedy sweep of the 25-entry candidate table (75 cost
+evaluations per block). The input is a deterministic LCG image with
+genuinely correlated channels (red ≈ green/2, blue ≈ green/3 + red/4,
+plus ±8 noise) so the `cost >= best` early-out prunes the way it does
+on natural content — neither the all-prune degenerate (solid) nor the
+never-prune one (uniform random). `pick_block_cte` was made `pub` for
+the harness, same shelf as `predictor_subtract` /
+`apply_subtract_green`.
+
+### Baseline (pre-change)
+
+| Bench | Time (full run) | Per block |
+|---|---:|---:|
+| `pick_block_cte_walk_256x256` | **1.5964–1.6070 ms** (median 1.6012 ms) | ~6.3 µs |
+
+(`--quick` same session: 1.5886 ms — consistent.)
+
+### Measurement-driven change: chunk-granular prune
+
+The baseline's inner cost loops carried a per-sample
+`if cost >= best { break }` — a loop-carried data-dependent exit that
+blocks auto-vectorisation, exactly the shape the round-280 walker
+moved to block-row granularity. The three per-axis sweeps now share
+one `sweep_cte_axis` helper that accumulates a branch-free 32-sample
+chunk (`CTE_PRUNE_CHUNK`) into a `u32` partial and checks the prune
+at chunk boundaries only.
+
+Pick-identical by the round-280 argument: per-sample contributions
+are non-negative (`channel_magnitude <= 128`), so a partial sum
+reaching `>= best` implies the full sum also compares `>= best`; a
+candidate that now completes instead of pruning yields its exact full
+sum, still `>= best`, and still loses. Completed sums and the
+strict-`<` earliest-wins tie-break are unchanged. Worst case is one
+extra 32-sample chunk per pruned candidate.
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `pick_block_cte_walk_256x256` | 1.6012 ms | **752.03 µs** | **−52.6%** |
+
+End-to-end (`--quick`, post-change): `lossless_encode_natural_128`
+119.88 ms, `lossless_encode_rgba_256` 1.2323 s — at the fast edge of
+the round-280 post-change spread (123.55–138.10 ms / 1.1947–1.2684 s),
+as expected for a pass that is one slice of a rank-2 ~9% profile
+entry.
+
+### Bit-identical proof
+
+* FNV-1a digest over the full encoded output of an 81-image
+  `encode_webp_lossless` sweep — 16 shapes from 1×1 to 128×128 × five
+  fill regimes (uniform random, gradient, 5-color palette, solid,
+  per-pixel random walk) + the 256×256 gradient bench shape:
+  `111b83e9ec73d760` (253 568 encoded bytes) before and after —
+  unchanged.
+* Full crate test suite passes unchanged (434 lib tests + all 10
+  integration binaries), including the two `pick_block_cte` pin
+  tests (solid-block minimum, known-slope recovery).
+* 3-minute `roundtrip_lossless` fuzz run (encode → decode pixel-exact
+  oracle, 1 574 runs) clean.
+
+### Followups
+
+* `Lz77Matcher::find` (rank 6 in the round-280 profile) — the
+  hash-chain walk is only benched indirectly through
+  `lz77_match`'s public-entry drive; a chain-depth-targeted scenario
+  would isolate it.
+* `pick_block_cte` still allocates its `samples` gather `Vec` per
+  block (256 allocations per 256×256 image at `size_bits = 4`);
+  fold-out via a caller-owned scratch buffer is the next obvious
+  micro-cut if the §3.5.2 pass shows up again post-chunking.
+
 ## Reproducing
 
 ```bash

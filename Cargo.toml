@@ -124,3 +124,11 @@ harness = false
 [[bench]]
 name = "prefix_from_code_lengths"
 harness = false
+
+# Round-281: encoder-side §3.5.2 color-transform-element chooser
+# (`pick_block_cte`) full-image block walk — the per-pixel-heavy
+# stage of `encode_with_color_transform` (rank 2 in the round-280
+# post-change encode profile).
+[[bench]]
+name = "pick_block_cte"
+harness = false

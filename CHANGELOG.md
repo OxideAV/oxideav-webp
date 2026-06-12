@@ -6,6 +6,28 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- §3.5.2 color-transform-element chooser (`pick_block_cte`, the
+  per-pixel-heavy stage of `encode_with_color_transform` — rank 2 at
+  ~9% self-time in the round-280 encode profile): the three per-axis
+  candidate sweeps now share a `sweep_cte_axis` helper that checks the
+  worse-than-best prune at 32-sample chunk granularity instead of per
+  sample, leaving the interior cost loop branch-free
+  (auto-vectorisable). Encoded output is bit-identical (FNV digest over
+  an 81-image encode sweep unchanged). New
+  `pick_block_cte_walk_256x256` bench: 1.6012 ms → 752.03 µs (−52.6%);
+  see `BENCHMARKS.md` round 281. `pick_block_cte` is now `pub` so the
+  bench harness can drive it directly.
+
+### Added
+
+- Criterion bench `pick_block_cte` (`pick_block_cte_walk_256x256`) —
+  the §3.5.2 encoder color-transform chooser walk at the
+  encoder-default `size_bits = 4` (256 blocks of a 256×256
+  correlated-channel image), closing the encoder bench-shelf gap
+  named by the round-280 followups.
+
+### Changed
+
 - §4.1 encoder block-mode chooser hot path (round-280 profile: the
   per-pixel `predictor_at` helper was 36% of total encode self-time):
   the per-block per-mode cost walks (`block_mode_cost`, the L1 pickers
