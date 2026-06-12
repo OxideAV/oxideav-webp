@@ -1236,6 +1236,212 @@ entry.
   fold-out via a caller-owned scratch buffer is the next obvious
   micro-cut if the §3.5.2 pass shows up again post-chunking.
 
+## Round-283 (2026-06-12): end-to-end decode coverage + full regression refresh
+
+BENCH-mode depth round — `src/` untouched. Three deliverables: three
+new end-to-end bench harnesses covering decode paths that only had
+per-pass coverage, a full regression re-run of all 21 bench targets
+on this host (stable + nightly `simd`) reflecting the state after the
+r277–r281 optimizations, and fresh decode / encode profiles ranking
+the next optimization candidates.
+
+### New bench: `lossless_decode_mixes`
+
+`benches/lossless_decode_mixes.rs` measures the public `decode_webp`
+entry point per **elected §4 transform mix**. The long-standing
+`lossless_decode` bench drives one gradient fixture whose encoder
+elects the §4.1 predictor path, so the end-to-end cost of the §4.2 /
+§4.3 / §4.4 inverse transforms and of the transform-free path was
+never visible above the per-pass `inverse_*` microbenches. Five
+256×256 fixtures steer the encoder's chooser onto each mix, and the
+elected transform list is **asserted at setup** via
+`read_vp8l_transform_list` so a future chooser change that re-routes
+a cell fails loudly instead of silently mislabeling the measurement:
+
+| Cell | Content | Elected (asserted) | Encoded size | Median |
+|---|---|---|---:|---:|
+| `predictor` | smooth gradient | §4.1 `Predictor(size_bits=4)` | 108 B | **254.7 µs** |
+| `colorindex` | 4-color 8×8 blocks | §4.4 `ColorIndexing(4)` | 218 B | **172.3 µs** |
+| `crosscolor` | random G, R≈G/2, B≈G/3+R/4 | §4.2 `Color(size_bits=8)` | 154 376 B | **3.033 ms** |
+| `subgreen` | random G, R≈G, B≈G | §4.3 `SubtractGreen` | 98 442 B | **1.254 ms** |
+| `none` | uniform random noise | (empty) | 196 686 B | **1.825 ms** |
+
+Observations:
+
+* The spread is dominated by the **§6 entropy decode**, not the §4
+  inverse pass: the per-pass benches put every 256×256 inverse
+  transform at 13–50 µs (predictor modes 475–830 µs), yet the cells
+  span 0.17–3.03 ms tracking encoded size (i.e. symbol count /
+  prefix-code mix), not transform identity.
+* `crosscolor` is the heaviest decode in the whole inventory: ~1.7×
+  the `none` cell on a *smaller* payload. Its literals decode through
+  four separate prefix codes per pixel (G, R, B + the §4.2 color
+  image's own prefix-code group), making it the best end-to-end probe
+  for any future `read_symbol` fast-path work.
+* `colorindex` beats every other cell despite running an extra §4.4
+  pass — the bundled 4-color image decodes 4 packed indices per green
+  symbol, cutting the per-pixel symbol count below 1.
+
+### New bench: `anim_decode`
+
+`benches/anim_decode.rs` is the first animated-path bench: the
+`ANIM`/`ANMF` chunk walk, per-frame §2.6 VP8L decode, and the
+§2.7.1.1 canvas compositor (blend / dispose / sub-frame placement)
+previously had no coverage at any level. One 12-frame 128×128
+timeline (a 32×32 square moving over a gradient) is assembled twice
+via `anim_encode::build_animated_webp` — once all-keyframes
+(`AnimFrameMode::Lossless`), once dirty-rect deltas
+(`AnimFrameMode::Delta`) — and setup asserts both layouts decode to
+identical final-frame pixels:
+
+| Cell | File size | Median | Per frame |
+|---|---:|---:|---:|
+| `anim_decode_keyframes_12x128` | 12 full-canvas frames | **2.181 ms** | ~182 µs |
+| `anim_decode_delta_12x128` | 1 keyframe + 11 dirty rects | **372.1 µs** | ~31 µs |
+
+The keyframe cell is 12 × the single-frame decode cost plus the
+compositor (a 128×128 frame decodes in ~170 µs standalone — the
+~12 µs/frame delta is the full-canvas overwrite composite + canvas
+clone per emitted frame). The delta cell shows the §2.7.1.1 sub-frame
+path working as intended: ~5.9× cheaper for the same visual timeline.
+
+### New bench: `metadata_walk`
+
+`benches/metadata_walk.rs` measures `extract_metadata` — the
+published §2.7 demux surface (full RIFF chunk walk + `ICCP` / `EXIF`
+/ `XMP ` payload lift). Cells split the chunk-walk cost from the
+payload-copy cost:
+
+| Cell | Layout | Median |
+|---|---|---:|
+| `metadata_walk_simple_nometa` | 1 chunk, no metadata | **18.86 ns** |
+| `metadata_walk_vp8x_full` | 5 chunks, ICC 3 KiB + Exif 1 KiB + XMP 2 KiB | **185.5 ns** |
+| `metadata_walk_anim64_full` | ~68 chunks (64 `ANMF`), same payloads | **421.0 ns** |
+
+The walk is comfortably non-hot: ~3.5 ns per chunk crossed (the
+anim64 − vp8x spread over ~63 extra chunks) plus ~25 ns/KiB of
+payload copy. No optimization warranted; the cells exist to keep the
+demux surface honest as the container code evolves.
+
+### Full regression table (stable, `--quick`, this host)
+
+All 21 bench targets re-run in one session on the same machine
+(`aarch64-apple-darwin`, M4). Reference is each cell's most recent
+recorded median (round noted); Δ beyond ±5% is called out.
+
+| Bench cell | Last recorded | Round-283 | Note |
+|---|---:|---:|---|
+| `lossless_encode_rgba_256` | 1.1947–1.2684 s (r280/281) | **1.247 s** | mid-spread |
+| `lossless_encode_natural_128` | 119.88–138.10 ms (r280/281) | **123.96 ms** | mid-spread |
+| `lossless_decode_argb_256` | ~643 µs (r207) | **655.5 µs** | within noise |
+| `vp8l_lz77_match` | 812.17 µs (r170) | **746.6 µs** | −8% (drift since r170; chain untouched) |
+| `argb_to_rgba` (scalar) | 8.56 µs (r180) | **8.69 µs** | within noise |
+| `inverse_predictor_mode11/12/13` | 484 / 605 / 835 µs (r194) | **476 / 603 / 831 µs** | unchanged |
+| `inverse_color_sb0/3/5/7` | 29.6 / 50.6 / 23.1 / 24.4 µs (r207) | **30.2 / 49.7 / 22.5 / 23.8 µs** | unchanged |
+| `inverse_color_indexing_p2/4/16/256` | 31.6 / 39.4 / 39.2 / 18.6 µs (r210) | **31.8 / 40.6 / 40.0 / 18.6 µs** | unchanged |
+| `inverse_subtract_green_256x256` | 13.7 µs (r217) | **13.43 µs** | unchanged |
+| `predictor_subtract_256x256` | ~36 µs (r224) | **34.32 µs** | unchanged |
+| `apply_subtract_green_256x256` | ~13.3–13.7 µs (r248) | **13.47 µs** | unchanged |
+| `inverse_color_table_p2/16/256` | 10.2 ns / 44.4 ns / 1.273 µs (r249) | **10.1 ns / 46.1 ns / 1.360 µs** | unchanged |
+| `build_code_lengths` dense d40/l256/g281/g2328 | 414 ns / 2.09 / 2.27 / 26.4 µs (r278) | **405 ns / 2.14 / 2.30 / 26.8 µs** | unchanged |
+| `build_code_lengths` sparse d40/l256/g281/g2328 | 118 / 286 / 303 ns / 1.34 µs (r277/278) | **122 / 276 / 294 ns / 1.32 µs** | unchanged |
+| `canonical_codes` dense d40/l256/g281/g2328 | 251 ns / 1.80 / 1.83 / 15.7 µs (r251) | **274 ns / 1.82 / 1.95 / 16.4 µs** | unchanged |
+| `canonical_codes` sparse d40/l256/g281/g2328 | 204 ns / 1.36 / 1.40 / 9.98 µs (r251) | **203 ns / 1.49 / 1.46 / 10.57 µs** | within noise |
+| `prefix_from_code_lengths` dense d40/l256/g281/g2328 | 178 / 582 / 635 ns / 4.63 µs (r277) | **188 / 625 / 661 ns / 4.87 µs** | within noise |
+| `prefix_from_code_lengths` sparse d40/l256/g281/g2328 | 74 / 256 / 269 ns / 1.81 µs (r277) | **74 / 278 / 284 ns / 1.82 µs** | within noise |
+| `read_lz77_value` fast/short/long/max | 0.52 / 1.83 / 5.35 / 7.0 ns (r252) | **0.52 / 1.83 / 5.35 / 6.99 ns** | unchanged |
+| `color_cache_hash` bits 1/4/8/11 | ~443 ns (r253) | **443–447 ns** | unchanged |
+| `value_to_prefix` fast/short/long/max | ~338 / 645 / 644 / 637 ns (r254) | **339 / 645 / 644 / 637 ns** | unchanged |
+| `pick_block_cte_walk_256x256` | 752.03 µs (r281) | **768.4 µs** | within noise |
+
+Every previously-optimized cell holds its post-optimization level —
+no regressions since the r277–r281 work landed.
+
+### Nightly `simd` feature pass
+
+The `simd` feature only swaps the `Vp8lImage::to_rgba` repack, so the
+nightly re-run covers the repack bench plus the end-to-end decode
+benches that flow through it:
+
+| Bench | Stable scalar | Nightly `simd` | Δ |
+|---|---:|---:|---:|
+| `argb_to_rgba` | 8.69 µs | **6.57 µs** | −24% (matches the r170 6.40 µs recording) |
+| `lossless_decode_argb_256` | 655.5 µs | 652.3 µs | within noise |
+| `lossless_decode_mix_*` (5 cells) | 172 µs – 3.03 ms | 183 µs – 3.10 ms | within nightly-codegen noise |
+| `anim_decode_keyframes_12x128` | 2.181 ms | 2.138 ms | within noise |
+| `anim_decode_delta_12x128` | 372.1 µs | 374.9 µs | within noise |
+
+The repack win is real but its end-to-end share is now ~1–4%, so the
+full-decode cells don't move outside noise — consistent with the
+profile below.
+
+### Fresh profiles (post-r281) and ranked next candidates
+
+**Decode** — an 8 s `/usr/bin/sample` of a release driver looping
+`decode_webp` on the `crosscolor` mix fixture (the heaviest decode
+cell), and a 6 s sample on the `none` (noise) fixture:
+
+| Top-of-stack symbol | crosscolor | noise |
+|---|---:|---:|
+| `vp8l_prefix::PrefixCode::read_symbol` | 6 031 (**~89%**) | 4 309 (**~85%**) |
+| `vp8l_decode::decode_one_symbol` | 397 (~6%) | 428 (~8%) |
+| `argb_to_rgba` repack | 288 (~4%) | 320 (~6%) |
+| `vp8l_transform::inverse_color` | 42 (<1%) | — |
+| `vp8l_prefix` table builds (`read_code_lengths` + `from_code_lengths`) | 41 (<1%) | — |
+
+**Encode** — an 8 s sample of a release driver looping
+`encode_webp_lossless` on the natural 128×128 tile:
+
+| Rank | Symbol | Samples | Share |
+|---:|---|---:|---:|
+| 1 | `for_each_block_residual` (two monomorphised walker instantiations) | 2 868 | ~38% |
+| 2 | `encode_argb_with_predictor_chooser` closure | 856 | ~11% |
+| 3 | `Lz77Matcher::find` + `insert` | 732 | ~10% |
+| 4 | `apply_forward_predictor` | 367 | ~5% |
+| 5 | `pick_block_cte` | 330 | ~4% |
+| 6 | `encode_vp8l_payload` + `encode_with_predictor_entropy` | 419 | ~6% |
+| 7 | `canonical_codes` + `tokenize_lz77` | 321 | ~4% |
+
+Ranked next-round optimization candidates:
+
+1. **Decoder `PrefixCode::read_symbol` k-bit primary lookup table.**
+   At ~85–89% of decode self-time on every entropy-heavy fixture this
+   is the single largest remaining target in the crate. The current
+   read walks the canonical decode rows length by length; a
+   `(1 << k)`-entry primary table indexed by the next `k` peeked bits
+   (each entry carrying `(symbol, code_length)` for codes ≤ k bits,
+   with a spill path for longer codes) turns the common case into one
+   load + one bit-advance. Must hold the round-275 `prefix_code`
+   differential fuzz harness and the §6.2.1 Kraft validation
+   semantics bit-for-bit. A/B references: all five
+   `lossless_decode_mix_*` cells (best probe: `crosscolor` at
+   3.03 ms) plus `lossless_decode_argb_256` and both `anim_decode`
+   cells.
+2. **Encoder chooser residual-walk arithmetic
+   (`for_each_block_residual` + chooser closure, ~49% combined).**
+   The r280 despecialisation removed the border/dispatch overhead;
+   what remains is the inherent 14-modes × per-pixel cost
+   arithmetic. Two shapes worth trying, in order: (a) SWAR the
+   per-pixel residual-magnitude accumulation inside the monomorphised
+   interior loops (the per-channel magnitude sums are independent
+   byte lanes — same identity family as the r170 `add_pred` rewrite);
+   (b) a per-block mode pre-filter that evaluates the cheap
+   single-source modes first and seeds the existing prune cap with
+   their best — pick-identical because it only tightens the cap
+   earlier. A/B references: `lossless_encode_natural_128` /
+   `lossless_encode_rgba_256`.
+3. **`Lz77Matcher::find` chain walk (~10% combined with `insert`).**
+   Flagged by the r281 followups and still unbenched in isolation —
+   the public-entry `lz77_match` bench amortises it against
+   tokenisation. First step is a chain-depth-targeted bench scenario
+   (repetitive content forcing deep hash chains), then a
+   pick-identical walk cut. Bench-first, same as `pick_block_cte` in
+   r281.
+
+The §2.7 demux walk (`metadata_walk`, ns-scale) and the §4.x inverse
+transforms (all ≤ 50 µs per 256×256 pass, < 1% of decode self-time)
+need no further dedicated rounds at current workloads.
+
 ## Reproducing
 
 ```bash

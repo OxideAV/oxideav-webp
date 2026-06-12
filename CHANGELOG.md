@@ -20,6 +20,22 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Three end-to-end criterion benches (round 283, BENCH depth round —
+  `src/` untouched), closing the decode-side coverage gaps above the
+  per-pass level: `lossless_decode_mixes` (full-file `decode_webp`
+  per elected §4 transform mix — predictor / color-indexing /
+  cross-color / subtract-green / no-transform, each fixture's elected
+  list asserted at setup via `read_vp8l_transform_list`),
+  `anim_decode` (§2.7.1.1 full-timeline animation decode of the same
+  12-frame 128×128 timeline in all-keyframe and dirty-rect-delta
+  `ANMF` layouts), and `metadata_walk` (`extract_metadata` chunk walk
+  over a simple no-metadata file, a 5-chunk `VP8X` still with
+  ICC + Exif + XMP, and a 64-frame animation carrying the same
+  payloads after the `ANMF` run). Full regression re-run of all 21
+  bench targets (stable + nightly `simd`) plus fresh decode / encode
+  profiles and the ranked next-hotspot list recorded in
+  `BENCHMARKS.md` round 283.
+
 - Fuzz target `roundtrip_metadata` (round 282) — differential oracle
   on the §2.7 metadata *write* path: the two independent
   extended-layout writers (`build::build_webp_file_with_metadata` and

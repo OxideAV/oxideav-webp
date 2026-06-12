@@ -36,46 +36,42 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships seventeen criterion benches under `benches/`: the
-original four end-to-end / hot-loop targets (`lossless_decode`,
-`lossless_encode`, `lz77_match`, `argb_to_rgba`); the four §4.x
-decoder-side inverse-transform per-pass benches added across rounds
-194 / 207 / 210 / 217 (`inverse_predictor`, `inverse_color`,
-`inverse_color_indexing`, `inverse_subtract_green`); the round-249
-§4.4 palette subtraction-decode bench (`inverse_color_table`); the
-two encoder-side §4.1 / §4.3 forward-transform per-pass benches
-added in rounds 224 / 248 (`predictor_subtract`,
-`apply_subtract_green`); the two encoder-side §3.7.2 per-pass
-benches added in rounds 250 / 251 (`build_code_lengths`,
-`canonical_codes`) covering each §3.7.1 prefix-code-group alphabet
-(distance-40, literal-256, green-281, green-2328) in both dense and
-sparse frequency regimes; the round-252 decoder-side §3.6.2.2 LZ77
-prefix-code-to-value per-call bench (`read_lz77_value`) covering
-the fast-path / short-extra / long-extra / max-extra regimes from
-§3.6.2.2 Table 4; the round-253 decoder-side §3.6.2.3 color-
-cache hash slot-index per-call bench (`color_cache_hash`) covering
-the §3.6.2.3 `code_bits` allowed range `[1..11]` at four
-representative points (1 / 4 / 8 / 11); and the round-254 encoder-
-side §5.2.2 LZ77 value-to-prefix-split per-call bench
-(`value_to_prefix`, mirror of the round-252 decoder-side cell
-layout) covering the same fast-path / short-extra / long-extra /
-max-extra regimes at value-side samples (3 / 40 / 40_000 / 900_000);
-and the round-276 decoder-side §6.2.1 canonical-table build bench
-(`prefix_from_code_lengths`, decode mirror of the round-250/251
-encoder pair) covering the same four §3.7.1 alphabets in both dense
-and sparse frequency regimes. Round 277 rewrote both sides of that
-length-then-code chain bit-identically — a sorted-leaf two-queue
-merge replacing the encoder's Huffman heap (dense `green2328`
-382.0 µs → 113.5 µs) and a single-rescan counting sort replacing the
-decoder's per-used-length rescan (dense `green2328`
-7.44 µs → 4.63 µs). Round 278 removed the §3.7.2 length-cap pass's
-per-adjustment O(n) target-selection rescan (bucket-per-length drain
-replaying the identical pick sequence; capped dense `green2328`
-111.9 µs → 26.4 µs, proven bit-identical by FNV digest plus a
-20 M-table differential fuzz against the pre-change implementation).
-Numbers, profile findings, and the
-optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
-with:
+The crate ships twenty-one criterion benches under `benches/`,
+grouped by domain:
+
+* **End-to-end** — `lossless_decode`, `lossless_encode`,
+  `lossless_decode_mixes` (round 283: full-file decode per elected
+  §4 transform mix — predictor / color-indexing / cross-color /
+  subtract-green / no-transform, the elected list asserted at
+  setup), `anim_decode` (round 283: §2.7.1.1 full-timeline animation
+  decode, all-keyframe vs dirty-rect-delta `ANMF` layouts), and
+  `metadata_walk` (round 283: `extract_metadata` chunk walk at three
+  chunk-count / payload tiers).
+* **Decoder §4.x inverse transforms** — `inverse_predictor`
+  (per-mode), `inverse_color` (per `size_bits`),
+  `inverse_color_indexing` (per palette tier),
+  `inverse_subtract_green`, `inverse_color_table`, plus the
+  `argb_to_rgba` repack.
+* **Encoder forward passes** — `predictor_subtract`,
+  `apply_subtract_green`, `lz77_match`, `pick_block_cte` (the
+  §3.5.2 chooser walk), and the §5.2.2 `value_to_prefix` split.
+* **Entropy / prefix-code chain** — `build_code_lengths` and
+  `canonical_codes` (encoder §3.7.2) and `prefix_from_code_lengths`
+  (decoder §6.2.1), each over the four §3.7.1 alphabets
+  (distance-40 / literal-256 / green-281 / green-2328) in dense and
+  sparse frequency regimes, plus the per-call `read_lz77_value`
+  (§3.6.2.2 Table 4 regimes) and `color_cache_hash` (§3.6.2.3
+  `code_bits` 1 / 4 / 8 / 11) decoder benches.
+
+Rounds 277 / 278 rewrote the §3.7.2 / §6.2.1 length-then-code chain
+bit-identically (sorted-leaf two-queue merge + single-rescan counting
+sort + O(1)-per-adjustment length cap; capped dense `green2328`
+417.8 µs → 26.4 µs end to end), and rounds 280 / 281 hoisted the
+§4.1 / §3.5.2 encoder chooser walks out of their per-pixel loops
+(`lossless_encode_natural_128` ~170 ms → ~120 ms). Numbers, profile
+findings, the full round-283 regression re-run (stable + nightly
+`simd`), and the optimization log live in
+[`BENCHMARKS.md`](./BENCHMARKS.md). Run with:
 
 ```text
 CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \

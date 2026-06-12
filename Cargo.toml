@@ -132,3 +132,19 @@ harness = false
 [[bench]]
 name = "pick_block_cte"
 harness = false
+
+# Round-283: end-to-end decode coverage beyond the single gradient
+# fixture — full-file decode per elected §4 transform mix, §2.7.1.1
+# animation full-timeline decode (keyframe vs delta layouts), and the
+# §2.7 metadata-chunk walk (`extract_metadata`).
+[[bench]]
+name = "lossless_decode_mixes"
+harness = false
+
+[[bench]]
+name = "anim_decode"
+harness = false
+
+[[bench]]
+name = "metadata_walk"
+harness = false
