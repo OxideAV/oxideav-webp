@@ -4,6 +4,24 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- Round-290 PROFILE-OPT depth round: `vp8_decode::yuv420_to_rgba` (the
+  §2.5 lossy decode's crate-owned 4:2:0 chroma up-sample + RFC 6386 §9.2
+  BT.601 YCbCr→RGB loop, ranked rank-1 webp-owned lossy hot path in r289)
+  now hoists the chroma-matrix terms out of the per-pixel loop. The two
+  luma pixels of a 4:2:0 pair share one chroma column, so the three
+  `(Cb−128, Cr−128)` contributions are computed once per column
+  (`chroma_offsets`) and reused; the output is written through pre-sized
+  per-row slices instead of four `Vec::push` calls per pixel.
+  **Decoded bytes are byte-for-byte identical** — the per-pixel
+  `ycbcr_to_rgb` form is retained as a `#[cfg(test)]` oracle, and the new
+  `yuv420_to_rgba_matches_per_pixel_reference_across_dimensions` test
+  proves equivalence across 9 even/odd dimensions with non-neutral chroma;
+  `cargo fuzz` (decode_still_paths, decode) over the corpus showed no
+  divergence. The conversion drops from ≈34 µs to ≈10.5 µs at 128×128
+  fixture size (−68%; −72% at 256×256) — see `BENCHMARKS.md` round-290.
+
 ### Fixed
 
 - Round-288 FUZZ depth round: `decode_webp`'s §2.7.1.1 animation path no

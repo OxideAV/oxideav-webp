@@ -102,7 +102,15 @@ sibling `oxideav-vp8` decode (entropy + IDCT + intra-pred + loop
 filter, out of this crate's scope) ≈39%, and the crate-owned
 `yuv420_to_rgba` YCbCr→RGB conversion ≈9% — the latter purely
 per-pixel-bound and the cleanest A/B target for a future SIMD pass (the
-lossy analogue of the `argb_to_rgba` SIMD treatment). Numbers,
+lossy analogue of the `argb_to_rgba` SIMD treatment). Round 290 acted on
+that candidate: `yuv420_to_rgba` now hoists the §9.2 chroma-matrix terms
+out of the per-pixel loop — the two luma pixels of a 4:2:0 pair share one
+chroma column, so the three `(Cb−128, Cr−128)` contributions are computed
+once per column and reused, and the output is written through pre-sized
+per-row slices instead of per-pixel `Vec::push`. The conversion drops from
+≈34 µs to ≈10.5 µs at fixture size (−68%; −72% at 256×256), byte-for-byte
+identical — proven by a per-pixel oracle test across 9 even/odd dimensions
+and by `cargo fuzz` (decode_still_paths + decode, no divergence). Numbers,
 profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run

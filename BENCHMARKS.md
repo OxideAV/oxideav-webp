@@ -1814,6 +1814,62 @@ the sibling's to optimize.
 * `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
   clean.
 
+## Round-290 (2026-06-13): `yuv420_to_rgba` chroma-pair hoist (rank-1 lossy opt)
+
+PROFILE-OPT depth round acting on the round-289 rank-1 candidate:
+`yuv420_to_rgba`, the only fully webp-owned lossy decode hot loop (4:2:0
+nearest-neighbour chroma up-sample + RFC 6386 §9.2 / RFC 9649 §10 BT.601
+full-range YCbCr→RGB matrix). **No output change** — decoded bytes are
+byte-for-byte identical.
+
+### The optimization
+
+Two structural wins, both byte-preserving:
+
+1. **Chroma-pair hoist.** §9.2 nearest-neighbour 4:2:0 maps the two luma
+   pixels `(2k, 2k+1)` of a row to the same chroma column `k`. The
+   matrix's three chroma contributions depend only on `(Cb−128, Cr−128)`,
+   so they are now computed **once per chroma column** (`chroma_offsets`)
+   and reused across both pixels of the pair — only the luma offset
+   `Y << 16` differs per pixel. The previous loop re-evaluated all three
+   chroma multiplies for every output pixel, i.e. twice per chroma sample.
+   The per-pixel arithmetic (`(Y << 16) + offset + HALF >> 16`, clamp) is
+   unchanged; `ycbcr_to_rgb` was refactored to call the same
+   `chroma_offsets` so the two forms share one coefficient source and are
+   provably identical. A new oracle test
+   (`yuv420_to_rgba_matches_per_pixel_reference_across_dimensions`) checks
+   the hoisted loop against the per-pixel `ycbcr_to_rgb` form across 9
+   even/odd dimension combinations with non-neutral chroma.
+2. **Pre-sized output + row slices.** The output is a single `vec![0; …]`
+   written through per-row sub-slices instead of four `Vec::push` calls
+   per pixel; the row-slice bounds let the optimiser drop per-pixel
+   capacity checks and reallocation branches.
+
+### Before/after (this host, `--quick`, median)
+
+| Cell | r289 (before) | r290 (after) | Δ |
+|---|---:|---:|---:|
+| `yuv420_to_rgba_16x16` | 530 ns | 346 ns | **−35%** |
+| `yuv420_to_rgba_128x128` | 33.3 µs | 10.5 µs | **−68%** |
+| `yuv420_to_rgba_256x256` | 130.4 µs | 36.5 µs | **−72%** |
+
+At fixture size (128×128) the crate-owned conversion drops from ~34 µs to
+~10.5 µs — roughly a 23.5 µs cut on every lossy still that path decodes.
+
+### Round-290 verification
+
+* **Byte identity:** all 436 lib tests (435 prior + the new oracle test) +
+  integration binaries (`fixture_walks`, `vp8_lossy_roundtrip`,
+  published-API, standalone e2e) pass; the new
+  `yuv420_to_rgba_matches_per_pixel_reference_across_dimensions` test
+  proves the hoisted loop equals the per-pixel reference byte-for-byte.
+  `cargo fuzz run decode_still_paths` (3170 runs) and `decode` (9.6M runs)
+  over the committed corpus produced no crash or divergence.
+* `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
+  clean. The only `src/` change is `vp8_decode.rs` (`yuv420_to_rgba`
+  rewrite + `chroma_offsets` helper + `ycbcr_to_rgb` refactored onto it,
+  now `#[cfg(test)]` as the oracle).
+
 ## Reproducing
 
 ```bash
