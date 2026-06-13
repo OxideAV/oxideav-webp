@@ -6,6 +6,32 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-286 benchmark-mode coverage of the two hotspots the round-283 /
+  round-284 profiles flagged but never benched in isolation
+  (`src/` byte-identical this round — both harnesses build their inputs
+  through the existing public API, no probe accessor needed). New
+  `benches/read_symbol.rs` isolates the decoder's §6.2.1
+  `PrefixCode::read_symbol` per-symbol reader — the rank-1 decode
+  hotspot at ~82% of decode self-time post-round-284 — across five
+  cells that separate the round-284 primary-table fast path
+  (`short8_uniform` / `short6_uniform`, all codes ≤ 8 bits resolve in
+  one table load), the long-code (> 8-bit) walk continuation the
+  round-284 follow-up targets (`long9_11`, every read spills past the
+  table), the realistic blended literal channel (`dense256`), and the
+  below-`MIN_LOOKUP_USED`-gate walk-only baseline (`belowgate16_walk`);
+  each cell packs a deterministic LCG symbol stream via the public
+  `canonical_codes` + `BitWriter` and times 4096 back-to-back reads
+  through a fresh `BitReader`. New `benches/lz77_chain.rs` isolates the
+  §5.2.2 LZ77 matcher (`Lz77Matcher::find` + `insert`, rank 3 in the
+  round-283 encode profile) across five hash-chain-depth regimes
+  (period-2/4/64 repeats, near-unique, gradient), driven through the
+  public `encode_argb_literals_with_width` entry. Measured the
+  long-code read path at +27% per symbol over the primary-table floor
+  (`dense256` at +11%) and found the matcher's expensive regime is the
+  shallow/unique insert+miss path (6.5–7× the deep-repeat cost), not
+  the deep walk — reframing the r283 chain-cut candidate. `BENCHMARKS.md`
+  ranks the decoder 9–11-bit second-level spill table (or
+  alphabet-size-aware primary width) as the next PROFILE-OPT target.
 - Round-285 fuzz hardening of the round-284 §6.2.1 read-symbol fast
   path + word-load `BitReader` (depth round, fuzz mode). Two new
   `cargo-fuzz` harnesses (#27 / #28, total now twenty-eight):

@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twenty-one criterion benches under `benches/`,
+The crate ships twenty-three criterion benches under `benches/`,
 grouped by domain:
 
 * **End-to-end** — `lossless_decode`, `lossless_encode`,
@@ -53,15 +53,20 @@ grouped by domain:
   `inverse_subtract_green`, `inverse_color_table`, plus the
   `argb_to_rgba` repack.
 * **Encoder forward passes** — `predictor_subtract`,
-  `apply_subtract_green`, `lz77_match`, `pick_block_cte` (the
-  §3.5.2 chooser walk), and the §5.2.2 `value_to_prefix` split.
+  `apply_subtract_green`, `lz77_match`, `lz77_chain` (round 286: the
+  §5.2.2 matcher across five hash-chain-depth regimes — period-2/4/64
+  repeats, near-unique, gradient), `pick_block_cte` (the §3.5.2
+  chooser walk), and the §5.2.2 `value_to_prefix` split.
 * **Entropy / prefix-code chain** — `build_code_lengths` and
   `canonical_codes` (encoder §3.7.2) and `prefix_from_code_lengths`
   (decoder §6.2.1), each over the four §3.7.1 alphabets
   (distance-40 / literal-256 / green-281 / green-2328) in dense and
-  sparse frequency regimes, plus the per-call `read_lz77_value`
-  (§3.6.2.2 Table 4 regimes) and `color_cache_hash` (§3.6.2.3
-  `code_bits` 1 / 4 / 8 / 11) decoder benches.
+  sparse frequency regimes, plus `read_symbol` (round 286: the
+  §6.2.1 per-symbol reader — the rank-1 decode hotspot — across the
+  primary-table fast path vs the > 8-bit walk continuation), the
+  per-call `read_lz77_value` (§3.6.2.2 Table 4 regimes) and
+  `color_cache_hash` (§3.6.2.3 `code_bits` 1 / 4 / 8 / 11) decoder
+  benches.
 
 Rounds 277 / 278 rewrote the §3.7.2 / §6.2.1 length-then-code chain
 bit-identically (sorted-leaf two-queue merge + single-rescan counting
@@ -72,7 +77,12 @@ sort + O(1)-per-adjustment length cap; capped dense `green2328`
 the §6.2.1 `read_symbol` decoder a 256-entry peeked-bits primary
 lookup table (entropy-heavy full-file decodes −37% to −49%,
 bit-identical across the full fixture corpus and pinned in CI by a
-corpus-wide decode digest test). Numbers, profile findings, the full
+corpus-wide decode digest test). Round 286 (benchmark mode, `src/`
+byte-identical) added the `read_symbol` and `lz77_chain` harnesses
+that isolate the rank-1 decode and rank-3 encode hotspots, measured
+the long-code (> 8-bit) read path at +27% per symbol over the
+primary-table floor, and ranked the decoder 9–11-bit spill table as
+the next PROFILE-OPT target. Numbers, profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
 with:

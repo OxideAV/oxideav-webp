@@ -37,6 +37,8 @@ the medians are still stable to a few percent.
 | `benches/build_code_lengths.rs` | `build_code_lengths_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 Huffman code-length builder over a single §3.7.1 prefix-code-group alphabet, parameterised over (a) alphabet size — DISTANCE = 40, RED/BLUE/ALPHA = 256, GREEN at smallest color-cache (281) and largest color-cache (2328) — and (b) frequency-table regime: *dense* (every symbol live, LCG-fill 1..=255) or *sparse* (`sqrt(N)` live symbols, 1/(k+1) Zipf shape). Eight cells total |
 | `benches/prefix_from_code_lengths.rs` | `prefix_from_code_lengths_{dense,sparse}_{distance40,literal256,green281,green2328}` | Decoder-side §6.2.1 canonical-table build (`PrefixCode::from_code_lengths`) over the same four §3.7.1 prefix-code-group alphabets and the same two dense / sparse frequency regimes as `build_code_lengths` / `canonical_codes`, with length tables produced by `build_code_lengths` at setup. The per-iteration `Vec` clone (the function takes the table by value) is excluded via `iter_batched` setup. Eight cells total |
 | `benches/canonical_codes.rs` | `canonical_codes_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 canonical-code-value assignment over the same four §3.7.1 prefix-code-group alphabets and the same two dense / sparse frequency regimes as `build_code_lengths`, sampling only the per-symbol code-value pass (the `build_code_lengths` call that produces the length table is outside the measured interval). Eight cells total |
+| `benches/read_symbol.rs` | `read_symbol_{short8_uniform,short6_uniform,long9_11,dense256,belowgate16_walk}` | Decoder-side §6.2.1 `PrefixCode::read_symbol` per-symbol reader — the rank-1 decode hotspot (~82% of decode self-time post-round-284). Five cells isolate the round-284 primary-table fast path (`short8` / `short6` all-table-hit), the long-code (> 8-bit) walk continuation the round-284 follow-up targets (`long9_11`, every read spills to the per-bit walk), the realistic blended literal channel (`dense256`), and the below-gate walk-only baseline (`belowgate16_walk`, no table built). Each cell packs a deterministic LCG symbol stream via the public `canonical_codes` + `BitWriter` and times 4096 back-to-back reads through a fresh `BitReader` |
+| `benches/lz77_chain.rs` | `lz77_chain_{deep_period2,deep_period4,medium_period64,shallow_unique,natural_gradient}` | §5.2.2 LZ77 hash-chain matcher (`Lz77Matcher::find` + `insert`, rank 3 in the round-283 encode profile) chain-*depth* scenarios — five 8192-pixel tiles that vary hash-chain depth from maximal (period-2/4 repeats), through moderate (period-64), to shallow (near-unique LCG / natural gradient). Driven through the public `encode_argb_literals_with_width` entry like `lz77_match`, but with depth-controlled inputs so a future chain-walk cut has A/B numbers per regime instead of one blended figure |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -1565,6 +1567,108 @@ sweep and re-clear the `prefix_code` differential harness; the
 `crosscolor` / `none` / `subgreen` cells are the A/B references.
 After that, the encoder-side candidates from r283 (chooser residual
 walk SWAR, `Lz77Matcher::find` chain bench) are unchanged.
+
+## Round-286 (2026-06-13): isolate the rank-1 decode + rank-3 encode hotspots
+
+DEPTH round, **BENCHMARK** mode. The round-284 PROFILE-OPT landed the
+decoder's §6.2.1 primary lookup table and flagged its own next target —
+the long-code (> 8-bit) continuation that dense 256+-symbol alphabets
+still route ~half their reads through, to be addressed by a
+second-level spill table or an alphabet-size-aware primary width. The
+round-283 encode profile flagged `Lz77Matcher::find` (rank 3, ~10%
+combined with `insert`) as "still unbenched in isolation." Both
+hotspots were measured only *through* end-to-end benches that blend
+them with surrounding work, so neither flagged candidate had a clean
+A/B reference. This round adds two harnesses that isolate them, then
+ranks the next PROFILE-OPT target.
+
+src/ is **byte-identical** this round — both benches construct their
+inputs through the existing public API (`canonical_codes` + `BitWriter`
+for the symbol streams; `encode_argb_literals_with_width` for the
+matcher), so no `#[doc(hidden)]` probe was needed.
+
+### New bench: `read_symbol` (decoder §6.2.1 rank-1 hotspot)
+
+`PrefixCode::read_symbol` is ~82% of decode self-time post-round-284 —
+the single largest symbol in the crate — yet the two existing
+prefix-code benches measure only the *table build*
+(`prefix_from_code_lengths`) and the §3.6.2.2 *value expansion*
+(`read_lz77_value`); the symbol-read hot loop itself had no isolated
+harness. The five cells separate the two paths the round-284 table
+created. Each times 4096 back-to-back reads over a deterministic
+LCG-packed stream (`--quick` medians, same `aarch64-apple-darwin`
+host):
+
+| Cell | Median (4096 reads) | Per symbol | Path |
+|---|---:|---:|---|
+| `read_symbol_short8_uniform` | 15.99 µs | ~3.90 ns | pure primary-table hit (all 8-bit codes) |
+| `read_symbol_dense256` | 17.73 µs | ~4.33 ns | table hit + long-code tail (lengths 7–13, peak 8) |
+| `read_symbol_long9_11` | 20.31 µs | ~4.96 ns | **every read spills to the > 8-bit walk** |
+| `read_symbol_short6_uniform` | 21.20 µs | ~5.18 ns | table hit, short codes packed densely |
+| `read_symbol_belowgate16_walk` | 20.93 µs | ~5.11 ns | no table (below `MIN_LOOKUP_USED`), per-bit walk |
+
+The signal the round-284 follow-up predicted is isolated cleanly:
+`long9_11` (every read overshoots the 8-bit table and continues the
+per-bit walk) costs **+27%** per symbol over the pure-table-hit
+`short8_uniform` lower bound, and `dense256` sits between them at +11%
+— exactly the long-code overhead a second-level spill table would
+remove. `short8` is the floor the spill-table change must not regress;
+`belowgate16_walk` and `short6` bound the gated-out walk path it must
+also leave unchanged.
+
+### New bench: `lz77_chain` (encoder §5.2.2 rank-3 hotspot)
+
+Five 8192-pixel tiles vary hash-chain depth, driven through the public
+`encode_argb_literals_with_width` entry (the matcher is package-private,
+as in `lz77_match`):
+
+| Cell | Median | Chain regime |
+|---|---:|---|
+| `lz77_chain_deep_period4` | 1.026 ms | maximal depth, 4 buckets — long match found immediately |
+| `lz77_chain_deep_period2` | 1.041 ms | maximal depth, 2 buckets |
+| `lz77_chain_medium_period64` | 1.157 ms | moderate depth, one-row period |
+| `lz77_chain_shallow_unique` | 6.81 ms | near-unique pixels, insert + miss dominate |
+| `lz77_chain_natural_gradient` | 7.38 ms | realistic gradient + noise, near-miss walks + literals |
+
+The depth axis reframes the r283 candidate. The deepest-chain cells are
+the **cheapest** (~1 ms): when content repeats with a short period the
+matcher finds a long match on its first candidate and skips the run, so
+total `find` calls collapse. The expensive regime is the opposite —
+`shallow_unique` / `natural_gradient` at **6.5–7×** the cost — where
+almost nothing matches and the per-position insert + short near-miss
+walk + literal-entropy coding runs on every pixel. A chain-walk
+depth-cap (the r283-flagged shape) would therefore barely move the
+expensive cells; the headroom on the matcher's hot regime is in the
+insert + miss-reject path and the literal coding it feeds, not the deep
+walk. This is a bench-first finding for the next encoder round.
+
+### Ranked next PROFILE-OPT target
+
+| Rank | Target | Evidence | A/B references |
+|---:|---|---|---|
+| **1** | **Decoder `read_symbol` 9–11-bit long-code coverage** (second-level spill table or alphabet-size-aware primary width) | `read_symbol_long9_11` +27% / `dense256` +11% over the `short8` floor; `read_symbol` is rank 1 at ~82% of decode self-time and dense 256+-symbol alphabets route ~half their reads through this path | `read_symbol_{long9_11,dense256,short8_uniform}` (must-not-regress: `short8_uniform`, `belowgate16_walk`); decode cells `crosscolor` 1.68 ms / `none` 0.94 ms / `subgreen` 0.88 ms |
+| 2 | Encoder chooser residual walk SWAR (`for_each_block_residual` + chooser closure, ~49% combined in r283) | unchanged from r283; the inherent 14-modes × per-pixel arithmetic after the r280 despecialisation | `lossless_encode_natural_128` / `lossless_encode_rgba_256`, `pick_block_cte` |
+| 3 | Encoder LZ77 **insert + miss-reject** path (not the deep-chain walk) | `lz77_chain` shows the shallow/unique regime at 6.5–7× the deep-repeat cost — the cost is in per-position insert + literal coding, not chain depth | `lz77_chain_{shallow_unique,natural_gradient}` vs `_deep_period2/4` |
+
+Target **1 is the recommended next PROFILE-OPT round** — highest share,
+cleanest A/B isolation, and the candidate the round-284 profile already
+named. The byte-identity bar for any such change is the round-284
+FNV-1a digest sweep over the full fixture corpus plus the
+`round284_fixture_corpus_decode_digests_are_pinned` CI pin, and the
+`prefix_code` differential fuzz harness.
+
+### Round-286 verification
+
+* **Byte identity:** `src/` is untouched this round (`git diff --stat`
+  shows only `Cargo.toml` + the two new bench files + this file), so
+  decode output is unchanged by construction. The full suite —
+  435 lib tests (was 434; +1 is the round-284 corpus pin already on
+  master) + all integration binaries — passes unchanged.
+* **References re-captured:** `lossless_decode_mix_{crosscolor,none,subgreen}_256x256`
+  at 1.68 / 0.94 / 0.88 ms reproduce the round-284 post-change
+  baselines within machine drift.
+* `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
+  clean.
 
 ## Reproducing
 

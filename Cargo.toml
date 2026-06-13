@@ -148,3 +148,22 @@ harness = false
 [[bench]]
 name = "metadata_walk"
 harness = false
+
+# Round-286: decoder-side §6.2.1 `PrefixCode::read_symbol` per-symbol
+# canonical-prefix-code reader — the rank-1 decode hotspot (~82% of
+# decode self-time post-round-284). Isolates the round-284 primary
+# table fast path (codes ≤ 8 bits) from the long-code (> 8-bit) walk
+# continuation the round-284 follow-up targets, giving the
+# second-level-spill-table candidate direct A/B numbers per regime.
+[[bench]]
+name = "read_symbol"
+harness = false
+
+# Round-286: §5.2.2 LZ77 hash-chain matcher chain-*depth* scenarios
+# (`Lz77Matcher::find` + `insert`, rank 3 in the round-283 encode
+# profile). Where `lz77_match` uses one repeating tile, these cells
+# vary hash-chain depth (period-2/4/64 repeats, unique, gradient) so a
+# future chain-walk cut has A/B numbers per depth regime.
+[[bench]]
+name = "lz77_chain"
+harness = false
