@@ -4,6 +4,41 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Round-288 FUZZ depth round: `decode_webp`'s §2.7.1.1 animation path no
+  longer eagerly allocates the full `VP8X` canvas before validating its
+  size. §2.7.1 permits a canvas up to 2^24 per side (product capped at
+  2^32 - 1); a ~60-byte file declaring a 16 777 154 × 64 canvas forced a
+  ~4 GiB `Vec` (libFuzzer OOM, surfaced by the new `decode_still_paths`
+  harness below). The canvas is now bounded at the §3.4 still-image
+  ceiling (`MAX_DECODE_DIMENSION = 16384` per side) — a dimension above
+  that can never be fully covered by a spec-valid `ANMF` sub-frame (each
+  sub-frame is itself a `VP8L` image) — and an over-ceiling canvas is
+  rejected with `WebpError::InvalidData`, allocating nothing. Covered by
+  the `oversized_anim_canvas_is_rejected_without_eager_allocation`
+  regression test (inclusive of the 16384 ceiling).
+
+### Added
+
+- Round-288 FUZZ depth round: a twenty-ninth `cargo-fuzz` harness,
+  `decode_still_paths`, a differential oracle on the two public
+  still-image decode entry points `decode_webp` (the published
+  `WebpImage` surface) and `decode_webp_image` (the low-level
+  `DecodedWebp` surface), seeded from the in-tree §2.6 lossless +
+  §2.7-extended fixtures. For a non-animated input the published façade
+  builds its single still frame by literally calling `decode_webp_image`,
+  so the harness asserts the two surfaces agree exactly (`Ok` ⇒
+  `frames.len() == 1` with byte-identical `frames[0].{rgba,width,height}`
+  + canvas-dimension echo + `duration_ms == 0` + no §2.7.1.1 carrier;
+  `Err` ⇒ the published path also `Err`), re-checks the §2.5/§2.6
+  flat-buffer carrier invariant (`rgba.len() == width * height * 4`) on
+  every still + every composited animation frame, and asserts
+  `decode_webp_image` determinism. A ~300 s ASan campaign over 25 772
+  runs is crash-free post-fix. The §2.5 `VP8 ` *lossy* decode (routed to
+  the `oxideav-vp8` sibling) is deliberately skipped from the cross-check
+  pending a sibling-side hardening — see the round report.
+
 ### Changed
 
 - Round-287 PROFILE-OPT (depth round): the §6.2.1 canonical-decoder

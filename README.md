@@ -102,7 +102,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty-eight [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Twenty-nine [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -565,7 +565,29 @@ phase; the round-273 carrier-echo / pixel-count / replay-determinism
 contract is asserted unchanged. A 15-minute ASan campaign cleared
 16.8 M runs with no crashes; same-session 4-minute regression re-runs
 of `prefix_code` (32.2 M), `decode_lossless` (9.4 M), and
-`prefix_code_group` (24.2 M) also ran clean. Run any
+`prefix_code_group` (24.2 M) also ran clean. `decode_still_paths`
+(round 288) is a differential oracle on the two public still-image
+decode entry points `decode_webp` (the published `WebpImage` surface)
+and `decode_webp_image` (the low-level `DecodedWebp` surface), seeded
+from the in-tree §2.6 lossless + §2.7-extended fixtures. For a
+non-animated input the published façade builds its single still frame by
+literally calling `decode_webp_image`, so the harness asserts the two
+surfaces agree exactly (`Ok` ⇒ `frames.len() == 1` with byte-identical
+`frames[0].{rgba, width, height}` + canvas-dimension echo +
+`duration_ms == 0` + no §2.7.1.1 carrier; `Err` ⇒ the published path
+also `Err`), re-checks the §2.5/§2.6 flat-buffer carrier invariant
+(`rgba.len() == width * height * 4`, non-empty iff both dimensions
+nonzero) on every decoded still and every composited animation frame,
+and asserts `decode_webp_image` replay determinism. The harness surfaced
+a libFuzzer OOM — a ~60-byte file declaring a §2.7.1 16 777 154 × 64
+animation canvas forced a ~4 GiB eager `Vec`; the round fixed it by
+bounding the animation canvas at the §3.4 still-image ceiling
+(`MAX_DECODE_DIMENSION = 16384` per side, rejected with `InvalidData`
+before allocating). A ~300 s ASan campaign over 25 772 runs is now
+crash-free. The §2.5 `VP8 ` *lossy* decode (routed to the `oxideav-vp8`
+sibling, which currently panics on some malformed bitstreams at its
+inverse-DCT stage) is deliberately skipped from the cross-check pending a
+sibling-side hardening. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -597,6 +619,7 @@ cargo +nightly fuzz run roundtrip_anim_modes --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run roundtrip_metadata   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run read_symbol_lut_diff --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_lossless_lut  --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_still_paths   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

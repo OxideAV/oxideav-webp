@@ -567,6 +567,16 @@ pub fn decode_lossless_image(bytes: &[u8]) -> Result<Option<vp8l_decode::Decoded
     Ok(Some(image))
 }
 
+/// §3.4 still-image dimension ceiling (16384 = `1 << 14`), the per-side
+/// maximum a §2.6 `VP8L` image header can encode (the 14-bit
+/// `width - 1` / `height - 1` fields plus one). Used as the eager-
+/// allocation bound on the §2.7.1.1 animation canvas: a `VP8X` canvas
+/// dimension above this can never be fully covered by a spec-valid
+/// `ANMF` sub-frame (each sub-frame is itself a `VP8L` image), so it is
+/// rejected before the full-canvas buffer is allocated rather than
+/// trusting the much larger §2.7.1 24-bit-per-side / 2^32-1-product cap.
+const MAX_DECODE_DIMENSION: u32 = 1 << 14;
+
 /// A fully decoded still WebP image: 8-bit RGBA pixels plus dimensions.
 ///
 /// `rgba` is `width * height * 4` bytes in scan-line (top-to-bottom,
@@ -1056,6 +1066,19 @@ fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpIm
         vp8x::Vp8xHeader::parse(vp8x_chunk.payload(bytes)).map_err(|_| WebpError::InvalidData)?;
     let canvas_w = vp8x.canvas_width;
     let canvas_h = vp8x.canvas_height;
+
+    // §2.7.1 permits a `VP8X` canvas up to 2^24 per side (product capped at
+    // 2^32 - 1). That spec cap is far larger than is safe to pre-allocate:
+    // a ~480-byte file declaring a 16 777 154 × 64 canvas demands a ~4 GiB
+    // buffer below before a single frame is decoded. Every §2.7.1.1 `ANMF`
+    // sub-frame is itself a §2.6 `VP8L` image, whose §3.4 dimensions are
+    // capped at 16384 per side — so a canvas exceeding that in either
+    // dimension can never be fully covered by a spec-valid frame and is
+    // rejected here rather than eagerly allocated. This bounds the canvas
+    // buffer at the §3.4 still-image ceiling (16384 × 16384 × 4 = 1 GiB).
+    if canvas_w > MAX_DECODE_DIMENSION || canvas_h > MAX_DECODE_DIMENSION {
+        return Err(WebpError::InvalidData);
+    }
 
     // Initialise canvas to the ANIM background colour (RGBA, scan order).
     let bg_rgba = [bg.red, bg.green, bg.blue, bg.alpha];

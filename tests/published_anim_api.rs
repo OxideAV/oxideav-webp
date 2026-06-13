@@ -429,3 +429,78 @@ fn delta_frame_with_alpha_blend_round_trips() {
         );
     }
 }
+
+/// Regression (round 288, `decode_still_paths` fuzz finding): a §2.7.1
+/// `VP8X` chunk may declare a canvas up to 2^24 per side (product capped
+/// at 2^32 - 1), but `decode_webp`'s §2.7.1.1 animation path must not
+/// *eagerly allocate* that full canvas before validating it against the
+/// §3.4 still-image ceiling. A ~60-byte file declaring a 16385 × 1 canvas
+/// previously forced a multi-gigabyte `Vec` (the fuzzer OOM'd on a
+/// 16 777 154 × 64 canvas). The decoder must instead reject the
+/// over-ceiling canvas with `InvalidData`, allocating nothing.
+#[test]
+fn oversized_anim_canvas_is_rejected_without_eager_allocation() {
+    // §2.7.1 VP8X payload: flag octet (animation bit set) + 24-bit
+    // reserved + 24-bit `Canvas Width Minus One` + 24-bit
+    // `Canvas Height Minus One`. 16385 - 1 = 16384 = 0x004000 exceeds the
+    // §3.4 16384 ceiling by one; height 1 - 1 = 0.
+    let mut vp8x = Vec::new();
+    vp8x.push(0b0000_0010); // §2.7.1 'A' (animation) flag bit.
+    vp8x.extend_from_slice(&[0, 0, 0]); // 24-bit reserved.
+    vp8x.extend_from_slice(&[0x00, 0x40, 0x00]); // width-minus-one = 16384 → width 16385.
+    vp8x.extend_from_slice(&[0x00, 0x00, 0x00]); // height-minus-one = 0 → height 1.
+
+    // §2.7.1.1 ANIM payload: 4-byte BGRA background + 2-byte loop count.
+    let anim = [0u8, 0, 0, 0, 0, 0];
+
+    fn chunk(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(fourcc);
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        v.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            v.push(0); // §2.3 pad byte.
+        }
+        v
+    }
+
+    let mut body = Vec::new();
+    body.extend_from_slice(chunk(b"VP8X", &vp8x).as_slice());
+    body.extend_from_slice(chunk(b"ANIM", &anim).as_slice());
+    // No ANMF frame is needed: the canvas guard fires before any frame walk.
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&((4 + body.len()) as u32).to_le_bytes());
+    file.extend_from_slice(b"WEBP");
+    file.extend_from_slice(&body);
+
+    // The decode must refuse the over-ceiling canvas with InvalidData and
+    // return promptly (no multi-gigabyte allocation).
+    assert_eq!(
+        decode_webp(&file),
+        Err(WebpError::InvalidData),
+        "an over-ceiling §2.7.1 animation canvas must be rejected, not eagerly allocated",
+    );
+
+    // A canvas exactly at the §3.4 ceiling (16384 × 1) passes the guard and
+    // proceeds to the frame walk (where the absent ANMF yields InvalidData),
+    // confirming the bound is inclusive of the ceiling.
+    let mut vp8x_ok = vp8x.clone();
+    vp8x_ok[4..7].copy_from_slice(&[0xff, 0x3f, 0x00]); // width-minus-one = 16383 → 16384.
+    let mut body_ok = Vec::new();
+    body_ok.extend_from_slice(chunk(b"VP8X", &vp8x_ok).as_slice());
+    body_ok.extend_from_slice(chunk(b"ANIM", &anim).as_slice());
+    let mut file_ok = Vec::new();
+    file_ok.extend_from_slice(b"RIFF");
+    file_ok.extend_from_slice(&((4 + body_ok.len()) as u32).to_le_bytes());
+    file_ok.extend_from_slice(b"WEBP");
+    file_ok.extend_from_slice(&body_ok);
+    // No ANMF → the frame loop produces zero frames → InvalidData (but the
+    // canvas guard did NOT trip; the allocation of 16384 * 4 = 64 KiB is fine).
+    assert_eq!(
+        decode_webp(&file_ok),
+        Err(WebpError::InvalidData),
+        "a canvas at the §3.4 ceiling passes the alloc guard (then errors on the empty frame list)",
+    );
+}

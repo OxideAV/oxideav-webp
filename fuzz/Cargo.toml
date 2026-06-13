@@ -425,7 +425,42 @@ cargo-fuzz = true
 # seeded from the committed fixture corpus's VP8L chunk payloads, so
 # the §6.2.1 lookup-table fast path and the word-load BitReader run hot
 # inside the assembled pipeline under adversarial mutation; the
-# round-273 carrier/echo/determinism contract is asserted unchanged.
+# round-273 carrier/echo/determinism contract is asserted unchanged. The
+# twenty-ninth harness is a differential oracle on the two public
+# still-image decode entry points `decode_webp` (the published
+# `WebpImage` surface) and `decode_webp_image` (the low-level
+# `DecodedWebp` surface), seeded from the committed §2.6 lossless +
+# §2.7-extended fixture corpus so the still-image façade — the §2.3
+# container walk, the §2.7 `VP8X`-extended routing, the §2.6 lossless
+# decode, and the §2.7.1.2 `ALPH` overlay on the VP8L form — runs hot
+# through the public entry points. For a non-animated input (no §2.7.1.1
+# `ANIM` chunk) the published façade builds its single still frame by
+# literally calling `decode_webp_image`, so the harness cross-checks the
+# two surfaces agree exactly (`Ok` ⇒ `frames.len() == 1` with
+# byte-identical `frames[0].{rgba,width,height}` + canvas-dimension echo
+# + `duration_ms == 0` + no §2.7.1.1 carrier; `Err` ⇒ the published path
+# also `Err`, never a still-image failure turned success), re-checks the
+# §2.5/§2.6 flat-buffer carrier invariant (`rgba.len() == width * height
+# * 4`, non-empty iff both dimensions nonzero) on every decoded still
+# and on every composited animation frame, and asserts `decode_webp_image`
+# determinism by re-decoding the same bytes; an §2.7.1.1 `ANIM` input is
+# excluded from the pixel cross-check (the published path diverges to the
+# full-canvas compositor) but still required to return a `Result` from
+# both entry points. This harness surfaced (on its first run) and the
+# round fixed a libFuzzer OOM in `decode_webp`'s §2.7.1.1 animation path:
+# a §2.7.1 canvas up to 2^24 per side was eagerly allocated before
+# validation, so a ~60-byte 16 777 154 × 64 canvas forced a ~4 GiB `Vec`
+# — now bounded at the §3.4 still-image ceiling (`MAX_DECODE_DIMENSION =
+# 16384` per side, rejected with `InvalidData` before allocating). The
+# §2.5 `VP8 ` *lossy* decode (`decode_lossy_image` →
+# `vp8_decode::decode_lossy_rgba` → `oxideav_vp8::decode_vp8`) is
+# deliberately skipped from the decode below: a malformed lossy bitstream
+# can currently panic *inside the `oxideav-vp8` sibling* (an inverse-DCT
+# residual overflow), a DoS below this crate's boundary that a webp-only
+# commit may not fix and that cargo-fuzz's `panic = "abort"` build
+# prevents `catch_unwind` from containing — so a non-animated input
+# routing to the sibling lossy decoder is gated out pending a sibling
+# round.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -634,6 +669,13 @@ bench = false
 [[bin]]
 name = "decode_lossless_lut"
 path = "fuzz_targets/decode_lossless_lut.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_still_paths"
+path = "fuzz_targets/decode_still_paths.rs"
 test = false
 doc = false
 bench = false

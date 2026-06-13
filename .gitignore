@@ -7,3 +7,7 @@ Cargo.lock
 # cargo-fuzz writes a per-target corpus under fuzz/corpus/ on every run;
 # these are generated artifacts, not source.
 /fuzz/corpus/
+
+# cargo-fuzz writes crash / OOM / slow-unit reproducers under
+# fuzz/artifacts/ — generated, not source.
+/fuzz/artifacts/
