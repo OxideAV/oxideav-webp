@@ -61,7 +61,15 @@ pub fn decode_lossy_rgba(bitstream: &[u8]) -> Result<(u32, u32, Vec<u8>), Decode
 /// (RFC 6386 §2 leaves the up-sampling kernel to the decoder; only the
 /// 4:2:0 sub-sampling geometry is normative). The YCbCr→RGB matrix is
 /// the BT.601 full-range form RFC 6386 §9.2 cites.
-fn yuv420_to_rgba(frame: &Vp8DecodedFrame) -> Vec<u8> {
+///
+/// This is the per-pixel lossy-decode reconstruction hot loop owned by
+/// this crate (the entropy decode + inverse transform are the sibling
+/// `oxideav-vp8` decoder's; everything this crate runs after the I420
+/// picture comes back happens here). It is `pub` so the
+/// `benches/lossy_decode.rs` harness can isolate it from the sibling
+/// decode — see `BENCHMARKS.md`. Exposing it does not change decoded
+/// bytes: it is the same function `decode_lossy_rgba` calls.
+pub fn yuv420_to_rgba(frame: &Vp8DecodedFrame) -> Vec<u8> {
     let w = frame.width as usize;
     let h = frame.height as usize;
     let uv_w = w.div_ceil(2);

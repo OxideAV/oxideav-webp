@@ -39,6 +39,7 @@ the medians are still stable to a few percent.
 | `benches/canonical_codes.rs` | `canonical_codes_{dense,sparse}_{distance40,literal256,green281,green2328}` | Encoder-side §3.7.2 canonical-code-value assignment over the same four §3.7.1 prefix-code-group alphabets and the same two dense / sparse frequency regimes as `build_code_lengths`, sampling only the per-symbol code-value pass (the `build_code_lengths` call that produces the length table is outside the measured interval). Eight cells total |
 | `benches/read_symbol.rs` | `read_symbol_{short8_uniform,short6_uniform,long9_11,dense256,belowgate16_walk}` | Decoder-side §6.2.1 `PrefixCode::read_symbol` per-symbol reader — the rank-1 decode hotspot (~82% of decode self-time post-round-284). Five cells isolate the round-284 primary-table fast path (`short8` / `short6` all-table-hit), the long-code (> 8-bit) walk continuation the round-284 follow-up targets (`long9_11`, every read spills to the per-bit walk), the realistic blended literal channel (`dense256`), and the below-gate walk-only baseline (`belowgate16_walk`, no table built). Each cell packs a deterministic LCG symbol stream via the public `canonical_codes` + `BitWriter` and times 4096 back-to-back reads through a fresh `BitReader` |
 | `benches/lz77_chain.rs` | `lz77_chain_{deep_period2,deep_period4,medium_period64,shallow_unique,natural_gradient}` | §5.2.2 LZ77 hash-chain matcher (`Lz77Matcher::find` + `insert`, rank 3 in the round-283 encode profile) chain-*depth* scenarios — five 8192-pixel tiles that vary hash-chain depth from maximal (period-2/4 repeats), through moderate (period-64), to shallow (near-unique LCG / natural gradient). Driven through the public `encode_argb_literals_with_width` entry like `lz77_match`, but with depth-controlled inputs so a future chain-walk cut has A/B numbers per regime instead of one blended figure |
+| `benches/lossy_decode.rs` | `decode_webp_lossy_e2e`, `decode_lossy_rgba_extracted`, `yuv420_to_rgba_{16x16,128x128,256x256}` | §2.5 `VP8 ` (lossy) decode path **this crate owns** at three altitudes: full public `decode_webp` over the committed 128×128 `VP8 `+`ALPH` fixture; `decode_lossy_rgba` over the extracted `VP8 ` bitstream (RIFF walk removed); and the crate-owned post-I420 reconstruction loop `yuv420_to_rgba` (4:2:0 nearest-neighbour chroma up-sample + RFC 6386 §9.2 BT.601 full-range YCbCr→RGB matrix) in isolation at three sizes. The sibling `oxideav-vp8` decoder owns the entropy/IDCT/prediction/loop-filter work; this bench isolates and ranks the lossy stage the webp crate can act on |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -1738,6 +1739,80 @@ wrong lever.
 | 1 | Encoder chooser residual walk SWAR (`for_each_block_residual` + chooser closure, ~49% combined in r283) | the inherent 14-modes × per-pixel arithmetic after the r280 despecialisation | `lossless_encode_natural_128` / `lossless_encode_rgba_256`, `pick_block_cte` |
 | 2 | Encoder LZ77 **insert + miss-reject** path (not the deep-chain walk) | `lz77_chain` shows the shallow/unique regime at 6.5–7× the deep-repeat cost | `lz77_chain_{shallow_unique,natural_gradient}` vs `_deep_period2/4` |
 | — | ~~Decoder `read_symbol` 9–11-bit spill table~~ | **resolved r287**: spill table rejected (L1-thrash regression); the per-bit row lookup it would have shortcut is now O(1) via `len_to_row` | — |
+
+## Round-289 (2026-06-13): §2.5 `VP8 ` lossy decode bench + hotspot map
+
+Every prior bench round profiled the **lossless** (VP8L) decode + encode
+paths. The §2.5 `VP8 ` lossy decode path had **no isolated harness** at
+all, even though `decode_webp` routes lossy files through it. This round
+adds `benches/lossy_decode.rs` and ranks the lossy decode hot path — with
+no behavior change (all 435 lib tests + integration binaries still
+green; decoded bytes identical).
+
+### Scope: what the webp crate owns on the lossy path
+
+The §2.5 lossy bitstream's entropy decode, inverse DCT (the "VP8 lossy
+IDCT"), intra prediction, and loop filter are **owned by the sibling
+`oxideav-vp8` decoder crate**, which `oxideav-webp` calls via
+`decode_vp8`. They are therefore out of this crate's editable scope — an
+IDCT bench belongs in `oxideav-vp8`. What `oxideav-webp` itself runs on
+the lossy path is the stage *after* the reconstructed I420 key-frame
+comes back: `vp8_decode::decode_lossy_rgba` → `vp8_decode::yuv420_to_rgba`
+(4:2:0 nearest-neighbour chroma up-sample + the RFC 6386 §9.2 / RFC 9649
+§10 BT.601 full-range YCbCr→RGB matrix, evaluated once per output pixel).
+`yuv420_to_rgba` was widened from `fn` to `pub fn` (a visibility change
+only — the same function `decode_lossy_rgba` already called; no emitted
+byte changes) so the bench can isolate it from the sibling decode.
+
+### New bench: `lossy_decode`
+
+Three altitudes, on this host (`--quick`):
+
+| Cell | Median | What it isolates |
+|---|---:|---|
+| `decode_webp_lossy_e2e` | 359.2 µs | full public `decode_webp`: RIFF walk + `VP8 ` decode + `ALPH` layering + YCbCr→RGB, over the 128×128 fixture |
+| `decode_lossy_rgba_extracted` | 173.4 µs | `decode_lossy_rgba` on the extracted `VP8 ` bitstream — sibling decode + conversion, **no** RIFF/`ALPH` |
+| `yuv420_to_rgba_16x16` | 551 ns | crate-owned conversion loop, 256 px |
+| `yuv420_to_rgba_128x128` | 34.0 µs | crate-owned conversion loop at fixture size |
+| `yuv420_to_rgba_256x256` | 136.6 µs | crate-owned conversion loop, 65 536 px |
+
+### Ranked lossy-decode hotspot map
+
+Decomposing the e2e cost by subtraction (all on this host, `--quick`):
+
+| Rank | Stage | Owner | Cost (per 128×128 lossy frame) | Share of e2e |
+|---:|---|---|---:|---:|
+| 1 | Container walk + `ALPH` plane layering | webp (this crate, already split across `metadata_walk` / decode) | ≈ 359.2 − 173.4 = **185.8 µs** | ≈ 52% |
+| 2 | Sibling VP8 decode (entropy + IDCT + intra-pred + loop filter) | **`oxideav-vp8`** (out of scope) | ≈ 173.4 − 34.0 = **139.4 µs** | ≈ 39% |
+| 3 | `yuv420_to_rgba` YCbCr→RGB + chroma up-sample | webp (this crate) | **34.0 µs** | ≈ 9% |
+
+The conversion scales linearly with pixel count (551 ns → 34.0 µs →
+136.6 µs across 256 → 16 384 → 65 536 px, ~4× per area-doubling),
+confirming it is purely per-pixel-bound: a Q16 fixed-point matrix + clamp
++ a chroma index per pixel, no branch on content. It is the **only fully
+webp-owned lossy hot loop** and the cleanest A/B target for a future SIMD
+or matrix-fusion pass — the `argb_to_rgba` lossless repack got exactly
+that treatment (scalar fallback + nightly `simd`), and `yuv420_to_rgba`
+is the lossy analogue. Rank 1 (container + `ALPH`) is dominated by the
+extended-layout `ALPH` plane decode, which has its own surface; rank 2 is
+the sibling's to optimize.
+
+### Ranked next PROFILE-OPT target (post-r289, lossy path)
+
+| Rank | Target | Evidence | A/B references |
+|---:|---|---|---|
+| 1 | `yuv420_to_rgba` SIMD / matrix-fusion (lossy analogue of the `argb_to_rgba` SIMD pass) | linear per-pixel scaling, ~9% of lossy e2e and 100%-webp-owned | `yuv420_to_rgba_{16x16,128x128,256x256}` |
+| — | VP8 lossy IDCT / entropy decode (~39% of lossy e2e) | **out of scope** — owned by sibling `oxideav-vp8`; an IDCT bench belongs in that crate | — |
+
+### Round-289 verification
+
+* **Byte identity:** all 435 lib tests + integration binaries
+  (`fixture_walks`, `vp8_lossy_roundtrip`, published-API, standalone e2e)
+  pass; the `lossy-with-alpha-128x128` fixture's expected SHA-256 still
+  matches (decoded bytes unchanged). The only `src/` change is the
+  `fn` → `pub fn` visibility widening of `yuv420_to_rgba`.
+* `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
+  clean.
 
 ## Reproducing
 

@@ -167,3 +167,14 @@ harness = false
 [[bench]]
 name = "lz77_chain"
 harness = false
+
+# Round-289: the §2.5 `VP8 ` (lossy) decode path this crate owns. The
+# sibling `oxideav-vp8` decoder does the entropy/IDCT/prediction/loop-
+# filter work; this crate's lossy cost is the post-I420 reconstruction —
+# `decode_lossy_rgba` → `yuv420_to_rgba` (4:2:0 chroma up-sample + §9.2
+# BT.601 YCbCr→RGB). Three altitudes: full public `decode_webp` e2e,
+# `decode_lossy_rgba` on the extracted bitstream (no RIFF walk), and the
+# `yuv420_to_rgba` conversion loop in isolation at 16/128/256 px.
+[[bench]]
+name = "lossy_decode"
+harness = false

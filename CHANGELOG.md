@@ -21,6 +21,23 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-289 BENCH depth round: `benches/lossy_decode.rs`, the first
+  isolated harness for the §2.5 `VP8 ` (lossy) decode path. Three
+  altitudes — full public `decode_webp` over the 128×128 `VP8 `+`ALPH`
+  fixture (`decode_webp_lossy_e2e`, ≈359 µs), `decode_lossy_rgba` over
+  the extracted `VP8 ` bitstream with the RIFF walk removed
+  (`decode_lossy_rgba_extracted`, ≈173 µs), and the crate-owned
+  post-I420 reconstruction loop `yuv420_to_rgba` (4:2:0 chroma up-sample
+  + RFC 6386 §9.2 BT.601 YCbCr→RGB) in isolation at 16/128/256 px
+  (≈551 ns / 34 µs / 137 µs, linear per-pixel). The sibling
+  `oxideav-vp8` decoder owns the entropy/IDCT/intra-pred/loop-filter
+  work (≈39% of lossy e2e, out of this crate's scope); the bench isolates
+  and ranks the lossy stage `oxideav-webp` itself can act on. The ranked
+  hotspot map is in `BENCHMARKS.md` (Round-289). `vp8_decode::yuv420_to_rgba`
+  widened `fn` → `pub fn` so the bench can isolate it — a visibility
+  change only; decoded bytes are identical (all 435 lib tests + fixture
+  SHA-256s unchanged). No behavior change.
+
 - Round-288 FUZZ depth round: a twenty-ninth `cargo-fuzz` harness,
   `decode_still_paths`, a differential oracle on the two public
   still-image decode entry points `decode_webp` (the published

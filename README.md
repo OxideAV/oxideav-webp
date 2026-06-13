@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twenty-three criterion benches under `benches/`,
+The crate ships twenty-four criterion benches under `benches/`,
 grouped by domain:
 
 * **End-to-end** — `lossless_decode`, `lossless_encode`,
@@ -44,9 +44,14 @@ grouped by domain:
   §4 transform mix — predictor / color-indexing / cross-color /
   subtract-green / no-transform, the elected list asserted at
   setup), `anim_decode` (round 283: §2.7.1.1 full-timeline animation
-  decode, all-keyframe vs dirty-rect-delta `ANMF` layouts), and
+  decode, all-keyframe vs dirty-rect-delta `ANMF` layouts),
   `metadata_walk` (round 283: `extract_metadata` chunk walk at three
-  chunk-count / payload tiers).
+  chunk-count / payload tiers), and `lossy_decode` (round 289: the
+  §2.5 `VP8 ` lossy path at three altitudes — full public
+  `decode_webp`, `decode_lossy_rgba` on the extracted bitstream, and
+  the crate-owned `yuv420_to_rgba` YCbCr→RGB conversion loop in
+  isolation; the sibling `oxideav-vp8` decoder owns the
+  entropy/IDCT/loop-filter work).
 * **Decoder §4.x inverse transforms** — `inverse_predictor`
   (per-mode), `inverse_color` (per `size_bits`),
   `inverse_color_indexing` (per palette tier),
@@ -88,7 +93,16 @@ length?" through a 16-byte direct length→row side table instead of a
 linear rescan per bit — a 2.33× speedup on the worst-case
 many-distinct-length walk (`read_symbol_manylen16_walk` 86.8 → 37.2 µs),
 byte-identical, with no added cache footprint; the spill table itself
-was prototyped and rejected as an L1-thrashing regression. Numbers,
+was prototyped and rejected as an L1-thrashing regression. Round 289
+(benchmark mode, decoded bytes identical) added the `lossy_decode`
+harness — the first coverage of the §2.5 `VP8 ` lossy path — and a
+ranked lossy-decode hotspot map: of a 128×128 lossy frame's ≈359 µs
+end-to-end decode, the container walk + `ALPH` layering is ≈52%, the
+sibling `oxideav-vp8` decode (entropy + IDCT + intra-pred + loop
+filter, out of this crate's scope) ≈39%, and the crate-owned
+`yuv420_to_rgba` YCbCr→RGB conversion ≈9% — the latter purely
+per-pixel-bound and the cleanest A/B target for a future SIMD pass (the
+lossy analogue of the `argb_to_rgba` SIMD treatment). Numbers,
 profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
