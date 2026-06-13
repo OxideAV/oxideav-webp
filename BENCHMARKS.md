@@ -1815,6 +1815,99 @@ the sibling's to optimize.
 * `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
   clean.
 
+## Round-293 (2026-06-14): §2.7.1.2 `ALPH` inverse-filter border-rule hoist (rank-1 lossy/alpha opt)
+
+PROFILE-OPT depth round acting on the round-291 rank-1 candidate: the
+§2.7.1.2 Stage-2 inverse-filter loop. The round-291 map flagged it for the
+same per-method border-rule hoist the lossless §3.5.2 inverse predictor
+received in r180. **No output change** — the reconstructed alpha plane is
+byte-for-byte identical for every filter method and dimension.
+
+### The hot loop before
+
+The Stage-2 loop reconstructed `alpha = (predictor + residual) % 256`
+pixel-by-pixel, and on **every** pixel evaluated two nested constant
+dispatches plus a closure index:
+
+* `match (x, y)` to special-case the top-left, then
+* `match header.filtering` (the per-method predictor), with an inner
+  `if x == 0` / `if y == 0` edge test, and
+* an `idx = |x, y| y * w + x` closure call for each of up to four
+  neighbour loads.
+
+The filter method and the plane geometry are loop-invariant, so all of
+that dispatch is re-decided 16 384 times for a 128×128 plane while the
+answer never changes mid-loop.
+
+### The optimization
+
+`decode_alpha`'s Stage 2 now calls a new private `inverse_filter(filtered,
+w, h, filtering)` that dispatches on `filtering` **once** and runs a
+specialised body per method:
+
+* **None** — predictor is 0 everywhere, so the reconstruction is the
+  identity `out = filtered`; the function returns the residual buffer with
+  no allocation and no per-pixel loop at all.
+* **Horizontal / Vertical / Gradient** — a one-shot border pass writes the
+  top-left (`out[0] = filtered[0]`), the first row, and (H/G) the
+  left-most column using their single in-bounds neighbour, then a tight
+  interior loop over `y in 1..h`, `x in 1..w` does only the steady-state
+  predictor. Neighbour addresses are precomputed row bases (`row = y*w`,
+  `above = row - w`) and direct index arithmetic — no `(x, y)` match, no
+  per-pixel filter dispatch, no closure.
+
+The per-pixel arithmetic (`(predictor + residual) & 0xff`, and Gradient's
+`clip(A + B − C)`) is unchanged, so the emitted bytes are identical by
+construction; a new oracle test re-derives the answer with the exact
+round-291 per-pixel `match` form and asserts equality.
+
+### Before/after (this host, `--quick`, median)
+
+| Cell | r291 (before) | r293 (after) | Δ |
+|---|---:|---:|---:|
+| `inverse_filter_none_128x128` | 9.5 µs | 0.23 µs | **−97%** |
+| `inverse_filter_vertical_128x128` | 13.5 µs | 1.57 µs | **−88%** |
+| `inverse_filter_horizontal_128x128` | 21.8 µs | 22.6 µs | no sig. change (p > 0.05) |
+| `inverse_filter_gradient_128x128` | 43.7 µs | 42.9 µs | no sig. change (p > 0.05) |
+
+`None` (the committed fixture's actual filter) collapses to a buffer move:
+~9 µs cut on every lossy-with-alpha still the path decodes. `Vertical`
+reads the row directly above, so its interior loop carries no intra-row
+dependency and the compiler auto-vectorises it once the per-pixel dispatch
+is gone — an 8.6× win. `Horizontal` and `Gradient` are statistically flat:
+each pixel's predictor reads the *immediately preceding* output (`out[i-1]`
+for Horizontal; `out[i-1]` via the `A` term for Gradient), a serial
+recurrence the dispatch hoist can't break and the optimiser can't
+vectorise — confirming the round-291 reading that their cost is the data
+dependency, not the dispatch. The hoist is still correct to land for them
+(it removes the redundant per-pixel branch with no regression) and is what
+makes the `None`/`Vertical` wins possible from one code path.
+
+### Round-293 verification
+
+* **Byte identity:** a new oracle test,
+  `hoisted_inverse_filter_matches_per_pixel_reference_across_methods_and_dims`,
+  re-implements the round-291 per-pixel `match (x, y)` / `match filtering`
+  loop verbatim as a reference and asserts the hoisted `inverse_filter`
+  equals it across 9 dimension shapes (1×1, 1×7, 7×1, 2×2, 3×5, 5×3,
+  16×16, 13×17, 128×128) × all four `F` methods on an LCG residual. All
+  439 lib tests (438 prior + this oracle) + every integration binary pass.
+  `cargo fuzz run decode_alph` (400 K runs) and `decode_still_paths`
+  (corpus-driven differential) found no crash or divergence.
+* **Scope:** the only `src/` change is `src/alph.rs` (Stage 2 extracted
+  into `inverse_filter` + the oracle test). No bench-file change — the
+  round-291 `alpha_decode` cells are the A/B harness.
+* `cargo fmt --check` + `cargo clippy -p oxideav-webp --all-targets
+  --no-deps -D warnings` clean.
+
+### Ranked next PROFILE-OPT target (post-r293)
+
+| Rank | Target | Evidence | A/B references |
+|---:|---|---|---|
+| 1 | Encoder chooser residual walk SWAR (`for_each_block_residual` + chooser closure, ~49% combined in r283) | the inherent 14-modes × per-pixel arithmetic after the r280 despecialisation | `lossless_encode_natural_128` / `lossless_encode_rgba_256`, `pick_block_cte` |
+| 2 | Encoder LZ77 **insert + miss-reject** path (not the deep-chain walk) | `lz77_chain` shows the shallow/unique regime at 6.5–7× the deep-repeat cost | `lz77_chain_{shallow_unique,natural_gradient}` vs `_deep_period2/4` |
+| — | ~~§2.7.1.2 inverse-filter border-rule hoist~~ | **resolved r293**: None −97%, Vertical −88%; Horizontal/Gradient bound by their left-neighbour serial recurrence (not the dispatch), flat as expected | `inverse_filter_{none,vertical}_128x128` |
+
 ## Round-291 (2026-06-14): §2.7.1.2 `ALPH` alpha-plane decode bench + refined lossy hotspot map
 
 BENCH depth round. The round-289 `lossy_decode` hotspot map attributed

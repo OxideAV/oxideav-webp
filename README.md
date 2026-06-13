@@ -124,7 +124,18 @@ cost is almost entirely the headerless VP8L lossless decode inside
 while the genuinely alpha-specific §2.7.1.2 inverse-filter loop ranks
 Gradient (43.7 µs) > Horizontal (21.8 µs) > Vertical (13.5 µs) > None
 (9.5 µs) at 128×128 — flagging a per-method border-rule hoist (the r180
-`inverse_predictor` treatment) as the next PROFILE-OPT target. Numbers,
+`inverse_predictor` treatment) as the next PROFILE-OPT target. Round 293
+acted on that candidate: the §2.7.1.2 Stage-2 inverse filter now dispatches
+on `F` once and splits each method into a one-shot border pass (top-left /
+first-row / first-column) plus a tight interior loop, instead of
+re-evaluating a `match (x, y)` + `match filtering` on every pixel. `None`
+becomes a plain identity move (no per-pixel work) and drops 9.5 µs → 0.23 µs
+(−97%); `Vertical` — whose predictor reads the row above, so the interior
+loop vectorises — drops 13.5 µs → 1.57 µs (−88%); `Horizontal` / `Gradient`
+are flat (their left-neighbour serial dependency, not the dispatch, was the
+bound). Byte-for-byte identical — proven by a new per-pixel oracle test
+across 9 dimension/method combinations and by 400 K `decode_alph` fuzz runs
+with no divergence. Numbers,
 profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run

@@ -4,6 +4,32 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Performance
+
+- Round-293 PROFILE-OPT depth round: hoisted the §2.7.1.2 `ALPH`
+  Stage-2 inverse-filter border rules out of the per-pixel loop. The
+  loop previously re-evaluated a `match (x, y)` top-left special case
+  plus a `match` on the (loop-invariant) filter method, with an inner
+  edge test and an index closure, on every one of the `width × height`
+  pixels. `decode_alpha`'s Stage 2 now calls a new private
+  `inverse_filter` that dispatches on the filter method **once** and
+  runs a specialised body per method: a one-shot border pass (top-left,
+  first row, and — for Horizontal/Gradient — left-most column) followed
+  by a tight interior loop with precomputed row-base indices. The
+  `None` method becomes a plain identity buffer move. On this host
+  (`aarch64-apple-darwin`, `--quick`): `inverse_filter_none_128x128`
+  9.5 µs → 0.23 µs (−97%), `inverse_filter_vertical_128x128`
+  13.5 µs → 1.57 µs (−88%, the row-above predictor auto-vectorises once
+  the dispatch is gone); `Horizontal` and `Gradient` are flat (their
+  left-neighbour serial recurrence, not the dispatch, is the bound).
+  **Decoded alpha planes are byte-for-byte unchanged for every filter
+  method and dimension** — proven by a new oracle test
+  (`hoisted_inverse_filter_matches_per_pixel_reference_across_methods_and_dims`,
+  the round-291 per-pixel form as reference, over 9 dimension shapes ×
+  4 methods) and by 400 K `decode_alph` fuzz runs plus the
+  `decode_still_paths` differential, no divergence. See `BENCHMARKS.md`
+  "Round-293".
+
 ### Fixed
 
 - Round-292 FUZZ depth round: a malformed §2.6 `VP8L` lossless chunk

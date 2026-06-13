@@ -339,61 +339,97 @@ pub fn decode_alpha(payload: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
     // Stage 2 — inverse filter into the final plane.
     let w = width as usize;
     let h = height as usize;
-    let mut out = vec![0u8; count];
 
-    // §2.7.1.2: alpha = (predictor + X) % 256. Indexing helpers below use
-    // the already-reconstructed `out` plane for the A / B / C neighbours.
-    let idx = |x: usize, y: usize| y * w + x;
+    Ok(inverse_filter(filtered, w, h, header.filtering))
+}
 
-    for y in 0..h {
-        for x in 0..w {
-            let xv = filtered[idx(x, y)] as i32;
+/// §2.7.1.2 Stage-2 inverse filter: reconstruct the alpha plane from the
+/// de-compressed residual `filtered` (length `w * h`, scan order) under
+/// the given §2.7.1.2 filtering method.
+///
+/// `alpha = (predictor + residual) % 256`, where the predictor reads the
+/// already-reconstructed `out` plane for the A = left / B = above /
+/// C = above-left neighbours (RFC 9649 §2.7.1.2 Figure 11). The
+/// per-method §2.7.1.2 edge cases — `(0,0)` always predicts 0; the first
+/// column and first row each fall back to the single in-bounds neighbour
+/// — are evaluated **once outside the interior loop** (one specialised
+/// border pass + one branch-free interior loop per method) rather than
+/// re-tested on every pixel. This is the same border-rule hoist the
+/// lossless §3.5.2 inverse predictor received; it does not change a
+/// single emitted byte (the per-pixel arithmetic is bit-for-bit the prior
+/// `match (x, y)` / `match filtering` form, just with the constant
+/// dispatch lifted out of the hot loop).
+fn inverse_filter(filtered: Vec<u8>, w: usize, h: usize, filtering: AlphFiltering) -> Vec<u8> {
+    // §2.7.1.2 method 0 (None): predictor = 0 for every pixel, so the
+    // reconstruction is the identity `out = filtered`. No border special
+    // case is needed — `(0,0)` already predicts 0 under None.
+    if filtering == AlphFiltering::None {
+        return filtered;
+    }
 
-            // §2.7.1.2 Figure 11 neighbours over the *reconstructed*
-            // plane: A = left, B = above, C = above-left.
-            let predictor: i32 = match (x, y) {
-                // Top-left always predicts 0, for every filter method.
-                (0, 0) => 0,
-                _ => match header.filtering {
-                    AlphFiltering::None => 0,
-                    AlphFiltering::Horizontal => {
-                        if x == 0 {
-                            // Left-most (0, y>0): predicted by (0, y-1).
-                            out[idx(0, y - 1)] as i32
-                        } else {
-                            out[idx(x - 1, y)] as i32
-                        }
-                    }
-                    AlphFiltering::Vertical => {
-                        if y == 0 {
-                            // Top-most (x>0, 0): predicted by (x-1, 0).
-                            out[idx(x - 1, 0)] as i32
-                        } else {
-                            out[idx(x, y - 1)] as i32
-                        }
-                    }
-                    AlphFiltering::Gradient => {
-                        if x == 0 {
-                            // Left-most (0, y>0): predicted by (0, y-1).
-                            out[idx(0, y - 1)] as i32
-                        } else if y == 0 {
-                            // Top-most (x>0, 0): predicted by (x-1, 0).
-                            out[idx(x - 1, 0)] as i32
-                        } else {
-                            let a = out[idx(x - 1, y)] as i32;
-                            let b = out[idx(x, y - 1)] as i32;
-                            let c = out[idx(x - 1, y - 1)] as i32;
-                            clip(a + b - c) as i32
-                        }
-                    }
-                },
-            };
+    let mut out = vec![0u8; w * h];
 
-            out[idx(x, y)] = ((predictor + xv) & 0xff) as u8;
+    // (0,0) always predicts 0, for every filter method.
+    out[0] = filtered[0];
+
+    match filtering {
+        AlphFiltering::None => unreachable!("handled above"),
+        AlphFiltering::Horizontal => {
+            // First row (x>0, y=0): predictor = A = left = out[x-1].
+            for x in 1..w {
+                out[x] = ((out[x - 1] as i32 + filtered[x] as i32) & 0xff) as u8;
+            }
+            for y in 1..h {
+                let row = y * w;
+                let above = row - w;
+                // Left-most (0, y>0): predicted by (0, y-1) = out[above].
+                out[row] = ((out[above] as i32 + filtered[row] as i32) & 0xff) as u8;
+                // Interior (x>0, y>0): predictor = A = left = out[row+x-1].
+                for x in 1..w {
+                    let i = row + x;
+                    out[i] = ((out[i - 1] as i32 + filtered[i] as i32) & 0xff) as u8;
+                }
+            }
+        }
+        AlphFiltering::Vertical => {
+            // First row (x>0, y=0): predictor = (x-1, 0) = out[x-1].
+            for x in 1..w {
+                out[x] = ((out[x - 1] as i32 + filtered[x] as i32) & 0xff) as u8;
+            }
+            // Interior + left-most (any x, y>0): predictor = B = above.
+            for y in 1..h {
+                let row = y * w;
+                let above = row - w;
+                for x in 0..w {
+                    let i = row + x;
+                    out[i] = ((out[above + x] as i32 + filtered[i] as i32) & 0xff) as u8;
+                }
+            }
+        }
+        AlphFiltering::Gradient => {
+            // First row (x>0, y=0): predictor = (x-1, 0) = out[x-1].
+            for x in 1..w {
+                out[x] = ((out[x - 1] as i32 + filtered[x] as i32) & 0xff) as u8;
+            }
+            for y in 1..h {
+                let row = y * w;
+                let above = row - w;
+                // Left-most (0, y>0): predicted by (0, y-1) = out[above].
+                out[row] = ((out[above] as i32 + filtered[row] as i32) & 0xff) as u8;
+                // Interior (x>0, y>0): predictor = clip(A + B − C).
+                for x in 1..w {
+                    let i = row + x;
+                    let a = out[i - 1] as i32;
+                    let b = out[above + x] as i32;
+                    let c = out[above + x - 1] as i32;
+                    let pred = clip(a + b - c) as i32;
+                    out[i] = ((pred + filtered[i] as i32) & 0xff) as u8;
+                }
+            }
         }
     }
 
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -662,5 +698,89 @@ mod tests {
     #[test]
     fn decode_empty_payload_is_rejected() {
         assert_eq!(decode_alpha(&[], 1, 1), Err(AlphError::EmptyPayload));
+    }
+
+    /// Straight per-pixel transcription of the §2.7.1.2 inverse filter as
+    /// the round-291 `match (x, y)` / `match filtering` form read, kept
+    /// here as the byte-identity oracle for the round-293 border-rule
+    /// hoist. If the hoisted [`inverse_filter`] ever diverges from this
+    /// reference on any plane / method, the test below fails.
+    fn inverse_filter_reference(filtered: &[u8], w: usize, h: usize, f: AlphFiltering) -> Vec<u8> {
+        let mut out = vec![0u8; w * h];
+        let idx = |x: usize, y: usize| y * w + x;
+        for y in 0..h {
+            for x in 0..w {
+                let xv = filtered[idx(x, y)] as i32;
+                let predictor: i32 = match (x, y) {
+                    (0, 0) => 0,
+                    _ => match f {
+                        AlphFiltering::None => 0,
+                        AlphFiltering::Horizontal => {
+                            if x == 0 {
+                                out[idx(0, y - 1)] as i32
+                            } else {
+                                out[idx(x - 1, y)] as i32
+                            }
+                        }
+                        AlphFiltering::Vertical => {
+                            if y == 0 {
+                                out[idx(x - 1, 0)] as i32
+                            } else {
+                                out[idx(x, y - 1)] as i32
+                            }
+                        }
+                        AlphFiltering::Gradient => {
+                            if x == 0 {
+                                out[idx(0, y - 1)] as i32
+                            } else if y == 0 {
+                                out[idx(x - 1, 0)] as i32
+                            } else {
+                                let a = out[idx(x - 1, y)] as i32;
+                                let b = out[idx(x, y - 1)] as i32;
+                                let c = out[idx(x - 1, y - 1)] as i32;
+                                clip(a + b - c) as i32
+                            }
+                        }
+                    },
+                };
+                out[idx(x, y)] = ((predictor + xv) & 0xff) as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hoisted_inverse_filter_matches_per_pixel_reference_across_methods_and_dims() {
+        // Deterministic LCG residual so the predictor sees a spread of
+        // neighbour values across every dimension/method combination; the
+        // hoisted Stage-2 loop must equal the per-pixel reference exactly.
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        for &(w, h) in &[
+            (1usize, 1usize),
+            (1, 7),
+            (7, 1),
+            (2, 2),
+            (3, 5),
+            (5, 3),
+            (16, 16),
+            (13, 17),
+            (128, 128),
+        ] {
+            let residual: Vec<u8> = (0..w * h).map(|_| next()).collect();
+            for f in [
+                AlphFiltering::None,
+                AlphFiltering::Horizontal,
+                AlphFiltering::Vertical,
+                AlphFiltering::Gradient,
+            ] {
+                let got = inverse_filter(residual.clone(), w, h, f);
+                let want = inverse_filter_reference(&residual, w, h, f);
+                assert_eq!(got, want, "mismatch at {w}x{h} method {f:?}");
+            }
+        }
     }
 }
