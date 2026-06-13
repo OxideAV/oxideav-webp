@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twenty-four criterion benches under `benches/`,
+The crate ships twenty-five criterion benches under `benches/`,
 grouped by domain:
 
 * **End-to-end** — `lossless_decode`, `lossless_encode`,
@@ -51,7 +51,11 @@ grouped by domain:
   `decode_webp`, `decode_lossy_rgba` on the extracted bitstream, and
   the crate-owned `yuv420_to_rgba` YCbCr→RGB conversion loop in
   isolation; the sibling `oxideav-vp8` decoder owns the
-  entropy/IDCT/loop-filter work).
+  entropy/IDCT/loop-filter work), and `alpha_decode` (round 291: the
+  §2.7.1.2 `ALPH` alpha-plane decode — the rank-1 webp-owned lossy
+  cost — at three altitudes: public `decode_alpha_plane` e2e,
+  `alph::decode_alpha` on the extracted payload, and the Stage-2
+  inverse-filter per-pixel loop in isolation, one cell per `F` method).
 * **Decoder §4.x inverse transforms** — `inverse_predictor`
   (per-mode), `inverse_color` (per `size_bits`),
   `inverse_color_indexing` (per palette tier),
@@ -110,7 +114,17 @@ once per column and reused, and the output is written through pre-sized
 per-row slices instead of per-pixel `Vec::push`. The conversion drops from
 ≈34 µs to ≈10.5 µs at fixture size (−68%; −72% at 256×256), byte-for-byte
 identical — proven by a per-pixel oracle test across 9 even/odd dimensions
-and by `cargo fuzz` (decode_still_paths + decode, no divergence). Numbers,
+and by `cargo fuzz` (decode_still_paths + decode, no divergence). Round 291
+(benchmark mode, no `src/` change) added the `alpha_decode` harness over
+the §2.7.1.2 `ALPH` decode — the rank-1 webp-owned lossy cost the round-289
+map had sized only by subtraction — and refined that map: a direct
+measurement shows the container walk is ≈1 µs (negligible) and the rank-1
+cost is almost entirely the headerless VP8L lossless decode inside
+`decode_alpha` (already covered by `read_symbol` / `lossless_decode*`),
+while the genuinely alpha-specific §2.7.1.2 inverse-filter loop ranks
+Gradient (43.7 µs) > Horizontal (21.8 µs) > Vertical (13.5 µs) > None
+(9.5 µs) at 128×128 — flagging a per-method border-rule hoist (the r180
+`inverse_predictor` treatment) as the next PROFILE-OPT target. Numbers,
 profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run

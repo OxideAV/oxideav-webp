@@ -40,6 +40,7 @@ the medians are still stable to a few percent.
 | `benches/read_symbol.rs` | `read_symbol_{short8_uniform,short6_uniform,long9_11,dense256,belowgate16_walk}` | Decoder-side §6.2.1 `PrefixCode::read_symbol` per-symbol reader — the rank-1 decode hotspot (~82% of decode self-time post-round-284). Five cells isolate the round-284 primary-table fast path (`short8` / `short6` all-table-hit), the long-code (> 8-bit) walk continuation the round-284 follow-up targets (`long9_11`, every read spills to the per-bit walk), the realistic blended literal channel (`dense256`), and the below-gate walk-only baseline (`belowgate16_walk`, no table built). Each cell packs a deterministic LCG symbol stream via the public `canonical_codes` + `BitWriter` and times 4096 back-to-back reads through a fresh `BitReader` |
 | `benches/lz77_chain.rs` | `lz77_chain_{deep_period2,deep_period4,medium_period64,shallow_unique,natural_gradient}` | §5.2.2 LZ77 hash-chain matcher (`Lz77Matcher::find` + `insert`, rank 3 in the round-283 encode profile) chain-*depth* scenarios — five 8192-pixel tiles that vary hash-chain depth from maximal (period-2/4 repeats), through moderate (period-64), to shallow (near-unique LCG / natural gradient). Driven through the public `encode_argb_literals_with_width` entry like `lz77_match`, but with depth-controlled inputs so a future chain-walk cut has A/B numbers per regime instead of one blended figure |
 | `benches/lossy_decode.rs` | `decode_webp_lossy_e2e`, `decode_lossy_rgba_extracted`, `yuv420_to_rgba_{16x16,128x128,256x256}` | §2.5 `VP8 ` (lossy) decode path **this crate owns** at three altitudes: full public `decode_webp` over the committed 128×128 `VP8 `+`ALPH` fixture; `decode_lossy_rgba` over the extracted `VP8 ` bitstream (RIFF walk removed); and the crate-owned post-I420 reconstruction loop `yuv420_to_rgba` (4:2:0 nearest-neighbour chroma up-sample + RFC 6386 §9.2 BT.601 full-range YCbCr→RGB matrix) in isolation at three sizes. The sibling `oxideav-vp8` decoder owns the entropy/IDCT/prediction/loop-filter work; this bench isolates and ranks the lossy stage the webp crate can act on |
+| `benches/alpha_decode.rs` | `decode_alpha_plane_e2e`, `decode_alpha_lossless_extracted`, `inverse_filter_{none,horizontal,vertical,gradient}_128x128` | §2.7.1.2 `ALPH` alpha-plane decode — the rank-1 webp-owned cost on the lossy path (≈52% of lossy e2e in the round-289 map, previously sized only by subtraction). Public `decode_alpha_plane` e2e over the committed fixture; `alph::decode_alpha` on the extracted `ALPH` payload (RIFF walk removed); and the §2.7.1.2 Stage-2 inverse-filter per-pixel loop in isolation, one cell per `F` method via synthetic uncompressed payloads. Splits the r289 rank-1 bucket: container walk ≈1 µs, the rest is the headerless VP8L lossless decode (already covered by `read_symbol` / `lossless_decode*`) |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -1813,6 +1814,96 @@ the sibling's to optimize.
   `fn` → `pub fn` visibility widening of `yuv420_to_rgba`.
 * `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
   clean.
+
+## Round-291 (2026-06-14): §2.7.1.2 `ALPH` alpha-plane decode bench + refined lossy hotspot map
+
+BENCH depth round. The round-289 `lossy_decode` hotspot map attributed
+≈52% of the lossy end-to-end cost (≈185.8 µs of the 359.2 µs e2e fixture
+decode) to "container walk + `ALPH` plane layering" — but that figure was
+obtained purely by **subtraction** (`decode_webp_lossy_e2e` −
+`decode_lossy_rgba_extracted`), with no direct instrument on the `ALPH`
+decode at all. This round adds `benches/alpha_decode.rs`, which times the
+rank-1 webp-owned alpha stage directly and decomposes it. **No behavior
+change** — no `src/` edit; all 436 lib tests still green; decoded bytes
+identical (the only diff is the new bench file + its `Cargo.toml`
+registration).
+
+### What the `ALPH` decode owns (§2.7.1.2)
+
+`alph::decode_alpha` runs two stages:
+
+1. **De-compression** (`C` field). Method 0 (`None`) copies the raw
+   bytes; method 1 (`Lossless`) decodes a headerless §3 VP8L image stream
+   and lifts the alpha out of each pixel's green channel. The committed
+   fixture's `ALPH` is `Lossless`/`None`-filter, decoding to a 16 384-byte
+   (128×128) plane.
+2. **Inverse filtering** (`F` field). A per-pixel predictor
+   (none / horizontal / vertical / gradient `clip(A+B−C)`) added mod-256
+   over the *reconstructed* plane, with §2.7.1.2 left-most / top-most edge
+   cases — the fully crate-owned per-pixel loop.
+
+### New bench: `alpha_decode`
+
+Five cells, on this host (`aarch64-apple-darwin`, `--quick`, median):
+
+| Cell | Median | What it isolates |
+|---|---:|---|
+| `decode_alpha_plane_e2e` | 171.8 µs | public `decode_alpha_plane`: RIFF walk + dimension resolve + the fixture's real `Lossless` `ALPH` decode |
+| `decode_alpha_lossless_extracted` | 170.9 µs | `alph::decode_alpha` on the extracted `ALPH` payload — RIFF walk removed |
+| `inverse_filter_none_128x128` | 9.5 µs | §2.7.1.2 Stage-2 loop, `F = None` (memcpy + predictor-0), synthetic uncompressed payload |
+| `inverse_filter_horizontal_128x128` | 21.8 µs | Stage-2 loop, `F = Horizontal` (left neighbour) |
+| `inverse_filter_vertical_128x128` | 13.5 µs | Stage-2 loop, `F = Vertical` (above neighbour) |
+| `inverse_filter_gradient_128x128` | 43.7 µs | Stage-2 loop, `F = Gradient` (`clip(A+B−C)`, deepest branch) |
+
+### Refined lossy-decode hotspot map (corrects the r289 subtraction estimate)
+
+The two direct measurements above let us split the r289 rank-1 bucket:
+
+| Sub-stage of the r289 "container + `ALPH`" bucket | Direct cost (128×128 fixture) | Evidence |
+|---|---:|---|
+| RIFF walk + dimension resolution | ≈ 171.8 − 170.9 = **≈ 1 µs** | e2e − extracted |
+| `ALPH` decode (headerless VP8L de-compress + green lift + inverse filter) | **≈ 170.9 µs** | `decode_alpha_lossless_extracted` |
+
+The container walk the r289 map lumped into rank 1 is **negligible**
+(~1 µs); the rank-1 cost is **almost entirely the headerless VP8L
+lossless decode** inside `decode_alpha` (the fixture's `ALPH` is
+`Lossless`-compressed). That decode is the same §3/§6.2.1 machinery the
+`lossless_decode*` / `read_symbol` / `prefix_from_code_lengths` benches
+already cover — the rank-1 lossy webp-owned cost is therefore *not* a new,
+unbenched loop but the **VP8L lossless decoder applied to the alpha
+plane**, which the r284/r287 `read_symbol` optimizations already speed up.
+
+The §2.7.1.2 **inverse-filter** loop (Stage 2) is the one genuinely
+alpha-specific crate-owned loop. Its cost ranks by filter method:
+
+| Rank | `F` method | Median (128×128) | Relative to `None` |
+|---:|---|---:|---:|
+| 1 | Gradient (`clip(A+B−C)`) | 43.7 µs | 4.6× |
+| 2 | Horizontal (left) | 21.8 µs | 2.3× |
+| 3 | Vertical (above) | 13.5 µs | 1.4× |
+| 4 | None (predictor 0) | 9.5 µs | 1.0× (memcpy floor) |
+
+The `None` cell is the de-compression-copy + allocation floor; the deltas
+above it are the per-pixel predictor walk. Gradient's 4.6× over the floor
+is the per-pixel `(x, y)` match dispatch plus three neighbour loads and
+the `clip(A+B−C)` arithmetic evaluated in the innermost loop body.
+
+### Ranked next PROFILE-OPT target (post-r291, lossy/alpha path)
+
+| Rank | Target | Evidence | A/B references |
+|---:|---|---|---|
+| 1 | §2.7.1.2 inverse-filter loop: hoist the per-pixel `match (x, y)` + per-method dispatch out of the inner loop (split first-row / first-column / interior, one specialised loop per `F`) — the lossless `inverse_predictor` got exactly this border-rule hoist in r180 | gradient at 4.6× the memcpy floor; the dispatch + edge-case match is re-evaluated every pixel | `inverse_filter_{none,horizontal,vertical,gradient}_128x128` |
+| — | `ALPH` `Lossless` de-compression (≈ the whole `decode_alpha_lossless_extracted` cost) | **already covered** — it is the VP8L lossless decoder (`read_symbol` / `lossless_decode*`), optimized in r284/r287; not alpha-specific | `decode_alpha_lossless_extracted`, `read_symbol`, `lossless_decode_mixes` |
+
+### Round-291 verification
+
+* **Byte identity:** no `src/` change — bench-only round (new
+  `benches/alpha_decode.rs` + its `[[bench]]` stanza). All 436 lib tests
+  pass; the `alpha_decode` bench's per-cell sanity assertions confirm the
+  fixture's alpha plane and the synthetic uncompressed payloads decode to
+  the expected `128 × 128` plane before timing.
+* `cargo fmt --check` + `cargo clippy -p oxideav-webp --all-targets
+  --no-deps -D warnings` clean.
 
 ## Round-290 (2026-06-13): `yuv420_to_rgba` chroma-pair hoist (rank-1 lossy opt)
 

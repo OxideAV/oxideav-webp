@@ -6,6 +6,22 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- Round-291 BENCH depth round: added `benches/alpha_decode.rs`, a
+  criterion harness over the §2.7.1.2 `ALPH` alpha-plane decode — the
+  rank-1 webp-owned cost on the lossy decode path, previously sized only
+  by subtraction in the round-289 hotspot map. Five cells: the public
+  `decode_alpha_plane` e2e over the committed fixture, `alph::decode_alpha`
+  on the extracted `ALPH` payload (RIFF walk removed), and the §2.7.1.2
+  Stage-2 inverse-filter per-pixel loop in isolation, one cell per `F`
+  method (synthetic uncompressed payloads). The measurements correct the
+  r289 estimate: the container walk is ≈1 µs (negligible), and the rank-1
+  cost is almost entirely the headerless VP8L lossless decode inside
+  `decode_alpha` (already covered by `read_symbol` / `lossless_decode*`).
+  The genuinely alpha-specific inverse-filter loop ranks Gradient (43.7 µs)
+  > Horizontal (21.8 µs) > Vertical (13.5 µs) > None (9.5 µs) at 128×128.
+  **No `src/` change — bench-only; decoded bytes are unchanged.** See
+  `BENCHMARKS.md` round-291.
+
 - Round-290 PROFILE-OPT depth round: `vp8_decode::yuv420_to_rgba` (the
   §2.5 lossy decode's crate-owned 4:2:0 chroma up-sample + RFC 6386 §9.2
   BT.601 YCbCr→RGB loop, ranked rank-1 webp-owned lossy hot path in r289)

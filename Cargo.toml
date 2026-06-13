@@ -168,6 +168,17 @@ harness = false
 name = "lz77_chain"
 harness = false
 
+# Round-291: the §2.7.1.2 `ALPH` (alpha-plane) decode path — the rank-1
+# webp-owned cost on the lossy decode path (≈52% of lossy e2e in the
+# round-289 map, previously sized only by subtraction). Three altitudes:
+# public `decode_alpha_plane` e2e over the committed fixture, `decode_alpha`
+# on the extracted `ALPH` payload (RIFF walk removed), and the §2.7.1.2
+# Stage-2 inverse-filter loop in isolation per filter method (synthetic
+# uncompressed payloads).
+[[bench]]
+name = "alpha_decode"
+harness = false
+
 # Round-289: the §2.5 `VP8 ` (lossy) decode path this crate owns. The
 # sibling `oxideav-vp8` decoder does the entropy/IDCT/prediction/loop-
 # filter work; this crate's lossy cost is the post-I420 reconstruction —
