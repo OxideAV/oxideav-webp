@@ -215,7 +215,28 @@ pub struct PrefixCode {
     /// codes below the `MIN_LOOKUP_USED` amortization gate (which
     /// decode through the per-bit walk, as before the table existed).
     lookup: Vec<u32>,
+    /// Direct length → [`length_rows`](Self::length_rows) index, sized
+    /// `MAX_CODE_LENGTH + 1` and seeded with [`NO_ROW`] for lengths that
+    /// carry no symbol. The per-bit walk
+    /// ([`read_symbol_walk`](Self::read_symbol_walk) /
+    /// [`read_symbol_long`](Self::read_symbol_long)) tests, at every bit,
+    /// whether a row exists at the current length; the pre-index code
+    /// did this with a linear `length_rows.iter().find(..)` scan on every
+    /// iteration, so a code with many distinct lengths re-scanned the row
+    /// vector once per consumed bit. This 16-byte side table turns that
+    /// inner test into one indexed load — and unlike a wider decode
+    /// table it adds no cache footprint (it shares a line or two with the
+    /// already-hot `PrefixCode` header), so it speeds the long-code path
+    /// without slowing the dense short-code path. Empty for the
+    /// single-leaf-node tree.
+    len_to_row: Vec<u8>,
 }
+
+/// [`PrefixCode::len_to_row`] sentinel: no row carries a symbol at this
+/// code length. `NUM_CODE_LENGTH_CODES`-independent; chosen as `u8::MAX`
+/// because a code has at most `MAX_CODE_LENGTH` (15) distinct lengths, so
+/// every real row index is `< 15` and never collides with the sentinel.
+const NO_ROW: u8 = u8::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LengthRow {
@@ -276,6 +297,7 @@ impl PrefixCode {
                 sorted_symbols: vec![sym],
                 single_symbol: Some(sym),
                 lookup: Vec::new(),
+                len_to_row: Vec::new(),
             });
         }
 
@@ -310,12 +332,16 @@ impl PrefixCode {
         // full table once per used length.)
         let mut length_rows: Vec<LengthRow> = Vec::new();
         let mut cursor = [0usize; MAX_CODE_LENGTH + 1];
+        // Direct length → row-index side table: the per-bit walk consults
+        // it once per bit instead of linearly scanning `length_rows`.
+        let mut len_to_row = vec![NO_ROW; MAX_CODE_LENGTH + 1];
         let mut first_symbol_index = 0usize;
         for len in 1..=MAX_CODE_LENGTH {
             if bl_count[len] == 0 {
                 continue;
             }
             cursor[len] = first_symbol_index;
+            len_to_row[len] = length_rows.len() as u8;
             length_rows.push(LengthRow {
                 length: len as u8,
                 first_code: next_code[len],
@@ -377,6 +403,7 @@ impl PrefixCode {
             sorted_symbols,
             single_symbol: None,
             lookup,
+            len_to_row,
         })
     }
 
@@ -454,8 +481,11 @@ impl PrefixCode {
             // the freshly read bit to the low end.
             code = (code << 1) | reader.read_bits(1)?;
             // Is there a row at this length whose code range contains
-            // `code`?
-            if let Some(row) = self.length_rows.iter().find(|r| r.length as usize == len) {
+            // `code`? `len_to_row` answers in one indexed load instead of
+            // a linear scan of `length_rows`.
+            let ri = self.len_to_row[len];
+            if ri != NO_ROW {
+                let row = &self.length_rows[ri as usize];
                 let offset = code.wrapping_sub(row.first_code);
                 if (offset as usize) < row.count {
                     return Ok(self.sorted_symbols[row.first_symbol_index + offset as usize]);
@@ -497,7 +527,9 @@ impl PrefixCode {
                 return Err(PrefixError::NoMatchingSymbol);
             }
             code = (code << 1) | reader.read_bits(1)?;
-            if let Some(row) = self.length_rows.iter().find(|r| r.length as usize == len) {
+            let ri = self.len_to_row[len];
+            if ri != NO_ROW {
+                let row = &self.length_rows[ri as usize];
                 let offset = code.wrapping_sub(row.first_code);
                 if (offset as usize) < row.count {
                     return Ok(self.sorted_symbols[row.first_symbol_index + offset as usize]);

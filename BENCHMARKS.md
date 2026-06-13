@@ -1670,6 +1670,75 @@ FNV-1a digest sweep over the full fixture corpus plus the
 * `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
   clean.
 
+## Round 287 — decoder per-bit walk: direct length→row side table
+
+PROFILE-OPT depth round acting on the round-286 rank-1 candidate. The
+§6.2.1 canonical-decoder per-bit walk (`read_symbol_walk` + its
+long-code continuation `read_symbol_long`) tested, **at every consumed
+bit**, whether a code row exists at the current length via a linear
+`length_rows.iter().find(|r| r.length == len)` rescan. The cost of that
+rescan scales with the number of distinct code lengths in the code, so
+it is invisible on uniform-length codes (every `belowgate` / `short`
+cell) but real on the length-diverse codes that header-dominated and
+adversarial streams produce. The change records a 16-byte
+`len_to_row: Vec<u8>` (length → row index, `NO_ROW = u8::MAX` sentinel)
+once in `from_code_lengths` and turns the per-bit test into one indexed
+load. No decode table widening, **no added cache footprint** (the side
+table shares a line or two with the already-hot `PrefixCode` header).
+
+### A/B (this machine, criterion `--baseline`)
+
+| Cell | HEAD (linear `find`) | r287 (`len_to_row`) | Δ |
+|---|---:|---:|---|
+| `read_symbol_manylen16_walk` (1..=14 + 2×15, all 15 lengths) | 86.76 µs | 37.18 µs | **−57% (2.33×)** |
+| `read_symbol_short8_uniform` | — | — | no sig. change (p≈1) |
+| `read_symbol_short6_uniform` | — | — | no sig. change |
+| `read_symbol_long9_11` | — | — | no sig. change |
+| `read_symbol_dense256` | — | — | no sig. change |
+| `read_symbol_belowgate16_walk` | — | — | no sig. change |
+| `lossless_decode_*` (all 6 end-to-end cells) | — | — | no sig. change |
+
+The new `manylen16_walk` cell is a Kraft-exact, maximally
+length-diverse code (one symbol at each of lengths 1..=14 plus two at
+15) — the regime the uniform-length `belowgate` cell cannot exercise.
+It is the only cell where the linear scan was hot, and it shows the full
+2.33× win; every other cell is statistically flat because few distinct
+lengths meant the scan was already cheap.
+
+### Rejected candidate — second-level spill table
+
+The round-284/286 named candidate (a 9–`LOOKUP2_BITS`-bit second-level
+spill table for codes overshooting the 8-bit primary) was **prototyped
+and measured a net regression**: at `LOOKUP2_BITS` = 12 (16 KiB) and 10
+(4 KiB) `read_symbol_long9_11` rose to ~21.7–22.5 µs (from ~18.9 µs
+baseline) and `dense256` to ~20.7–21.3 µs (from ~17.7 µs). The second
+peeked word-load plus a random access into a 4–16 KiB table that
+thrashes L1 against the 1 KiB primary costs more than the 1–3 extra
+per-bit iterations the walk-from-8 actually does for a 9–11-bit code.
+The conclusion: the long-code path's cost was the **per-bit row lookup**
+(now O(1)), not the bit-by-bit consumption — so a bigger table was the
+wrong lever.
+
+### Round-287 verification
+
+* **Byte identity:** the `read_symbol_reference` differential unit test
+  (fast path vs pre-table per-bit walk, lockstep cursor + EOF-field
+  comparison) and the `read_symbol_lut_diff` fuzz oracle both still
+  pass; all 435 lib tests + every integration binary (fixture walks,
+  round-trips, published-API, standalone e2e) are green.
+* `src/` diff is confined to `src/vp8l_prefix.rs`; the only other change
+  is the new `manylen` bench cell in `benches/read_symbol.rs`.
+* `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
+  clean.
+
+### Ranked next PROFILE-OPT target (post-r287)
+
+| Rank | Target | Evidence | A/B references |
+|---:|---|---|---|
+| 1 | Encoder chooser residual walk SWAR (`for_each_block_residual` + chooser closure, ~49% combined in r283) | the inherent 14-modes × per-pixel arithmetic after the r280 despecialisation | `lossless_encode_natural_128` / `lossless_encode_rgba_256`, `pick_block_cte` |
+| 2 | Encoder LZ77 **insert + miss-reject** path (not the deep-chain walk) | `lz77_chain` shows the shallow/unique regime at 6.5–7× the deep-repeat cost | `lz77_chain_{shallow_unique,natural_gradient}` vs `_deep_period2/4` |
+| — | ~~Decoder `read_symbol` 9–11-bit spill table~~ | **resolved r287**: spill table rejected (L1-thrash regression); the per-bit row lookup it would have shortcut is now O(1) via `len_to_row` | — |
+
 ## Reproducing
 
 ```bash

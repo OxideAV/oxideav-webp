@@ -144,6 +144,28 @@ fn lengths_belowgate() -> Vec<u8> {
     vec![4u8; 16]
 }
 
+/// A maximally length-diverse table: one symbol at each of lengths
+/// `1..=14` plus two at length 15 (Kraft-exact: `Σ 2⁻ⁱ` for `i∈1..=14`
+/// `+ 2·2⁻¹⁵ = (1 − 2⁻¹⁴) + 2⁻¹⁴ = 1`). `used = 16` sits below the
+/// `MIN_LOOKUP_USED = 32` gate, so every read runs the pure per-bit
+/// walk — and because the 16 used symbols span all 15 distinct lengths,
+/// the walk's per-bit "is there a row at this length?" test is the case
+/// where the pre-`len_to_row` linear `length_rows.iter().find(..)` scan
+/// was at its most expensive (up to 15 rows scanned at each consumed
+/// bit, with codes running all the way to the 15-bit ceiling). This is
+/// the cell the round-287 direct length→row side table targets: an
+/// adversarial many-distinct-length code, the regime the uniform-length
+/// `belowgate` cell can't exercise.
+fn lengths_manylen() -> Vec<u8> {
+    let mut l = vec![0u8; 16];
+    for (i, slot) in l.iter_mut().take(14).enumerate() {
+        *slot = (i + 1) as u8; // lengths 1..=14
+    }
+    l[14] = 15;
+    l[15] = 15;
+    l
+}
+
 /// Pack a deterministic LCG stream of `SYMS_PER_ITER` symbols, drawn
 /// uniformly over the *used* symbols of `lengths`, into a byte buffer
 /// using the canonical code values — MSB-first within each code (the
@@ -217,6 +239,10 @@ fn bench_belowgate(c: &mut Criterion) {
     bench_cell(c, lengths_belowgate(), "belowgate16_walk");
 }
 
+fn bench_manylen(c: &mut Criterion) {
+    bench_cell(c, lengths_manylen(), "manylen16_walk");
+}
+
 criterion_group!(
     benches,
     bench_short8,
@@ -224,5 +250,6 @@ criterion_group!(
     bench_long9_11,
     bench_dense256,
     bench_belowgate,
+    bench_manylen,
 );
 criterion_main!(benches);

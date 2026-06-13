@@ -4,6 +4,35 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- Round-287 PROFILE-OPT (depth round): the §6.2.1 canonical-decoder
+  per-bit walk (`PrefixCode::read_symbol_walk` and its long-code
+  continuation `read_symbol_long`) now resolves "is there a code row at
+  this length?" through a 16-byte direct length→row side table
+  (`len_to_row`, built once in `from_code_lengths`) instead of a linear
+  `length_rows.iter().find(..)` rescan on every consumed bit. The walk
+  is the decode path for every code below the `MIN_LOOKUP_USED` gate and
+  the > 8-bit / near-EOF fallback for the round-284 primary table, so
+  the rescan cost grew with the number of distinct code lengths. Output
+  is byte-identical (the `read_symbol_reference` differential test and
+  the `read_symbol_lut_diff` fuzz oracle both still pass; all 435 unit
+  tests + the fixture-walk and round-trip suites are green). The
+  round-284 candidate — a 9–`LOOKUP2_BITS`-bit second-level *spill*
+  table — was prototyped and **rejected**: it measured a net regression
+  on `read_symbol_long9_11` / `read_symbol_dense256` (the extra 4–16 KiB
+  table thrashes L1 against the 1 KiB primary, and a single-bit walk
+  from length 8 already beats a second peeked word-load + random table
+  access). The chosen side-table change adds no cache footprint. New
+  `read_symbol_manylen16_walk` bench cell (one symbol at each of lengths
+  1..=14 plus two at 15 — a Kraft-exact, maximally length-diverse code
+  the uniform-length cells can't exercise) isolates the targeted regime:
+  **86.8 µs → 37.2 µs per 4096 reads, a 2.33× speedup** on the
+  worst-case walk; the uniform short-code, 9–11-bit, dense-literal, and
+  end-to-end `lossless_decode*` benches show no statistically
+  significant change (the linear scan was already cheap when few
+  distinct lengths are present).
+
 ### Added
 
 - Round-286 benchmark-mode coverage of the two hotspots the round-283 /

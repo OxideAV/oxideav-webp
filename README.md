@@ -82,7 +82,14 @@ byte-identical) added the `read_symbol` and `lz77_chain` harnesses
 that isolate the rank-1 decode and rank-3 encode hotspots, measured
 the long-code (> 8-bit) read path at +27% per symbol over the
 primary-table floor, and ranked the decoder 9–11-bit spill table as
-the next PROFILE-OPT target. Numbers, profile findings, the full
+the next PROFILE-OPT target. Round 287 acted on that candidate:
+the per-bit §6.2.1 walk now resolves "is there a code row at this
+length?" through a 16-byte direct length→row side table instead of a
+linear rescan per bit — a 2.33× speedup on the worst-case
+many-distinct-length walk (`read_symbol_manylen16_walk` 86.8 → 37.2 µs),
+byte-identical, with no added cache footprint; the spill table itself
+was prototyped and rejected as an L1-thrashing regression. Numbers,
+profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
 with:
