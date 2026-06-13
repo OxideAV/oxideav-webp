@@ -138,7 +138,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Twenty-nine [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Thirty [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -623,7 +623,29 @@ before allocating). A ~300 s ASan campaign over 25 772 runs is now
 crash-free. The §2.5 `VP8 ` *lossy* decode (routed to the `oxideav-vp8`
 sibling, which currently panics on some malformed bitstreams at its
 inverse-DCT stage) is deliberately skipped from the cross-check pending a
-sibling-side hardening. Run any
+sibling-side hardening. `decode_lossless_image` (round 292) drives the
+public top-level lossless façade `decode_lossless_image` — the layer that
+walks the §2.3 `RIFF`/`WEBP` container, selects the §2.6 `VP8L` chunk,
+reads the chunk's own §3.4 image-header dimensions, and runs the full
+§4/§5/§6 decode to a typed `DecodedImage`. Unlike the round-273
+`decode_lossless` harness (dimensions supplied *by the harness* over a
+bare payload), the decoded dimensions here come from the **file's own**
+§3.4 14-bit fields, exercising the §3.4-header → §4-decode
+dimension-coherence path end to end; on every `Ok(Some(image))` it
+asserts `image.{width,height}` echo the §3.4-resolved chunk dimensions,
+the §6.2.2 `width * height` pixel count, a non-empty buffer, and replay
+determinism. A cheap structural pre-pass gates the full-decode tail by
+declared pixel count so an adversarial `16384 × 16384` header can't blow
+the per-iteration budget. The harness surfaced a second libFuzzer OOM —
+distinct from the r288 animation-canvas finding: a ~30-byte `VP8L` chunk
+declaring a §3.4 `16360 × 12284` still forced `vp8l_decode::decode_image`
+to eager-reserve ~800 MiB *before* the EOF-checked §5/§6 loop ran. The
+round fixed it by capping the eager `Vec::with_capacity` at
+`MAX_EAGER_PIXEL_RESERVATION = 1 << 22` pixels (`eager_pixel_capacity`);
+the buffer still grows on demand for a legitimately large image and the
+self-terminating loop raises `DecodeError::Eof` on a truncated stream, so
+decoded bytes for all valid images are unchanged. A ~120 s ASan campaign
+over 48 882 runs is now crash-free, peak RSS 1.2 GiB. Run any
 one with (nightly + `cargo-fuzz` installed):
 
 ```text
@@ -656,6 +678,7 @@ cargo +nightly fuzz run roundtrip_metadata   --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run read_symbol_lut_diff --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_lossless_lut  --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_still_paths   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_lossless_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

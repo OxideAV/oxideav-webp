@@ -4,6 +4,44 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Round-292 FUZZ depth round: a malformed §2.6 `VP8L` lossless chunk
+  whose §3.4 5-byte image-header declares a huge canvas (the 14-bit
+  `width - 1` / `height - 1` fields reach `16384 × 16384 ≈ 2.7e8`
+  pixels) but carries only a few backing bytes no longer forces an
+  unbounded eager allocation. `vp8l_decode::decode_image` and
+  `decode_argb_multi_group` previously pre-sized their output buffer to
+  the full declared `width * height` (`Vec::with_capacity`), so a
+  ~30-byte chunk could drive an ~800 MiB allocation **before** the
+  EOF-checked §5/§6 decode loop read a single symbol — a decode-time
+  out-of-memory DoS surfaced by the new `decode_lossless_image` fuzz
+  target. The eager reservation is now capped at
+  `MAX_EAGER_PIXEL_RESERVATION = 1 << 22` pixels via
+  `eager_pixel_capacity`; the buffer still grows on demand for a
+  legitimately large image, and the self-terminating decode loop raises
+  `DecodeError::Eof` for a truncated stream as before. **Decoded bytes
+  for all valid images are unchanged** — the cap only affects the
+  *initial* capacity hint, not the final buffer contents (438 lib tests
+  pass, including two new `eager_pixel_capacity_*` regression tests).
+
+### Added
+
+- Round-292 FUZZ depth round: added
+  `fuzz/fuzz_targets/decode_lossless_image.rs`, a structure-aware
+  libFuzzer panic/OOM-free decode target over the public top-level
+  lossless façade `decode_lossless_image` — the layer that walks the
+  §2.3 `RIFF`/`WEBP` container, selects the §2.6 `VP8L` chunk, reads the
+  chunk's own §3.4 image-header dimensions, and runs the full §4/§5/§6
+  decode returning the typed `DecodedImage`. Distinct from the round-286
+  `decode_lossless` harness (which supplies `(width, height)` *from the
+  harness* over a bare payload): here the decoded dimensions come from
+  the **file's own** §3.4 header, exercising the §3.4-header → §4-decode
+  dimension-coherence path end to end. A cheap structural pre-pass gates
+  the full-decode tail by declared pixel count. Seeded from the in-tree
+  `tests/data/*.webp` fixtures; 48,882 executions post-fix, 0 findings.
+  The pre-fix run surfaced the eager-allocation OOM fixed above.
+
 ### Changed
 
 - Round-291 BENCH depth round: added `benches/alpha_decode.rs`, a

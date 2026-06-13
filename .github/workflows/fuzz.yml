@@ -2,8 +2,8 @@ name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The reusable
 # workflow auto-discovers every target under fuzz/fuzz_targets/ and
-# splits the 30-minute total budget evenly across them (twenty-nine
-# targets as of round 288, ~62 s each, corpus persisted across runs via
+# splits the 30-minute total budget evenly across them (thirty
+# targets as of round 292, ~60 s each, corpus persisted across runs via
 # actions/cache). `libwebp-dev` is installed for any black-box
 # cross-validation harness that may dlopen the reference decoder at
 # runtime.

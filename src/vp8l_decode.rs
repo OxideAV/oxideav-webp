@@ -233,6 +233,39 @@ pub const DISTANCE_MAP: [(i32, i32); NUM_DISTANCE_MAP_CODES] = [
 /// (32 - color_cache_code_bits)`."
 pub const COLOR_CACHE_HASH_MULTIPLIER: u32 = 0x1e35_a7bd;
 
+/// Eager-reservation ceiling for the §5.2 / §6.2.2 per-pixel ARGB
+/// decode buffers, in pixels.
+///
+/// The §3.4 image-header's 14-bit `width - 1` / `height - 1` fields can
+/// declare up to `16384 × 16384 ≈ 2.7e8` pixels — a 1 GiB `Vec<u32>` —
+/// while the carrying §2.6 `VP8L` chunk is only a few dozen bytes. The
+/// declared `width * height` therefore cannot be trusted to pre-size the
+/// output buffer: a tiny truncated chunk that declares a huge canvas
+/// would force an eager multi-hundred-MiB allocation *before* the decode
+/// loop reads a single symbol and discovers the stream is exhausted.
+///
+/// The decode loop is self-terminating — every symbol read goes through
+/// the EOF-checked [`crate::vp8l_stream::BitReader`], and a truncated
+/// stream raises [`DecodeError::Eof`] long before `width * height` pixels
+/// are emitted — so the full `total_pixels` reservation is only an
+/// allocation *optimization*, not a correctness requirement. Capping the
+/// initial reservation at this ceiling keeps that optimization for
+/// normally-sized images while letting the `Vec` grow on demand for a
+/// legitimately large one, so a malformed header can no longer drive an
+/// unbounded eager allocation. `1 << 22 = 4_194_304` pixels (16 MiB of
+/// `u32`) comfortably covers any realistic single still image without
+/// trusting the header's worst case.
+const MAX_EAGER_PIXEL_RESERVATION: usize = 1 << 22;
+
+/// Initial `Vec<u32>` capacity for a `total_pixels`-sized decode buffer,
+/// capped at [`MAX_EAGER_PIXEL_RESERVATION`] so a §3.4-header-declared but
+/// unbacked pixel count cannot force an unbounded eager allocation. The
+/// `Vec` still grows to `total_pixels` if the bitstream legitimately
+/// produces them.
+fn eager_pixel_capacity(total_pixels: usize) -> usize {
+    total_pixels.min(MAX_EAGER_PIXEL_RESERVATION)
+}
+
 /// Errors raised while decoding the §5.2 per-pixel ARGB stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -742,7 +775,11 @@ pub fn decode_image(
     let cache_size = color_cache.as_ref().map(|c| c.size()).unwrap_or(0);
     let alphabet_size = PrefixCodeGroup::green_alphabet_size(cache_size);
     let total_pixels = (width as usize) * (height as usize);
-    let mut pixels: Vec<u32> = Vec::with_capacity(total_pixels);
+    // §3.4 dimensions can declare far more pixels than the §2.6 chunk
+    // can back; cap the eager reservation so a malformed header cannot
+    // force an unbounded allocation before the EOF-checked decode loop
+    // runs. The `Vec` still grows to `total_pixels` on demand.
+    let mut pixels: Vec<u32> = Vec::with_capacity(eager_pixel_capacity(total_pixels));
 
     while pixels.len() < total_pixels {
         decode_one_symbol(
@@ -1152,7 +1189,10 @@ fn decode_argb_multi_group(
     let alphabet_size = PrefixCodeGroup::green_alphabet_size(cache_size);
     let total_pixels = (width as usize) * (height as usize);
     let mut color_cache = cache_enabled.then(|| ColorCache::new(cache_code_bits));
-    let mut pixels: Vec<u32> = Vec::with_capacity(total_pixels);
+    // See `decode_image`: cap the eager reservation against a malformed
+    // §3.4 header so an unbacked pixel count cannot drive an unbounded
+    // allocation; the `Vec` still grows to `total_pixels` on demand.
+    let mut pixels: Vec<u32> = Vec::with_capacity(eager_pixel_capacity(total_pixels));
 
     // The current pixel's (x, y) is derived from `pixels.len()` — the
     // decode loop fills in scan-line order, and an LZ77 backref pushes
@@ -1193,6 +1233,26 @@ fn decode_argb_multi_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eager_pixel_capacity_is_capped_for_a_huge_declared_pixel_count() {
+        // A §3.4 header can declare up to 16384 × 16384 ≈ 2.7e8 pixels;
+        // the eager reservation must be clamped to the ceiling so a
+        // malformed header cannot drive an unbounded allocation before
+        // the EOF-checked decode loop runs.
+        let huge = 16_384usize * 16_384usize;
+        assert_eq!(eager_pixel_capacity(huge), MAX_EAGER_PIXEL_RESERVATION);
+        assert!(eager_pixel_capacity(huge) < huge);
+    }
+
+    #[test]
+    fn eager_pixel_capacity_is_exact_for_a_realistic_image() {
+        // A normally-sized image still pre-sizes its buffer exactly — the
+        // cap is only reached by canvases far larger than any real still.
+        let small = 128usize * 128usize;
+        assert_eq!(eager_pixel_capacity(small), small);
+        assert!(small < MAX_EAGER_PIXEL_RESERVATION);
+    }
 
     /// Tiny LSB-first bit writer for building synthetic §5.2 streams.
     struct BitWriter {

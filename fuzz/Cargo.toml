@@ -679,3 +679,33 @@ path = "fuzz_targets/decode_still_paths.rs"
 test = false
 doc = false
 bench = false
+
+# The thirtieth harness drives the public top-level lossless façade
+# `decode_lossless_image` across an attacker-controlled byte buffer — the
+# layer that walks the §2.3 RIFF/WEBP container, selects the §2.6 `VP8L`
+# chunk, reads the chunk's own §3.4 5-byte image-header (the 14-bit
+# `width - 1` / `height - 1` fields), runs the full §4/§5/§6 decode, and
+# returns the typed `vp8l_decode::DecodedImage` ARGB-`u32` surface (or
+# `Ok(None)` when no `VP8L` chunk is present). Unlike the round-286
+# `decode_lossless` / `decode_lossless_headerless` harnesses — which drive
+# the §4 transform-list driver standalone with the `(width, height)` pair
+# supplied *by the harness* over a bare chunk-payload slice — this harness
+# takes the decoded dimensions from the **file's own** §3.4 header, so the
+# §3.4-header → §4-decode dimension-coherence path (and the inverse-
+# transform un-bundling back to the §3.4 canvas width) is exercised end to
+# end. A cheap structural pre-pass extracts the §2.6 chunk handle and reads
+# its §3.4 declared dimensions; when the declared `width * height` exceeds
+# `1 << 16` pixels the full §4/§5/§6 decode tail is gated (the §3.4 14-bit
+# fields can declare up to 16384 × 16384 = a 1 GiB ARGB buffer) but the
+# façade is still driven for the Result contract. On every `Ok(Some(image))`
+# the §3.4 dimension coherence (`image.width()`/`image.height()` equal the
+# §3.4-resolved chunk dimensions), the §6.2.2 `width*height` pixel count, a
+# non-empty buffer, and pure-function determinism (replaying the same bytes
+# yields a byte-identical pixel buffer) are all cross-checked; `Ok(None)`
+# and `Err(_)` are required only to return a `Result` rather than panic.
+[[bin]]
+name = "decode_lossless_image"
+path = "fuzz_targets/decode_lossless_image.rs"
+test = false
+doc = false
+bench = false
