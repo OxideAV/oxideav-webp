@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twenty-six criterion benches under `benches/`,
+The crate ships twenty-seven criterion benches under `benches/`,
 grouped by domain:
 
 * **End-to-end** — `lossless_decode`, `lossless_encode`,
@@ -79,7 +79,11 @@ grouped by domain:
   primary-table fast path vs the > 8-bit walk continuation), the
   per-call `read_lz77_value` (§3.6.2.2 Table 4 regimes) and
   `color_cache_hash` (§3.6.2.3 `code_bits` 1 / 4 / 8 / 11) decoder
-  benches.
+  benches, plus `backward_reference` (round 297: the §5.2.2 decoder
+  LZ77 copy-back `apply_backward_reference` — the run replay that
+  mirrors the `lz77_match` / `lz77_chain` encoder matchers — across
+  non-overlap / partial-overlap / `dist == 1` RLE / many-short-run
+  regimes).
 
 Rounds 277 / 278 rewrote the §3.7.2 / §6.2.1 length-then-code chain
 bit-identically (sorted-leaf two-queue merge + single-rescan counting

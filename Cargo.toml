@@ -200,3 +200,15 @@ harness = false
 [[bench]]
 name = "meta_prefix_cluster"
 harness = false
+
+# Round-297: decoder-side §5.2.2 `apply_backward_reference` — the LZ77
+# copy-back that replays one chosen run into the decoded ARGB buffer
+# (`decode_one_symbol`'s length-symbol branch). The `lz77_match` /
+# `lz77_chain` benches measure the encoder's chain matcher that *finds* a
+# run; the decoder copy-back that *replays* it had no isolated harness.
+# Cells isolate the §5.2.2 dist/length regimes: non-overlap (dist >=
+# length), partial overlap (dist < length), dist == 1 RLE fill, and a
+# many-short-run fragmented stream.
+[[bench]]
+name = "backward_reference"
+harness = false

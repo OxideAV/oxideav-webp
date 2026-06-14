@@ -42,6 +42,7 @@ the medians are still stable to a few percent.
 | `benches/lossy_decode.rs` | `decode_webp_lossy_e2e`, `decode_lossy_rgba_extracted`, `yuv420_to_rgba_{16x16,128x128,256x256}` | §2.5 `VP8 ` (lossy) decode path **this crate owns** at three altitudes: full public `decode_webp` over the committed 128×128 `VP8 `+`ALPH` fixture; `decode_lossy_rgba` over the extracted `VP8 ` bitstream (RIFF walk removed); and the crate-owned post-I420 reconstruction loop `yuv420_to_rgba` (4:2:0 nearest-neighbour chroma up-sample + RFC 6386 §9.2 BT.601 full-range YCbCr→RGB matrix) in isolation at three sizes. The sibling `oxideav-vp8` decoder owns the entropy/IDCT/prediction/loop-filter work; this bench isolates and ranks the lossy stage the webp crate can act on |
 | `benches/alpha_decode.rs` | `decode_alpha_plane_e2e`, `decode_alpha_lossless_extracted`, `inverse_filter_{none,horizontal,vertical,gradient}_128x128` | §2.7.1.2 `ALPH` alpha-plane decode — the rank-1 webp-owned cost on the lossy path (≈52% of lossy e2e in the round-289 map, previously sized only by subtraction). Public `decode_alpha_plane` e2e over the committed fixture; `alph::decode_alpha` on the extracted `ALPH` payload (RIFF walk removed); and the §2.7.1.2 Stage-2 inverse-filter per-pixel loop in isolation, one cell per `F` method via synthetic uncompressed payloads. Splits the r289 rank-1 bucket: container walk ≈1 µs, the rest is the headerless VP8L lossless decode (already covered by `read_symbol` / `lossless_decode*`) |
 | `benches/meta_prefix_cluster.rs` | `meta_prefix_cluster_content_256/{bimodal,gradient,uniform}`, `meta_prefix_cluster_groups_256/{2,3,4}`, `meta_prefix_cluster_size/{128,256,384}` | Encoder-side §6.2.2 entropy-image block-clustering heuristic (`cluster_blocks_by_histogram_distance`) behind `encode_with_meta_prefix`. Coarse-RGB-histogram (16 bins/channel → 48-dim/block) Lloyd's k-means over the `1 << prefix_bits`-aligned blocks: a per-pixel feature-binning pass, deterministic farthest-point seeding, an up-to-8-pass assignment/update loop, and a compaction onto a contiguous group range. The RFC-defined entropy image is a decoder construct; this is the *encoder's* partition chooser, previously sized only by subtraction inside the `lossless_encode` e2e. Three altitudes: content regime (bimodal split / smooth gradient / uniform single-group early-out), `num_groups ∈ {2,3,4}`, and image side ∈ {128,256,384} px |
+| `benches/backward_reference.rs` | `apply_backward_reference_{nonoverlap_d64_l64,overlap_partial_d4_l64,rle_dist1_l64,manyruns_512_short}` | Decoder-side §5.2.2 `apply_backward_reference` — the LZ77 copy-back that replays one chosen run into the decoded ARGB buffer (`decode_one_symbol`'s length-symbol branch). The `lz77_match` / `lz77_chain` benches measure the *encoder's* hash-chain matcher that **finds** a run; the decoder copy-back that **replays** it had no isolated harness. Four cells isolate the §5.2.2 walk's `dist`/`length` regimes: non-overlap (`dist >= length`, settled-source region copy), partial overlap (`dist = 4 < length = 64`, self-referential read-after-append window repeat), `dist == 1` RLE flat-colour fill (tightest dependency chain), and a 512-element fragmented stream of short runs (per-call entry/guard cost). Each cell `clone`s an LCG-filled literal prefix in `iter_batched` setup so the function's append starts from a fresh buffer outside the measured interval |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -2149,6 +2150,68 @@ The Lloyd loop is a clear second only on poorly-separated content
   byte are unchanged; all lib tests pass.
 * `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
   clean.
+
+## Round-297 (2026-06-14): §5.2.2 decoder LZ77 copy-back bench
+
+BENCH depth round. The two LZ77 benches on the shelf — `lz77_match` and
+`lz77_chain` — both measure the **encoder's** hash-chain matcher, the
+search that *finds* a backward-reference run. The **decoder's** copy-back
+that *replays* a chosen run — `apply_backward_reference`, called once per
+length symbol from `decode_one_symbol` — had no isolated harness; its cost
+was folded into the `lossless_decode*` end-to-end numbers. This round adds
+`benches/backward_reference.rs`.
+
+### What the copy-back owns (§5.2.2, decoder side)
+
+For a length symbol, `decode_one_symbol` reads the §5.2.2 length `L` and
+the scan-line pixel distance `D`, then calls `apply_backward_reference` to
+append `L` pixels copied from `D` positions back. The walk is
+`for i in 0..L { pixels.push(pixels[src + i]) }` after two pre-write
+guards (underflow `dist > position`, overflow `position + length >
+total_pixels`). Cost splits by the `D`/`L` relation:
+
+* `dist >= length` — source region fully materialised before the copy; a
+  settled-source region copy.
+* `dist < length` — the run reads pixels it is itself emitting; the
+  just-copied `dist`-pixel window repeats (read-after-append).
+* `dist == 1` — maximal overlap: a single-pixel run-length fill (flat-
+  colour span); the tightest dependency chain the walk can form.
+
+### New bench: `backward_reference`
+
+Four cells, all inputs synthesised in-bench (an LCG-filled 256-pixel
+literal prefix), each `clone`d in `iter_batched` setup so the append
+starts from a fresh buffer outside the measured interval. Result folded
+into a `black_box` accumulator.
+
+### Measured (this host, `aarch64-apple-darwin`, `--quick`, median)
+
+| Cell | Median | Notes |
+|---|---:|---|
+| `nonoverlap_d64_l64` | 1.14 µs | 32 runs × 64 px, `dist == 64`; settled-source region copy — the copy lower bound |
+| `rle_dist1_l64` | 1.12 µs | 32 runs × 64 px, `dist == 1` fill; maximal overlap, single hot source pixel |
+| `overlap_partial_d4_l64` | 1.20 µs | 32 runs × 64 px, `dist == 4`; 4-px window repeats 16× (read-after-append) |
+| `manyruns_512_short` | 1.50 µs | 512 short runs (L ∈ {2..5}, D ∈ {1,2,4,7}); per-call entry/guard cost dominates |
+
+### Reading the numbers
+
+The three 32-run × 64-px cells move within ~7 % of each other (1.12–1.20
+µs): the per-element copy is cheap and the overlap regime barely matters
+at these run lengths — `Vec::push` growth-amortisation and the per-run
+guard pair are the floor, not the inner read. The `manyruns` cell (512
+runs over the same total append volume) is +32 % over the long-run cells,
+confirming the **per-call entry/guard cost**, not the per-pixel copy, is
+what a fragmented real stream pays. Any future copy-back tightening
+(`extend_from_within` for the non-overlap case, or a length-bucketed fast
+path) has its A/B reference here, split per regime.
+
+### Round-297 verification
+
+* **No `src/` change.** The function is already `pub`
+  (`vp8l_decode::apply_backward_reference`); the bench drives the public
+  entry point directly. Zero behavioural change, so no FNV-1a A/B was
+  required; all lib tests pass unchanged.
+* `cargo fmt --check` + `cargo clippy --benches -D warnings` clean.
 
 ## Reproducing
 
