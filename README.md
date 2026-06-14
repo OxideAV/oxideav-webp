@@ -825,7 +825,13 @@ per-block §4.1 mode-selection cost models the single-transform predictor
 path has carried since rounds 159–162: each chain now sweeps the
 folded-L1 magnitude proxy, the round-161 Shannon-entropy bit cost, and the
 round-162 sub-image-aware entropy cost over the *transform-decorrelated*
-residual the predictor actually models, keeping the smallest. On smooth,
+residual the predictor actually models, keeping the smallest. Round 306
+widened the sub-image-aware setting on the stacked chains from the single
+mid-range weight round 305 bootstrapped to the **full lambda sweep** the
+single-transform path uses — `4 000` / `16 000` / `64 000` / `256 000`
+milli-per-bit — so each chain lands on the residual-vs-sub-image cost
+crossover its own decorrelated residual exhibits rather than one fixed
+guess. On smooth,
 mildly-noisy photo-like content the entropy-aware models shrink the color +
 predictor chain ~12–21 % versus the L1 proxy (the per-block mode histogram
 concentrates, compacting both the §7.2 predictor sub-image and the residual

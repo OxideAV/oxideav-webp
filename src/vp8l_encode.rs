@@ -2829,20 +2829,46 @@ fn build_predictor_image_strategy(
     }
 }
 
-/// Round 305 — the predictor-sub-image strategies the stacked §3.5 chains
+/// Round 306 — the predictor-sub-image strategies the stacked §3.5 chains
 /// sweep. The L1 proxy (the rounds 302–304 baseline) leads so a tie keeps
-/// the historical choice; the entropy and a single sub-image-aware
-/// entropy setting follow. The lambda value mirrors the mid-range setting
-/// the single-transform chooser sweeps — high enough to converge the mode
-/// set on smooth transform-decorrelated residuals, low enough that the
-/// residual cost still dominates on noisy content. The chooser keeps the
-/// byte-shortest stream across all three, so the sweep is non-regressing
-/// against the L1 baseline.
-const STACKED_PREDICTOR_STRATEGIES: [PredictorSubImageStrategy; 3] = [
+/// the historical choice; the round-161 plain entropy chooser follows; then
+/// the round-162 sub-image-aware entropy chooser across the **full lambda
+/// sweep** the single-transform predictor path
+/// ([`encode_argb_with_predictor_chooser`]) has carried since round 162.
+///
+/// Round 305 bootstrapped the stacked chains with only a single mid-range
+/// sub-image-aware lambda (`16_000`); the single-transform path instead
+/// sweeps four weights — `4_000` / `16_000` / `64_000` / `256_000`
+/// milli-per-bit — straddling the empirically-observed residual-vs-
+/// sub-image cost crossover (~`64_000`) on smooth transform-decorrelated
+/// content. Below the crossover the residual cost dominates and a low
+/// lambda barely perturbs the round-161 choice; above it the §7.2
+/// sub-image's prefix-code mass dominates and a high lambda converges the
+/// mode set into longer runs, shrinking the sub-image header. Threading the
+/// same four weights through the stacked chains lets each chain land on the
+/// crossover its own *transform-decorrelated* residual exhibits rather than
+/// the one fixed mid-range guess.
+///
+/// The chooser keeps the byte-shortest stream across all six strategies, so
+/// the wider sweep is strictly non-regressing against both the L1 baseline
+/// and the round-305 single-lambda setting. Round-trip output is unchanged
+/// by the strategy: lambda only biases *which §4.1 mode is recorded* per
+/// block; the forward transform recomputes residuals against the chosen
+/// modes and the decoder reads the same modes back.
+const STACKED_PREDICTOR_STRATEGIES: [PredictorSubImageStrategy; 6] = [
     PredictorSubImageStrategy::L1,
     PredictorSubImageStrategy::Entropy,
     PredictorSubImageStrategy::EntropySubaware {
+        lambda_milli: 4_000,
+    },
+    PredictorSubImageStrategy::EntropySubaware {
         lambda_milli: 16_000,
+    },
+    PredictorSubImageStrategy::EntropySubaware {
+        lambda_milli: 64_000,
+    },
+    PredictorSubImageStrategy::EntropySubaware {
+        lambda_milli: 256_000,
     },
 ];
 
@@ -9269,6 +9295,25 @@ mod tests {
                 );
             }
         }
+
+        // Round 306: the stacked-chain sub-image-aware lambda set must
+        // match the single-transform predictor path's lambda sweep
+        // (encode_argb_with_predictor_chooser, [4_000, 16_000, 64_000,
+        // 256_000]) so the two paths land on the same residual-vs-
+        // sub-image cost crossover. If the single-transform sweep ever
+        // changes, this asserts the stacked sweep is updated in lockstep.
+        let stacked_lambdas: Vec<u64> = STACKED_PREDICTOR_STRATEGIES
+            .iter()
+            .filter_map(|s| match s {
+                PredictorSubImageStrategy::EntropySubaware { lambda_milli } => Some(*lambda_milli),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stacked_lambdas,
+            vec![4_000u64, 16_000, 64_000, 256_000],
+            "stacked sub-image-aware lambda sweep must mirror the single-transform path"
+        );
 
         // Palette content for the color-indexing chain.
         let palette = [0xff00_0000u32, 0xff20_4060, 0xff60_c0ff, 0xffff_ffff];

@@ -6,6 +6,22 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-306 lossless-encode cost improvement: the §3.5 **stacked-transform
+  chains** now sweep the **full sub-image-aware lambda set** the
+  single-transform predictor path has carried since round 162 —
+  `4_000` / `16_000` / `64_000` / `256_000` milli-per-bit — instead of the
+  single mid-range `16_000` weight round 305 bootstrapped them with. The
+  four weights straddle the empirically-observed residual-vs-§7.2-sub-image
+  cost crossover (~`64_000`) on smooth transform-decorrelated content, so
+  each chain (color + predictor, color + subtract-green + predictor,
+  color-indexing + predictor) can land on the crossover its own decorrelated
+  residual exhibits rather than one fixed guess. `STACKED_PREDICTOR_STRATEGIES`
+  grows from 3 to 6 entries; the chooser keeps the byte-shortest stream
+  across all of them, so the wider sweep is strictly non-regressing against
+  both the L1 baseline and the round-305 single-lambda setting. Round-trip
+  output is unchanged (lambda only biases which §4.1 mode is *recorded* per
+  block — the decoder reads the same modes back). No decoder change required.
+
 - Round-305 lossless-encode cost improvement: the §3.5 **stacked-transform
   chains** (color + predictor, color + subtract-green + predictor,
   color-indexing + predictor) now sweep the **predictor-sub-image cost
