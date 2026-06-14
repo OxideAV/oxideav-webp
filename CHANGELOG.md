@@ -71,6 +71,24 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-298 FUZZ depth round: added
+  `fuzz/fuzz_targets/parse_vp8_chunk.rs`, a libFuzzer panic/OOM-free
+  target over the §2.5 simple-lossy `VP8 ` chunk handle standalone entry
+  point `vp8_chunk::WebpLossyChunk::from_payload` — the RFC 6386 §9.1
+  key-frame-header peek the §2 RIFF walker reaches only along the
+  well-formed-container path. The entire fuzz buffer is forwarded
+  verbatim as the §2.5 `VP8 ` payload candidate; every successfully-
+  decoded field is cross-checked against the §9.1 byte layout the parser
+  observed (LE frame tag from bytes 0..3 with the key-frame frame-type,
+  `version`/`show_frame`/19-bit `first_partition_size` bitfields, the
+  §9.1 start code at bytes 3..6, the 14-bit dimension / 2-bit scale split
+  of the width/height words, and the verbatim `bitstream()` borrow), and
+  every refusal branch (`PayloadTooShortForKeyframe`, `NotAKeyframe`,
+  `BadStartCode`) is cross-checked against its §9.1 / §2.5 trigger.
+  87,063,810 executions (~1.43 M exec/s, peak RSS 550 MiB), 0 findings —
+  the existing `from_payload` length gate and frame-tag/start-code checks
+  already make the path panic-free.
+
 - Round-292 FUZZ depth round: added
   `fuzz/fuzz_targets/decode_lossless_image.rs`, a structure-aware
   libFuzzer panic/OOM-free decode target over the public top-level

@@ -183,7 +183,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Thirty-one [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Thirty-two [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -708,8 +708,25 @@ On every `Ok(Some(plane))` the §2.7.1.2 carrier invariant and replay
 determinism are cross-checked. A ~90 s ASan campaign over **23 926 275
 runs** (~263 K exec/s, peak RSS 541 MiB) is crash-free — no panic, OOM,
 or overflow surfaced; the existing `decode_alpha` `checked_mul` and the
-headerless lossless eager-reservation cap already defend this path. Run
-any one with (nightly + `cargo-fuzz` installed):
+headerless lossless eager-reservation cap already defend this path.
+`parse_vp8_chunk` (round 298) drives the §2.5 simple-lossy `VP8 ` chunk
+handle standalone entry point `vp8_chunk::WebpLossyChunk::from_payload` —
+the keyframe-header peek the §2 RIFF walker reaches only along the
+well-formed-container path — over an attacker-controlled byte slice of
+arbitrary length. Every successfully-decoded field is cross-checked
+against the RFC 6386 §9.1 key-frame header byte layout the parser
+observed (the little-endian frame tag from bytes 0..3 with the key-frame
+frame-type, `version` at bits 1..3, `show_frame` at bit 4, the 19-bit
+`first_partition_size` at bits 5..23, the §9.1 start code `0x9D 0x01 0x2A`
+at bytes 3..6, the 14-bit `width` / 2-bit `horizontal_scale` split of the
+width word at bytes 6..8, the same split of the height word at bytes
+8..10, and `bitstream()` echoing the input verbatim); every refusal
+branch is cross-checked against its §9.1 / §2.5 trigger
+(`PayloadTooShortForKeyframe` below the 10-byte minimum, `NotAKeyframe`
+on an interframe frame-type bit §2.5 forbids, `BadStartCode` echoing
+bytes 3..6 verbatim). A ~60 s ASan campaign over **87 063 810 runs**
+(~1.43 M exec/s, peak RSS 550 MiB) is crash-free — no panic, OOM, or
+overflow surfaced. Run any one with (nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -743,6 +760,7 @@ cargo +nightly fuzz run decode_lossless_lut  --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run decode_still_paths   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_lossless_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_alpha_plane   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run parse_vp8_chunk      --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

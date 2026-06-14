@@ -739,3 +739,33 @@ path = "fuzz_targets/decode_alpha_plane.rs"
 test = false
 doc = false
 bench = false
+
+# The thirty-second harness drives the §2.5 simple-lossy `VP8 ` chunk
+# handle standalone entry point `vp8_chunk::WebpLossyChunk::from_payload`
+# directly: an arbitrary fuzz buffer is forwarded verbatim as the §2.5
+# `VP8 ` payload candidate (the bytes that follow the 8-byte §2.3 chunk
+# header), with every successfully-decoded field cross-checked against
+# the RFC 6386 §9.1 key-frame header byte layout the parser observed (the
+# little-endian frame tag assembled from bytes 0..3 with bit 0 forced to
+# the key-frame value, `version` at bits 1..3, `show_frame` at bit 4, the
+# 19-bit `first_partition_size` at bits 5..23, the §9.1 start code
+# `0x9D 0x01 0x2A` at bytes 3..6, the 14-bit `width` / 2-bit
+# `horizontal_scale` split of the little-endian width word at bytes 6..8,
+# the same split of the height word at bytes 8..10, and the `bitstream()`
+# borrow echoing the input slice byte-for-byte), and every refusal branch
+# cross-checked against the §9.1 / §2.5 trigger (PayloadTooShortForKeyframe's
+# `got` equal to the slice length and below the 10-byte header minimum;
+# NotAKeyframe implying a >=10-byte payload with frame-tag bit 0 set, the
+# interframe §2.5 forbids; BadStartCode implying a >=10-byte key-frame
+# payload whose `got` echoes bytes 3..6 verbatim and is not the start
+# code). The `NotVp8Chunk` FourCC-gate variant lives only on the
+# `from_chunk` path and is asserted unreachable here. Unlike the §2 RIFF
+# walker path the `decode` / `decode_still_paths` harnesses reach this
+# peek through, this harness drives the bare §9.1 header parser over an
+# attacker-controlled byte slice of arbitrary length.
+[[bin]]
+name = "parse_vp8_chunk"
+path = "fuzz_targets/parse_vp8_chunk.rs"
+test = false
+doc = false
+bench = false
