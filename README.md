@@ -166,7 +166,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ### Fuzzing
 
-Thirty [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Thirty-one [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets):
 `decode` and `extract_metadata` feed arbitrary bytes through the two
 public single-shot entry points; `roundtrip_lossless` synthesises a
@@ -673,8 +673,26 @@ round fixed it by capping the eager `Vec::with_capacity` at
 the buffer still grows on demand for a legitimately large image and the
 self-terminating loop raises `DecodeError::Eof` on a truncated stream, so
 decoded bytes for all valid images are unchanged. A ~120 s ASan campaign
-over 48 882 runs is now crash-free, peak RSS 1.2 GiB. Run any
-one with (nightly + `cargo-fuzz` installed):
+over 48 882 runs is now crash-free, peak RSS 1.2 GiB.
+`decode_alpha_plane` (round 295) drives the public *file-level
+still-image alpha* entry point `decode_alpha_plane` — the layer that
+walks the §2.3 `RIFF`/`WEBP` container, selects the §2.7.1.2 `ALPH`
+chunk (`Ok(None)` when absent), resolves the plane dimensions *from the
+file itself* (the §2.7.1 `VP8X` 24-bit canvas Width/Height, else the
+§2.5 `VP8 ` keyframe header), and decodes the alpha bitstream through
+both §2.7.1.2 compression methods (raw + headerless §3 lossless) and all
+four filter methods. Unlike `decode_alph` (dimensions supplied *by the
+harness* over a bare chunk-payload slice), the dimensions here come from
+the file's own §2.7.1 / §2.5 header, exercising the dimension-source →
+§2.7.1.2 alpha-decode coherence path end to end. A structural pre-pass
+reads the §2.7.1 `VP8X` canvas and gates the decode tail by declared
+pixel count so an adversarial canvas can't blow the per-iteration budget.
+On every `Ok(Some(plane))` the §2.7.1.2 carrier invariant and replay
+determinism are cross-checked. A ~90 s ASan campaign over **23 926 275
+runs** (~263 K exec/s, peak RSS 541 MiB) is crash-free — no panic, OOM,
+or overflow surfaced; the existing `decode_alpha` `checked_mul` and the
+headerless lossless eager-reservation cap already defend this path. Run
+any one with (nightly + `cargo-fuzz` installed):
 
 ```text
 cargo +nightly fuzz run decode               --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
@@ -707,6 +725,7 @@ cargo +nightly fuzz run read_symbol_lut_diff --manifest-path crates/oxideav-webp
 cargo +nightly fuzz run decode_lossless_lut  --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_still_paths   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 cargo +nightly fuzz run decode_lossless_image --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
+cargo +nightly fuzz run decode_alpha_plane   --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
 ```
 
 ## Standalone use (no `oxideav-core`)

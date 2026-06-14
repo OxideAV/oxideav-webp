@@ -709,3 +709,33 @@ path = "fuzz_targets/decode_lossless_image.rs"
 test = false
 doc = false
 bench = false
+
+# The thirty-first harness drives the public *file-level still-image
+# alpha* entry point `decode_alpha_plane` over an attacker-controlled
+# byte buffer — the layer that walks the §2.3 RIFF/WEBP container,
+# selects the §2.7.1.2 `ALPH` chunk (`Ok(None)` when absent), resolves
+# the plane dimensions *from the file itself* (the §2.7.1 `VP8X` 24-bit
+# canvas Width/Height when a `VP8X` chunk exists, else the §2.5 `VP8 `
+# keyframe header), and decodes the alpha bitstream through both
+# §2.7.1.2 compression methods (raw + headerless lossless) and all four
+# §2.7.1.2 filter methods. Unlike the round-279 `decode_alph` /
+# `parse_alph` harnesses — which drive `alph::decode_alpha` /
+# `AlphHeader::parse` standalone with the `(width, height)` pair supplied
+# *by the harness* over a bare chunk-payload slice — this harness takes
+# the dimensions from the file's own §2.7.1 / §2.5 header, so the
+# dimension-source → §2.7.1.2 alpha-decode coherence path is exercised
+# end to end. A cheap structural pre-pass reads the §2.7.1 `VP8X` canvas
+# dimensions; when the declared `width * height` exceeds `1 << 20` pixels
+# the decode tail is gated (the §2.7.1 24-bit canvas fields can declare a
+# plane far beyond any real still; the dimension caps are unit-tested
+# separately) but the file is still parsed for the Result contract. On
+# every `Ok(Some(plane))` the §2.7.1.2 carrier invariant and pure-function
+# determinism (replaying the same bytes yields a byte-identical plane) are
+# cross-checked; `Ok(None)` and `Err(_)` are required only to return a
+# `Result` rather than panic.
+[[bin]]
+name = "decode_alpha_plane"
+path = "fuzz_targets/decode_alpha_plane.rs"
+test = false
+doc = false
+bench = false
