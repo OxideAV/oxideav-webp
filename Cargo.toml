@@ -59,6 +59,10 @@ name = "lossless_encode"
 harness = false
 
 [[bench]]
+name = "stacked_transform_encode"
+harness = false
+
+[[bench]]
 name = "lossless_decode"
 harness = false
 

@@ -6,6 +6,22 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-307 benchmark: new `stacked_transform_encode` criterion bench drives
+  the public `encode_webp_lossless` entry point across the three distinct
+  content regimes the RFC 9649 §3.5 **stacked-transform chains** target —
+  `palette_indexed` (activates the §4.4 color-indexing path and its round-302
+  color-indexing → §4.1 predictor chain), `photo_decorrelated` (red/blue as
+  affine functions of green, activating the §4.2 cross-color transform and its
+  round-303/304 color → predictor and color → subtract-green → predictor
+  chains), and `smooth_gradient` (drives the §4.1 predictor sub-image lambda
+  sweep across the residual-vs-§7.2-sub-image cost crossover rounds 302–306
+  tuned). Rounds 302–306 each reasoned about an "empirically-observed
+  crossover" without a committed harness exercising the chooser on per-regime
+  inputs; this bench supplies that A/B target for both encode time and output
+  size. Encode-only timing (inputs built once outside `b.iter`); all three
+  inputs were verified to round-trip losslessly through encode → decode. No
+  production-code change — measurement infrastructure only.
+
 - Round-306 lossless-encode cost improvement: the §3.5 **stacked-transform
   chains** now sweep the **full sub-image-aware lambda set** the
   single-transform predictor path has carried since round 162 —

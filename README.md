@@ -36,10 +36,19 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twenty-eight criterion benches under `benches/`,
+The crate ships twenty-nine criterion benches under `benches/`,
 grouped by domain:
 
 * **End-to-end** — `lossless_decode`, `lossless_encode`,
+  `stacked_transform_encode` (round 307: full-file `encode_webp_lossless`
+  separated by the three content regimes the §3.5 stacked-transform
+  chains target — `palette_indexed` (§4.4 color-indexing → §4.1
+  predictor), `photo_decorrelated` (§4.2 cross-color → predictor and
+  → §4.3 subtract-green → predictor), and `smooth_gradient` (the §4.1
+  predictor sub-image lambda sweep across the residual-vs-§7.2-sub-image
+  cost crossover rounds 302–306 tuned). Gives those cost-model rounds a
+  committed per-regime A/B harness for both encode time and output size;
+  all three inputs round-trip losslessly),
   `lossless_decode_mixes` (round 283: full-file decode per elected
   §4 transform mix — predictor / color-indexing / cross-color /
   subtract-green / no-transform, the elected list asserted at
