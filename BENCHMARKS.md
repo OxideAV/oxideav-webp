@@ -27,7 +27,7 @@ the medians are still stable to a few percent.
 | `benches/lossless_decode.rs` | `lossless_decode_argb_256` | Full RIFF/WEBP decode of the encoded 256×256 gradient |
 | `benches/lz77_match.rs`      | `vp8l_lz77_match` | §5.2.2 hash-chain LZ77 matcher over a 4096-pixel synthetic tile |
 | `benches/argb_to_rgba.rs`    | `argb_to_rgba` | `Vp8lImage::to_rgba` repack on a 256×256 image |
-| `benches/inverse_predictor.rs` | `inverse_predictor_modeN_256x256` | §4.1 inverse predictor on a 256×256 buffer, mode-pinned (N ∈ {11, 12, 13}) |
+| `benches/inverse_predictor.rs` | `inverse_predictor_modeN_256x256`, `inverse_predictor_blocks16_mixed_256x256` | §4.1 inverse predictor on a 256×256 buffer: mode-pinned `size_bits=0` cells (N ∈ {11, 12, 13}) plus a realistic `size_bits=4` (16×16 block) cell with a per-block LCG mode mix over [0, 13]. The on-wire `size_bits = ReadBits(3) + 2` is always in [2, 9], so the block cell exercises the multi-pixel-per-block interior the `size_bits=0` cells never reach |
 | `benches/inverse_color.rs` | `inverse_color_256x256_sbN` | §4.2 inverse color transform on a 256×256 buffer, parameterised over `size_bits` (N ∈ {0, 3, 5, 7}) |
 | `benches/inverse_color_indexing.rs` | `inverse_color_indexing_256x256_paletteN` | §4.4 inverse color-indexing transform on a 256×256 output buffer, parameterised over palette size (N ∈ {2, 4, 16, 256}) which selects all four `width_bits` bundling levels |
 | `benches/inverse_subtract_green.rs` | `inverse_subtract_green_256x256` | §4.3 subtract-green inverse transform on a 256×256 ARGB buffer (deterministic LCG fill) |
@@ -2176,3 +2176,58 @@ sample $! 4 -f /tmp/prof_decode.sample
 
 The driver source lives in this repo's history; a fresh copy is a
 five-line `main()` that calls `decode_webp` in a tight loop.
+
+## Round-296 (2026-06-14) — `inverse_predictor` per-block mode hoist (evaluated, not landed) + realistic-block bench
+
+### Profile target
+
+`vp8l_transform::inverse_predictor` is the rank-1 lossless-decode
+self-time function (~80% per the round-170 profile; the §4.1 predictor
+runs once per pixel). The interior x loop loads the per-pixel predictor
+mode as `green(predictor_image[block_row + (x >> size_bits)])` on every
+pixel even though the mode is constant across each `1 << size_bits`
+block in x — exactly the redundancy the round-207 `inverse_color` CTE
+hoist removed for the §4.2 transform. Because the on-wire field is
+`size_bits = ReadBits(3) + 2` (always in [2, 9]), a block spans at
+least 4 pixels, so the per-pixel `block_index` recompute + array load +
+`green()` extract are all redundant within a block.
+
+### Hoist evaluated
+
+A block-walked interior (load the mode once per block, run the inner
+pixel span branch-free) was implemented and proven **byte-identical**:
+
+* the existing `inverse_predictor_matches_unsplit_reference_random`
+  cross-check (size_bits ∈ {0, 1, 2, 3} over seven aspect ratios incl.
+  13×9 / size_bits=2 which crosses block boundaries) passed against a
+  verbatim per-pixel reference; and
+* an FNV-1a A/B over all seven `docs/image/webp/fixtures/lossless-*`
+  `input.webp` decodes (`decode_lossless_image` → ARGB → little-endian
+  byte hash) produced identical 64-bit hashes before and after the
+  hoist (e.g. `lossless-128x128-natural` = `01da6591551892ed` both
+  ways).
+
+### Not landed — no measurable win on this target
+
+The realistic mixed-mode block path is dominated by the 14-way
+`predict()` match, not by the per-pixel mode load, so removing the load
+did not produce a stable improvement. Worse, the machine was saturated
+during measurement (load average ≈ 23 from concurrent workspace
+agents): the **unchanged baseline** cell drifted from ~235 µs to
+0.5–1.4 ms across back-to-back runs, so no valid before/after delta
+could be taken. Same call as the round-224 `predictor_subtract`
+biased-SWAR experiment — proven byte-identical, retained the original
+body, recorded the finding. The hoist is a clean future-round
+candidate to re-measure on a quiet machine; the byte-identity proof
+and cross-check test are already in place as its A/B reference.
+
+### New bench: realistic block cell
+
+`benches/inverse_predictor.rs` gains
+`inverse_predictor_blocks16_mixed_256x256`: a `size_bits=4` (16×16
+block) 256×256 run with a deterministic per-block LCG mode mix over
+[0, 13]. Every pre-existing `inverse_predictor` cell pinned
+`size_bits=0` (one predictor per pixel — the block degenerates), so the
+multi-pixel-per-block interior — the path every real bitstream takes —
+was previously unbenchmarked. This cell is the A/B reference for any
+future hoist or vectorisation of the predictor interior.

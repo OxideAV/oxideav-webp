@@ -6,6 +6,24 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Performance
 
+- Round-296 PROFILE depth round: evaluated a per-block predictor-mode
+  hoist for the §4.1 `vp8l_transform::inverse_predictor` interior loop
+  (load the block's mode once per `1 << size_bits` block instead of on
+  every pixel, mirroring the round-207 `inverse_color` CTE hoist). The
+  hoist was proven byte-identical — the existing randomised cross-check
+  test plus an FNV-1a A/B over all seven `lossless-*` fixtures both
+  matched — but it produced no measurable win (the interior is
+  dominated by the 14-way `predict()` dispatch, not the mode load) and
+  the measurement host was saturated by concurrent agents (baseline
+  drift of 4–6×), so the original per-pixel body was retained per the
+  round-224 precedent. The realistic block path is now benched:
+  `benches/inverse_predictor.rs` adds
+  `inverse_predictor_blocks16_mixed_256x256` (`size_bits=4`, 16×16
+  blocks, per-block LCG mode mix), filling the coverage gap left by the
+  pre-existing `size_bits=0` cells (which the on-wire `size_bits =
+  ReadBits(3) + 2 ∈ [2, 9]` never reaches). See `BENCHMARKS.md`
+  "Round-296".
+
 - Round-293 PROFILE-OPT depth round: hoisted the §2.7.1.2 `ALPH`
   Stage-2 inverse-filter border rules out of the per-pixel loop. The
   loop previously re-evaluated a `match (x, y)` top-left special case
