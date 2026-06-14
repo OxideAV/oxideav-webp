@@ -189,3 +189,14 @@ harness = false
 [[bench]]
 name = "lossy_decode"
 harness = false
+
+# Round-294: the encoder-side §6.2.2 entropy-image block-clustering
+# heuristic (`cluster_blocks_by_histogram_distance`) behind
+# `encode_with_meta_prefix`. Coarse-RGB-histogram Lloyd's k-means over
+# the `1 << prefix_bits`-aligned blocks: per-pixel feature pass +
+# farthest-point seeding + up-to-8-pass assignment/update loop. Three
+# altitudes: content regime (bimodal / gradient / uniform-degenerate),
+# num_groups sweep (2/3/4), and image-size sweep (128/256/384 px).
+[[bench]]
+name = "meta_prefix_cluster"
+harness = false

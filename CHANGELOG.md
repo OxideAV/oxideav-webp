@@ -70,6 +70,28 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- Round-294 BENCH depth round: added `benches/meta_prefix_cluster.rs`, a
+  criterion harness over the encoder's §6.2.2 entropy-image
+  block-clustering heuristic (`cluster_blocks_by_histogram_distance`)
+  behind `encode_with_meta_prefix` — the last encode stage sized only by
+  subtraction inside the `lossless_encode` end-to-end number. The kernel
+  is a coarse-RGB-histogram (16 bins/channel → 48-dim/block) Lloyd's
+  k-means over the `1 << prefix_bits`-aligned blocks: a per-pixel
+  feature-binning pass, deterministic farthest-point seeding, an
+  up-to-8-pass assignment/update loop, and a compaction. Three altitudes:
+  content regime (bimodal split / smooth gradient / uniform single-group
+  early-out), `num_groups ∈ {2,3,4}`, image side ∈ {128,256,384} px. The
+  ranked hotspot map: the per-pixel feature pass dominates (≈70–80% of
+  clustering self-time — the uniform cell, which skips the Lloyd loop, is
+  122 of 150 µs; the size sweep scales with pixel not block count), the
+  Lloyd loop is a clear second only on poorly-separated content (gradient
+  204 µs vs. bimodal 150 µs), and `num_groups` 2→4 is nearly flat
+  (147→150 µs) at the default block size. **No behavioural change — the
+  only `src/` edit is a `fn` → `pub fn` visibility widen on
+  `cluster_blocks_by_histogram_distance` so the bench can drive it in
+  isolation (matching the `pick_block_cte` exposure pattern); every
+  emitted byte is unchanged.** See `BENCHMARKS.md` round-294.
+
 - Round-291 BENCH depth round: added `benches/alpha_decode.rs`, a
   criterion harness over the §2.7.1.2 `ALPH` alpha-plane decode — the
   rank-1 webp-owned cost on the lossy decode path, previously sized only

@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twenty-five criterion benches under `benches/`,
+The crate ships twenty-six criterion benches under `benches/`,
 grouped by domain:
 
 * **End-to-end** — `lossless_decode`, `lossless_encode`,
@@ -65,7 +65,11 @@ grouped by domain:
   `apply_subtract_green`, `lz77_match`, `lz77_chain` (round 286: the
   §5.2.2 matcher across five hash-chain-depth regimes — period-2/4/64
   repeats, near-unique, gradient), `pick_block_cte` (the §3.5.2
-  chooser walk), and the §5.2.2 `value_to_prefix` split.
+  chooser walk), `meta_prefix_cluster` (round 294: the §6.2.2
+  entropy-image block-clustering heuristic behind
+  `encode_with_meta_prefix` — coarse-RGB-histogram Lloyd's k-means
+  across content regime / `num_groups` / image-size sweeps), and the
+  §5.2.2 `value_to_prefix` split.
 * **Entropy / prefix-code chain** — `build_code_lengths` and
   `canonical_codes` (encoder §3.7.2) and `prefix_from_code_lengths`
   (decoder §6.2.1), each over the four §3.7.1 alphabets
@@ -135,7 +139,20 @@ loop vectorises — drops 13.5 µs → 1.57 µs (−88%); `Horizontal` / `Gradie
 are flat (their left-neighbour serial dependency, not the dispatch, was the
 bound). Byte-for-byte identical — proven by a new per-pixel oracle test
 across 9 dimension/method combinations and by 400 K `decode_alph` fuzz runs
-with no divergence. Numbers,
+with no divergence. Round 294
+(benchmark mode, no behavioural change — one `fn` → `pub fn` visibility
+widen on `cluster_blocks_by_histogram_distance`, matching the
+`pick_block_cte` exposure pattern) added the `meta_prefix_cluster`
+harness over the encoder's §6.2.2 entropy-image block-clustering
+heuristic — the last encode stage sized only by subtraction inside the
+`lossless_encode` e2e number — and ranked it: the per-pixel
+feature-binning pass dominates (≈70–80% of clustering self-time, isolated
+by the uniform-content cell that skips the Lloyd loop; the kernel is
+pixel-bound not block-bound), the Lloyd assignment/update loop is a clear
+second only on poorly-separated content (gradient +36% over a clean
+bimodal split), and `num_groups` 2→4 is nearly free at the default block
+size — flagging a feature-pass scattered-write reduction as the next
+PROFILE-OPT target. Numbers,
 profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run

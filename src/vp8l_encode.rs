@@ -3828,7 +3828,11 @@ fn seed_cluster_centroids(features: &[u32], block_count: usize, num_groups: u32)
 /// seeding rule, the Lloyd loop's tie-break (lowest-index centroid
 /// wins on equal-distance), and the compaction pass are all
 /// deterministic.
-fn cluster_blocks_by_histogram_distance(
+///
+/// Exposed `pub` (like [`pick_block_cte`]) so the `meta_prefix_cluster`
+/// criterion bench can drive this §6.2.2 entropy-image kernel in
+/// isolation. Not part of the crate's documented stable surface.
+pub fn cluster_blocks_by_histogram_distance(
     pixels: &[u32],
     width: u32,
     height: u32,

@@ -41,6 +41,7 @@ the medians are still stable to a few percent.
 | `benches/lz77_chain.rs` | `lz77_chain_{deep_period2,deep_period4,medium_period64,shallow_unique,natural_gradient}` | §5.2.2 LZ77 hash-chain matcher (`Lz77Matcher::find` + `insert`, rank 3 in the round-283 encode profile) chain-*depth* scenarios — five 8192-pixel tiles that vary hash-chain depth from maximal (period-2/4 repeats), through moderate (period-64), to shallow (near-unique LCG / natural gradient). Driven through the public `encode_argb_literals_with_width` entry like `lz77_match`, but with depth-controlled inputs so a future chain-walk cut has A/B numbers per regime instead of one blended figure |
 | `benches/lossy_decode.rs` | `decode_webp_lossy_e2e`, `decode_lossy_rgba_extracted`, `yuv420_to_rgba_{16x16,128x128,256x256}` | §2.5 `VP8 ` (lossy) decode path **this crate owns** at three altitudes: full public `decode_webp` over the committed 128×128 `VP8 `+`ALPH` fixture; `decode_lossy_rgba` over the extracted `VP8 ` bitstream (RIFF walk removed); and the crate-owned post-I420 reconstruction loop `yuv420_to_rgba` (4:2:0 nearest-neighbour chroma up-sample + RFC 6386 §9.2 BT.601 full-range YCbCr→RGB matrix) in isolation at three sizes. The sibling `oxideav-vp8` decoder owns the entropy/IDCT/prediction/loop-filter work; this bench isolates and ranks the lossy stage the webp crate can act on |
 | `benches/alpha_decode.rs` | `decode_alpha_plane_e2e`, `decode_alpha_lossless_extracted`, `inverse_filter_{none,horizontal,vertical,gradient}_128x128` | §2.7.1.2 `ALPH` alpha-plane decode — the rank-1 webp-owned cost on the lossy path (≈52% of lossy e2e in the round-289 map, previously sized only by subtraction). Public `decode_alpha_plane` e2e over the committed fixture; `alph::decode_alpha` on the extracted `ALPH` payload (RIFF walk removed); and the §2.7.1.2 Stage-2 inverse-filter per-pixel loop in isolation, one cell per `F` method via synthetic uncompressed payloads. Splits the r289 rank-1 bucket: container walk ≈1 µs, the rest is the headerless VP8L lossless decode (already covered by `read_symbol` / `lossless_decode*`) |
+| `benches/meta_prefix_cluster.rs` | `meta_prefix_cluster_content_256/{bimodal,gradient,uniform}`, `meta_prefix_cluster_groups_256/{2,3,4}`, `meta_prefix_cluster_size/{128,256,384}` | Encoder-side §6.2.2 entropy-image block-clustering heuristic (`cluster_blocks_by_histogram_distance`) behind `encode_with_meta_prefix`. Coarse-RGB-histogram (16 bins/channel → 48-dim/block) Lloyd's k-means over the `1 << prefix_bits`-aligned blocks: a per-pixel feature-binning pass, deterministic farthest-point seeding, an up-to-8-pass assignment/update loop, and a compaction onto a contiguous group range. The RFC-defined entropy image is a decoder construct; this is the *encoder's* partition chooser, previously sized only by subtraction inside the `lossless_encode` e2e. Three altitudes: content regime (bimodal split / smooth gradient / uniform single-group early-out), `num_groups ∈ {2,3,4}`, and image side ∈ {128,256,384} px |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -2053,6 +2054,101 @@ At fixture size (128×128) the crate-owned conversion drops from ~34 µs to
   clean. The only `src/` change is `vp8_decode.rs` (`yuv420_to_rgba`
   rewrite + `chroma_offsets` helper + `ycbcr_to_rgb` refactored onto it,
   now `#[cfg(test)]` as the oracle).
+
+## Round-294 (2026-06-14): §6.2.2 entropy-image clustering bench + encode hotspot map
+
+BENCH depth round. Every prior encode bench isolated a *per-symbol* or
+*per-pixel-block* kernel (`pick_block_cte`, `build_code_lengths`,
+`canonical_codes`, `lz77_chain`, `predictor_subtract`, …). The one
+remaining encode stage sized only by subtraction inside the
+`lossless_encode` end-to-end number was the *meta-prefix partition
+chooser*: the heuristic that decides which §6.2.2 prefix-code group each
+image block belongs to before the multi-group candidate is emitted. This
+round adds `benches/meta_prefix_cluster.rs` and ranks that kernel.
+
+### What the clusterer owns (§6.2.2, encoder side)
+
+The RFC 9649 §6.2.2 *entropy image* is a **decoder** construct: it stores,
+for each `1 << prefix_bits`-aligned block, a *meta prefix code* selecting
+one of `num_prefix_groups` five-code prefix-code groups (the meta code is
+carried in the red+green channels of the entropy pixel;
+`num_prefix_groups = max(entropy image) + 1`). The spec says nothing about
+how an encoder *chooses* that partition — only how to read it back. This
+crate's `encode_with_meta_prefix` chooses it with
+`cluster_blocks_by_histogram_distance`, a deterministic
+coarse-RGB-histogram Lloyd's k-means:
+
+1. **Feature pass** (`histogram_block_features`) — one sweep over every
+   pixel, binning each channel into `256 >> 4 = 16` bins → a 48-dim count
+   vector per block. **O(width × height)**.
+2. **Seeding** (`seed_cluster_centroids`) — deterministic farthest-from-
+   chosen-set point selection (no RNG). **O(num_groups × block_count² ×
+   feat_dim)** worst case.
+3. **Lloyd loop** — up to `CLUSTER_MAX_ITERATIONS = 8` assignment/update
+   passes; each assignment pass re-materialises every centroid average
+   from its running sum (`raw / divisor`) per block per group.
+   **O(passes × block_count × num_groups × feat_dim)**.
+4. **Compaction** onto a contiguous `0..used-1` group range.
+
+The chooser invokes this once per `(prefix_bits, num_groups, cache)`
+candidate, so its weight scales with the candidate grid as well as the
+image.
+
+### New bench: `meta_prefix_cluster`
+
+Three altitudes, all inputs synthesised in-bench (no committed fixtures),
+result folded into a `black_box` accumulator:
+
+* **content** — fixed 256×256, default `prefix_bits = 4` (256-block
+  entropy image), `num_groups = 4`, three contents.
+* **num_groups** — bimodal content, `num_groups ∈ {2,3,4}`.
+* **size** — bimodal content, side ∈ {128,256,384} px (block counts
+  64 / 256 / 576).
+
+### Measured (this host, `aarch64-apple-darwin`, `--quick`, median)
+
+| Cell | Median | Notes |
+|---|---:|---|
+| `content_256/uniform` | 122.4 µs | **degenerate floor** — seeding finds < 2 distinguishable centroids, returns the single-group early-out. This is the feature pass + failed seed scan with **no Lloyd loop**. |
+| `content_256/bimodal` | 150.1 µs | clean two-region split; Lloyd converges in a few passes. |
+| `content_256/gradient` | 203.7 µs | smooth ramp — every pass reassigns boundary blocks, so the Lloyd loop runs the most iterations of the three. |
+| `groups_256/2` | 147.4 µs | |
+| `groups_256/3` | 152.9 µs | |
+| `groups_256/4` | 150.3 µs | |
+| `size/128` | 37.8 µs | 64 blocks, 16 384 px |
+| `size/256` | 152.4 µs | 256 blocks, 65 536 px |
+| `size/384` | 337.3 µs | 576 blocks, 147 456 px |
+
+### Ranked clustering hotspot map
+
+| Rank | Stage | Evidence | Share (256×256, num_groups 4) |
+|---:|---|---|---|
+| 1 | **Feature pass** (`histogram_block_features`, per-pixel bin update) | the `uniform` cell — which runs the feature pass + seed but **skips the entire Lloyd loop** — is 122 µs of the 150 µs `bimodal` total; the size sweep scales near-linearly with **pixel** count (37.8 / 152 / 337 µs ≈ 1 : 4 : 8.9 vs. pixel ratio 1 : 4 : 9), not block count | ≈ 70–80 % |
+| 2 | **Lloyd assignment/update loop** | the `bimodal` → `gradient` delta (150 → 204 µs, +36 %) is pure extra Lloyd iteration; the bimodal-minus-uniform delta (≈28 µs) is the loop's contribution at convergence | ≈ 15–25 % |
+| 3 | **Seeding** (`seed_cluster_centroids`) | the `num_groups` sweep is nearly flat (147 → 153 µs across 2→4), so the seeding's `O(num_groups × block_count²)` term is small at 256 blocks — it would only dominate at larger block counts with high `num_groups` | ≈ 5 % |
+
+**Takeaway.** The per-pixel feature-binning pass dominates — the clusterer
+is pixel-bound, not block-bound, at the encoder's default `prefix_bits`.
+The Lloyd loop is a clear second only on poorly-separated content
+(gradients). `num_groups` is nearly free at this image size.
+
+### Ranked next PROFILE-OPT target (post-r294, encode/clustering path)
+
+| Rank | Target | Evidence | A/B references |
+|---:|---|---|---|
+| 1 | **Feature pass**: the inner loop does three dependent shift/mask + three scattered `features[…] += 1` writes per pixel. A row-blocked accumulation (one block's 48-dim vector kept hot, flushed at block boundary) or a packed `[u8; 48]`→`[u32; 48]` widen would cut the scattered-write pressure | rank-1 ≈ 70–80 % of clustering self-time; `uniform` cell isolates it (no Lloyd loop) | `content_256/uniform`, `size/{128,256,384}` |
+| 2 | **Lloyd assignment**: cache the per-centroid `raw / divisor` average vector once per pass instead of re-dividing inside the per-block × per-group × per-bin triple loop | the `gradient` cell shows the loop's worst case; the division is `cluster_k × CLUSTER_FEATURE_DIM` per block per pass | `content_256/gradient`, `content_256/bimodal` |
+
+### Round-294 verification
+
+* **Byte identity:** no behavioural change. The only `src/` edit is a
+  visibility widen — `cluster_blocks_by_histogram_distance` from `fn` to
+  `pub fn` (matching the established `pick_block_cte` bench-exposure
+  pattern in the same `pub mod vp8l_encode`), so the bench can drive the
+  kernel in isolation. The function body, its callers, and every emitted
+  byte are unchanged; all lib tests pass.
+* `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D warnings`
+  clean.
 
 ## Reproducing
 
