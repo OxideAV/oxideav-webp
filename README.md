@@ -152,7 +152,20 @@ pixel-bound not block-bound), the Lloyd assignment/update loop is a clear
 second only on poorly-separated content (gradient +36% over a clean
 bimodal split), and `num_groups` 2→4 is nearly free at the default block
 size — flagging a feature-pass scattered-write reduction as the next
-PROFILE-OPT target. Numbers,
+PROFILE-OPT target. Round 296 returned to the rank-1 lossless-decode
+hotspot `inverse_predictor`: its interior loads the per-pixel predictor
+mode every pixel though the mode is constant across each `1 <<
+size_bits` block (`size_bits = ReadBits(3) + 2 ∈ [2, 9]`, so blocks are
+always multi-pixel). A per-block mode hoist (mirroring the round-207
+`inverse_color` CTE hoist) was implemented and proven byte-identical —
+the existing cross-check test plus an FNV-1a A/B over all seven
+`lossless-*` fixtures both matched — but yielded no measurable win (the
+interior is dominated by the 14-way `predict()` dispatch, not the mode
+load) and the host was saturated during measurement, so the original
+body was retained per the round-224 precedent. The realistic block path
+is now benched (`inverse_predictor_blocks16_mixed_256x256`, `size_bits
+= 4`), filling the gap left by the pre-existing `size_bits = 0` cells.
+Numbers,
 profile findings, the full
 round-283 regression re-run (stable + nightly `simd`), and the
 optimization log live in [`BENCHMARKS.md`](./BENCHMARKS.md). Run
