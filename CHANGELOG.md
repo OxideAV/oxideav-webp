@@ -6,6 +6,20 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Performance
 
+- Round-299 PROFILE depth round: rewrote the private
+  `crate::argb_to_rgba` helper — the ARGB-`u32` → packed `[R, G, B, A]`
+  converter the public `decode_webp` lossless still path
+  (`decode_lossless_image`) and the animation sub-frame path call — from
+  the original four-`push`-per-pixel loop to the pre-sized
+  `chunks_exact_mut(4)` form that round 170 already adopted for the
+  public `Vp8lImage::to_rgba`. Output is byte-for-byte identical
+  (`[R, G, B, A]` order; the full 439-test `--lib` suite passes
+  unchanged). New A/B bench cells `repack_push_loop` /
+  `repack_chunks_exact` in `benches/argb_to_rgba.rs` measure ~130 µs vs.
+  ~8.9 µs over a 256×256 buffer (≈14.5× faster), matching the existing
+  `argb_to_rgba` cell. A `chunks_exact_mut` rewrite of the lossy
+  `yuv420_to_rgba` interior was also tried but regressed ~2.1–2.4× and
+  was reverted. See `BENCHMARKS.md` "Round-299".
 - Round-296 PROFILE depth round: evaluated a per-block predictor-mode
   hoist for the §4.1 `vp8l_transform::inverse_predictor` interior loop
   (load the block's mode once per `1 << size_bits` block instead of on

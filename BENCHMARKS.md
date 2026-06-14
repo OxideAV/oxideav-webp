@@ -26,7 +26,7 @@ the medians are still stable to a few percent.
 | `benches/lossless_encode.rs` | `lossless_encode_natural_128` | Full RIFF/WEBP encode of a 128×128 tile from the in-tree natural-image fixture |
 | `benches/lossless_decode.rs` | `lossless_decode_argb_256` | Full RIFF/WEBP decode of the encoded 256×256 gradient |
 | `benches/lz77_match.rs`      | `vp8l_lz77_match` | §5.2.2 hash-chain LZ77 matcher over a 4096-pixel synthetic tile |
-| `benches/argb_to_rgba.rs`    | `argb_to_rgba` | `Vp8lImage::to_rgba` repack on a 256×256 image |
+| `benches/argb_to_rgba.rs`    | `argb_to_rgba`, `repack_push_loop`, `repack_chunks_exact` | `Vp8lImage::to_rgba` repack on a 256×256 image, plus two A/B cells isolating the byte-repack *form* (`Vec::push` vs. pre-sized `chunks_exact_mut(4)`) the private `decode_lossless_image` converter uses |
 | `benches/inverse_predictor.rs` | `inverse_predictor_modeN_256x256`, `inverse_predictor_blocks16_mixed_256x256` | §4.1 inverse predictor on a 256×256 buffer: mode-pinned `size_bits=0` cells (N ∈ {11, 12, 13}) plus a realistic `size_bits=4` (16×16 block) cell with a per-block LCG mode mix over [0, 13]. The on-wire `size_bits = ReadBits(3) + 2` is always in [2, 9], so the block cell exercises the multi-pixel-per-block interior the `size_bits=0` cells never reach |
 | `benches/inverse_color.rs` | `inverse_color_256x256_sbN` | §4.2 inverse color transform on a 256×256 buffer, parameterised over `size_bits` (N ∈ {0, 3, 5, 7}) |
 | `benches/inverse_color_indexing.rs` | `inverse_color_indexing_256x256_paletteN` | §4.4 inverse color-indexing transform on a 256×256 output buffer, parameterised over palette size (N ∈ {2, 4, 16, 256}) which selects all four `width_bits` bundling levels |
@@ -2294,3 +2294,52 @@ block) 256×256 run with a deterministic per-block LCG mode mix over
 multi-pixel-per-block interior — the path every real bitstream takes —
 was previously unbenchmarked. This cell is the A/B reference for any
 future hoist or vectorisation of the predictor interior.
+
+## Round-299 (2026-06-14) — private lossless-decode `argb_to_rgba` pre-sized repack
+
+The round-170 sweep rewrote the **public** `Vp8lImage::to_rgba` from a
+four-`push`-per-pixel loop to a pre-sized `chunks_exact_mut(4)` form
+(−93% / ~14.5×, recorded above). The **private** `crate::argb_to_rgba`
+helper — the converter the public `decode_webp` lossless still path
+(`decode_lossless_image`) and the animation sub-frame path actually
+call — was still on the original `Vec::push` shape. This round brings it
+to the same pre-sized form.
+
+### Change
+
+`src/lib.rs::argb_to_rgba` now allocates `vec![0u8; pixels.len() * 4]`
+up front and writes each pixel's `[R, G, B, A]` channels into a
+`chunks_exact_mut(4)` chunk, dropping the per-byte capacity/bounds
+check the `push` loop paid and letting the compiler auto-vectorise the
+strided stores. Output is byte-for-byte identical — `[R, G, B, A]` order
+matching `oxideav_core::PixelFormat::Rgba`; the full `--lib` suite
+(439 tests, incl. the lossless decode round-trips) passes unchanged.
+
+### New A/B bench cells: `benches/argb_to_rgba.rs`
+
+`repack_push_loop` / `repack_chunks_exact` time the two repack *forms*
+in isolation over the same 65,536-pixel (256×256) ARGB buffer, with an
+in-bench `assert_eq!` proving they agree byte-for-byte before timing.
+
+### Round-299 measurement
+
+256×256 (65,536-pixel) buffer, `--quick`, aarch64:
+
+| Cell | Time |
+|---|---|
+| `repack_push_loop` (old private-converter form) | ~130 µs |
+| `repack_chunks_exact` (new form, now in `argb_to_rgba`) | ~8.9 µs |
+
+≈14.5× faster, matching the existing `argb_to_rgba` (`to_rgba_scalar`)
+cell at ~8.9 µs — confirming the private converter now hits the same
+auto-vectorised path the public method reached in round 170.
+
+### Considered and not landed
+
+A `chunks_exact_mut(4)` + `[u8; 4]` array-store rewrite of the lossy
+`yuv420_to_rgba` interior was implemented and proven byte-identical
+(the existing `yuv420_to_rgba_matches_per_pixel_reference_across_dimensions`
+oracle passed), but the iterator-driven shape **regressed** the
+`yuv420_to_rgba_{128x128,256x256}` cells by ~2.1–2.4× versus the
+index-addressed loop the compiler already vectorises well. Reverted;
+the index form is retained.

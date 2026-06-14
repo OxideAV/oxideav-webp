@@ -1556,12 +1556,19 @@ pub const CODEC_ID_VP8: &str = "webp_vp8";
 /// into interleaved 8-bit `[R, G, B, A]` bytes — the
 /// `oxideav_core::PixelFormat::Rgba` layout.
 fn argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pixels.len() * 4);
-    for &argb in pixels {
-        out.push((argb >> 16) as u8); // R
-        out.push((argb >> 8) as u8); // G
-        out.push(argb as u8); // B
-        out.push((argb >> 24) as u8); // A
+    // Write four bytes per pixel into a pre-sized buffer via
+    // `chunks_exact_mut(4)`, the same shape `Vp8lImage::to_rgba_scalar`
+    // adopted: it drops the per-`push` capacity-check + bounds-check the
+    // one-byte-at-a-time loop incurred and lets the compiler auto-
+    // vectorise the strided channel stores. The produced bytes are
+    // byte-for-byte identical to the prior push loop — `[R, G, B, A]`
+    // order matching `oxideav_core::PixelFormat::Rgba`.
+    let mut out = vec![0u8; pixels.len() * 4];
+    for (chunk, &argb) in out.chunks_exact_mut(4).zip(pixels.iter()) {
+        chunk[0] = (argb >> 16) as u8; // R
+        chunk[1] = (argb >> 8) as u8; // G
+        chunk[2] = argb as u8; // B
+        chunk[3] = (argb >> 24) as u8; // A
     }
     out
 }
