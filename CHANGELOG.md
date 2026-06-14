@@ -4,6 +4,31 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Round-302 lossless-encode feature: the §3.5 stacked-transform path.
+  The encoder now evaluates a **chained** candidate that applies the
+  §4.4 color-indexing transform followed by the §4.1 spatial predictor
+  over the bundled palette-index image, written into one
+  `optional-transform` list (color-indexing read first → predictor read
+  second → end). RFC 9649 §3.5 permits up to four transforms stacked
+  (each used once) with inverses applied last-read-first; the decoder
+  already runs that reverse-order chain, so it un-applies the predictor
+  over the packed indices first, then un-bundles the color index — no
+  decoder change. On palette content (icons, line art, screen captures)
+  the bundled indices run in long spatially-coherent stretches, so the
+  predictor drives the residuals toward zero and shrinks the entropy
+  stage below the single-transform color-indexing path. The candidate
+  is non-regressing (kept only when strictly smaller than the running
+  best) and self-skips when the packed image is too small to carry a
+  predictor block. Two predictor `size_bits` are swept (default
+  per-region granularity + a maximal single-block header), each across
+  the round-148 `cache_code_bits ∈ [1..11]` + disabled-cache sweep.
+  New tests: `round_302_color_indexing_predictor_round_trips_through_decoder`
+  (four bundling regimes), `…_round_trips_with_cache_and_single_block`,
+  `…_skips_subblock_packed_image`, and
+  `round_302_chooser_never_regresses_and_round_trips`.
+
 ### Performance
 
 - Round-301 PROFILE-OPT round: gave the encoder-side §5.2.2

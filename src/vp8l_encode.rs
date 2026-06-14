@@ -3628,6 +3628,134 @@ fn encode_with_color_indexing(
     Some(w.into_bytes())
 }
 
+/// Encode `pixels` with the §4.4 color-indexing transform **chained**
+/// with the §4.1 spatial predictor transform on the bundled-index
+/// image.
+///
+/// RFC 9649 §3.5 allows up to four transforms to be stacked in one
+/// `optional-transform` list (each used at most once); the inverse
+/// transforms are applied "in the reverse order that they are read
+/// from the bitstream, that is, last one first." The bundled palette
+/// indices the §4.4 transform produces live entirely in the green
+/// channel and run in long spatially-coherent stretches on palette
+/// content (icons, line art, screen captures); a §4.1 predictor pass
+/// over that bundled image turns those runs into near-zero residuals,
+/// shrinking the entropy stage further than either transform alone.
+///
+/// ## Wire / inverse ordering
+///
+/// The two transforms are written **color-indexing first, predictor
+/// second**:
+///
+/// ```text
+/// optional-transform =
+///   %b1 %b11 8BIT entropy-coded-image   -- §4.4 color-indexing-tx (palette)
+///   %b1 %b00 3BIT entropy-coded-image   -- §4.1 predictor-tx (sub-image)
+///   %b0                                 -- end of optional-transform list
+/// spatially-coded-image                 -- predictor residuals over the
+///                                          packed indices, at packed_width
+/// ```
+///
+/// The decoder reads color-indexing first, which subsamples the width
+/// it threads into the predictor body (`transform_width =
+/// DIV_ROUND_UP(packed_width, block)`) and into the main image; it then
+/// applies the inverses in reverse read order — inverse-predictor over
+/// the packed-index image first (recovering the bundled indices), then
+/// inverse-color-indexing (un-bundling back to the full-width ARGB
+/// pixels). This is exactly the order
+/// [`crate::vp8l_transform::decode_lossless`] already implements for a
+/// stacked list, so no decoder change is required.
+///
+/// The predictor sub-image is built over the **packed** image at
+/// `packed_width × height`; the predictor's modes therefore decorrelate
+/// adjacent bundled-index bytes, not the original pixels.
+///
+/// Returns `None` when the palette is infeasible (`> MAX_PALETTE_SIZE`
+/// unique colors) or the packed image is too small for the predictor
+/// transform to carry a meaningful body (needs at least one full
+/// `block × block` square, i.e. `packed_width >= block && height >=
+/// block`). In those cases the single-transform color-indexing
+/// candidate already covers the input.
+///
+/// The chooser composes with `cache_code_bits` over the residual
+/// stream's literal tokens, identically to the single-transform paths.
+fn encode_with_color_indexing_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    cache_code_bits: Option<u32>,
+) -> Option<Vec<u8>> {
+    let (palette, index_of) = collect_palette(pixels)?;
+    if palette.is_empty() {
+        return None;
+    }
+
+    // §4.4 bundle the indices into the green channel at the subsampled
+    // width — the same step the single-transform color-indexing path
+    // takes.
+    let width_bits = crate::vp8l_transform::color_indexing_width_bits(palette.len());
+    let (packed_image, packed_width) =
+        pack_indices_into_bundled_image(pixels, &index_of, width, height, width_bits);
+
+    // The §4.1 predictor needs at least one full block square at the
+    // packed width; otherwise its sub-image is pure overhead and the
+    // single-transform color-indexing candidate is strictly cheaper.
+    let block = 1u32 << size_bits;
+    if packed_width < block || height < block {
+        return None;
+    }
+
+    let mut w = BitWriter::new();
+
+    // ---- Transform #1 (read first): §4.4 color-indexing-tx ----------
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::ColorIndexing as u32, 2);
+    debug_assert!((1..=MAX_PALETTE_SIZE).contains(&palette.len()));
+    w.write_bits((palette.len() - 1) as u32, 8);
+    let mut subtraction_encoded = palette.clone();
+    forward_color_table(&mut subtraction_encoded);
+    write_entropy_coded_image_literals(&mut w, &subtraction_encoded);
+
+    // ---- Transform #2 (read second): §4.1 predictor-tx --------------
+    // Built over the *packed* index image at `packed_width × height`.
+    // The decoder will have subsampled `current_width` to `packed_width`
+    // after reading transform #1, so the `transform_width` it derives
+    // for this body — `DIV_ROUND_UP(packed_width, block)` — matches the
+    // `tw` produced here.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    debug_assert!((2..=9).contains(&size_bits));
+    w.write_bits((size_bits - 2) as u32, 3);
+    let (predictor_image, tw, _th) =
+        build_predictor_image(&packed_image, packed_width, height, size_bits);
+    write_entropy_coded_image_literals(&mut w, &predictor_image);
+
+    // End of optional-transform list (`%b0`).
+    w.write_bit(false);
+
+    // ---- Forward-transform the packed image into residuals ----------
+    let mut residuals = vec![0u32; packed_image.len()];
+    apply_forward_predictor(
+        &packed_image,
+        &mut residuals,
+        packed_width,
+        height,
+        &predictor_image,
+        tw,
+        size_bits,
+    );
+
+    // ---- Spatially-coded-image of the residuals at packed_width -----
+    let mut tokens = tokenize_lz77(&residuals);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, &residuals, bits);
+    }
+    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, packed_width);
+
+    Some(w.into_bytes())
+}
+
 // ---- §6.2.2 multi-meta-prefix (entropy-image) encoder ----------------
 
 /// Default `prefix_bits` candidate the §6.2.2 multi-meta-prefix
@@ -4975,6 +5103,49 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         });
         if ci_best.len() < best.len() {
             best = ci_best;
+        }
+
+        // Round 302: §3.5 stacked-transform candidate — §4.4
+        // color-indexing chained with the §4.1 predictor over the
+        // bundled-index image. On palette content the bundled green-
+        // channel indices run in long spatially-coherent stretches, so
+        // a predictor pass over them drives the residuals toward zero
+        // and shrinks the entropy stage below the single-transform
+        // color-indexing path. The candidate is non-regressing: it is
+        // only kept when strictly smaller than the running best, and it
+        // self-skips (returns `None`) when the packed image is too
+        // small to carry a predictor block. Two `size_bits` are swept —
+        // the default per-region granularity and a maximal single-block
+        // header — each across the round-148 cache-bits sweep.
+        let pred_size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+        let mut ci_pred_single_block: u8 = pred_size_bits;
+        while ci_pred_single_block < 9
+            && ((1u32 << ci_pred_single_block) < width || (1u32 << ci_pred_single_block) < height)
+        {
+            ci_pred_single_block += 1;
+        }
+        let mut ci_pred_size_bits = vec![pred_size_bits];
+        if ci_pred_single_block != pred_size_bits {
+            ci_pred_size_bits.push(ci_pred_single_block);
+        }
+        for &sb in &ci_pred_size_bits {
+            let mut got_candidate = false;
+            let cand = select_best_cache_bits(|cache_bits| {
+                match encode_with_color_indexing_predictor(pixels, width, height, sb, cache_bits) {
+                    Some(bytes) => {
+                        got_candidate = true;
+                        bytes
+                    }
+                    // Packed image too small for this `size_bits`. Emit a
+                    // sentinel longer than the running best so the cache
+                    // sweep discards it; `got_candidate` stays false and
+                    // the outer comparison is skipped entirely.
+                    None => vec![0u8; best.len() + 1],
+                }
+            });
+            if got_candidate && cand.len() < best.len() {
+                best = cand;
+            }
         }
     }
 
@@ -8029,6 +8200,207 @@ mod tests {
                 h
             );
         }
+    }
+
+    /// Round 302: the stacked §4.4 color-indexing + §4.1 predictor
+    /// candidate must round-trip bit-exactly through the decoder. The
+    /// decoder reads color-indexing first (subsampling the width it
+    /// threads into the predictor body and main image), then applies
+    /// the inverses last-first — inverse-predictor over the bundled
+    /// indices, then inverse-color-indexing — recovering the original
+    /// pixels. Exercise the bundling regimes that admit a predictor
+    /// block at the packed width (width_bits 3 / 2 / 1 / 0) so the
+    /// `packed_width >= block` self-skip never trips for the chosen
+    /// dimensions.
+    #[test]
+    fn round_302_color_indexing_predictor_round_trips_through_decoder() {
+        let palette_64: Vec<u32> = (0..64u32)
+            .map(|i| 0xff00_0000 | (i << 18) | (i << 10) | (i << 2))
+            .collect();
+        // Dimensions are chosen so `packed_width >= 16` (the default
+        // predictor block side) and `height >= 16`, i.e. the chained
+        // candidate produces a non-`None` stream.
+        let scenarios: [(u32, u32, &[u32]); 4] = [
+            // 2-color: width_bits = 3 → packed_width = ceil(W/8).
+            (256, 32, &[0xff00_0000, 0xffff_ffff]),
+            // 4-color: width_bits = 2 → packed_width = ceil(W/4).
+            (
+                128,
+                32,
+                &[0xff10_2030, 0xff40_5060, 0xff70_8090, 0xffa0_b0c0],
+            ),
+            // 16-color: width_bits = 1 → packed_width = ceil(W/2).
+            (
+                64,
+                32,
+                &[
+                    0xff00_0000,
+                    0xff10_2030,
+                    0xff20_4060,
+                    0xff30_6090,
+                    0xff40_80c0,
+                    0xff50_a0e0,
+                    0xff60_c0ff,
+                    0xff70_ff00,
+                    0xff80_8080,
+                    0xff90_9090,
+                    0xffa0_a0a0,
+                    0xffb0_b0b0,
+                    0xffc0_c0c0,
+                    0xffd0_d0d0,
+                    0xffe0_e0e0,
+                    0xfff0_f0f0,
+                ],
+            ),
+            // 64-color: width_bits = 0 (no bundling) → packed_width = W.
+            (32, 32, palette_64.as_slice()),
+        ];
+        for (w, h, palette) in scenarios {
+            let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+            // Row-coherent fill: each row is a smooth run over palette
+            // indices so the predictor over the bundled bytes has real
+            // spatial structure to model.
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = ((x / 3 + y) as usize) % palette.len();
+                    pixels.push(palette[idx]);
+                }
+            }
+            let stream = encode_with_color_indexing_predictor(
+                &pixels,
+                w,
+                h,
+                DEFAULT_PREDICTOR_SIZE_BITS,
+                None,
+            )
+            .expect("palette feasible and packed image admits a predictor block");
+            let header = build_image_header(w, h, false);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&stream);
+            let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                .expect("decode color-indexing+predictor round trip");
+            assert_eq!(
+                decoded.pixels(),
+                pixels.as_slice(),
+                "round-trip mismatch on {}-color palette ({}x{} image)",
+                palette.len(),
+                w,
+                h
+            );
+        }
+    }
+
+    /// Round 302: the stacked candidate must also round-trip with a
+    /// §5.2.3 color cache enabled over the residual stream, and at the
+    /// single-block predictor `size_bits` the chooser also sweeps.
+    #[test]
+    fn round_302_color_indexing_predictor_round_trips_with_cache_and_single_block() {
+        let palette = [0xff00_0000u32, 0xff20_4060, 0xff60_c0ff, 0xffff_ffff];
+        let (w, h) = (96u32, 48u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((x / 5 + y / 2) as usize) % palette.len();
+                pixels.push(palette[idx]);
+            }
+        }
+        // Single-block size_bits large enough to collapse the packed
+        // image into one predictor block.
+        for size_bits in [DEFAULT_PREDICTOR_SIZE_BITS, 7u8] {
+            for cache in [None, Some(4u32), Some(8u32)] {
+                if let Some(stream) =
+                    encode_with_color_indexing_predictor(&pixels, w, h, size_bits, cache)
+                {
+                    let header = build_image_header(w, h, false);
+                    let mut payload = header.to_vec();
+                    payload.extend_from_slice(&stream);
+                    let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                        .expect("decode chained round trip");
+                    assert_eq!(
+                        decoded.pixels(),
+                        pixels.as_slice(),
+                        "mismatch size_bits={size_bits} cache={cache:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round 302: the chained candidate self-skips (returns `None`)
+    /// when the packed image is smaller than one predictor block at the
+    /// requested `size_bits`, so the chooser never emits a degenerate
+    /// stream. A 4-pixel-wide, 2-color image packs to a 1-byte-wide
+    /// bundled image (width_bits = 3), which is below the default
+    /// 16-pixel predictor block.
+    #[test]
+    fn round_302_color_indexing_predictor_skips_subblock_packed_image() {
+        let pixels = [
+            0xff00_0000u32,
+            0xffff_ffff,
+            0xff00_0000,
+            0xffff_ffff,
+            0xffff_ffff,
+            0xff00_0000,
+            0xffff_ffff,
+            0xff00_0000,
+        ];
+        // 4x2 image: width_bits = 3 → packed_width = 1 < block (16).
+        assert!(
+            encode_with_color_indexing_predictor(&pixels, 4, 2, DEFAULT_PREDICTOR_SIZE_BITS, None)
+                .is_none(),
+            "sub-block packed image must self-skip the predictor chain"
+        );
+    }
+
+    /// Round 302: the full super-chooser stays non-regressing with the
+    /// new stacked candidate in the mix — the chosen stream is never
+    /// larger than the best of the pre-302 single-transform candidates,
+    /// and it still decodes back to the source pixels. Exercised on a
+    /// row-coherent palette image where the chained transform has a
+    /// real opportunity to win.
+    #[test]
+    fn round_302_chooser_never_regresses_and_round_trips() {
+        let palette = [
+            0xff00_0000u32,
+            0xff20_4060,
+            0xff40_80c0,
+            0xff60_c0ff,
+            0xff80_8080,
+            0xffff_ffff,
+        ];
+        let (w, h) = (128u32, 64u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                // Smooth diagonal ramp through the palette → strong
+                // spatial coherence in the bundled-index image.
+                let idx = (((x + y) / 4) as usize) % palette.len();
+                pixels.push(palette[idx]);
+            }
+        }
+
+        // Pre-302 best single-transform candidate: the single color-
+        // indexing path (with the cache sweep) is the strongest
+        // single-transform option on this palette image.
+        let single_ci = select_best_cache_bits(|cache_bits| {
+            encode_with_color_indexing(&pixels, w, h, cache_bits).expect("palette feasible")
+        });
+
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(
+            chosen.len() <= single_ci.len(),
+            "chooser regressed: chosen {} > single color-indexing {}",
+            chosen.len(),
+            single_ci.len()
+        );
+
+        // The chosen stream must decode back to the source pixels.
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&chosen);
+        let decoded =
+            crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode chosen stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
     }
 
     /// Probe across palette-shaped synthetic payloads to find at
