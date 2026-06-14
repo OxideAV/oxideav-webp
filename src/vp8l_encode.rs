@@ -3913,6 +3913,134 @@ fn encode_with_color_transform_predictor(
     w.into_bytes()
 }
 
+/// Encode `pixels` with a **three-transform** §3.5 stack: §4.2 cross-color
+/// (read first) → §4.3 subtract-green (read second) → §4.1 spatial
+/// predictor (read third), chained over one `optional-transform` list.
+///
+/// RFC 9649 §3.5 permits up to four transforms stacked in one list, each
+/// used at most once, with the inverses applied "in the reverse order that
+/// they are read from the bitstream, that is, last one first." This
+/// candidate is the natural three-axis extension of the round-303
+/// color-transform + predictor pair: after the §4.2 per-block color
+/// transform has removed the *modeled* inter-channel correlation (rewriting
+/// red / blue as residuals against green per the per-block
+/// `ColorTransformElement`), a header-free §4.3 subtract-green pass removes
+/// the *uniform* red/blue-vs-green correlation that survives the per-block
+/// model (the CTE multipliers are coarse 3.5-bit fixed-point values, so a
+/// residual green-correlated component routinely remains), and a §4.1
+/// predictor pass then removes the spatial correlation left in each channel.
+/// The entropy stage therefore sees residuals driven closer to zero than any
+/// one- or two-transform path achieves alone, on content where all three
+/// correlation axes carry mass.
+///
+/// ## Wire / inverse ordering
+///
+/// ```text
+/// optional-transform =
+///   %b1 %b01 3BIT entropy-coded-image   -- §4.2 color-tx (color sub-image)
+///   %b1 %b10                            -- §4.3 subtract-green (no data)
+///   %b1 %b00 3BIT entropy-coded-image   -- §4.1 predictor-tx (sub-image)
+///   %b0                                 -- end of optional-transform list
+/// spatially-coded-image                 -- predictor residuals over the
+///                                          color- + subtract-green-
+///                                          transformed image
+/// ```
+///
+/// The §4.3 subtract-green transform carries **no** transform data (just
+/// the `%b1 %b10` presence + type bits), exactly as §4.3 specifies. None of
+/// the three transforms subsamples the width, so both sub-image bodies and
+/// the main image run at the full canvas `width`. The decoder reads color
+/// first, subtract-green second, predictor third, then applies the inverses
+/// last-read-first — inverse-predictor (recovering the color- +
+/// subtract-green-transformed image), inverse-subtract-green (recovering the
+/// color-transformed image), inverse-color (recovering the originals). This
+/// is exactly the generic reverse-read-order chain
+/// [`crate::vp8l_transform::decode_lossless`] already applies, so no decoder
+/// change is required.
+///
+/// The predictor sub-image is built over the **color- + subtract-green-
+/// transformed** image, so its per-block modes decorrelate that residual,
+/// not the raw pixels.
+///
+/// `size_bits` is shared by the §4.2 color and §4.1 predictor transforms
+/// (the §4.3 subtract-green transform has no `size_bits`); each writes its
+/// own 3-bit `size_bits - 2` header. The caller gates on
+/// `width >= block && height >= block` so both sub-images carry at least one
+/// full block square.
+fn encode_with_color_transform_subtract_green_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    cache_code_bits: Option<u32>,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+
+    // ---- Transform #1 (read first): §4.2 color-tx -------------------
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Color as u32, 2);
+    debug_assert!((2..=9).contains(&size_bits));
+    w.write_bits((size_bits - 2) as u32, 3);
+    let (color_image, ctw, _cth) = build_color_image(pixels, width, height, size_bits);
+    write_entropy_coded_image_literals(&mut w, &color_image);
+
+    // Forward the §4.2 color transform over the originals.
+    let mut transformed = vec![0u32; pixels.len()];
+    apply_forward_color(
+        pixels,
+        &mut transformed,
+        width,
+        height,
+        &color_image,
+        ctw,
+        size_bits,
+    );
+
+    // ---- Transform #2 (read second): §4.3 subtract-green ------------
+    // Header-free: just the presence bit + the 2-bit type. The forward
+    // pass rewrites red/blue against green in place over the
+    // color-transformed image.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
+    apply_subtract_green(&mut transformed);
+
+    // ---- Transform #3 (read third): §4.1 predictor-tx --------------
+    // Built over the color- + subtract-green-transformed image at full
+    // `width × height`. Neither earlier transform subsampled the width,
+    // so the decoder still has `current_width == width` here and the
+    // `transform_width` it derives matches `ptw`.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    w.write_bits((size_bits - 2) as u32, 3);
+    let (predictor_image, ptw, _pth) =
+        build_predictor_image(&transformed, width, height, size_bits);
+    write_entropy_coded_image_literals(&mut w, &predictor_image);
+
+    // End of optional-transform list (`%b0`).
+    w.write_bit(false);
+
+    // ---- Forward-transform the transformed image into residuals -----
+    let mut residuals = vec![0u32; transformed.len()];
+    apply_forward_predictor(
+        &transformed,
+        &mut residuals,
+        width,
+        height,
+        &predictor_image,
+        ptw,
+        size_bits,
+    );
+
+    // ---- Spatially-coded-image of the residuals at full width -------
+    let mut tokens = tokenize_lz77(&residuals);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, &residuals, bits);
+    }
+    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
+
+    w.into_bytes()
+}
+
 // ---- §6.2.2 multi-meta-prefix (entropy-image) encoder ----------------
 
 /// Default `prefix_bits` candidate the §6.2.2 multi-meta-prefix
@@ -5263,6 +5391,33 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         for &sb in &ctp_size_bits {
             let cand = select_best_cache_bits(|cache_bits| {
                 encode_with_color_transform_predictor(pixels, width, height, sb, cache_bits)
+            });
+            if cand.len() < best.len() {
+                best = cand;
+            }
+        }
+
+        // Round 304: §3.5 *three-transform* stacked candidate — §4.2
+        // cross-color → §4.3 subtract-green → §4.1 predictor, the natural
+        // three-axis extension of the round-303 color + predictor pair.
+        // The per-block §4.2 color transform removes the modeled
+        // inter-channel correlation; a header-free §4.3 subtract-green pass
+        // then removes the uniform red/blue-vs-green correlation that
+        // survives the coarse per-block CTE multipliers; a §4.1 predictor
+        // pass removes the spatial correlation left in each channel. RFC
+        // 9649 §3.5 permits up to four transforms stacked (each used once)
+        // with inverses applied last-read-first; the decoder's generic
+        // reverse-read-order chain already handles this list, so no decoder
+        // change is required. The candidate is non-regressing (kept only
+        // when strictly smaller than the running best) and reuses the same
+        // `width >= ctx_block && height >= ctx_block` gate, swept over the
+        // default per-region and maximal single-block `size_bits` each
+        // across the round-148 cache-bits sweep.
+        for &sb in &ctp_size_bits {
+            let cand = select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform_subtract_green_predictor(
+                    pixels, width, height, sb, cache_bits,
+                )
             });
             if cand.len() < best.len() {
                 best = cand;
@@ -8748,6 +8903,145 @@ mod tests {
             "chooser regressed: chosen {} > pre-303 best {}",
             chosen.len(),
             pre303
+        );
+
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&chosen);
+        let decoded =
+            crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode chosen stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 304: the three-transform §4.2 color → §4.3 subtract-green →
+    /// §4.1 predictor stack must round-trip bit-exactly through the
+    /// decoder. The decoder reads color first, subtract-green second,
+    /// predictor third (none subsample the width), then applies the
+    /// inverses last-first — inverse-predictor, inverse-subtract-green,
+    /// inverse-color — recovering the original pixels. Exercise photo-like
+    /// content across a default and single-block `size_bits`, with and
+    /// without a residual-stream color cache.
+    #[test]
+    fn round_304_color_subtract_green_predictor_round_trips_through_decoder() {
+        let (w, h) = (128u32, 96u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x0bad_c0de;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (state >> 27) as i32 - 16;
+                let g = ((x + y) % 256) as i32;
+                let r = (g + 31 + n).clamp(0, 255) as u32;
+                let b = (g - 22 - n).clamp(0, 255) as u32;
+                pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+        for size_bits in [DEFAULT_COLOR_TRANSFORM_SIZE_BITS, 7u8] {
+            for cache in [None, Some(4u32), Some(9u32)] {
+                let stream = encode_with_color_transform_subtract_green_predictor(
+                    &pixels, w, h, size_bits, cache,
+                );
+                let header = build_image_header(w, h, false);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&stream);
+                let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                    .expect("decode color+subtract-green+predictor round trip");
+                assert_eq!(
+                    decoded.pixels(),
+                    pixels.as_slice(),
+                    "round-trip mismatch size_bits={size_bits} cache={cache:?}"
+                );
+            }
+        }
+    }
+
+    /// Round 304: the smallest admissible input (exactly `block × block`)
+    /// still round-trips through the three-transform stack.
+    #[test]
+    fn round_304_color_subtract_green_predictor_single_block_round_trips() {
+        let block = 1u32 << DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let (w, h) = (block, block);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let g = (x * 5 + y * 3) % 256;
+                let r = (g + 27) % 256;
+                let b = (g + 180) % 256;
+                pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+            }
+        }
+        let stream = encode_with_color_transform_subtract_green_predictor(
+            &pixels,
+            w,
+            h,
+            DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
+            None,
+        );
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+            .expect("decode single-block 3-stack");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 304: the full super-chooser stays non-regressing with the new
+    /// three-transform color → subtract-green → predictor candidate in the
+    /// mix — the chosen stream is never larger than the best of the
+    /// pre-304 candidates (the round-303 color + predictor 2-stack plus the
+    /// single color / predictor / subtract-green paths) and still decodes
+    /// back to the source pixels.
+    #[test]
+    fn round_304_chooser_never_regresses_and_round_trips() {
+        let (w, h) = (160u32, 120u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x1357_9bdf;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let n = (state >> 28) as i32 - 8;
+                let g = ((x as i32) - (y as i32)).rem_euclid(256);
+                let r = (g + 44 + n).clamp(0, 255) as u32;
+                let b = (g - 33 + n).clamp(0, 255) as u32;
+                pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+
+        // Pre-304 best across the single block transforms plus the
+        // round-303 color + predictor 2-stack.
+        let single_pred = select_best_cache_bits(|cache_bits| {
+            encode_with_predictor(&pixels, w, h, DEFAULT_PREDICTOR_SIZE_BITS, cache_bits, w)
+        });
+        let single_color = select_best_cache_bits(|cache_bits| {
+            encode_with_color_transform(
+                &pixels,
+                w,
+                h,
+                DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
+                cache_bits,
+                w,
+            )
+        });
+        let color_pred = select_best_cache_bits(|cache_bits| {
+            encode_with_color_transform_predictor(
+                &pixels,
+                w,
+                h,
+                DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
+                cache_bits,
+            )
+        });
+        let pre304 = single_pred
+            .len()
+            .min(single_color.len())
+            .min(color_pred.len());
+
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(
+            chosen.len() <= pre304,
+            "chooser regressed: chosen {} > pre-304 best {}",
+            chosen.len(),
+            pre304
         );
 
         let header = build_image_header(w, h, false);

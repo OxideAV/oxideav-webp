@@ -6,6 +6,33 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-304 lossless-encode feature: the first §3.5 **three-transform**
+  stacked candidate — §4.2 cross-color → §4.3 subtract-green → §4.1
+  spatial predictor, chained into one `optional-transform` list. It is the
+  natural three-axis extension of the round-303 color + predictor pair:
+  the per-block §4.2 color transform removes the *modeled* inter-channel
+  correlation, a header-free §4.3 subtract-green pass then removes the
+  *uniform* red/blue-vs-green correlation that survives the coarse
+  3.5-bit-fixed-point per-block CTE multipliers, and the §4.1 predictor
+  pass removes the *spatial* correlation left in each channel — so the
+  entropy stage sees residuals driven closer to zero than any one- or
+  two-transform path achieves alone on content where all three
+  correlation axes carry mass. RFC 9649 §3.5 permits up to four transforms
+  stacked (each used at most once) with inverses applied last-read-first;
+  none of the three subsamples the width, so both sub-image bodies and the
+  main image run at full canvas width. The decoder's generic
+  reverse-read-order chain already applies inverse-predictor →
+  inverse-subtract-green → inverse-color, so no decoder change is required.
+  The candidate is non-regressing (kept only when strictly smaller than
+  the running best) and reuses the existing `width >= block && height >=
+  block` gate, with two `size_bits` swept (default per-region granularity
+  + a maximal single-block header) each across the `cache_code_bits ∈
+  [1..11]` + disabled-cache sweep. New tests:
+  `round_304_color_subtract_green_predictor_round_trips_through_decoder`
+  (default + single-block `size_bits` × no/4-/9-bit cache),
+  `…_single_block_round_trips`, and
+  `round_304_chooser_never_regresses_and_round_trips`.
+
 - Round-303 lossless-encode feature: a second §3.5 stacked-transform
   candidate aimed at **photo / natural-image** content — the §4.2
   cross-color transform chained with the §4.1 spatial predictor.
