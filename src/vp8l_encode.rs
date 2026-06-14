@@ -500,20 +500,41 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
 /// because the decoder reconstructs pixels from whatever complete code the
 /// lengths describe.
 fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
+    limit_code_lengths_to(lengths, used, MAX_CODE_LENGTH);
+}
+
+/// As [`limit_code_lengths`], but caps every code length at the
+/// caller-supplied `max_len` rather than [`MAX_CODE_LENGTH`].
+///
+/// The §3.7.2.1.2 *code-length-code* (the meta-code that transmits the
+/// literal length table) writes each of its own lengths in a **3-bit**
+/// on-wire field, so its lengths must not exceed `7` — a constraint
+/// tighter than the 15-bit `MAX_CODE_LENGTH` ceiling that applies to the
+/// literal codes themselves. A skewed enough CLC frequency histogram
+/// (one length value vastly more common than the rest) makes the plain
+/// Huffman build assign a length-8-or-more code to a rare CLC symbol;
+/// without this cap the 3-bit field silently truncates it, corrupting the
+/// table into an incomplete (Kraft < 1) code the decoder rejects. Capping
+/// the CLC at 7 with a Kraft re-balance keeps the on-wire table valid.
+///
+/// `max_len <= MAX_CODE_LENGTH` is required (the Kraft arithmetic uses
+/// `2^max_len` as the common denominator).
+fn limit_code_lengths_to(lengths: &mut [u8], used: &[usize], max_len: usize) {
+    debug_assert!((1..=MAX_CODE_LENGTH).contains(&max_len));
     // Clamp.
     for &s in used {
-        if lengths[s] as usize > MAX_CODE_LENGTH {
-            lengths[s] = MAX_CODE_LENGTH as u8;
+        if lengths[s] as usize > max_len {
+            lengths[s] = max_len as u8;
         }
     }
-    // Kraft sum over denominator 2^MAX_CODE_LENGTH.
-    let full: i64 = 1i64 << MAX_CODE_LENGTH;
+    // Kraft sum over denominator 2^max_len.
+    let full: i64 = 1i64 << max_len;
     let kraft = |lengths: &[u8]| -> i64 {
         let mut k = 0i64;
         for &s in used {
             let l = lengths[s] as usize;
             if l > 0 {
-                k += 1i64 << (MAX_CODE_LENGTH - l);
+                k += 1i64 << (max_len - l);
             }
         }
         k
@@ -540,10 +561,10 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
     //    ever gains a member while the pass is still running.
     let mut k = kraft(lengths);
     if k > full {
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); MAX_CODE_LENGTH];
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); max_len];
         for &s in used {
             let l = lengths[s] as usize;
-            if l < MAX_CODE_LENGTH {
+            if l < max_len {
                 buckets[l].push(s);
             }
         }
@@ -551,18 +572,18 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
         // which treated a (theoretical) zero-length used symbol as
         // eligible; the §3.7.2 build never produces one for a used
         // symbol, so the bucket is empty in practice.
-        'over: for l0 in (0..MAX_CODE_LENGTH).rev() {
+        'over: for l0 in (0..max_len).rev() {
             while k > full {
                 let Some(s) = buckets[l0].pop() else { break };
                 // Lengthening from `l` to `l + 1` swaps the Kraft term
-                // `2^(MAX-l)` for `2^(MAX-l-1)`, i.e. removes exactly
-                // `2^(MAX-l-1)` — same integer a full recompute would
+                // `2^(max-l)` for `2^(max-l-1)`, i.e. removes exactly
+                // `2^(max-l-1)` — same integer a full recompute would
                 // give.
                 let mut l = l0;
-                while k > full && l < MAX_CODE_LENGTH {
+                while k > full && l < max_len {
                     l += 1;
                     lengths[s] = l as u8;
-                    k -= 1i64 << (MAX_CODE_LENGTH - l);
+                    k -= 1i64 << (max_len - l);
                 }
             }
             if k <= full {
@@ -584,16 +605,39 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
         }
         match target {
             Some(s) => {
-                // Shortening `s` from `l` to `l - 1` swaps `2^(MAX-l)` for
-                // `2^(MAX-l+1)`, i.e. adds exactly `2^(MAX-l)` — again the
+                // Shortening `s` from `l` to `l - 1` swaps `2^(max-l)` for
+                // `2^(max-l+1)`, i.e. adds exactly `2^(max-l)` — again the
                 // same integer a full recompute would give.
                 let l = lengths[s] as usize;
                 lengths[s] -= 1;
-                k += 1i64 << (MAX_CODE_LENGTH - l);
+                k += 1i64 << (max_len - l);
             }
             None => break,
         }
     }
+}
+
+/// Maximum on-wire length for a §3.7.2.1.2 code-length-code symbol: the
+/// CLC lengths are each written in a 3-bit field, so they range `[0..7]`.
+const MAX_CLC_CODE_LENGTH: usize = 7;
+
+/// Build the §3.7.2.1.2 code-length-code (CLC) lengths for a literal
+/// length table, capped at [`MAX_CLC_CODE_LENGTH`] so every length fits
+/// the 3-bit on-wire field. The plain Huffman build can assign a CLC
+/// symbol a length of 8 or more on a skewed histogram; this wrapper
+/// re-balances any such over-long code back under 7 while keeping the
+/// table complete, so both [`write_normal_code_lengths`] and
+/// [`normal_form_bits`] see the same valid lengths.
+fn build_clc_code_lengths(clc_freq: &[u32]) -> Vec<u8> {
+    let mut clc_lengths = build_code_lengths(clc_freq);
+    if clc_lengths
+        .iter()
+        .any(|&l| l as usize > MAX_CLC_CODE_LENGTH)
+    {
+        let used: Vec<usize> = (0..clc_freq.len()).filter(|&s| clc_freq[s] > 0).collect();
+        limit_code_lengths_to(&mut clc_lengths, &used, MAX_CLC_CODE_LENGTH);
+    }
+    clc_lengths
 }
 
 /// Build the canonical code values for a per-symbol length table.
@@ -813,7 +857,7 @@ fn normal_form_bits(lengths: &[u8]) -> usize {
     for &l in lengths {
         clc_freq[l as usize] += 1;
     }
-    let clc_lengths = build_code_lengths(&clc_freq);
+    let clc_lengths = build_clc_code_lengths(&clc_freq);
 
     // Locate the highest-ordered CLC symbol that has a non-zero length.
     let mut max_order_used = 0usize;
@@ -890,7 +934,7 @@ fn write_normal_code_lengths(w: &mut BitWriter, lengths: &[u8]) {
     for &l in lengths {
         clc_freq[l as usize] += 1;
     }
-    let clc_lengths = build_code_lengths(&clc_freq);
+    let clc_lengths = build_clc_code_lengths(&clc_freq);
     let clc_codes = canonical_codes(&clc_lengths);
 
     // num_code_lengths: how many CLC lengths we transmit, in
@@ -3756,6 +3800,119 @@ fn encode_with_color_indexing_predictor(
     Some(w.into_bytes())
 }
 
+/// Encode `pixels` with the §4.2 cross-color transform **chained** with
+/// the §4.1 spatial predictor transform, the stacked pair the spec
+/// targets at photo / natural-image content.
+///
+/// RFC 9649 §3.5 allows up to four transforms to be stacked in one
+/// `optional-transform` list (each used at most once); the inverse
+/// transforms are applied "in the reverse order that they are read from
+/// the bitstream, that is, last one first." On photo content the §4.2
+/// color transform first removes the inter-channel correlation (rewriting
+/// red and blue as residuals against green per the per-block
+/// `ColorTransformElement`); a §4.1 spatial-predictor pass over the
+/// color-decorrelated image then removes the *spatial* correlation that
+/// survives in each channel, driving the residuals the entropy stage sees
+/// closer to zero than either transform alone.
+///
+/// ## Wire / inverse ordering
+///
+/// The two transforms are written **color-transform first, predictor
+/// second**:
+///
+/// ```text
+/// optional-transform =
+///   %b1 %b01 3BIT entropy-coded-image   -- §4.2 color-tx (color sub-image)
+///   %b1 %b00 3BIT entropy-coded-image   -- §4.1 predictor-tx (sub-image)
+///   %b0                                 -- end of optional-transform list
+/// spatially-coded-image                 -- predictor residuals over the
+///                                          color-transformed image
+/// ```
+///
+/// Neither transform subsamples the width, so both sub-image bodies and
+/// the main image run at the full canvas `width`. The decoder reads
+/// color-transform first, predictor second, then applies the inverses in
+/// reverse read order — inverse-predictor first (recovering the
+/// color-transformed image), then inverse-color (recovering the original
+/// ARGB pixels). This is exactly the order
+/// [`crate::vp8l_transform::decode_lossless`] already implements for a
+/// stacked list, so no decoder change is required.
+///
+/// The predictor sub-image is built over the **color-transformed** image,
+/// so its per-block modes decorrelate the color residuals, not the raw
+/// pixels.
+///
+/// `size_bits` is shared by both transforms (each writes its own 3-bit
+/// `size_bits - 2` header). The caller is responsible for gating on
+/// `width >= block && height >= block` so both sub-images carry at least
+/// one full block square; the chooser does this before calling.
+fn encode_with_color_transform_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    cache_code_bits: Option<u32>,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+
+    // ---- Transform #1 (read first): §4.2 color-tx -------------------
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Color as u32, 2);
+    debug_assert!((2..=9).contains(&size_bits));
+    w.write_bits((size_bits - 2) as u32, 3);
+    let (color_image, ctw, _cth) = build_color_image(pixels, width, height, size_bits);
+    write_entropy_coded_image_literals(&mut w, &color_image);
+
+    // Forward the §4.2 color transform over the originals so the
+    // predictor below sees the color-decorrelated image.
+    let mut color_transformed = vec![0u32; pixels.len()];
+    apply_forward_color(
+        pixels,
+        &mut color_transformed,
+        width,
+        height,
+        &color_image,
+        ctw,
+        size_bits,
+    );
+
+    // ---- Transform #2 (read second): §4.1 predictor-tx --------------
+    // Built over the color-transformed image at full `width × height`.
+    // The decoder will have left `current_width` at `width` after the
+    // color transform (color-tx does not subsample), so the
+    // `transform_width` it derives matches `ptw` here.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    w.write_bits((size_bits - 2) as u32, 3);
+    let (predictor_image, ptw, _pth) =
+        build_predictor_image(&color_transformed, width, height, size_bits);
+    write_entropy_coded_image_literals(&mut w, &predictor_image);
+
+    // End of optional-transform list (`%b0`).
+    w.write_bit(false);
+
+    // ---- Forward-transform the color-transformed image into residuals
+    let mut residuals = vec![0u32; color_transformed.len()];
+    apply_forward_predictor(
+        &color_transformed,
+        &mut residuals,
+        width,
+        height,
+        &predictor_image,
+        ptw,
+        size_bits,
+    );
+
+    // ---- Spatially-coded-image of the residuals at full width -------
+    let mut tokens = tokenize_lz77(&residuals);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, &residuals, bits);
+    }
+    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
+
+    w.into_bytes()
+}
+
 // ---- §6.2.2 multi-meta-prefix (entropy-image) encoder ----------------
 
 /// Default `prefix_bits` candidate the §6.2.2 multi-meta-prefix
@@ -5085,6 +5242,32 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                 best = cand;
             }
         }
+
+        // Round 303: §3.5 stacked-transform candidate — §4.2 cross-color
+        // chained with the §4.1 predictor over the color-transformed
+        // image, the pair the spec targets at photo / natural-image
+        // content. The color transform decorrelates red / blue against
+        // green; the predictor then removes the spatial correlation that
+        // survives in each channel, so the entropy stage sees residuals
+        // closer to zero than either transform alone. The candidate is
+        // non-regressing (kept only when strictly smaller than the running
+        // best) and reuses the same `width >= ctx_block && height >=
+        // ctx_block` gate (both stacked sub-images need at least one full
+        // block square). Two `size_bits` are swept — the default
+        // per-region granularity and a maximal single-block header —
+        // each across the round-148 cache-bits sweep.
+        let mut ctp_size_bits = vec![ctx_size_bits];
+        if try_single_block {
+            ctp_size_bits.push(single_block_size_bits);
+        }
+        for &sb in &ctp_size_bits {
+            let cand = select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform_predictor(pixels, width, height, sb, cache_bits)
+            });
+            if cand.len() < best.len() {
+                best = cand;
+            }
+        }
     }
 
     // Round 150: §4.4 color-indexing transform candidate. Considered
@@ -5308,6 +5491,45 @@ mod tests {
             }
         }
         assert!((k - 1.0).abs() < 1e-9, "Kraft sum {k} != 1");
+    }
+
+    /// Round 303: the §3.7.2.1.2 code-length-code lengths are written in a
+    /// 3-bit on-wire field, so they must never exceed 7. A skewed CLC
+    /// frequency histogram (one length value far more common than the rest)
+    /// drives the plain Huffman build to assign a length-8+ code to a rare
+    /// CLC symbol; `build_clc_code_lengths` must re-balance it back under 8
+    /// while keeping the table complete (Kraft sum exactly 1). Without the
+    /// cap the 3-bit field silently truncated the over-long length to 0,
+    /// corrupting the table into an incomplete code the decoder rejects.
+    #[test]
+    fn clc_code_lengths_capped_at_seven_and_complete() {
+        // Histogram that drives the plain build past length 7: one
+        // dominant length value plus a long tail of rare ones, exactly the
+        // shape that produces a deep Huffman tree.
+        let clc_freq: Vec<u32> = vec![
+            1, 100_000, 1, 50_000, 25_000, 12_000, 6_000, 3_000, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        ];
+        // The plain build does produce an over-long (>7) code here, so the
+        // cap path is genuinely exercised.
+        let plain = build_code_lengths(&clc_freq);
+        assert!(
+            plain.iter().any(|&l| l as usize > MAX_CLC_CODE_LENGTH),
+            "test premise: plain build must exceed the 3-bit CLC ceiling"
+        );
+
+        let capped = build_clc_code_lengths(&clc_freq);
+        assert!(
+            capped.iter().all(|&l| l as usize <= MAX_CLC_CODE_LENGTH),
+            "CLC lengths must all fit the 3-bit field: {capped:?}"
+        );
+        // Still a complete code (Kraft sum == 1 over the used symbols).
+        let mut k = 0f64;
+        for &l in &capped {
+            if l > 0 {
+                k += 2f64.powi(-(l as i32));
+            }
+        }
+        assert!((k - 1.0).abs() < 1e-9, "capped CLC Kraft sum {k} != 1");
     }
 
     #[test]
@@ -8395,6 +8617,139 @@ mod tests {
         );
 
         // The chosen stream must decode back to the source pixels.
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&chosen);
+        let decoded =
+            crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode chosen stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 303: the stacked §4.2 color-transform + §4.1 predictor
+    /// candidate must round-trip bit-exactly through the decoder. The
+    /// decoder reads color-transform first, predictor second (neither
+    /// subsamples the width), then applies the inverses last-first —
+    /// inverse-predictor over the color-transformed image, then
+    /// inverse-color — recovering the original pixels. Exercise photo-
+    /// like content across a default and single-block `size_bits`, with
+    /// and without a residual-stream color cache.
+    #[test]
+    fn round_303_color_transform_predictor_round_trips_through_decoder() {
+        // Synthetic photo-like content: smooth channel gradients plus a
+        // deterministic noise term, so red / blue carry real correlation
+        // against green (the §4.2 transform has something to model) and
+        // the gradients give the §4.1 predictor real spatial structure.
+        let (w, h) = (128u32, 96u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x1234_5678;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (state >> 27) as i32 - 16;
+                let g = ((x + y) % 256) as i32;
+                let r = (g + 24 + n).clamp(0, 255) as u32;
+                let b = (g - 18 - n).clamp(0, 255) as u32;
+                pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+        for size_bits in [DEFAULT_COLOR_TRANSFORM_SIZE_BITS, 7u8] {
+            for cache in [None, Some(4u32), Some(9u32)] {
+                let stream = encode_with_color_transform_predictor(&pixels, w, h, size_bits, cache);
+                let header = build_image_header(w, h, false);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(&stream);
+                let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                    .expect("decode color-transform+predictor round trip");
+                assert_eq!(
+                    decoded.pixels(),
+                    pixels.as_slice(),
+                    "round-trip mismatch size_bits={size_bits} cache={cache:?}"
+                );
+            }
+        }
+    }
+
+    /// Round 303: a single-row / single-column-degenerate image still
+    /// round-trips. With `width < block` the chooser never calls the
+    /// chained path, but the encoder itself must still produce a valid
+    /// stream when handed a one-block image (the smallest admissible
+    /// input: exactly `block × block`).
+    #[test]
+    fn round_303_color_transform_predictor_single_block_round_trips() {
+        let block = 1u32 << DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let (w, h) = (block, block);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let g = (x * 7 + y * 5) % 256;
+                let r = (g + 13) % 256;
+                let b = (g + 200) % 256;
+                pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+            }
+        }
+        let stream = encode_with_color_transform_predictor(
+            &pixels,
+            w,
+            h,
+            DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
+            None,
+        );
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+            .expect("decode single-block chain");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 303: the full super-chooser stays non-regressing with the
+    /// new color-transform + predictor candidate in the mix — the chosen
+    /// stream is never larger than the best of the pre-303 candidates,
+    /// and it still decodes back to the source pixels. Exercised on a
+    /// photo-like image where the chained transform has a real chance to
+    /// win against the single color-transform and single predictor paths.
+    #[test]
+    fn round_303_chooser_never_regresses_and_round_trips() {
+        let (w, h) = (160u32, 120u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0xfeed_face;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let n = (state >> 28) as i32 - 8;
+                let g = ((x as i32) - (y as i32)).rem_euclid(256);
+                let r = (g + 40 + n).clamp(0, 255) as u32;
+                let b = (g - 30 + n).clamp(0, 255) as u32;
+                pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+
+        // Pre-303 best of the two single block-transform paths on this
+        // photo-like image (predictor + color transform, each with the
+        // cache sweep).
+        let single_pred = select_best_cache_bits(|cache_bits| {
+            encode_with_predictor(&pixels, w, h, DEFAULT_PREDICTOR_SIZE_BITS, cache_bits, w)
+        });
+        let single_color = select_best_cache_bits(|cache_bits| {
+            encode_with_color_transform(
+                &pixels,
+                w,
+                h,
+                DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
+                cache_bits,
+                w,
+            )
+        });
+        let pre303 = single_pred.len().min(single_color.len());
+
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(
+            chosen.len() <= pre303,
+            "chooser regressed: chosen {} > pre-303 best {}",
+            chosen.len(),
+            pre303
+        );
+
         let header = build_image_header(w, h, false);
         let mut payload = header.to_vec();
         payload.extend_from_slice(&chosen);

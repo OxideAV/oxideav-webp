@@ -6,6 +6,51 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-303 lossless-encode feature: a second §3.5 stacked-transform
+  candidate aimed at **photo / natural-image** content — the §4.2
+  cross-color transform chained with the §4.1 spatial predictor.
+  The encoder now evaluates a candidate that writes the color transform
+  first (read first) and the predictor second (read second) into one
+  `optional-transform` list. The §4.2 transform removes the
+  inter-channel correlation (rewriting red/blue as residuals against
+  green per the per-block `ColorTransformElement`); a predictor pass
+  over that color-decorrelated image then removes the *spatial*
+  correlation surviving in each channel, so the entropy stage sees
+  residuals closer to zero than either transform alone. Neither
+  transform subsamples the width, so both sub-image bodies and the main
+  image run at full canvas width; the decoder already applies the
+  inverses last-read-first (inverse-predictor recovering the
+  color-transformed image, then inverse-color recovering the original
+  pixels), so no decoder change is required. The candidate is
+  non-regressing (kept only when strictly smaller than the running best)
+  and reuses the existing `width >= block && height >= block` gate, with
+  two `size_bits` swept (default per-region granularity + a maximal
+  single-block header), each across the `cache_code_bits ∈ [1..11]` +
+  disabled-cache sweep. New tests:
+  `round_303_color_transform_predictor_round_trips_through_decoder`
+  (default + single-block `size_bits` × no/4-/9-bit cache),
+  `…_single_block_round_trips`, and
+  `round_303_chooser_never_regresses_and_round_trips`.
+
+### Fixed
+
+- Round-303 lossless-encode correctness fix in the §3.7.2.1.2
+  *code-length-code* (CLC) writer. The CLC lengths are each written in a
+  3-bit on-wire field (range `[0..7]`), but the encoder built them with
+  the general 15-bit Huffman builder. A sufficiently skewed CLC
+  frequency histogram (one length value far more common than the rest)
+  makes the builder assign a length-8-or-more code to a rare CLC symbol;
+  the 3-bit field then silently truncated it, corrupting the on-wire
+  table into an incomplete (Kraft < 1) prefix code the decoder rejects
+  with `Prefix(Incomplete)`. The fix caps CLC lengths at 7 via a Kraft
+  re-balancing pass (`build_clc_code_lengths` / the new
+  `limit_code_lengths_to`), keeping the table complete. This was a
+  latent defect reachable by any encoder candidate whose residual
+  distribution produced a skewed CLC histogram — surfaced here by the
+  new color-transform + predictor chain at the per-region color
+  `size_bits`. New test:
+  `clc_code_lengths_capped_at_seven_and_complete`.
+
 - Round-302 lossless-encode feature: the §3.5 stacked-transform path.
   The encoder now evaluates a **chained** candidate that applies the
   §4.4 color-indexing transform followed by the §4.1 spatial predictor
