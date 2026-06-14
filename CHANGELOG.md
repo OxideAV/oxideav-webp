@@ -6,6 +6,23 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Performance
 
+- Round-301 PROFILE-OPT round: gave the encoder-side §5.2.2
+  `pixel_distance_to_distance_code` distance-code chooser (the rank-1
+  round-300 target) a **smallest-code early-out**. Map codes occupy
+  `1..=120` and the scan-line fallback is `D + 120 ≥ 121`, and the
+  `DISTANCE_MAP` entries are visited in ascending code order, so the
+  first entry whose `max(xi + yi·W, 1)` equals the distance is already
+  the smallest valid code; the chooser now returns on that first match
+  instead of always scanning all 120 entries. The chosen code — and
+  therefore every emitted byte — is unchanged, proven by a new
+  `distance_chooser_early_out_matches_full_scan` test that asserts
+  identity against an inline full no-early-out scan-with-tie-break over
+  distances `1..=400` + `{1000, 4096, 70_000}` across widths
+  `{1, 2, 16, 128, 256, 1024}`. On the `distance_code` bench the
+  matching cells drop from ~64 µs to ~0.8–2.4 µs per 1024 calls
+  (≈30–160×); the genuine no-match worst case (`dist_large_nomatch`)
+  still walks all 120 entries since there is no smaller code to find.
+  See `BENCHMARKS.md` "Round-301".
 - Round-300 BENCH round (no `src/` change): added
   `benches/distance_code.rs`, isolating the encoder-side §5.2.2
   `pixel_distance_to_distance_code` distance-code chooser — run at least

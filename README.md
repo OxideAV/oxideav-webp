@@ -71,9 +71,19 @@ grouped by domain:
   across content regime / `num_groups` / image-size sweeps), the
   §5.2.2 `value_to_prefix` split, and `distance_code` (round 300: the
   §5.2.2 `pixel_distance_to_distance_code` chooser run twice per match
-  — a no-early-out 120-entry `DISTANCE_MAP` scan picking the smallest
-  distance code — across RLE / row-above / close-neighbour / no-match
-  regimes, all flat at ~63 ns/call).
+  — a 120-entry `DISTANCE_MAP` scan picking the smallest distance code
+  — across RLE / row-above / close-neighbour / no-match regimes). Round
+  301 gave the chooser a smallest-code early-out: because map codes
+  occupy `1..=120` and the scan-line fallback is `D + 120 ≥ 121`, the
+  *first* entry (in ascending code order) whose `max(xi + yi·W, 1)`
+  equals the distance is already the smallest valid code, so the scan
+  returns on first match instead of running all 120 entries. The chosen
+  code — and therefore every emitted byte — is unchanged (proven by an
+  equivalence test against the full no-early-out scan over distances
+  1..=400 + a large tail across six widths); the matching regimes drop
+  from ~64 µs/cell to ~0.8–2.4 µs (≈30–160× on the inner-loop probe),
+  while the genuine no-match worst case (`dist_large_nomatch`) still
+  scans all 120 entries as before.
 * **Entropy / prefix-code chain** — `build_code_lengths` and
   `canonical_codes` (encoder §3.7.2) and `prefix_from_code_lengths`
   (decoder §6.2.1), each over the four §3.7.1 alphabets

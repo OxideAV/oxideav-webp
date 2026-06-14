@@ -1492,12 +1492,25 @@ fn distance_to_code(distance: usize) -> u32 {
 /// A distance-map entry `(xi, yi)` at index `c-1` reconstructs to
 /// `max(xi + yi * image_width, 1)` per the decoder's
 /// [`crate::vp8l_decode::distance_code_to_pixel_distance`]. The chooser
-/// scans all 120 entries and returns the **smallest** raw code that
-/// reconstructs to `distance` — smaller raw codes feed
-/// [`value_to_prefix`] through low-prefix slots (codes `1..=4` use 0
-/// extra bits; code `5` uses 1 extra bit; …), which then enter the
-/// distance prefix-code's Huffman tree with the highest frequencies and
-/// the shortest emitted lengths.
+/// returns the **smallest** raw code that reconstructs to `distance` —
+/// smaller raw codes feed [`value_to_prefix`] through low-prefix slots
+/// (codes `1..=4` use 0 extra bits; code `5` uses 1 extra bit; …), which
+/// then enter the distance prefix-code's Huffman tree with the highest
+/// frequencies and the shortest emitted lengths.
+///
+/// # Smallest-code early-out
+///
+/// Map codes occupy `1..=120` and the scan-line fallback is
+/// `distance + 120 >= 121`, so **any** matching map entry is strictly
+/// smaller than the fallback. Because the entries are visited in
+/// ascending code order (`idx + 1`), the *first* entry whose
+/// reconstruction equals `distance` is, by construction, the smallest
+/// valid code — no later entry (higher code) and not the fallback can
+/// beat it. The scan therefore returns on the first match instead of
+/// continuing through all 120 entries. When no entry matches it falls
+/// through to the scan-line code. This preserves the exact same chosen
+/// code as a full scan with a smallest-code tie-break, so the emitted
+/// bytes are unchanged.
 ///
 /// The reconstruction is identical to the legacy scan-line form, so the
 /// decoder produces the exact same pixel distance and the round-trip
@@ -1507,8 +1520,6 @@ fn distance_to_code(distance: usize) -> u32 {
 /// `1 <= distance <= position` per §5.2.2's backward-reference invariant).
 pub fn pixel_distance_to_distance_code(distance: usize, image_width: u32) -> u32 {
     debug_assert!(distance >= 1, "§5.2.2 distance must be >= 1");
-    let scan_line_code = distance as u32 + crate::vp8l_decode::NUM_DISTANCE_MAP_CODES as u32;
-    let mut best = scan_line_code;
     let width_i32 = image_width as i32;
     for (idx, &(xi, yi)) in crate::vp8l_decode::DISTANCE_MAP.iter().enumerate() {
         // The decoder computes `xi + yi * W` and clamps to 1. Match the
@@ -1517,13 +1528,13 @@ pub fn pixel_distance_to_distance_code(distance: usize, image_width: u32) -> u32
         let raw = xi + yi * width_i32;
         let mapped = if raw < 1 { 1 } else { raw as usize };
         if mapped == distance {
-            let candidate = (idx + 1) as u32;
-            if candidate < best {
-                best = candidate;
-            }
+            // First match is the smallest code (entries are in ascending
+            // code order) and always < the scan-line fallback (>= 121),
+            // so return immediately.
+            return (idx + 1) as u32;
         }
     }
-    best
+    distance as u32 + crate::vp8l_decode::NUM_DISTANCE_MAP_CODES as u32
 }
 
 /// Accumulate the per-symbol frequencies for a token stream so the entropy
@@ -6315,6 +6326,56 @@ mod tests {
                 d,
                 "chooser code {code} for d={d} (xi={xi},yi={yi}) does not round-trip",
             );
+        }
+    }
+
+    /// The smallest-code early-out must produce byte-for-byte the same
+    /// code as a full no-early-out linear scan that tracks the minimum
+    /// matching code. The reference below re-implements the round-119
+    /// full-scan-with-tie-break (start at the scan-line code, visit every
+    /// one of the 120 entries, keep the smallest matching code); the
+    /// production [`pixel_distance_to_distance_code`] returns on the first
+    /// match. Across a representative distance range and several widths,
+    /// both must agree on every input.
+    #[test]
+    fn distance_chooser_early_out_matches_full_scan() {
+        use crate::vp8l_decode::{DISTANCE_MAP, NUM_DISTANCE_MAP_CODES};
+
+        // Full no-early-out linear scan with smallest-code tie-break —
+        // the behaviour the early-out replaces. Bit-exactness against the
+        // production chooser is what this test pins.
+        fn full_scan(distance: usize, image_width: u32) -> u32 {
+            let scan_line_code = distance as u32 + NUM_DISTANCE_MAP_CODES as u32;
+            let mut best = scan_line_code;
+            let width_i32 = image_width as i32;
+            for (idx, &(xi, yi)) in DISTANCE_MAP.iter().enumerate() {
+                let raw = xi + yi * width_i32;
+                let mapped = if raw < 1 { 1 } else { raw as usize };
+                if mapped == distance {
+                    let candidate = (idx + 1) as u32;
+                    if candidate < best {
+                        best = candidate;
+                    }
+                }
+            }
+            best
+        }
+
+        // Widths spanning width-1 (no spatial structure), narrow, typical
+        // tile, and a wide row so the clamp-to-1 and large-distance
+        // regimes are all exercised.
+        for &width in &[1u32, 2, 16, 128, 256, 1024] {
+            // Distance 1..=400 covers every clamp-to-1 hit, every
+            // single-row / multi-row map distance for these widths, and
+            // a long tail that has no map representation (scan-line
+            // fallback). Plus a few large distances past any map reach.
+            for distance in (1usize..=400).chain([1000, 4096, 70_000]) {
+                assert_eq!(
+                    pixel_distance_to_distance_code(distance, width),
+                    full_scan(distance, width),
+                    "early-out diverged from full scan at distance={distance} width={width}",
+                );
+            }
         }
     }
 
