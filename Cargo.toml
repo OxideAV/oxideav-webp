@@ -212,3 +212,18 @@ harness = false
 [[bench]]
 name = "backward_reference"
 harness = false
+
+# Round-300: encoder-side §5.2.2 `pixel_distance_to_distance_code` — the
+# distance-code chooser run (at least) twice per emitted LZ77 backward
+# reference. It linearly scans all 120 `DISTANCE_MAP` entries with no
+# early-out, picking the smaller of the scan-line code `D + 120` and any
+# distance-map code reconstructing to `D` for the image width. `lz77_match`
+# / `lz77_chain` time the matcher that *finds* a run and `value_to_prefix`
+# the per-symbol split; the distance→code mapping between them had no
+# isolated harness. Four cells fix width 256 and vary distance: RLE
+# (dist 1), the row-above match (dist == width, code 1), a close horizontal
+# neighbour (dist 2), and a no-map-match large distance (full scan, scan-
+# line fallback).
+[[bench]]
+name = "distance_code"
+harness = false

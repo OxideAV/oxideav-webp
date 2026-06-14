@@ -43,6 +43,7 @@ the medians are still stable to a few percent.
 | `benches/alpha_decode.rs` | `decode_alpha_plane_e2e`, `decode_alpha_lossless_extracted`, `inverse_filter_{none,horizontal,vertical,gradient}_128x128` | §2.7.1.2 `ALPH` alpha-plane decode — the rank-1 webp-owned cost on the lossy path (≈52% of lossy e2e in the round-289 map, previously sized only by subtraction). Public `decode_alpha_plane` e2e over the committed fixture; `alph::decode_alpha` on the extracted `ALPH` payload (RIFF walk removed); and the §2.7.1.2 Stage-2 inverse-filter per-pixel loop in isolation, one cell per `F` method via synthetic uncompressed payloads. Splits the r289 rank-1 bucket: container walk ≈1 µs, the rest is the headerless VP8L lossless decode (already covered by `read_symbol` / `lossless_decode*`) |
 | `benches/meta_prefix_cluster.rs` | `meta_prefix_cluster_content_256/{bimodal,gradient,uniform}`, `meta_prefix_cluster_groups_256/{2,3,4}`, `meta_prefix_cluster_size/{128,256,384}` | Encoder-side §6.2.2 entropy-image block-clustering heuristic (`cluster_blocks_by_histogram_distance`) behind `encode_with_meta_prefix`. Coarse-RGB-histogram (16 bins/channel → 48-dim/block) Lloyd's k-means over the `1 << prefix_bits`-aligned blocks: a per-pixel feature-binning pass, deterministic farthest-point seeding, an up-to-8-pass assignment/update loop, and a compaction onto a contiguous group range. The RFC-defined entropy image is a decoder construct; this is the *encoder's* partition chooser, previously sized only by subtraction inside the `lossless_encode` e2e. Three altitudes: content regime (bimodal split / smooth gradient / uniform single-group early-out), `num_groups ∈ {2,3,4}`, and image side ∈ {128,256,384} px |
 | `benches/backward_reference.rs` | `apply_backward_reference_{nonoverlap_d64_l64,overlap_partial_d4_l64,rle_dist1_l64,manyruns_512_short}` | Decoder-side §5.2.2 `apply_backward_reference` — the LZ77 copy-back that replays one chosen run into the decoded ARGB buffer (`decode_one_symbol`'s length-symbol branch). The `lz77_match` / `lz77_chain` benches measure the *encoder's* hash-chain matcher that **finds** a run; the decoder copy-back that **replays** it had no isolated harness. Four cells isolate the §5.2.2 walk's `dist`/`length` regimes: non-overlap (`dist >= length`, settled-source region copy), partial overlap (`dist = 4 < length = 64`, self-referential read-after-append window repeat), `dist == 1` RLE flat-colour fill (tightest dependency chain), and a 512-element fragmented stream of short runs (per-call entry/guard cost). Each cell `clone`s an LCG-filled literal prefix in `iter_batched` setup so the function's append starts from a fresh buffer outside the measured interval |
+| `benches/distance_code.rs` | `distance_code_{dist1_rle,dist_row_above,dist_small_neighbor,dist_large_nomatch}` | Encoder-side §5.2.2 `pixel_distance_to_distance_code` — the distance-code chooser run (at least) twice per emitted LZ77 backward reference (once in `count_frequencies` to build the DISTANCE frequency table, once in the emit loop). It linearly scans **all 120** `DISTANCE_MAP` entries with **no early-out**, picking the smaller of the scan-line code `D + 120` and any distance-map code `c ∈ 1..=120` reconstructing to `D` for the image width. The `lz77_match` / `lz77_chain` benches time the matcher that *finds* a run and `value_to_prefix` the per-symbol prefix split; the distance→code mapping between them had no isolated harness. Four cells fix `image_width = 256` and vary `distance`: `dist1_rle` (flat-colour RLE, multiple clamp-to-1 map hits), `dist_row_above` (`distance == width`, the `(0,1)` "pixel above" match at index 0 → code 1, cheapest), `dist_small_neighbor` (`distance = 2`, close horizontal neighbour matched mid-scan), and `dist_large_nomatch` (`distance = 70_000`, no map entry matches → full 120-scan + scan-line fallback). Each cell runs an inner loop of 1024 chooser calls, XOR-accumulating the codes |
 
 ## Round-170 baseline (pre-optimization)
 
@@ -2343,3 +2344,71 @@ oracle passed), but the iterator-driven shape **regressed** the
 `yuv420_to_rgba_{128x128,256x256}` cells by ~2.1–2.4× versus the
 index-addressed loop the compiler already vectorises well. Reverted;
 the index form is retained.
+
+## Round-300 (2026-06-14): §5.2.2 encoder distance-code chooser bench
+
+The encode path's per-match cost was split across `lz77_match` /
+`lz77_chain` (the hash-chain matcher that *finds* a backward reference)
+and `value_to_prefix` (the per-symbol prefix split). The step **between**
+them — mapping a chosen pixel `distance` to a §5.2.2 *distance code* —
+had no isolated harness. This round adds `benches/distance_code.rs`.
+**Bench-only round — no `src/` change.**
+
+### What the chooser owns (§5.2.2)
+
+`pixel_distance_to_distance_code(distance, image_width)` returns the
+smaller of:
+
+* the legacy scan-line code `D + 120` (always valid); and
+* any distance-map code `c ∈ 1..=120` whose neighbour offset `(xi, yi)`
+  reconstructs to `max(xi + yi * image_width, 1) == D` — these small
+  codes feed `value_to_prefix` through low-prefix slots, so the DISTANCE
+  Huffman tree gives them the shortest emitted lengths.
+
+It is called **at least twice per emitted LZ77 match** (once in
+`count_frequencies` to build the DISTANCE frequency table, once in the
+emit loop) and has **no early-out**: it linearly scans all 120
+`DISTANCE_MAP` entries, recomputing `xi + yi * W` and the clamp-to-1 on
+every call regardless of where (or whether) a match lands.
+
+### New bench: `distance_code`
+
+`image_width = 256`, 1024 chooser calls per `b.iter` body, `--quick`,
+aarch64-apple-darwin (median per cell, ÷1024 ≈ per-call):
+
+| Cell | Median (1024 calls) | ≈ per call | Regime |
+|---|---|---|---|
+| `distance_code_dist1_rle` | 64.6 µs | ~63 ns | `distance = 1`; multiple clamp-to-1 map hits |
+| `distance_code_dist_row_above` | 64.1 µs | ~63 ns | `distance = 256 = width`; `(0,1)` match at index 0 → code 1 (cheapest) |
+| `distance_code_dist_small_neighbor` | 64.4 µs | ~63 ns | `distance = 2`; `(2,0)` match mid-scan |
+| `distance_code_dist_large_nomatch` | 64.1 µs | ~63 ns | `distance = 70_000`; no map match → full scan + scan-line fallback |
+
+### Finding
+
+The four cells are **flat within noise** (~64 µs / ~63 ns per call across
+all regimes). This is the signature of a no-early-out fixed-iteration
+scan: the per-call cost is set by the 120-entry `DISTANCE_MAP` walk, not
+by where the best code lands or whether one matches at all. The
+`dist_row_above` cell — which matches code 1 on the **first** scanned
+entry — costs the same as `dist_large_nomatch`, which matches nothing and
+runs to completion.
+
+### Ranked next PROFILE-OPT target (post-r300, encode path)
+
+| Rank | Candidate | Evidence | A/B harness |
+|---:|---|---|---|
+| 1 | §5.2.2 distance-code chooser early-out / lookup: the 120-entry scan is fixed-cost per call and runs twice per match; a precomputed reverse map (`distance → smallest code`, keyed per `image_width` or for the common `distance < width` near-neighbourhood) would let the common small-distance regimes short-circuit instead of always scanning all 120 | all four cells flat at ~63 ns/call; `dist_row_above` (matches at index 0) costs the same as `dist_large_nomatch` (matches nothing) — pure scan cost, no input sensitivity | `distance_code_{dist1_rle,dist_row_above,dist_small_neighbor,dist_large_nomatch}` (must-not-regress: bit-exact round-trip) |
+
+Any such rewrite must preserve the **smallest-code** tie-break the
+current scan guarantees (`candidate < best`) and stay bit-exact against
+the decoder's `distance_code_to_pixel_distance` reconstruction — the
+existing encode round-trip tests are the correctness gate.
+
+### Round-300 verification
+
+* **Byte identity:** no `src/` change — bench-only round (new
+  `benches/distance_code.rs` + its `[[bench]]` stanza). The chooser is a
+  pure function of `(distance, image_width)`; the bench's XOR accumulator
+  + `black_box` guards prevent the optimiser from eliding any call.
+* `cargo fmt --check` + `cargo clippy --all-targets --no-deps -D
+  warnings` clean.

@@ -6,6 +6,20 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Performance
 
+- Round-300 BENCH round (no `src/` change): added
+  `benches/distance_code.rs`, isolating the encoder-side §5.2.2
+  `pixel_distance_to_distance_code` distance-code chooser — run at least
+  twice per emitted LZ77 backward reference and performing a no-early-out
+  linear scan of all 120 `DISTANCE_MAP` entries to pick the smallest
+  valid distance code. Four cells fix `image_width = 256` and vary
+  `distance`: `dist1_rle` (RLE, multiple clamp-to-1 hits),
+  `dist_row_above` (`distance == width`, code-1 match at scan index 0),
+  `dist_small_neighbor` (`distance = 2`), and `dist_large_nomatch`
+  (`distance = 70_000`, no map match → full scan + scan-line fallback).
+  Baseline: all four cells flat within noise at ~64 µs / 1024 calls
+  (~63 ns/call), confirming the cost is the fixed 120-entry scan, not the
+  match location — the A/B harness for a future reverse-map early-out.
+  See `BENCHMARKS.md` "Round-300".
 - Round-299 PROFILE depth round: rewrote the private
   `crate::argb_to_rgba` helper — the ARGB-`u32` → packed `[R, G, B, A]`
   converter the public `decode_webp` lossless still path

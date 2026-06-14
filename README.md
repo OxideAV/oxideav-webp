@@ -36,7 +36,7 @@ oxideav-webp = "0.1"
 
 ### Benchmarks
 
-The crate ships twenty-seven criterion benches under `benches/`,
+The crate ships twenty-eight criterion benches under `benches/`,
 grouped by domain:
 
 * **End-to-end** — `lossless_decode`, `lossless_encode`,
@@ -68,8 +68,12 @@ grouped by domain:
   chooser walk), `meta_prefix_cluster` (round 294: the §6.2.2
   entropy-image block-clustering heuristic behind
   `encode_with_meta_prefix` — coarse-RGB-histogram Lloyd's k-means
-  across content regime / `num_groups` / image-size sweeps), and the
-  §5.2.2 `value_to_prefix` split.
+  across content regime / `num_groups` / image-size sweeps), the
+  §5.2.2 `value_to_prefix` split, and `distance_code` (round 300: the
+  §5.2.2 `pixel_distance_to_distance_code` chooser run twice per match
+  — a no-early-out 120-entry `DISTANCE_MAP` scan picking the smallest
+  distance code — across RLE / row-above / close-neighbour / no-match
+  regimes, all flat at ~63 ns/call).
 * **Entropy / prefix-code chain** — `build_code_lengths` and
   `canonical_codes` (encoder §3.7.2) and `prefix_from_code_lengths`
   (decoder §6.2.1), each over the four §3.7.1 alphabets
