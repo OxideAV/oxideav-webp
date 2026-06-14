@@ -2766,6 +2766,86 @@ fn build_predictor_image_entropy_subaware(
     (img, tw, th)
 }
 
+/// Round 305 — per-block predictor-mode selection strategy for the §4.1
+/// predictor sub-image, used to parameterise which cost model the stacked
+/// §3.5 transform chains build their predictor sub-image with.
+///
+/// The single-transform predictor path
+/// ([`encode_argb_with_predictor_chooser`]) already sweeps every one of
+/// these strategies and keeps the byte-shortest stream (rounds 159–162).
+/// The stacked chains added in rounds 302–304
+/// ([`encode_with_color_transform_predictor`],
+/// [`encode_with_color_transform_subtract_green_predictor`],
+/// [`encode_with_color_indexing_predictor`]) were bootstrapped with only
+/// the [`PredictorSubImageStrategy::L1`] proxy chooser. Threading this
+/// strategy through them lets the chooser try the entropy and
+/// sub-image-aware entropy cost models over the *transform-decorrelated*
+/// image those chains feed the predictor — exactly the residual the
+/// predictor sub-image actually sees — and keep whichever is smallest.
+///
+/// Round-trip correctness is independent of the strategy: every variant
+/// only changes *which §4.1 mode is recorded per block* in the sub-image;
+/// the forward transform recomputes residuals against the chosen modes and
+/// the decoder reads the same modes back, so the reconstruction is
+/// bit-identical regardless of strategy. The chooser keeps the strategy
+/// solely on a byte-cost basis, so a strategy that hurts on a given input
+/// is simply not selected — the path strictly extends the encoder's option
+/// set without ever regressing the L1 baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictorSubImageStrategy {
+    /// Round-159 folded-L1 magnitude proxy chooser
+    /// ([`build_predictor_image`]).
+    L1,
+    /// Round-161 Shannon-entropy bit-cost chooser
+    /// ([`build_predictor_image_entropy`]).
+    Entropy,
+    /// Round-162 sub-image-aware Shannon-entropy chooser
+    /// ([`build_predictor_image_entropy_subaware`]) at the given
+    /// `lambda_milli` per-sub-image-bit weight.
+    EntropySubaware { lambda_milli: u64 },
+}
+
+/// Round 305 — build a §4.1 predictor sub-image under the given
+/// [`PredictorSubImageStrategy`]. Dispatches to the round-159 / round-161 /
+/// round-162 builders, all of which share the
+/// `(pixels, width, height, size_bits) -> (sub_image, tw, th)` shape, so
+/// the stacked chains can pick a cost model uniformly. See
+/// [`PredictorSubImageStrategy`] for the round-trip invariance argument.
+fn build_predictor_image_strategy(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    strategy: PredictorSubImageStrategy,
+) -> (Vec<u32>, u32, u32) {
+    match strategy {
+        PredictorSubImageStrategy::L1 => build_predictor_image(pixels, width, height, size_bits),
+        PredictorSubImageStrategy::Entropy => {
+            build_predictor_image_entropy(pixels, width, height, size_bits)
+        }
+        PredictorSubImageStrategy::EntropySubaware { lambda_milli } => {
+            build_predictor_image_entropy_subaware(pixels, width, height, size_bits, lambda_milli)
+        }
+    }
+}
+
+/// Round 305 — the predictor-sub-image strategies the stacked §3.5 chains
+/// sweep. The L1 proxy (the rounds 302–304 baseline) leads so a tie keeps
+/// the historical choice; the entropy and a single sub-image-aware
+/// entropy setting follow. The lambda value mirrors the mid-range setting
+/// the single-transform chooser sweeps — high enough to converge the mode
+/// set on smooth transform-decorrelated residuals, low enough that the
+/// residual cost still dominates on noisy content. The chooser keeps the
+/// byte-shortest stream across all three, so the sweep is non-regressing
+/// against the L1 baseline.
+const STACKED_PREDICTOR_STRATEGIES: [PredictorSubImageStrategy; 3] = [
+    PredictorSubImageStrategy::L1,
+    PredictorSubImageStrategy::Entropy,
+    PredictorSubImageStrategy::EntropySubaware {
+        lambda_milli: 16_000,
+    },
+];
+
 /// Apply the §4.1 *forward* predictor transform: for each pixel,
 /// replace it with the per-channel mod-256 residual `(original -
 /// pred)`. `pred` is computed from the **source** (un-modified)
@@ -3729,6 +3809,7 @@ fn encode_with_color_indexing_predictor(
     height: u32,
     size_bits: u8,
     cache_code_bits: Option<u32>,
+    pred_strategy: PredictorSubImageStrategy,
 ) -> Option<Vec<u8>> {
     let (palette, index_of) = collect_palette(pixels)?;
     if palette.is_empty() {
@@ -3771,8 +3852,16 @@ fn encode_with_color_indexing_predictor(
     w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
     debug_assert!((2..=9).contains(&size_bits));
     w.write_bits((size_bits - 2) as u32, 3);
-    let (predictor_image, tw, _th) =
-        build_predictor_image(&packed_image, packed_width, height, size_bits);
+    // Round 305: build the predictor sub-image over the *packed index*
+    // image under `pred_strategy`. The chooser sweeps L1 / entropy /
+    // sub-image-aware and keeps the byte-shortest.
+    let (predictor_image, tw, _th) = build_predictor_image_strategy(
+        &packed_image,
+        packed_width,
+        height,
+        size_bits,
+        pred_strategy,
+    );
     write_entropy_coded_image_literals(&mut w, &predictor_image);
 
     // End of optional-transform list (`%b0`).
@@ -3852,6 +3941,7 @@ fn encode_with_color_transform_predictor(
     height: u32,
     size_bits: u8,
     cache_code_bits: Option<u32>,
+    pred_strategy: PredictorSubImageStrategy,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
 
@@ -3880,12 +3970,15 @@ fn encode_with_color_transform_predictor(
     // Built over the color-transformed image at full `width × height`.
     // The decoder will have left `current_width` at `width` after the
     // color transform (color-tx does not subsample), so the
-    // `transform_width` it derives matches `ptw` here.
+    // `transform_width` it derives matches `ptw` here. The predictor
+    // sub-image is built under `pred_strategy` (round 305) — the
+    // chooser sweeps L1 / entropy / sub-image-aware over this
+    // color-decorrelated residual and keeps the byte-shortest.
     w.write_bit(true);
     w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
     w.write_bits((size_bits - 2) as u32, 3);
     let (predictor_image, ptw, _pth) =
-        build_predictor_image(&color_transformed, width, height, size_bits);
+        build_predictor_image_strategy(&color_transformed, width, height, size_bits, pred_strategy);
     write_entropy_coded_image_literals(&mut w, &predictor_image);
 
     // End of optional-transform list (`%b0`).
@@ -3973,6 +4066,7 @@ fn encode_with_color_transform_subtract_green_predictor(
     height: u32,
     size_bits: u8,
     cache_code_bits: Option<u32>,
+    pred_strategy: PredictorSubImageStrategy,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
 
@@ -4008,12 +4102,13 @@ fn encode_with_color_transform_subtract_green_predictor(
     // Built over the color- + subtract-green-transformed image at full
     // `width × height`. Neither earlier transform subsampled the width,
     // so the decoder still has `current_width == width` here and the
-    // `transform_width` it derives matches `ptw`.
+    // `transform_width` it derives matches `ptw`. The predictor
+    // sub-image is built under `pred_strategy` (round 305).
     w.write_bit(true);
     w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
     w.write_bits((size_bits - 2) as u32, 3);
     let (predictor_image, ptw, _pth) =
-        build_predictor_image(&transformed, width, height, size_bits);
+        build_predictor_image_strategy(&transformed, width, height, size_bits, pred_strategy);
     write_entropy_coded_image_literals(&mut w, &predictor_image);
 
     // End of optional-transform list (`%b0`).
@@ -5388,12 +5483,25 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         if try_single_block {
             ctp_size_bits.push(single_block_size_bits);
         }
+        // Round 305: sweep the predictor-sub-image strategy (L1 /
+        // entropy / sub-image-aware) over the color-decorrelated
+        // residual the chain feeds the predictor. Non-regressing — the
+        // byte-shortest candidate is kept.
         for &sb in &ctp_size_bits {
-            let cand = select_best_cache_bits(|cache_bits| {
-                encode_with_color_transform_predictor(pixels, width, height, sb, cache_bits)
-            });
-            if cand.len() < best.len() {
-                best = cand;
+            for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                let cand = select_best_cache_bits(|cache_bits| {
+                    encode_with_color_transform_predictor(
+                        pixels,
+                        width,
+                        height,
+                        sb,
+                        cache_bits,
+                        pred_strategy,
+                    )
+                });
+                if cand.len() < best.len() {
+                    best = cand;
+                }
             }
         }
 
@@ -5413,14 +5521,22 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // `width >= ctx_block && height >= ctx_block` gate, swept over the
         // default per-region and maximal single-block `size_bits` each
         // across the round-148 cache-bits sweep.
+        // Round 305: sweep the predictor-sub-image strategy here too.
         for &sb in &ctp_size_bits {
-            let cand = select_best_cache_bits(|cache_bits| {
-                encode_with_color_transform_subtract_green_predictor(
-                    pixels, width, height, sb, cache_bits,
-                )
-            });
-            if cand.len() < best.len() {
-                best = cand;
+            for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                let cand = select_best_cache_bits(|cache_bits| {
+                    encode_with_color_transform_subtract_green_predictor(
+                        pixels,
+                        width,
+                        height,
+                        sb,
+                        cache_bits,
+                        pred_strategy,
+                    )
+                });
+                if cand.len() < best.len() {
+                    best = cand;
+                }
             }
         }
     }
@@ -5466,23 +5582,36 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         if ci_pred_single_block != pred_size_bits {
             ci_pred_size_bits.push(ci_pred_single_block);
         }
+        // Round 305: sweep the predictor-sub-image strategy (L1 /
+        // entropy / sub-image-aware) over the packed-index residual the
+        // chain feeds the predictor. Non-regressing — kept only when
+        // strictly smaller than the running best.
         for &sb in &ci_pred_size_bits {
-            let mut got_candidate = false;
-            let cand = select_best_cache_bits(|cache_bits| {
-                match encode_with_color_indexing_predictor(pixels, width, height, sb, cache_bits) {
-                    Some(bytes) => {
-                        got_candidate = true;
-                        bytes
+            for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                let mut got_candidate = false;
+                let cand = select_best_cache_bits(|cache_bits| {
+                    match encode_with_color_indexing_predictor(
+                        pixels,
+                        width,
+                        height,
+                        sb,
+                        cache_bits,
+                        pred_strategy,
+                    ) {
+                        Some(bytes) => {
+                            got_candidate = true;
+                            bytes
+                        }
+                        // Packed image too small for this `size_bits`. Emit
+                        // a sentinel longer than the running best so the
+                        // cache sweep discards it; `got_candidate` stays
+                        // false and the outer comparison is skipped.
+                        None => vec![0u8; best.len() + 1],
                     }
-                    // Packed image too small for this `size_bits`. Emit a
-                    // sentinel longer than the running best so the cache
-                    // sweep discards it; `got_candidate` stays false and
-                    // the outer comparison is skipped entirely.
-                    None => vec![0u8; best.len() + 1],
+                });
+                if got_candidate && cand.len() < best.len() {
+                    best = cand;
                 }
-            });
-            if got_candidate && cand.len() < best.len() {
-                best = cand;
             }
         }
     }
@@ -8649,6 +8778,7 @@ mod tests {
                 h,
                 DEFAULT_PREDICTOR_SIZE_BITS,
                 None,
+                PredictorSubImageStrategy::L1,
             )
             .expect("palette feasible and packed image admits a predictor block");
             let header = build_image_header(w, h, false);
@@ -8683,21 +8813,31 @@ mod tests {
         }
         // Single-block size_bits large enough to collapse the packed
         // image into one predictor block.
+        // Round 305: also sweep the predictor-sub-image strategy so the
+        // entropy / sub-image-aware builders are exercised on the
+        // packed-index residual round-trip.
         for size_bits in [DEFAULT_PREDICTOR_SIZE_BITS, 7u8] {
             for cache in [None, Some(4u32), Some(8u32)] {
-                if let Some(stream) =
-                    encode_with_color_indexing_predictor(&pixels, w, h, size_bits, cache)
-                {
-                    let header = build_image_header(w, h, false);
-                    let mut payload = header.to_vec();
-                    payload.extend_from_slice(&stream);
-                    let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
-                        .expect("decode chained round trip");
-                    assert_eq!(
-                        decoded.pixels(),
-                        pixels.as_slice(),
-                        "mismatch size_bits={size_bits} cache={cache:?}"
-                    );
+                for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                    if let Some(stream) = encode_with_color_indexing_predictor(
+                        &pixels,
+                        w,
+                        h,
+                        size_bits,
+                        cache,
+                        pred_strategy,
+                    ) {
+                        let header = build_image_header(w, h, false);
+                        let mut payload = header.to_vec();
+                        payload.extend_from_slice(&stream);
+                        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                            .expect("decode chained round trip");
+                        assert_eq!(
+                            decoded.pixels(),
+                            pixels.as_slice(),
+                            "mismatch size_bits={size_bits} cache={cache:?} strategy={pred_strategy:?}"
+                        );
+                    }
                 }
             }
         }
@@ -8723,8 +8863,15 @@ mod tests {
         ];
         // 4x2 image: width_bits = 3 → packed_width = 1 < block (16).
         assert!(
-            encode_with_color_indexing_predictor(&pixels, 4, 2, DEFAULT_PREDICTOR_SIZE_BITS, None)
-                .is_none(),
+            encode_with_color_indexing_predictor(
+                &pixels,
+                4,
+                2,
+                DEFAULT_PREDICTOR_SIZE_BITS,
+                None,
+                PredictorSubImageStrategy::L1
+            )
+            .is_none(),
             "sub-block packed image must self-skip the predictor chain"
         );
     }
@@ -8807,19 +8954,29 @@ mod tests {
                 pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
             }
         }
+        // Round 305: sweep the predictor-sub-image strategy too.
         for size_bits in [DEFAULT_COLOR_TRANSFORM_SIZE_BITS, 7u8] {
             for cache in [None, Some(4u32), Some(9u32)] {
-                let stream = encode_with_color_transform_predictor(&pixels, w, h, size_bits, cache);
-                let header = build_image_header(w, h, false);
-                let mut payload = header.to_vec();
-                payload.extend_from_slice(&stream);
-                let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
-                    .expect("decode color-transform+predictor round trip");
-                assert_eq!(
-                    decoded.pixels(),
-                    pixels.as_slice(),
-                    "round-trip mismatch size_bits={size_bits} cache={cache:?}"
-                );
+                for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                    let stream = encode_with_color_transform_predictor(
+                        &pixels,
+                        w,
+                        h,
+                        size_bits,
+                        cache,
+                        pred_strategy,
+                    );
+                    let header = build_image_header(w, h, false);
+                    let mut payload = header.to_vec();
+                    payload.extend_from_slice(&stream);
+                    let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                        .expect("decode color-transform+predictor round trip");
+                    assert_eq!(
+                        decoded.pixels(),
+                        pixels.as_slice(),
+                        "round-trip mismatch size_bits={size_bits} cache={cache:?} strategy={pred_strategy:?}"
+                    );
+                }
             }
         }
     }
@@ -8848,6 +9005,7 @@ mod tests {
             h,
             DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
             None,
+            PredictorSubImageStrategy::L1,
         );
         let header = build_image_header(w, h, false);
         let mut payload = header.to_vec();
@@ -8936,21 +9094,29 @@ mod tests {
                 pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
             }
         }
+        // Round 305: sweep the predictor-sub-image strategy too.
         for size_bits in [DEFAULT_COLOR_TRANSFORM_SIZE_BITS, 7u8] {
             for cache in [None, Some(4u32), Some(9u32)] {
-                let stream = encode_with_color_transform_subtract_green_predictor(
-                    &pixels, w, h, size_bits, cache,
-                );
-                let header = build_image_header(w, h, false);
-                let mut payload = header.to_vec();
-                payload.extend_from_slice(&stream);
-                let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
-                    .expect("decode color+subtract-green+predictor round trip");
-                assert_eq!(
-                    decoded.pixels(),
-                    pixels.as_slice(),
-                    "round-trip mismatch size_bits={size_bits} cache={cache:?}"
-                );
+                for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                    let stream = encode_with_color_transform_subtract_green_predictor(
+                        &pixels,
+                        w,
+                        h,
+                        size_bits,
+                        cache,
+                        pred_strategy,
+                    );
+                    let header = build_image_header(w, h, false);
+                    let mut payload = header.to_vec();
+                    payload.extend_from_slice(&stream);
+                    let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                        .expect("decode color+subtract-green+predictor round trip");
+                    assert_eq!(
+                        decoded.pixels(),
+                        pixels.as_slice(),
+                        "round-trip mismatch size_bits={size_bits} cache={cache:?} strategy={pred_strategy:?}"
+                    );
+                }
             }
         }
     }
@@ -8976,6 +9142,7 @@ mod tests {
             h,
             DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
             None,
+            PredictorSubImageStrategy::L1,
         );
         let header = build_image_header(w, h, false);
         let mut payload = header.to_vec();
@@ -9029,6 +9196,7 @@ mod tests {
                 h,
                 DEFAULT_COLOR_TRANSFORM_SIZE_BITS,
                 cache_bits,
+                PredictorSubImageStrategy::L1,
             )
         });
         let pre304 = single_pred
@@ -9050,6 +9218,230 @@ mod tests {
         let decoded =
             crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode chosen stream");
         assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 305: every predictor-sub-image strategy threaded through
+    /// the stacked §3.5 chains must round-trip bit-exactly. Each
+    /// strategy only changes which §4.1 mode is recorded per block in
+    /// the sub-image; the forward transform recomputes residuals against
+    /// the chosen modes and the decoder reads them back, so the
+    /// reconstruction is strategy-independent. Exercise all three
+    /// stacked chains (color + predictor, color + subtract-green +
+    /// predictor, color-indexing + predictor) across the full strategy
+    /// set on content where each chain is admissible.
+    #[test]
+    fn round_305_stacked_predictor_strategies_round_trip() {
+        // Photo-like content for the two color-transform chains.
+        let (w, h) = (128u32, 96u32);
+        let mut photo: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x9e37_79b9;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (state >> 27) as i32 - 16;
+                let g = ((x + y) % 256) as i32;
+                let r = (g + 28 + n).clamp(0, 255) as u32;
+                let b = (g - 19 - n).clamp(0, 255) as u32;
+                photo.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+        for &strategy in &STACKED_PREDICTOR_STRATEGIES {
+            let sb = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+            let s1 = encode_with_color_transform_predictor(&photo, w, h, sb, Some(8), strategy);
+            let s2 = encode_with_color_transform_subtract_green_predictor(
+                &photo,
+                w,
+                h,
+                sb,
+                Some(8),
+                strategy,
+            );
+            for stream in [&s1, &s2] {
+                let header = build_image_header(w, h, false);
+                let mut payload = header.to_vec();
+                payload.extend_from_slice(stream);
+                let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                    .unwrap_or_else(|_| panic!("decode failed for strategy {strategy:?}"));
+                assert_eq!(
+                    decoded.pixels(),
+                    photo.as_slice(),
+                    "color-chain round-trip mismatch strategy={strategy:?}"
+                );
+            }
+        }
+
+        // Palette content for the color-indexing chain.
+        let palette = [0xff00_0000u32, 0xff20_4060, 0xff60_c0ff, 0xffff_ffff];
+        let (pw, ph) = (96u32, 48u32);
+        let mut pal: Vec<u32> = Vec::with_capacity((pw * ph) as usize);
+        for y in 0..ph {
+            for x in 0..pw {
+                let idx = ((x / 3 + y) as usize) % palette.len();
+                pal.push(palette[idx]);
+            }
+        }
+        for &strategy in &STACKED_PREDICTOR_STRATEGIES {
+            let stream = encode_with_color_indexing_predictor(
+                &pal,
+                pw,
+                ph,
+                DEFAULT_PREDICTOR_SIZE_BITS,
+                Some(4),
+                strategy,
+            )
+            .expect("palette feasible, packed image admits a predictor block");
+            let header = build_image_header(pw, ph, false);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&stream);
+            let decoded = crate::vp8l_transform::decode_lossless(&payload, pw, ph)
+                .unwrap_or_else(|_| panic!("decode failed for strategy {strategy:?}"));
+            assert_eq!(
+                decoded.pixels(),
+                pal.as_slice(),
+                "color-indexing-chain round-trip mismatch strategy={strategy:?}"
+            );
+        }
+    }
+
+    /// Round 305: the entropy-aware strategies must *actually win* on
+    /// the stacked color-transform + predictor chain for at least one
+    /// real input — guarding the feature from becoming dead code. On
+    /// smooth, mildly-noisy photo-like content the color transform
+    /// decorrelates the channels, leaving a residual the §4.1 predictor
+    /// sub-image models far better under a true Huffman bit-cost than
+    /// under the L1 magnitude proxy: the per-block mode histogram
+    /// concentrates, shrinking both the §7.2 sub-image and the residual
+    /// stream. The non-L1 best here is materially smaller than L1.
+    #[test]
+    fn round_305_entropy_strategy_beats_l1_on_photo_chain() {
+        let (w, h) = (96u32, 64u32);
+        let mut px: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x1000_0000;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (state >> 29) as i32 - 2;
+                let g = ((x + y) % 256) as i32;
+                let r = (g + 20 + n).clamp(0, 255) as u32;
+                let b = (g - 15 - n).clamp(0, 255) as u32;
+                px.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+        let sb = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let l1 = encode_with_color_transform_predictor(
+            &px,
+            w,
+            h,
+            sb,
+            Some(8),
+            PredictorSubImageStrategy::L1,
+        )
+        .len();
+        let entropy = encode_with_color_transform_predictor(
+            &px,
+            w,
+            h,
+            sb,
+            Some(8),
+            PredictorSubImageStrategy::Entropy,
+        )
+        .len();
+        let subaware = encode_with_color_transform_predictor(
+            &px,
+            w,
+            h,
+            sb,
+            Some(8),
+            PredictorSubImageStrategy::EntropySubaware {
+                lambda_milli: 16_000,
+            },
+        )
+        .len();
+        let best_non_l1 = entropy.min(subaware);
+        assert!(
+            best_non_l1 < l1,
+            "expected an entropy-aware strategy to beat L1: L1={l1} entropy={entropy} subaware={subaware}"
+        );
+    }
+
+    /// Round 305: the strategy sweep is non-regressing — the
+    /// super-chooser's chosen stream is never larger than the round-304
+    /// baseline (which built the stacked chains with only the L1
+    /// predictor strategy). Since the L1 strategy remains in
+    /// [`STACKED_PREDICTOR_STRATEGIES`], adding the entropy variants can
+    /// only ever keep a smaller stream, never a larger one.
+    #[test]
+    fn round_305_strategy_sweep_never_regresses() {
+        let (w, h) = (160u32, 120u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x2545_f491;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let n = (state >> 29) as i32 - 2;
+                let g = ((x as i32) - (y as i32)).rem_euclid(256);
+                let r = (g + 36 + n).clamp(0, 255) as u32;
+                let b = (g - 25 + n).clamp(0, 255) as u32;
+                pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+
+        // Baseline: the two color-transform stacked chains built with
+        // only the L1 strategy (the round-304 behaviour), best across the
+        // cache sweep and the per-region / single-block size_bits.
+        let mut sb_sweep = vec![DEFAULT_COLOR_TRANSFORM_SIZE_BITS];
+        let mut single = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        while single < 9 && ((1u32 << single) < w || (1u32 << single) < h) {
+            single += 1;
+        }
+        if single != DEFAULT_COLOR_TRANSFORM_SIZE_BITS {
+            sb_sweep.push(single);
+        }
+        let mut l1_best = usize::MAX;
+        for &sb in &sb_sweep {
+            let a = select_best_cache_bits(|cb| {
+                encode_with_color_transform_predictor(
+                    &pixels,
+                    w,
+                    h,
+                    sb,
+                    cb,
+                    PredictorSubImageStrategy::L1,
+                )
+            });
+            let b = select_best_cache_bits(|cb| {
+                encode_with_color_transform_subtract_green_predictor(
+                    &pixels,
+                    w,
+                    h,
+                    sb,
+                    cb,
+                    PredictorSubImageStrategy::L1,
+                )
+            });
+            l1_best = l1_best.min(a.len()).min(b.len());
+        }
+
+        // With the full strategy sweep, the best stacked candidate is
+        // never larger than the L1-only baseline.
+        let mut swept_best = usize::MAX;
+        for &sb in &sb_sweep {
+            for &strategy in &STACKED_PREDICTOR_STRATEGIES {
+                let a = select_best_cache_bits(|cb| {
+                    encode_with_color_transform_predictor(&pixels, w, h, sb, cb, strategy)
+                });
+                let b = select_best_cache_bits(|cb| {
+                    encode_with_color_transform_subtract_green_predictor(
+                        &pixels, w, h, sb, cb, strategy,
+                    )
+                });
+                swept_best = swept_best.min(a.len()).min(b.len());
+            }
+        }
+        assert!(
+            swept_best <= l1_best,
+            "strategy sweep regressed: swept {swept_best} > L1-only {l1_best}"
+        );
     }
 
     /// Probe across palette-shaped synthetic payloads to find at

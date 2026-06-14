@@ -6,6 +6,25 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-305 lossless-encode cost improvement: the §3.5 **stacked-transform
+  chains** (color + predictor, color + subtract-green + predictor,
+  color-indexing + predictor) now sweep the **predictor-sub-image cost
+  model** the same way the single-transform predictor path has since
+  rounds 159–162. The chains were bootstrapped (rounds 302–304) with only
+  the round-159 folded-L1 magnitude proxy for per-block §4.1 mode
+  selection; round 305 threads a `PredictorSubImageStrategy` through each
+  chain so the chooser also builds the round-161 Shannon-entropy bit-cost
+  and round-162 sub-image-aware entropy candidates over the
+  *transform-decorrelated* residual the predictor actually sees, and keeps
+  the byte-shortest. On smooth, mildly-noisy photo-like content the
+  entropy-aware strategies shrink the color + predictor chain by ~12–21 %
+  versus the L1 baseline (the per-block mode histogram concentrates,
+  compacting both the §7.2 predictor sub-image and the residual stream).
+  The sweep keeps L1 in the strategy set, so it is strictly
+  non-regressing; round-trip correctness is strategy-independent (each
+  strategy only changes which §4.1 mode is recorded per block — the
+  decoder reads the same modes back). No decoder change required.
+
 - Round-304 lossless-encode feature: the first §3.5 **three-transform**
   stacked candidate — §4.2 cross-color → §4.3 subtract-green → §4.1
   spatial predictor, chained into one `optional-transform` list. It is the

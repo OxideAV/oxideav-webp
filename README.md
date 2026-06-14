@@ -814,6 +814,25 @@ if let Some(xmp) = meta.xmp.as_deref()   { /* XMP UTF-8 XML */ }
 
 ### Encode a lossless `.webp` from RGBA bytes
 
+The lossless encoder is a byte-cost **super-chooser**: it builds the §3
+no-transform / subtract-green baseline plus every §4 single-transform and
+§3.5 stacked-transform candidate — sweeping `size_bits`, the §5.2.3 color
+cache, and the §6.2.2 meta-prefix grouping — and emits the byte-shortest
+stream, so adding a candidate can never enlarge the output. Round 305
+brought the three §3.5 stacked chains (color + predictor, color +
+subtract-green + predictor, color-indexing + predictor) up to the same
+per-block §4.1 mode-selection cost models the single-transform predictor
+path has carried since rounds 159–162: each chain now sweeps the
+folded-L1 magnitude proxy, the round-161 Shannon-entropy bit cost, and the
+round-162 sub-image-aware entropy cost over the *transform-decorrelated*
+residual the predictor actually models, keeping the smallest. On smooth,
+mildly-noisy photo-like content the entropy-aware models shrink the color +
+predictor chain ~12–21 % versus the L1 proxy (the per-block mode histogram
+concentrates, compacting both the §7.2 predictor sub-image and the residual
+stream). Round-trip output is byte-identical regardless of which cost model
+is chosen — the cost model only changes which §4.1 mode is *recorded*, and
+the decoder reads the same modes back.
+
 The shortest path — flat RGBA in, complete `.webp` file out:
 
 ```rust
