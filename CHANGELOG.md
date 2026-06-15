@@ -81,6 +81,33 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-309 **lossy-frame animated-WebP decode**: an animated `.webp` whose
+  per-frame `ANMF` "Frame Data" carries a §2.5 `VP8 ` (lossy) bitstream is now
+  composited onto the canvas instead of being refused with
+  `WebpError::Unsupported`. RFC 9649 §2.7.2 Figure 14's rendering loop
+  explicitly accepts a per-frame bitstream that is `"VP8 "` **or** `"VP8L"`
+  ("else if subchunk.tag == \"VP8 \" OR subchunk.tag == \"VP8L\""), plus an
+  optional §2.7.1.2 `ALPH` plane over either — but `decode_animation` only ever
+  decoded the §2.6 `VP8L` lossless sub-chunk (the kind the in-crate animation
+  encoder produces) and returned `Unsupported` for a lossy frame, even though
+  the still extended-lossy path has decoded §2.5 `VP8 ` (via the `oxideav-vp8`
+  sibling keyframe decoder) since round 124. The per-frame decode now dispatches
+  on the Frame Data sub-chunk FourCC: a `VP8L` sub-chunk is decoded exactly as
+  before; a `VP8 ` sub-chunk is routed to the same `vp8_decode::decode_lossy_rgba`
+  the still path uses, taking the frame's pixel dimensions from the keyframe
+  header (the §2.7.1.1 Frame Width/Height fields continue to govern only the
+  canvas placement rect). An optional `ALPH` sub-chunk now layers its decoded
+  alpha plane over **either** bitstream kind — the lossless RGBA already carries
+  alpha; the lossy YUV reconstruction is opaque until the plane is applied,
+  matching the §2.7.1.2 still extended-lossy + alpha treatment. New
+  `registry`-gated test `vp8_lossy_roundtrip::animation_with_lossy_vp8_frames_decodes`
+  hand-assembles a spec-shaped two-frame animation around a real `VP8 ` keyframe
+  emitted by the lossy encoder (there is no committed lossy-frame fixture — the
+  in-crate animation encoder only writes VP8L frames) and asserts `decode_webp`
+  returns two full-canvas frames at the canvas dimensions. No change to the
+  lossless-frame path's decoded bytes; standalone (`--no-default-features`) build
+  unaffected (the lossy decode delegation is always compiled in).
+
 - Round-308 lossless-encode cost improvement: the single-transform §4.2
   **cross-color** path now adds an **entropy-cost per-block CTE chooser**
   alongside the existing L1-magnitude one. Where the L1 chooser scores each

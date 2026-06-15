@@ -1021,10 +1021,13 @@ pub fn decode_webp(bytes: &[u8]) -> Result<WebpImage, WebpError> {
 ///
 /// Each §2.7.1.1 `ANMF` chunk carries a 16-byte header
 /// ([`anmf::AnmfHeader`]) followed by its "Frame Data" — a padded §2.3
-/// sub-RIFF holding the frame's bitstream. This decoder handles the
-/// §2.6 `VP8L` lossless sub-chunk (the path the in-crate animation encoder
-/// produces); an `ANMF` carrying only a §2.5 `VP8 ` lossy sub-chunk is
-/// [`WebpError::Unsupported`] (the VP8 lossy decoder is not rebuilt yet).
+/// sub-RIFF holding the frame's bitstream. This decoder handles both
+/// per-frame bitstream kinds the §2.7.2 Figure 14 rendering loop accepts:
+/// the §2.6 `VP8L` lossless sub-chunk (the path the in-crate animation
+/// encoder produces) and the §2.5 `VP8 ` lossy sub-chunk (routed to the
+/// same `oxideav-vp8` keyframe decoder the still extended-lossy path uses).
+/// An optional §2.7.1.2 `ALPH` sub-chunk layers an alpha plane over either
+/// bitstream kind.
 ///
 /// **Canvas compositing (round 127):** the canvas is sized from the
 /// §2.7.1 `VP8X` chunk and initialised to the §2.7.1.1 `ANIM`
@@ -1102,37 +1105,46 @@ fn decode_animation(bytes: &[u8], c: &container::WebpContainer) -> Result<WebpIm
         let header = anmf::AnmfHeader::parse(payload).map_err(|_| WebpError::InvalidData)?;
         let frame_data = &payload[header.frame_data_offset()..];
 
-        // The Frame Data sub-RIFF is a flat list of §2.3 padded chunks. Find
-        // the VP8L bitstream sub-chunk (lossy VP8 is not decoded here).
-        let vp8l = find_subchunk(frame_data, container::fourcc::VP8L);
-        let Some(vp8l_payload) = vp8l else {
-            // A VP8 lossy sub-chunk is recognized-but-unsupported.
-            if find_subchunk(frame_data, container::fourcc::VP8).is_some() {
-                return Err(WebpError::Unsupported);
-            }
-            return Err(WebpError::InvalidData);
-        };
+        // §2.7.1.1 / §2.7.2: the Frame Data sub-RIFF is a flat list of §2.3
+        // padded chunks carrying the per-frame bitstream — either a §2.6
+        // `VP8L` (lossless) or a §2.5 `VP8 ` (lossy) sub-chunk, plus an
+        // optional §2.7.1.2 `ALPH` alpha plane (Figure 14's rendering loop
+        // accepts "VP8 " OR "VP8L"). Decode whichever bitstream is present to
+        // a flat `sub_w * sub_h * 4` RGBA tile; the frame's pixel dimensions
+        // come from the bitstream's own header (the ANMF Frame Width/Height
+        // fields govern only the canvas placement rect checked below).
+        let (sub_w, sub_h, mut sub_rgba) =
+            if let Some(vp8l_payload) = find_subchunk(frame_data, container::fourcc::VP8L) {
+                let chunk = vp8l_chunk::WebpLosslessChunk::from_payload(vp8l_payload)
+                    .map_err(|e| WebpError::from(Error::from(e)))?;
+                let sub_w = chunk.width();
+                let sub_h = chunk.height();
+                let image = vp8l_transform::decode_lossless(chunk.bitstream(), sub_w, sub_h)
+                    .map_err(|e| WebpError::from(Error::from(e)))?;
+                (sub_w, sub_h, argb_to_rgba(image.pixels()))
+            } else if let Some(vp8_payload) = find_subchunk(frame_data, container::fourcc::VP8) {
+                // §2.5 lossy frame: route the keyframe bitstream to the same
+                // decoder the still extended-lossy path uses, then layer any
+                // §2.7.1.2 `ALPH` plane over the opaque YUV reconstruction.
+                vp8_decode::decode_lossy_rgba(vp8_payload).map_err(WebpError::from)?
+            } else {
+                return Err(WebpError::InvalidData);
+            };
 
-        let chunk = vp8l_chunk::WebpLosslessChunk::from_payload(vp8l_payload)
-            .map_err(|e| WebpError::from(Error::from(e)))?;
-        let sub_w = chunk.width();
-        let sub_h = chunk.height();
-        let image = vp8l_transform::decode_lossless(chunk.bitstream(), sub_w, sub_h)
-            .map_err(|e| WebpError::from(Error::from(e)))?;
-
-        // An optional ALPH sub-chunk overrides the VP8L per-pixel alpha.
-        let mut pixels = image;
+        // §2.7.1.2: an optional `ALPH` sub-chunk overrides the per-pixel alpha
+        // of either bitstream kind — the lossless RGBA already carries alpha,
+        // the lossy reconstruction is opaque YUV until the plane is layered on.
         if let Some(alph_payload) = find_subchunk(frame_data, container::fourcc::ALPH) {
             if let Ok(plane) = alph::decode_alpha(alph_payload, sub_w, sub_h) {
-                let px = pixels.pixels_mut();
-                if plane.len() == px.len() {
-                    for (p, &a) in px.iter_mut().zip(plane.iter()) {
-                        *p = (*p & 0x00ff_ffff) | (u32::from(a) << 24);
+                if plane.len() == (sub_w as usize) * (sub_h as usize)
+                    && plane.len() * 4 == sub_rgba.len()
+                {
+                    for (px, &a) in sub_rgba.chunks_exact_mut(4).zip(plane.iter()) {
+                        px[3] = a;
                     }
                 }
             }
         }
-        let sub_rgba = argb_to_rgba(pixels.pixels());
 
         // §2.7.1.1: "Before rendering each frame, the previous frame's
         // Disposal method is applied" — clears the previous rect to bg

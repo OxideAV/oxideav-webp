@@ -5,7 +5,10 @@ ANMF). Decoder and encoder both at production status as of 2026-05-27.
 
 * Full **decode** of every container variant: simple-lossy (VP8),
   simple-lossless (VP8L), extended (`VP8X`) with `ALPH` alpha plane,
-  ICCP / EXIF / XMP metadata, and animated WebP (`ANIM` + `ANMF`).
+  ICCP / EXIF / XMP metadata, and animated WebP (`ANIM` + `ANMF`) —
+  with per-frame `ANMF` bitstreams of **both** kinds the §2.7.2 Figure 14
+  rendering loop permits (`VP8L` lossless *and* `VP8 ` lossy, each with an
+  optional `ALPH` alpha plane layered over it).
 * **Encode** of complete `.webp` files in both lossless (VP8L) and
   lossy (VP8) modes, plus complete animated `.webp` files.
 * Decoded pixels land in a tightly-packed `Vec<u8>` of `width * height

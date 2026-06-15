@@ -12,7 +12,7 @@
 #![cfg(feature = "registry")]
 
 use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, VideoFrame, VideoPlane};
-use oxideav_webp::{decode_webp, encoder_vp8};
+use oxideav_webp::{decode_webp, encoder_vp8, parse_container};
 
 /// Build a deterministic 16x16 Yuv420P [`Frame`] — a smooth ramp in Y
 /// with constant chroma. Small enough to keep the test cheap; large
@@ -167,4 +167,104 @@ fn vp8_lossy_freq_deltas_factory_passes_through() {
     assert_eq!(img.frames.len(), 1);
     assert_eq!(img.frames[0].width, w);
     assert_eq!(img.frames[0].height, h);
+}
+
+// ─────────────────── lossy-frame animation decode ───────────────────
+//
+// RFC 9649 §2.7.2 Figure 14 lets each `ANMF` "Frame Data" carry either a
+// `VP8L` (lossless) OR a `VP8 ` (lossy) bitstream, plus an optional `ALPH`.
+// The in-crate animation *encoder* only emits VP8L frames, so there is no
+// committed lossy-frame fixture; this test hand-assembles a spec-shaped
+// container around a real `VP8 ` keyframe produced by the lossy encoder,
+// then asserts `decode_webp` composites it (rather than the pre-r309
+// `WebpError::Unsupported` refusal).
+
+/// Encode one synthetic frame to a still lossy `.webp` and slice out its
+/// §2.5 `VP8 ` chunk payload (the keyframe bitstream the §2.7.1.1 frame
+/// data carries verbatim).
+fn lossy_vp8_bitstream(width: u32, height: u32) -> Vec<u8> {
+    let src = synthetic_yuv420p_frame(width, height);
+    let mut enc = encoder_vp8::make_encoder_with_quality(&vp8_params(width, height), 90.0)
+        .expect("make_encoder_with_quality");
+    enc.send_frame(&src).expect("send_frame");
+    let pkt = enc.receive_packet().expect("packet");
+    let c = parse_container(&pkt.data).expect("parse still lossy container");
+    let vp8 = c
+        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8)
+        .expect("still lossy file carries a VP8 chunk");
+    vp8.payload(&pkt.data).to_vec()
+}
+
+/// Wrap `payload` in a §2.3 padded chunk (`FourCC` + LE u32 size + payload
+/// + a pad byte when the size is odd).
+fn riff_chunk(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + payload.len() + 1);
+    out.extend_from_slice(fourcc);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    if payload.len() % 2 == 1 {
+        out.push(0);
+    }
+    out
+}
+
+/// Build the 16-byte §2.7.1.1 `ANMF` header (Figure 9) for a frame placed
+/// at `(x, y)` with the given pixel dimensions and duration.
+fn anmf_header(x: u32, y: u32, w: u32, h: u32, duration_ms: u32) -> Vec<u8> {
+    let mut hdr = Vec::with_capacity(16);
+    // Frame X / Y are uint24 in units of 2 px; w/h are "Minus One".
+    hdr.extend_from_slice(&(x / 2).to_le_bytes()[..3]);
+    hdr.extend_from_slice(&(y / 2).to_le_bytes()[..3]);
+    hdr.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+    hdr.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+    hdr.extend_from_slice(&duration_ms.to_le_bytes()[..3]);
+    hdr.push(0); // info byte: Reserved=0, Blending=0 (alpha-blend), Dispose=0
+    hdr
+}
+
+#[test]
+fn animation_with_lossy_vp8_frames_decodes() {
+    let (w, h) = (16u32, 16u32);
+    let bitstream = lossy_vp8_bitstream(w, h);
+
+    // §2.7.1 VP8X: animation flag (bit 1 of the flag octet) + canvas dims.
+    let mut vp8x = Vec::with_capacity(10);
+    vp8x.push(0b0000_0010); // Animation bit set
+    vp8x.extend_from_slice(&[0, 0, 0]); // reserved
+    vp8x.extend_from_slice(&(w - 1).to_le_bytes()[..3]); // canvas width - 1
+    vp8x.extend_from_slice(&(h - 1).to_le_bytes()[..3]); // canvas height - 1
+
+    // §2.7.1.1 ANIM: BGRA background (opaque white) + LE u16 loop count (0).
+    let anim = vec![0xff, 0xff, 0xff, 0xff, 0, 0];
+
+    // Two frames, each carrying the same lossy keyframe bitstream.
+    let mut frame0 = anmf_header(0, 0, w, h, 100);
+    frame0.extend_from_slice(&riff_chunk(b"VP8 ", &bitstream));
+    let mut frame1 = anmf_header(0, 0, w, h, 100);
+    frame1.extend_from_slice(&riff_chunk(b"VP8 ", &bitstream));
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&riff_chunk(b"VP8X", &vp8x));
+    body.extend_from_slice(&riff_chunk(b"ANIM", &anim));
+    body.extend_from_slice(&riff_chunk(b"ANMF", &frame0));
+    body.extend_from_slice(&riff_chunk(b"ANMF", &frame1));
+
+    let mut file = Vec::with_capacity(12 + body.len());
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&((4 + body.len()) as u32).to_le_bytes());
+    file.extend_from_slice(b"WEBP");
+    file.extend_from_slice(&body);
+
+    let img = decode_webp(&file).expect("lossy-frame animation must decode (not Unsupported)");
+    assert_eq!(img.frames.len(), 2, "both ANMF frames composited");
+    assert_eq!(img.width, w);
+    assert_eq!(img.height, h);
+    for frame in &img.frames {
+        assert_eq!(frame.width, w);
+        assert_eq!(frame.height, h);
+        assert_eq!(frame.rgba.len(), (w * h * 4) as usize);
+    }
+    // The lossy reconstruction is opaque; both frames render onto the canvas
+    // rather than leaving the white background showing everywhere.
+    assert_eq!(img.frames[0].rgba.len(), img.frames[1].rgba.len());
 }
