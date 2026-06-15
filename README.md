@@ -183,7 +183,10 @@ fall into three groups:
   `decode_alpha_plane`, `extract_metadata`, and the differential
   `roundtrip_lossless` / `roundtrip_animated` / `roundtrip_anim_modes`
   / `roundtrip_metadata` oracles that assert the encode→decode contract
-  pixel-for-pixel.
+  pixel-for-pixel, plus `roundtrip_alpha_filter` — a forward-filter →
+  method-0 `ALPH` → decode oracle pinning the §2.7.1.2 inverse-filter
+  reconstructed *values* across all four `F` methods and the interior /
+  left-most-column / top-most-row / `(0,0)`-corner border cases.
 * **Standalone parsers** — one target per chunk/header parser
   (`parse_container`, `parse_vp8x`, `parse_vp8_chunk`, `parse_anmf`,
   `parse_anim`, `parse_alph`, `parse_transform_list`,

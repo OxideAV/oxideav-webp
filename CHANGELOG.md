@@ -4,6 +4,10 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Other
+
+- round 314 FUZZ — add `roundtrip_alpha_filter` differential oracle pinning the §2.7.1.2 ALPH inverse-filter reconstructed *values* (forward-filter → method-0 ALPH → decode → byte-identical), across all four F methods and the interior / left-most-column / top-most-row / (0,0)-corner border cases
+
 ## [0.2.2](https://github.com/OxideAV/oxideav-webp/compare/v0.2.1...v0.2.2) - 2026-06-15
 
 ### Other

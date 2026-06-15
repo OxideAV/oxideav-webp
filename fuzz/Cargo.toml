@@ -769,3 +769,19 @@ path = "fuzz_targets/parse_vp8_chunk.rs"
 test = false
 doc = false
 bench = false
+
+# Round-trip differential oracle over the §2.7.1.2 ALPH inverse-filter
+# stage. Unlike `decode_alph` / `decode_alpha_plane` (which assert only
+# the "Result, length = w*h" contract on attacker bytes), this harness
+# pins the reconstructed *values*: a synthesised plane is forward-
+# filtered per §2.7.1.2 (the algebraic inverse of the decoder's per-
+# pixel reconstruct step, derived from RFC 9649 §2.7.1.2 Figure 11),
+# wrapped as a method-0 ALPH payload, decoded, and asserted byte-
+# identical to the original across all four F methods and the interior /
+# left-most-column / top-most-row / (0,0)-corner border cases.
+[[bin]]
+name = "roundtrip_alpha_filter"
+path = "fuzz_targets/roundtrip_alpha_filter.rs"
+test = false
+doc = false
+bench = false
