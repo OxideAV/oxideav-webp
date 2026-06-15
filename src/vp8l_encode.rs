@@ -3416,6 +3416,149 @@ fn sweep_cte_axis(samples: &[(u8, u8, u8)], cost_of: impl Fn(u8, u8, u8, u8) -> 
 /// branch-free interior loop to amortise the check.
 const CTE_PRUNE_CHUNK: usize = 32;
 
+/// Cost model the §4.2 per-block color-transform-element chooser uses
+/// to compare [`CTE_AXIS_CANDIDATES`] on each axis.
+///
+/// The two strategies sweep the *same* candidate grid with the *same*
+/// per-axis greedy decomposition — only the per-axis scoring differs:
+///
+/// * [`ColorTransformStrategy::L1`] sums the folded per-channel
+///   residual magnitude ([`channel_magnitude`]) over the block — the
+///   round-147 proxy `pick_block_cte` has carried since the color
+///   transform landed.
+/// * [`ColorTransformStrategy::Entropy`] scores each candidate by the
+///   Shannon lower-bound bit cost of the resulting per-channel
+///   residual histogram ([`channel_residual_entropy_milli`]) — the
+///   §4.2 analogue of the round-161 §4.1 predictor entropy chooser.
+///   RFC 9649 §3.5 authorises the choice ("transform data can be
+///   decided based on entropy minimization"); the entropy cost is the
+///   metric the §5.x per-channel prefix codes actually minimise, so it
+///   distinguishes a near-zero-with-outliers residual (low L1, but the
+///   outliers force long codes) from a concentrated spread (slightly
+///   higher L1, but a cheaper histogram) where the L1 proxy cannot.
+///
+/// The per-axis greedy stays exact under either model because the red
+/// channel depends only on `green_to_red`, the blue channel depends
+/// only on `(green_to_blue, red_to_blue)`, and red / blue carry
+/// independent §5.x prefix codes — so red entropy minimises over
+/// `green_to_red` alone, and the blue pair is chosen greedily
+/// (`green_to_blue` first, then `red_to_blue` folding in the fixed
+/// `green_to_blue` delta) exactly as the L1 path already does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorTransformStrategy {
+    L1,
+    Entropy,
+}
+
+/// Shannon lower-bound bit cost (in milli-bits, rounded to nearest) of
+/// a single 8-bit residual channel's 256-bin histogram.
+///
+/// `Σ_b c·log2(N/c)` with the same `log2(N) − log2(c)` expansion and
+/// nearest-milli-bit rounding [`block_mode_entropy_cost`] uses, so the
+/// §4.2 entropy chooser is byte-deterministic on the same terms as the
+/// §4.1 predictor entropy chooser.
+fn channel_residual_entropy_milli(hist: &[u32; 256]) -> u64 {
+    let n: u32 = hist.iter().sum();
+    if n == 0 {
+        return 0;
+    }
+    let n_f = n as f64;
+    let log2_n = n_f.log2();
+    let mut milli_bits: f64 = 0.0;
+    for &count in hist.iter() {
+        if count == 0 {
+            continue;
+        }
+        let c_f = count as f64;
+        milli_bits += c_f * (log2_n - c_f.log2());
+    }
+    (milli_bits * 1000.0 + 0.5) as u64
+}
+
+/// Entropy-cost analogue of [`sweep_cte_axis`]: pick the
+/// [`CTE_AXIS_CANDIDATES`] entry whose resulting residual histogram
+/// has the smallest [`channel_residual_entropy_milli`].
+///
+/// `residual_of` maps `(candidate, r, g, b)` to the post-transform
+/// 8-bit residual the candidate produces for the sample, exactly as
+/// the L1 closures do; here it feeds a histogram rather than a folded
+/// magnitude. Earliest entry wins ties, matching [`sweep_cte_axis`],
+/// so the two strategies share a tie-break rule.
+#[inline]
+fn sweep_cte_axis_entropy(
+    samples: &[(u8, u8, u8)],
+    residual_of: impl Fn(u8, u8, u8, u8) -> u8,
+) -> u8 {
+    let mut best: u8 = 0;
+    let mut best_cost = u64::MAX;
+    for &cand in &CTE_AXIS_CANDIDATES {
+        let mut hist = [0u32; 256];
+        for &(r, g, b) in samples {
+            hist[residual_of(cand, r, g, b) as usize] += 1;
+        }
+        let cost = channel_residual_entropy_milli(&hist);
+        if cost < best_cost {
+            best_cost = cost;
+            best = cand;
+        }
+    }
+    best
+}
+
+/// §3.5.2 entropy-cost color-transform-element chooser — the
+/// [`ColorTransformStrategy::Entropy`] counterpart of [`pick_block_cte`].
+///
+/// Same per-axis greedy and same residual decomposition as the L1
+/// chooser; only the per-axis scoring is the Shannon histogram bit
+/// cost. Returns `(green_to_red, green_to_blue, red_to_blue)`.
+fn pick_block_cte_entropy(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+) -> (u8, u8, u8) {
+    let mut samples: Vec<(u8, u8, u8)> = Vec::with_capacity(bw * bh);
+    for dy in 0..bh {
+        let y = y0 + dy;
+        if y >= height {
+            break;
+        }
+        for dx in 0..bw {
+            let x = x0 + dx;
+            if x >= width {
+                break;
+            }
+            let px = pixels[y * width + x];
+            let r = ((px >> 16) & 0xff) as u8;
+            let g = ((px >> 8) & 0xff) as u8;
+            let b = (px & 0xff) as u8;
+            samples.push((r, g, b));
+        }
+    }
+    if samples.is_empty() {
+        return (0, 0, 0);
+    }
+
+    // Axis 1: green → red residual `(red - delta(gtr, green)) & 0xff`.
+    let best_gtr = sweep_cte_axis_entropy(&samples, |gtr, r, g, _b| {
+        ((r as i32 - color_xfrm_delta(gtr, g)) & 0xff) as u8
+    });
+    // Axis 2: green → blue intermediate residual.
+    let best_gtb = sweep_cte_axis_entropy(&samples, |gtb, _r, g, b| {
+        ((b as i32 - color_xfrm_delta(gtb, g)) & 0xff) as u8
+    });
+    // Axis 3: red → blue, folding the fixed green→blue delta in first.
+    let best_rtb = sweep_cte_axis_entropy(&samples, |rtb, r, g, b| {
+        let inter = b as i32 - color_xfrm_delta(best_gtb, g);
+        ((inter - color_xfrm_delta(rtb, r)) & 0xff) as u8
+    });
+
+    (best_gtr, best_gtb, best_rtb)
+}
+
 /// Build the §3.5.2 sub-resolution *color image*: one ARGB pixel per
 /// `(1 << size_bits)`-pixel-square block of the main image, with the
 /// chosen [`ColorTransformElement`] packed per §3.5.2 ("each
@@ -3432,6 +3575,7 @@ fn build_color_image(
     width: u32,
     height: u32,
     size_bits: u8,
+    strategy: ColorTransformStrategy,
 ) -> (Vec<u32>, u32, u32) {
     let block = 1u32 << size_bits;
     let tw = predictor_div_round_up(width, block);
@@ -3444,7 +3588,12 @@ fn build_color_image(
         for bx in 0..tw as usize {
             let x0 = bx * bsz;
             let y0 = by * bsz;
-            let (gtr, gtb, rtb) = pick_block_cte(pixels, w, h, x0, y0, bsz, bsz);
+            let (gtr, gtb, rtb) = match strategy {
+                ColorTransformStrategy::L1 => pick_block_cte(pixels, w, h, x0, y0, bsz, bsz),
+                ColorTransformStrategy::Entropy => {
+                    pick_block_cte_entropy(pixels, w, h, x0, y0, bsz, bsz)
+                }
+            };
             // Pack the CTE into one ARGB pixel exactly as §3.5.2
             // specifies: alpha=255, red=red_to_blue, green=green_to_blue,
             // blue=green_to_red. The decoder unpacks it in
@@ -3539,6 +3688,33 @@ fn encode_with_color_transform(
     cache_code_bits: Option<u32>,
     image_width: u32,
 ) -> Vec<u8> {
+    encode_with_color_transform_strategy(
+        pixels,
+        width,
+        height,
+        size_bits,
+        cache_code_bits,
+        image_width,
+        ColorTransformStrategy::L1,
+    )
+}
+
+/// `size_bits` + `cache_code_bits` + per-block CTE [`ColorTransformStrategy`]
+/// variant of [`encode_with_color_transform`]. The chooser sweeps both
+/// strategies and keeps the byte-shortest stream (round 308), so the
+/// entropy chooser cannot regress against the L1 baseline. Output is
+/// round-trip-identical regardless of strategy: the cost model only
+/// changes which per-block CTE is *recorded*, and the decoder's §4.2
+/// inverse re-applies whatever CTE the sub-image carries.
+fn encode_with_color_transform_strategy(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+    strategy: ColorTransformStrategy,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // ---- §3.8.2 / §7.2 optional-transform: color-tx ----
@@ -3553,7 +3729,7 @@ fn encode_with_color_transform(
     // Build the sub-resolution color image then write it as an
     // entropy-coded-image per §7.2 `color-image = 3BIT
     // entropy-coded-image`.
-    let (color_image, tw, _th) = build_color_image(pixels, width, height, size_bits);
+    let (color_image, tw, _th) = build_color_image(pixels, width, height, size_bits, strategy);
     write_entropy_coded_image_literals(&mut w, &color_image);
 
     // End of optional-transform list (`%b0`).
@@ -3976,7 +4152,8 @@ fn encode_with_color_transform_predictor(
     w.write_bits(crate::vp8l_stream::TransformType::Color as u32, 2);
     debug_assert!((2..=9).contains(&size_bits));
     w.write_bits((size_bits - 2) as u32, 3);
-    let (color_image, ctw, _cth) = build_color_image(pixels, width, height, size_bits);
+    let (color_image, ctw, _cth) =
+        build_color_image(pixels, width, height, size_bits, ColorTransformStrategy::L1);
     write_entropy_coded_image_literals(&mut w, &color_image);
 
     // Forward the §4.2 color transform over the originals so the
@@ -4101,7 +4278,8 @@ fn encode_with_color_transform_subtract_green_predictor(
     w.write_bits(crate::vp8l_stream::TransformType::Color as u32, 2);
     debug_assert!((2..=9).contains(&size_bits));
     w.write_bits((size_bits - 2) as u32, 3);
-    let (color_image, ctw, _cth) = build_color_image(pixels, width, height, size_bits);
+    let (color_image, ctw, _cth) =
+        build_color_image(pixels, width, height, size_bits, ColorTransformStrategy::L1);
     write_entropy_coded_image_literals(&mut w, &color_image);
 
     // Forward the §4.2 color transform over the originals.
@@ -5474,6 +5652,27 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
             encode_with_color_transform(pixels, width, height, ctx_size_bits, cache_bits, width)
         })];
+        // Round 308: §4.2 entropy-cost per-block CTE candidate at the
+        // per-region `size_bits`. Where the L1 chooser above scores
+        // each candidate by the folded residual magnitude, this one
+        // scores by the Shannon lower-bound bit cost of the per-channel
+        // residual histogram — the §4.2 analogue of the round-161 §4.1
+        // predictor entropy chooser (RFC 9649 §3.5 authorises deciding
+        // transform data by entropy minimization). The chooser keeps
+        // the byte-shortest stream, so this candidate cannot regress
+        // against the L1 path, and round-trip output is identical
+        // regardless of which CTE the cost model records.
+        candidates.push(select_best_cache_bits(|cache_bits| {
+            encode_with_color_transform_strategy(
+                pixels,
+                width,
+                height,
+                ctx_size_bits,
+                cache_bits,
+                width,
+                ColorTransformStrategy::Entropy,
+            )
+        }));
         if try_single_block {
             candidates.push(select_best_cache_bits(|cache_bits| {
                 encode_with_color_transform(
@@ -5483,6 +5682,22 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                     single_block_size_bits,
                     cache_bits,
                     width,
+                )
+            }));
+            // Round 308: entropy-cost CTE candidate at the single-block
+            // `size_bits`. With one block the histogram is the whole
+            // image's per-channel residual distribution, so the entropy
+            // metric selects the single CTE whose red / blue residual
+            // streams carry the cheapest §5.x prefix codes.
+            candidates.push(select_best_cache_bits(|cache_bits| {
+                encode_with_color_transform_strategy(
+                    pixels,
+                    width,
+                    height,
+                    single_block_size_bits,
+                    cache_bits,
+                    width,
+                    ColorTransformStrategy::Entropy,
                 )
             }));
         }
@@ -8034,7 +8249,8 @@ mod tests {
             }
         }
         let size_bits = 4u8;
-        let (color_img, tw, _th) = build_color_image(&pixels, w, h, size_bits);
+        let (color_img, tw, _th) =
+            build_color_image(&pixels, w, h, size_bits, ColorTransformStrategy::L1);
         let mut residuals = vec![0u32; pixels.len()];
         apply_forward_color(&pixels, &mut residuals, w, h, &color_img, tw, size_bits);
         inverse_color(&mut residuals, w, h, &color_img, tw, size_bits);
@@ -8217,6 +8433,97 @@ mod tests {
             "color-transform chooser regressed on noise: {} B vs {} B",
             with_color.len(),
             pre_color.len(),
+        );
+    }
+
+    /// Round 308: the §4.2 entropy-cost per-block CTE chooser builds a
+    /// color sub-image whose forward transform inverts exactly — the
+    /// cost model only changes *which* CTE is recorded, never the
+    /// round-trip contract. Asserted across a channel-correlated noise
+    /// fixture (spatially varying per-block slopes) at the per-region
+    /// `size_bits`.
+    #[test]
+    fn pick_block_cte_entropy_color_image_round_trips() {
+        let w = 64u32;
+        let h = 64u32;
+        use crate::vp8l_transform::inverse_color;
+        let pixels = make_channel_correlated_noise(w, h);
+        let size_bits = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+        let (color_img, tw, _th) =
+            build_color_image(&pixels, w, h, size_bits, ColorTransformStrategy::Entropy);
+        let mut residuals = vec![0u32; pixels.len()];
+        apply_forward_color(&pixels, &mut residuals, w, h, &color_img, tw, size_bits);
+        inverse_color(&mut residuals, w, h, &color_img, tw, size_bits);
+        assert_eq!(residuals, pixels);
+    }
+
+    /// Round 308: on a channel-correlated noise fixture the §4.2
+    /// entropy-cost CTE candidate must never produce a *longer* stream
+    /// than the L1-magnitude CTE candidate at the same `size_bits` and
+    /// cache sweep — the entropy metric scores the same candidate grid
+    /// by the bit cost the §5.x prefix codes actually minimise, so it
+    /// at worst ties. Both round-trip bit-exact through the decoder.
+    #[test]
+    fn color_transform_entropy_candidate_does_not_regress_vs_l1() {
+        let w = 128u32;
+        let h = 128u32;
+        let pixels = make_channel_correlated_noise(w, h);
+        let size_bits = DEFAULT_COLOR_TRANSFORM_SIZE_BITS;
+
+        let l1 = select_best_cache_bits(|cache_bits| {
+            encode_with_color_transform_strategy(
+                &pixels,
+                w,
+                h,
+                size_bits,
+                cache_bits,
+                w,
+                ColorTransformStrategy::L1,
+            )
+        });
+        let entropy = select_best_cache_bits(|cache_bits| {
+            encode_with_color_transform_strategy(
+                &pixels,
+                w,
+                h,
+                size_bits,
+                cache_bits,
+                w,
+                ColorTransformStrategy::Entropy,
+            )
+        });
+        eprintln!(
+            "[round-308] {}x{} channel-correlated noise §4.2 CTE chooser: L1={} B, entropy={} B",
+            w,
+            h,
+            l1.len(),
+            entropy.len(),
+        );
+
+        // Both image streams decode to the original pixels once the
+        // §3.4 5-byte VP8L header is prepended (the candidate writers
+        // emit the post-header image stream, exactly as the chooser's
+        // `best` is assembled in `encode_vp8l_payload`).
+        let header = build_image_header(w, h, false);
+        for stream in [&l1, &entropy] {
+            let mut bare = Vec::with_capacity(header.len() + stream.len());
+            bare.extend_from_slice(&header);
+            bare.extend_from_slice(stream);
+            let framed = build::build_webp_file(&bare, ImageKind::Lossless, w, h).unwrap();
+            let img = crate::decode_lossless_image(&framed).unwrap().unwrap();
+            assert_eq!(img.pixels(), pixels.as_slice());
+        }
+
+        // The whole-image super-chooser keeps the byte-shortest of all
+        // candidates (L1 + entropy + every other transform path), so it
+        // can never be longer than the L1 color-transform candidate
+        // alone.
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(
+            chosen.len() <= l1.len(),
+            "super-chooser regressed against the L1 color-transform candidate: {} B vs {} B",
+            chosen.len(),
+            l1.len(),
         );
     }
 

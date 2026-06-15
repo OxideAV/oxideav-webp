@@ -846,7 +846,20 @@ predictor chain ~12–21 % versus the L1 proxy (the per-block mode histogram
 concentrates, compacting both the §7.2 predictor sub-image and the residual
 stream). Round-trip output is byte-identical regardless of which cost model
 is chosen — the cost model only changes which §4.1 mode is *recorded*, and
-the decoder reads the same modes back.
+the decoder reads the same modes back. Round 308 brought the *single-transform*
+§4.2 cross-color path up to the same footing: its per-block color-transform-
+element chooser now sweeps the L1-magnitude proxy **and** a Shannon-entropy
+bit-cost model — the §4.2 analogue of the round-161 §4.1 predictor entropy
+chooser — scoring each `(green_to_red, green_to_blue, red_to_blue)` candidate
+by the bit cost of the resulting per-channel residual histogram rather than its
+folded magnitude. The per-axis greedy stays exact (red residual depends only on
+`green_to_red`, blue only on `(green_to_blue, red_to_blue)`, and red / blue
+carry independent §5.x prefix codes); the entropy candidate is evaluated at the
+per-region and single-block `size_bits` across the cache sweep, and the
+super-chooser keeps the byte-shortest stream so it cannot regress. On a
+channel-correlated-noise fixture it shrinks the §4.2 stream ~0.1 %, and as with
+the §4.1 path the recorded CTE is the only thing the cost model changes — the
+decoder re-applies whatever element the §4.2 sub-image carries.
 
 The shortest path — flat RGBA in, complete `.webp` file out:
 

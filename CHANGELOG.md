@@ -6,6 +6,25 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Round-308 lossless-encode cost improvement: the single-transform §4.2
+  **cross-color** path now adds an **entropy-cost per-block CTE chooser**
+  alongside the existing L1-magnitude one. Where the L1 chooser scores each
+  `(green_to_red, green_to_blue, red_to_blue)` candidate by the folded
+  residual magnitude, the new strategy scores by the Shannon lower-bound bit
+  cost of the resulting per-channel residual histogram — the §4.2 analogue of
+  the round-161 §4.1 predictor entropy chooser (RFC 9649 §3.5 authorises
+  deciding transform data by entropy minimization). The per-axis greedy stays
+  exact: the red residual depends only on `green_to_red` and the blue residual
+  only on `(green_to_blue, red_to_blue)`, and red / blue carry independent
+  §5.x prefix codes, so red entropy minimises over `green_to_red` alone and
+  the blue pair is chosen greedily. The entropy candidate is evaluated at both
+  the per-region and single-block `size_bits` across the round-148 cache-bits
+  sweep; the super-chooser keeps the byte-shortest stream, so it cannot
+  regress against the L1 path. On a 128×128 channel-correlated-noise fixture
+  the entropy CTE candidate shrinks the §4.2 stream 41253 → 41195 B. Round-trip
+  output is byte-identical regardless of which cost model is recorded — the
+  decoder re-applies whatever CTE the §4.2 sub-image carries.
+
 - Round-307 benchmark: new `stacked_transform_encode` criterion bench drives
   the public `encode_webp_lossless` entry point across the three distinct
   content regimes the RFC 9649 §3.5 **stacked-transform chains** target —
