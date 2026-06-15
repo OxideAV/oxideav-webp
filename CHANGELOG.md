@@ -4,6 +4,81 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/OxideAV/oxideav-webp/compare/v0.2.1...v0.2.2) - 2026-06-15
+
+### Other
+
+- §4.2 single-transform entropy-cost per-block CTE chooser (r308)
+- round 307 — §3.5 stacked-transform encode harness, separated by content regime
+- §3.5 stacked chains sweep full sub-image lambda set (r306)
+- §3.5 stacked chains sweep entropy-aware predictor sub-image cost models
+- §3.5 three-transform stacked candidate (color → subtract-green → predictor)
+- §3.5 stacked color-transform + predictor candidate (photo)
+- §3.5 stacked color-indexing + predictor transform candidate
+- distance-code chooser smallest-code early-out (§5.2.2)
+- *(r300)* §5.2.2 encoder distance-code chooser isolated harness
+- *(lossless)* pre-size private argb_to_rgba repack (~14.5x on the byte step)
+- round 298 FUZZ — add parse_vp8_chunk harness over §2.5 VP8 chunk handle
+- round 297 — §5.2.2 decoder LZ77 copy-back bench (apply_backward_reference)
+- README round-296 PROFILE narrative — inverse_predictor per-block hoist evaluation + realistic-block bench
+- round 296 PROFILE — realistic-block inverse_predictor bench + per-block mode-hoist evaluation
+- add decode_alpha_plane libFuzzer target over the file-level still-image alpha path
+- webp r294: meta_prefix_cluster bench + §6.2.2 entropy-image clustering hotspot map
+- webp r293: hoist §2.7.1.2 ALPH inverse-filter border rules out of the per-pixel loop (rank-1 lossy/alpha opt)
+- r292 decode_lossless_image target + fix §3.4-header eager-alloc OOM
+- round 291 — §2.7.1.2 ALPH alpha-plane decode harness + refined lossy hotspot map
+- webp r290: yuv420_to_rgba §9.2 chroma-pair hoist (rank-1 lossy opt, byte-identical)
+- r289 §2.5 VP8 lossy decode harness + ranked hotspot map
+- *(r288)* decode_still_paths differential oracle + fix animation-canvas OOM
+- O(1) length→row side table for the §6.2.1 per-bit walk (r287 PROFILE-OPT)
+- round 286 — isolate §6.2.1 read_symbol (rank-1 decode) + §5.2.2 lz77_chain (rank-3 encode) hotspots; rank next PROFILE-OPT target
+- r285 harnesses #27+#28 — §6.2.1 read-symbol LUT differential + wide-carrier lossless decode
+- r284 — §6.2.1 read_symbol primary lookup table + word-load ReadBits
+- round 283 — end-to-end decode coverage (transform mixes, animation timeline, metadata walk) + full regression refresh
+- r282 harness #25 roundtrip_metadata — §2.7 metadata write-path differential
+- round 281 — §3.5.2 pick_block_cte chooser-walk bench + chunk-granular axis prune
+- r280 — hoist §4.1 border rules + mode dispatch out of the encoder chooser's per-pixel loop
+- r279 harness #24 roundtrip_anim_modes — §2.7.1.1 assembly differential; fix Delta/Auto dispose + AlphaBlend emission
+- r278 — remove §3.7.2 length-cap pass's per-adjustment O(n) target-selection rescan
+- r277 — bit-identical dense-cell rewrite of the §3.7.2/§6.2.1 length-then-code chain
+- round 276 — §6.2.1 PrefixCode::from_code_lengths decoder canonical-table bench
+- add prefix_code target — §6.2.1 single canonical prefix-code reader
+- r274 fuzz harness #23 prefix_code_group — §6.2 prefix-code-group reader
+- r273 decode_lossless fuzz harness + fix BitReader::bits_remaining usize underflow
+- round 272 — §6.2.2 decode_argb top-level ARGB main-image harness (21st)
+- 20th harness — §7.3 decode_entropy_coded_image standalone
+- 19th cargo-fuzz harness decode_entropy_image (§6.2.2 entropy-image decode)
+- round 269 — publish the §4.4 width_bits threshold-table accessor, deduplicate its three private copies
+- round 268 — §6.2.2 MetaPrefixIndex::from_parts validated constructor + block-lookup harness (18th)
+- round 267 — §5.2.2 backward-reference assembler harness (17th)
+- round 266 — §4.3 subtract-green + §4.4 color-table + color-indexing harness (16th)
+- add §4.1 + §4.2 inverse-transform passes harness (15th fuzz target)
+- add §5.2.3 ColorCache primitives harness (14th fuzz target)
+- round 263 — distance_code harness on §5.2.2 distance-code-to-pixel-distance lookup
+- round 262 — parse_container harness on §2.3 / §2.4 RIFF chunk-walker
+- round 261 — parse_meta_prefix harness on §5.2.3 + §6.2.2 + §6.2 preamble reader
+- round 260 — parse_transform_list harness on §4 VP8L transform-list reader
+- round 259 — parse_alph harness on §2.7.1.2 ALPH info-byte parser
+- round 258 — parse_anim harness on §2.7.1.1 ANIM chunk parser
+- round 257 — parse_anmf harness on §2.7.1.1 ANMF chunk header parser
+- round 256 — parse_vp8x harness on §2.7.1 VP8X chunk parser
+- round 255 — decode_alph harness on §2.7.1.2 ALPH standalone entry
+- round 254 — §5.2.2 value_to_prefix per-call bench
+- round 253 — §3.6.2.3 color_cache_hash per-call bench
+- round 252 — §3.6.2.2 read_lz77_value per-call bench
+- round 251 — §3.7.2 canonical_codes per-pass bench
+- round 250 — §3.7.2 build_code_lengths Huffman builder bench
+- round 249 — §4.4 inverse_color_table palette subtraction-decode bench
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round 248 — encoder-side §4.3 apply_subtract_green bench coverage
+- round 238 — roundtrip_animated harness on §2.7.1.1 ANIM/ANMF carrier
+- round 224 — predictor_subtract bench + SWAR experiment
+- round 217 — §4.3 inverse_subtract_green bench coverage
+- round 210 — §4.4 inverse_color_indexing per-bundle hoist + bench
+- round 207 — §4.2 inverse_color per-block CTE hoist + bench
+- round 204 — first cargo-fuzz harness (decode + extract_metadata + lossless roundtrip)
+- round 194 — §4.1 Select algebraic simplification + per-mode bench
+
 ### Added
 
 - Round-308 lossless-encode cost improvement: the single-transform §4.2
