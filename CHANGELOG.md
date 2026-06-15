@@ -6,6 +6,7 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Other
 
+- round 318 FUZZ — add `roundtrip_alpha_filter_lossless` differential oracle for the §2.7.1.2 ALPH **compression-method-1** path (forward-filter → residual packed into a §3 headerless VP8L green channel → method-1 ALPH → decode → byte-identical), exercising the VP8L-decode → green-extract → inverse-filter chain across all four F methods and the §2.7.1.2 border shapes; mirrored by a `decode_method1_lossless_round_trips_all_filters` lib test so the chain is value-pinned in the normal test run
 - round 314 FUZZ — add `roundtrip_alpha_filter` differential oracle pinning the §2.7.1.2 ALPH inverse-filter reconstructed *values* (forward-filter → method-0 ALPH → decode → byte-identical), across all four F methods and the interior / left-most-column / top-most-row / (0,0)-corner border cases
 
 ## [0.2.2](https://github.com/OxideAV/oxideav-webp/compare/v0.2.1...v0.2.2) - 2026-06-15

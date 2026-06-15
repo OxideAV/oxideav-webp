@@ -785,3 +785,17 @@ path = "fuzz_targets/roundtrip_alpha_filter.rs"
 test = false
 doc = false
 bench = false
+
+# Round-318 differential oracle on the §2.7.1.2 ALPH *compression method 1*
+# (lossless-compressed) inverse path: forward-filter a known alpha plane,
+# pack the residual into the GREEN channel of a §3 headerless VP8L stream,
+# wrap as a method-1 ALPH payload, decode, and assert the reconstructed
+# plane is byte-identical — exercising the VP8L-decode → green-extract →
+# inverse-filter chain that the method-0 roundtrip_alpha_filter target
+# never reaches.
+[[bin]]
+name = "roundtrip_alpha_filter_lossless"
+path = "fuzz_targets/roundtrip_alpha_filter_lossless.rs"
+test = false
+doc = false
+bench = false

@@ -783,4 +783,114 @@ mod tests {
             }
         }
     }
+
+    /// §2.7.1.2 forward filter `X = (alpha - predictor) mod 256`, the
+    /// algebraic inverse of [`inverse_filter`]'s `alpha = (predictor +
+    /// X) % 256`. Reads the *original* plane in scan order; each
+    /// predictor sees only already-emitted neighbours, so on a correct
+    /// decode the predictor the encoder reads equals the one the decoder
+    /// reads from the reconstructed plane. Mirrors RFC 9649 §2.7.1.2
+    /// Figure 11 + the per-method border rules.
+    fn forward_filter(plane: &[u8], w: usize, h: usize, f: AlphFiltering) -> Vec<u8> {
+        let pred = |p: &[u8], x: usize, y: usize| -> i32 {
+            if x == 0 && y == 0 {
+                return 0;
+            }
+            let idx = |xx: usize, yy: usize| p[yy * w + xx] as i32;
+            match f {
+                AlphFiltering::None => 0,
+                AlphFiltering::Horizontal => {
+                    if x == 0 {
+                        idx(0, y - 1)
+                    } else {
+                        idx(x - 1, y)
+                    }
+                }
+                AlphFiltering::Vertical => {
+                    if y == 0 {
+                        idx(x - 1, 0)
+                    } else {
+                        idx(x, y - 1)
+                    }
+                }
+                AlphFiltering::Gradient => {
+                    if x == 0 {
+                        idx(0, y - 1)
+                    } else if y == 0 {
+                        idx(x - 1, 0)
+                    } else {
+                        clip(idx(x - 1, y) + idx(x, y - 1) - idx(x - 1, y - 1)) as i32
+                    }
+                }
+            }
+        };
+        let mut residual = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                residual[i] = ((plane[i] as i32 - pred(plane, x, y)) & 0xff) as u8;
+            }
+        }
+        residual
+    }
+
+    /// Round 318 — full §2.7.1.2 **compression-method-1** decode chain
+    /// oracle: forward-filter a known plane, pack the residual into the
+    /// GREEN channel of a §3 headerless VP8L stream (built by the
+    /// crate's own encoder), wrap as a method-1 ALPH payload, and assert
+    /// `decode_alpha` (VP8L decode → green extract → inverse filter)
+    /// reproduces the original plane byte-for-byte across all four F
+    /// methods and a spread of dimensions including the §2.7.1.2 border
+    /// shapes (1-wide / 1-tall / corner).
+    #[test]
+    fn decode_method1_lossless_round_trips_all_filters() {
+        let mut state: u32 = 0x9e37_79b9;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        for &(w, h) in &[
+            (1usize, 1usize),
+            (1, 9),
+            (9, 1),
+            (2, 2),
+            (3, 5),
+            (16, 16),
+            (13, 17),
+        ] {
+            let plane: Vec<u8> = (0..w * h).map(|_| next()).collect();
+            for f in [
+                AlphFiltering::None,
+                AlphFiltering::Horizontal,
+                AlphFiltering::Vertical,
+                AlphFiltering::Gradient,
+            ] {
+                let residual = forward_filter(&plane, w, h, f);
+                // Method-1 carrier: residual byte → green channel of an
+                // opaque ARGB pixel. The VP8L stream is lossless, so the
+                // decoder's green channel is bit-for-bit this residual.
+                let argb: Vec<u32> = residual
+                    .iter()
+                    .map(|&g| 0xff00_0000u32 | ((g as u32) << 8))
+                    .collect();
+                let bitstream =
+                    crate::vp8l_encode::encode_argb_literals_with_width(&argb, w as u32);
+                let f_bits = match f {
+                    AlphFiltering::None => 0,
+                    AlphFiltering::Horizontal => 1,
+                    AlphFiltering::Vertical => 2,
+                    AlphFiltering::Gradient => 3,
+                };
+                let mut payload = vec![info(0, 0, f_bits, 1)];
+                payload.extend_from_slice(&bitstream);
+
+                let decoded = decode_alpha(&payload, w as u32, h as u32)
+                    .expect("method-1 ALPH from a valid VP8L stream must decode");
+                assert_eq!(
+                    decoded, plane,
+                    "method-1 chain mismatch at {w}x{h} filter {f:?}"
+                );
+            }
+        }
+    }
 }
