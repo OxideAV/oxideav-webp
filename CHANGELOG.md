@@ -6,6 +6,7 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Other
 
+- round 322 — close the docs-corpus end-to-end decode gap for the bit-exactly-reconstructible fixtures: mirror `lossless-32x32-rgb`, `lossless-color-cache-stress`, `lossless-cross-color-active`, and `lossy-near-lossless-q40` into `tests/data/` and assert `decode_webp` reproduces each fixture's committed `expected.png` ground truth pixel-for-pixel (dimensions + a spread of edge/interior RGBA samples, plus a whole-buffer opaque-alpha check on the RGB file). Covers the §5.2.3 color-cache, §4.2 CROSS_COLOR transform, opaque-RGB, and near-lossless VP8L container paths, none previously pixel-validated end-to-end
 - round 318 FUZZ — add `roundtrip_alpha_filter_lossless` differential oracle for the §2.7.1.2 ALPH **compression-method-1** path (forward-filter → residual packed into a §3 headerless VP8L green channel → method-1 ALPH → decode → byte-identical), exercising the VP8L-decode → green-extract → inverse-filter chain across all four F methods and the §2.7.1.2 border shapes; mirrored by a `decode_method1_lossless_round_trips_all_filters` lib test so the chain is value-pinned in the normal test run
 - round 314 FUZZ — add `roundtrip_alpha_filter` differential oracle pinning the §2.7.1.2 ALPH inverse-filter reconstructed *values* (forward-filter → method-0 ALPH → decode → byte-identical), across all four F methods and the interior / left-most-column / top-most-row / (0,0)-corner border cases
 

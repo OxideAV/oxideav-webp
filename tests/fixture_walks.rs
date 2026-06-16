@@ -1,17 +1,18 @@
 //! Integration tests that drive [`oxideav_webp::parse_container`]
 //! against a small in-crate copy of the WebP fixture corpus.
 //!
-//! The five `tests/data/*.webp` files are byte-for-byte copies of
-//! `docs/image/webp/fixtures/{lossy-1x1, lossless-1x1,
-//! extended-with-exif, lossy-with-alpha-128x128,
-//! animated-with-alpha}/input.webp`. They live inside the crate so
-//! that CI (which checks out only this repository, not the umbrella
-//! workspace) can reach them via `include_bytes!`.
+//! The `tests/data/*.webp` files are byte-for-byte copies of the
+//! `docs/image/webp/fixtures/<name>/input.webp` corpus. They live
+//! inside the crate so that CI (which checks out only this repository,
+//! not the umbrella workspace) can reach them via `include_bytes!`.
 //!
-//! Fixtures here are *opaque* inputs to the structural walker plus
-//! the `VP8X` / `ALPH` / `ANIM` header-field parsers. Pixel-level
-//! decode is not yet implemented and is explicitly out of scope for
-//! this test file.
+//! Tests here fall in two layers. The early ones drive the structural
+//! walker plus the `VP8X` / `ALPH` / `ANIM` header-field parsers over
+//! *opaque* inputs. The later ones decode end-to-end through the full
+//! §4–§6 lossless chain and check the reconstructed RGBA against each
+//! fixture's committed `expected.png` ground truth — exact for every
+//! lossless (and near-lossless) container, which the decoder
+//! reconstructs bit-for-bit.
 
 use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
@@ -39,6 +40,10 @@ const LOSSLESS_COLOR_INDEXING: &[u8] = include_bytes!("data/lossless-color-index
 const EXTENDED_WITH_EXIF: &[u8] = include_bytes!("data/extended-with-exif.webp");
 const LOSSY_WITH_ALPHA: &[u8] = include_bytes!("data/lossy-with-alpha-128x128.webp");
 const ANIMATED_WITH_ALPHA: &[u8] = include_bytes!("data/animated-with-alpha.webp");
+const LOSSLESS_32X32_RGB: &[u8] = include_bytes!("data/lossless-32x32-rgb.webp");
+const LOSSLESS_COLOR_CACHE_STRESS: &[u8] = include_bytes!("data/lossless-color-cache-stress.webp");
+const LOSSLESS_CROSS_COLOR_ACTIVE: &[u8] = include_bytes!("data/lossless-cross-color-active.webp");
+const LOSSY_NEAR_LOSSLESS_Q40: &[u8] = include_bytes!("data/lossy-near-lossless-q40.webp");
 
 #[test]
 fn fixture_lossy_1x1_has_a_single_vp8_chunk() {
@@ -1414,4 +1419,176 @@ fn round115_encoded_file_is_a_well_formed_simple_lossless_container() {
     let chunk = extract_lossless_chunk(&file).unwrap().unwrap();
     assert_eq!(chunk.width(), original.width);
     assert_eq!(chunk.height(), original.height);
+}
+
+// ---------------------------------------------------------------------
+// Round 322 — end-to-end decode coverage for the remaining
+// bit-exactly-reconstructible fixtures in the docs corpus.
+//
+// `docs/image/webp/fixtures/` ships eighteen fixtures, each with a
+// committed `expected.png` decoded ground truth. Earlier rounds mirror
+// a subset into `tests/data/` and validate them end-to-end; these four
+// close the gap for the lossless (and near-lossless) inputs whose full
+// §4–§6 reconstruction the decoder reproduces bit-for-bit:
+//
+//   * `lossless-32x32-rgb`          — opaque RGB, no alpha plane
+//   * `lossless-color-cache-stress` — §5.2.3 color-cache heavy
+//   * `lossless-cross-color-active` — §4.2 CROSS_COLOR transform active
+//   * `lossy-near-lossless-q40`     — `cwebp -near_lossless 40`, which is
+//                                     a VP8L (lossless container) encode,
+//                                     so it decodes exactly despite the
+//                                     residual-quantizing pre-pass name.
+//
+// Each ground-truth value below is read from the fixture's
+// `expected.png` (RGBA, 8-bit). The decoder's flat `[R, G, B, A]`
+// buffer is asserted to match those samples at a spread of edge +
+// interior coordinates. (The true-lossy `VP8 ` fixtures — q1/q75/q100 —
+// are deliberately *not* pixel-validated here: RFC 6386 §2 leaves the
+// 4:2:0 chroma up-sampling kernel to the decoder, and this crate's
+// spec-baseline nearest-neighbour kernel reconstructs values a few
+// units off the `expected.png` produced by a fancier up-sampler — a
+// quality choice, not a conformance defect, so it is not asserted as an
+// equality.)
+// ---------------------------------------------------------------------
+
+/// Read the RGBA byte at `(x, y)` from a row-major `width`-wide flat
+/// `[R, G, B, A]` buffer.
+fn rgba_at(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+    let o = ((y * width + x) * 4) as usize;
+    [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]
+}
+
+/// Assert `decode_webp` on `file` yields `w*h` and the listed
+/// `(x, y) -> [R, G, B, A]` ground-truth samples (from `expected.png`).
+fn assert_decode_matches(file: &[u8], w: u32, h: u32, samples: &[((u32, u32), [u8; 4])]) {
+    let img = decode_webp(file).expect("fixture decodes");
+    assert_eq!(img.frames.len(), 1, "still image is a single frame");
+    let f = &img.frames[0];
+    assert_eq!((f.width, f.height), (w, h), "dimensions");
+    assert_eq!(f.rgba.len(), (w * h * 4) as usize, "tight RGBA buffer");
+    for &((x, y), want) in samples {
+        assert_eq!(rgba_at(&f.rgba, w, x, y), want, "pixel ({x}, {y}) mismatch");
+    }
+}
+
+#[test]
+fn round322_lossless_32x32_rgb_decodes_to_expected_png() {
+    // Opaque RGB lossless: alpha is synthesised 0xff for every pixel.
+    assert_decode_matches(
+        LOSSLESS_32X32_RGB,
+        32,
+        32,
+        &[
+            ((0, 0), [0, 0, 0, 255]),
+            ((31, 0), [248, 0, 124, 255]),
+            ((0, 31), [0, 248, 124, 255]),
+            ((31, 31), [248, 248, 248, 255]),
+            ((16, 16), [128, 128, 128, 255]),
+            ((1, 2), [8, 16, 12, 255]),
+            ((3, 5), [24, 40, 32, 255]),
+            ((7, 11), [56, 88, 72, 255]),
+            ((10, 10), [80, 80, 80, 255]),
+            ((21, 21), [168, 168, 168, 255]),
+            ((8, 24), [64, 192, 128, 255]),
+            ((30, 30), [240, 240, 240, 255]),
+            ((13, 17), [104, 136, 120, 255]),
+            ((27, 3), [216, 24, 120, 255]),
+        ],
+    );
+}
+
+#[test]
+fn round322_lossless_color_cache_stress_decodes_to_expected_png() {
+    // §5.2.3 color-cache-heavy stream: many pixels resolve through the
+    // 2^color_cache_code_bits hash cache rather than a literal/back-ref.
+    assert_decode_matches(
+        LOSSLESS_COLOR_CACHE_STRESS,
+        64,
+        64,
+        &[
+            ((0, 0), [57, 12, 140, 255]),
+            ((63, 0), [172, 52, 47, 255]),
+            ((0, 63), [116, 148, 40, 255]),
+            ((63, 63), [111, 119, 13, 255]),
+            ((32, 32), [119, 51, 194, 255]),
+            ((1, 2), [40, 150, 185, 255]),
+            ((3, 5), [98, 35, 23, 255]),
+            ((7, 11), [119, 51, 194, 255]),
+            ((21, 21), [142, 79, 110, 255]),
+            ((42, 42), [119, 51, 194, 255]),
+            ((16, 48), [142, 79, 110, 255]),
+            ((62, 62), [119, 51, 194, 255]),
+            ((13, 17), [111, 119, 13, 255]),
+            ((59, 3), [235, 63, 193, 255]),
+        ],
+    );
+}
+
+#[test]
+fn round322_lossless_cross_color_active_decodes_to_expected_png() {
+    // §4.2 CROSS_COLOR (color) transform active: the inverse must undo
+    // the green-into-red / green-and-red-into-blue de-correlation.
+    assert_decode_matches(
+        LOSSLESS_CROSS_COLOR_ACTIVE,
+        64,
+        64,
+        &[
+            ((0, 0), [0, 0, 255, 255]),
+            ((63, 0), [252, 189, 129, 255]),
+            ((0, 63), [0, 63, 255, 255]),
+            ((63, 63), [252, 252, 129, 255]),
+            ((32, 32), [128, 128, 191, 255]),
+            ((1, 2), [4, 5, 253, 255]),
+            ((3, 5), [12, 14, 249, 255]),
+            ((7, 11), [28, 32, 241, 255]),
+            ((21, 21), [84, 84, 213, 255]),
+            ((42, 42), [168, 168, 171, 255]),
+            ((16, 48), [64, 96, 223, 255]),
+            ((62, 62), [248, 248, 131, 255]),
+            ((13, 17), [52, 56, 229, 255]),
+            ((59, 3), [236, 180, 137, 255]),
+        ],
+    );
+}
+
+#[test]
+fn round322_lossy_near_lossless_q40_decodes_exactly() {
+    // `cwebp -near_lossless 40` emits a VP8L (lossless container) stream
+    // whose residual pre-pass is baked into the encoded pixels, so the
+    // decode is bit-exact against `expected.png` — the same exactness
+    // every plain lossless fixture enjoys.
+    assert_decode_matches(
+        LOSSY_NEAR_LOSSLESS_Q40,
+        128,
+        128,
+        &[
+            ((0, 0), [133, 233, 241, 255]),
+            ((127, 0), [191, 96, 238, 255]),
+            ((0, 127), [135, 81, 1, 255]),
+            ((127, 127), [189, 224, 0, 255]),
+            ((64, 64), [251, 251, 152, 255]),
+            ((1, 2), [151, 232, 238, 255]),
+            ((3, 5), [181, 232, 225, 255]),
+            ((7, 11), [235, 229, 196, 255]),
+            ((42, 42), [0, 255, 44, 255]),
+            ((85, 85), [76, 224, 236, 255]),
+            ((32, 96), [214, 55, 37, 255]),
+            ((126, 126), [196, 223, 0, 255]),
+            ((13, 17), [250, 235, 147, 255]),
+            ((123, 3), [206, 73, 248, 255]),
+        ],
+    );
+}
+
+#[test]
+fn round322_lossless_32x32_rgb_carries_synthetic_opaque_alpha() {
+    // An RGB (no-ALPH, no in-stream alpha) lossless file fills every
+    // alpha byte with 0xff. Confirm across the whole buffer, not just
+    // the spot-checked pixels.
+    let img = decode_webp(LOSSLESS_32X32_RGB).expect("rgb fixture decodes");
+    let f = &img.frames[0];
+    assert!(
+        f.rgba.chunks_exact(4).all(|p| p[3] == 0xff),
+        "every alpha byte is opaque for an RGB lossless file"
+    );
 }
