@@ -44,6 +44,7 @@ const LOSSLESS_32X32_RGB: &[u8] = include_bytes!("data/lossless-32x32-rgb.webp")
 const LOSSLESS_COLOR_CACHE_STRESS: &[u8] = include_bytes!("data/lossless-color-cache-stress.webp");
 const LOSSLESS_CROSS_COLOR_ACTIVE: &[u8] = include_bytes!("data/lossless-cross-color-active.webp");
 const LOSSY_NEAR_LOSSLESS_Q40: &[u8] = include_bytes!("data/lossy-near-lossless-q40.webp");
+const ANIMATED_3_FRAMES_RGB: &[u8] = include_bytes!("data/animated-3-frames-rgb.webp");
 
 #[test]
 fn fixture_lossy_1x1_has_a_single_vp8_chunk() {
@@ -1590,5 +1591,145 @@ fn round322_lossless_32x32_rgb_carries_synthetic_opaque_alpha() {
     assert!(
         f.rgba.chunks_exact(4).all(|p| p[3] == 0xff),
         "every alpha byte is opaque for an RGB lossless file"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Round 327 — close the last *lossless* animation end-to-end pixel gap.
+//
+// `animated-with-alpha` (the other ANIM fixture in the in-crate corpus)
+// is already geometry- + digest-validated above, but `animated-3-frames-
+// rgb` — the docs corpus's 3-frame *opaque-RGB* VP8L animation — had no
+// in-crate copy and was never pixel-validated against its committed
+// `expected_NNNN.png` ground truth. It is a fully reconstructible
+// lossless animation: per the fixture's `trace.txt`, VP8X declares a
+// 64×64 canvas with the animation flag set, ANIM carries
+// bgcolor=0xffffffff / loop_count=0, and three full-canvas (64×64 at
+// offset 0,0) ANMF frames each wrap a VP8L lossless image. Frame 1 is
+// NO_BLEND (flags_byte=0x02), frames 2 and 3 are BLEND (flags_byte=0x00);
+// because every source frame is fully opaque, blending a full-canvas
+// opaque frame over the canvas yields that frame's own pixels, so each
+// composited output equals its per-frame decode — which is what the
+// committed `expected_NNNN.png` frames hold.
+//
+// The frames are visually distinct (frame 0 = red field, frame 1 = green
+// field, frame 2 = blue field, each with a white interior feature), so
+// the per-frame ground-truth samples below pin not just the §4–§6 VP8L
+// reconstruction but also the §2.7.1.1 frame ordering and the
+// per-frame compositing result. All ground-truth bytes are read from the
+// fixture's own `expected_0000/0001/0002.png` oracle outputs.
+// ---------------------------------------------------------------------
+
+#[test]
+fn round327_animated_3_frames_rgb_decodes_three_distinct_frames_to_expected_pngs() {
+    let img = decode_webp(ANIMATED_3_FRAMES_RGB).expect("animated-3-frames-rgb decodes");
+    assert_eq!(img.frames.len(), 3, "three ANMF frames");
+    // ANIM globals: white-opaque background, infinite loop.
+    assert_eq!(
+        img.anim_background_rgba,
+        Some([0xFF, 0xFF, 0xFF, 0xFF]),
+        "ANIM bgcolor=0xffffffff → RGBA white"
+    );
+    assert_eq!(img.anim_loop_count, Some(0), "loop_count=0 (infinite)");
+
+    // Per-frame ground-truth samples lifted from each frame's committed
+    // `expected_NNNN.png`. The field colour differs per frame; the
+    // interior (32,32)/(42,42) is white in every frame, and (21,21) is
+    // white in frames 0/1 but the field colour in frame 2 — so the
+    // sample set uniquely distinguishes all three frames and their order.
+    let frame0: &[((u32, u32), [u8; 4])] = &[
+        ((0, 0), [255, 60, 60, 255]),
+        ((63, 0), [255, 60, 60, 255]),
+        ((0, 63), [255, 60, 60, 255]),
+        ((63, 63), [255, 60, 60, 255]),
+        ((32, 32), [255, 255, 255, 255]),
+        ((1, 2), [255, 60, 60, 255]),
+        ((3, 5), [255, 60, 60, 255]),
+        ((7, 11), [255, 60, 60, 255]),
+        ((21, 21), [255, 255, 255, 255]),
+        ((42, 42), [255, 255, 255, 255]),
+        ((16, 48), [255, 60, 60, 255]),
+        ((62, 62), [255, 60, 60, 255]),
+        ((13, 17), [255, 60, 60, 255]),
+        ((59, 3), [255, 60, 60, 255]),
+    ];
+    let frame1: &[((u32, u32), [u8; 4])] = &[
+        ((0, 0), [60, 255, 60, 255]),
+        ((63, 0), [60, 255, 60, 255]),
+        ((0, 63), [60, 255, 60, 255]),
+        ((63, 63), [60, 255, 60, 255]),
+        ((32, 32), [255, 255, 255, 255]),
+        ((1, 2), [60, 255, 60, 255]),
+        ((3, 5), [60, 255, 60, 255]),
+        ((7, 11), [60, 255, 60, 255]),
+        ((21, 21), [255, 255, 255, 255]),
+        ((42, 42), [255, 255, 255, 255]),
+        ((16, 48), [60, 255, 60, 255]),
+        ((62, 62), [60, 255, 60, 255]),
+        ((13, 17), [60, 255, 60, 255]),
+        ((59, 3), [60, 255, 60, 255]),
+    ];
+    let frame2: &[((u32, u32), [u8; 4])] = &[
+        ((0, 0), [60, 60, 255, 255]),
+        ((63, 0), [60, 60, 255, 255]),
+        ((0, 63), [60, 60, 255, 255]),
+        ((63, 63), [60, 60, 255, 255]),
+        ((32, 32), [255, 255, 255, 255]),
+        ((1, 2), [60, 60, 255, 255]),
+        ((3, 5), [60, 60, 255, 255]),
+        ((7, 11), [60, 60, 255, 255]),
+        ((21, 21), [60, 60, 255, 255]),
+        ((42, 42), [255, 255, 255, 255]),
+        ((16, 48), [60, 60, 255, 255]),
+        ((62, 62), [60, 60, 255, 255]),
+        ((13, 17), [60, 60, 255, 255]),
+        ((59, 3), [60, 60, 255, 255]),
+    ];
+    let frame_samples = [frame0, frame1, frame2];
+
+    for (i, samples) in frame_samples.iter().enumerate() {
+        let f = &img.frames[i];
+        assert_eq!((f.width, f.height), (64, 64), "frame {i} dimensions");
+        assert_eq!(f.duration_ms, 100, "frame {i} duration (ANMF native ms)");
+        assert_eq!(f.rgba.len(), 64 * 64 * 4, "frame {i} tight RGBA buffer");
+        for &((x, y), want) in samples.iter() {
+            assert_eq!(
+                rgba_at(&f.rgba, 64, x, y),
+                want,
+                "frame {i} pixel ({x}, {y}) mismatch"
+            );
+        }
+        // Every pixel is fully opaque (RGB source, alpha synthesised 0xff).
+        assert!(
+            f.rgba.chunks_exact(4).all(|p| p[3] == 0xff),
+            "frame {i} alpha is opaque everywhere"
+        );
+    }
+
+    // The three frames are pairwise distinct (the animation moves).
+    assert_ne!(img.frames[0].rgba, img.frames[1].rgba, "frames 0/1 differ");
+    assert_ne!(img.frames[1].rgba, img.frames[2].rgba, "frames 1/2 differ");
+    assert_ne!(img.frames[0].rgba, img.frames[2].rgba, "frames 0/2 differ");
+}
+
+#[test]
+fn round327_animated_3_frames_rgb_whole_buffer_digest_is_pinned() {
+    // Whole-buffer lock over the same `width_le ‖ height_le ‖
+    // frame_count_le ‖ frames[..].rgba` layout the round-284 corpus pin
+    // uses, derived from concatenating the three `expected_NNNN.png`
+    // oracle frames. Catches any reconstruction drift the 14-sample
+    // spot-check above would miss.
+    let img = decode_webp(ANIMATED_3_FRAMES_RGB).expect("animated-3-frames-rgb decodes");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&img.width.to_le_bytes());
+    buf.extend_from_slice(&img.height.to_le_bytes());
+    buf.extend_from_slice(&(img.frames.len() as u32).to_le_bytes());
+    for f in &img.frames {
+        buf.extend_from_slice(&f.rgba);
+    }
+    assert_eq!(
+        fnv1a64(&buf),
+        0xd565_0ed4_7ba8_f556,
+        "decoded-output digest"
     );
 }
