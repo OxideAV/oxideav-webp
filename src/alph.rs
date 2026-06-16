@@ -432,6 +432,233 @@ fn inverse_filter(filtered: Vec<u8>, w: usize, h: usize, filtering: AlphFilterin
     out
 }
 
+/// §2.7.1.2 **forward** filter: the algebraic inverse of [`inverse_filter`].
+///
+/// Produces the residual plane the §2.7.1.2 decoder reconstructs from:
+/// `residual = (alpha - predictor) mod 256`, read over the *original*
+/// `plane` (length `w * h`, scan order) under the given filtering method.
+/// The predictor is the same per-method rule the inverse pass uses
+/// (None = 0 / Horizontal = A = left / Vertical = B = above /
+/// Gradient = clip(A + B − C)), with the identical §2.7.1.2 border cases:
+/// `(0,0)` predicts 0; the first column and first row each fall back to
+/// the single in-bounds neighbour.
+///
+/// Because the filter is causal — every predictor reads only neighbours
+/// that precede the current pixel in scan order — the predictor the
+/// encoder reads from the original plane equals the one the decoder reads
+/// from the reconstructed plane on a correct decode. So
+/// `inverse_filter(forward_filter(plane, …), …)` is the identity for every
+/// method (this is what [`encode_alpha`]'s round-trip rests on).
+fn forward_filter(plane: &[u8], w: usize, h: usize, filtering: AlphFiltering) -> Vec<u8> {
+    // None: predictor = 0 everywhere → residual is the plane unchanged.
+    if filtering == AlphFiltering::None || w == 0 || h == 0 {
+        return plane.to_vec();
+    }
+
+    let mut residual = vec![0u8; w * h];
+
+    // (0,0) always predicts 0, for every method.
+    residual[0] = plane[0];
+
+    match filtering {
+        AlphFiltering::None => unreachable!("handled above"),
+        AlphFiltering::Horizontal => {
+            // First row (x>0, y=0): predictor = A = left.
+            for x in 1..w {
+                residual[x] = (plane[x] as i32 - plane[x - 1] as i32) as u8;
+            }
+            for y in 1..h {
+                let row = y * w;
+                let above = row - w;
+                // Left-most (0, y>0): predictor = (0, y-1).
+                residual[row] = (plane[row] as i32 - plane[above] as i32) as u8;
+                // Interior (x>0, y>0): predictor = A = left.
+                for x in 1..w {
+                    let i = row + x;
+                    residual[i] = (plane[i] as i32 - plane[i - 1] as i32) as u8;
+                }
+            }
+        }
+        AlphFiltering::Vertical => {
+            // First row (x>0, y=0): predictor = (x-1, 0).
+            for x in 1..w {
+                residual[x] = (plane[x] as i32 - plane[x - 1] as i32) as u8;
+            }
+            // Interior + left-most (any x, y>0): predictor = B = above.
+            for y in 1..h {
+                let row = y * w;
+                let above = row - w;
+                for x in 0..w {
+                    let i = row + x;
+                    residual[i] = (plane[i] as i32 - plane[above + x] as i32) as u8;
+                }
+            }
+        }
+        AlphFiltering::Gradient => {
+            // First row (x>0, y=0): predictor = (x-1, 0).
+            for x in 1..w {
+                residual[x] = (plane[x] as i32 - plane[x - 1] as i32) as u8;
+            }
+            for y in 1..h {
+                let row = y * w;
+                let above = row - w;
+                // Left-most (0, y>0): predictor = (0, y-1).
+                residual[row] = (plane[row] as i32 - plane[above] as i32) as u8;
+                // Interior (x>0, y>0): predictor = clip(A + B − C).
+                for x in 1..w {
+                    let i = row + x;
+                    let a = plane[i - 1] as i32;
+                    let b = plane[above + x] as i32;
+                    let c = plane[above + x - 1] as i32;
+                    let pred = clip(a + b - c) as i32;
+                    residual[i] = (plane[i] as i32 - pred) as u8;
+                }
+            }
+        }
+    }
+
+    residual
+}
+
+/// §2.7.1.2 forward-filter selection cost: the sum of residual byte
+/// *magnitudes* interpreted as signed two's-complement (-128..=127).
+///
+/// A residual close to 0 (or 255, i.e. -1) means the predictor tracked the
+/// alpha plane well; the filter whose residual has the smallest total
+/// magnitude is the one whose residual stream is the flattest — the
+/// standard predictor-selection heuristic (RFC 9649 §2.7.1.2 leaves the
+/// *choice* of filter to the encoder; only the per-method reconstruction
+/// is normative). For a method-0 (raw) ALPH the payload length is
+/// `w*h + 1` for every filter, so this cost is the only thing that
+/// distinguishes the candidates; it does not affect decoded bytes — every
+/// candidate round-trips to the same plane.
+fn forward_filter_cost(residual: &[u8]) -> u64 {
+    residual
+        .iter()
+        .map(|&r| u64::from((r as i8).unsigned_abs()))
+        .sum()
+}
+
+/// Encode an 8-bit alpha plane into a complete §2.7.1.2 `ALPH` chunk
+/// payload (info byte + raw, **compression-method-0** alpha bitstream).
+///
+/// `plane` is `width * height` alpha bytes in scan order. The encoder
+/// runs the §2.7.1.2 forward filter for all four `F` methods
+/// (None / Horizontal / Vertical / Gradient) and keeps the one whose
+/// residual stream is flattest by [`forward_filter_cost`], emitting that
+/// filter's residual as the raw alpha bitstream with the matching `F`
+/// field set in the info byte (`C` = 0 raw, `P` = 0, `Rsv` = 0). The
+/// returned bytes are exactly the §2.3 chunk *payload* — the caller wraps
+/// them in the `ALPH` FourCc + size header.
+///
+/// The output is bit-exactly round-trippable: for every selected filter,
+/// [`decode_alpha`] reconstructs `plane` byte-for-byte (the forward filter
+/// is the algebraic inverse of the §2.7.1.2 inverse filter, and method-0
+/// stores the residual verbatim). Which filter wins only changes the `F`
+/// nibble and the residual bytes, never the reconstructed plane — the same
+/// "cost model picks the mode, not the result" invariant the lossless
+/// encoder upholds.
+///
+/// # Errors
+///
+/// Returns [`AlphError::RawLengthMismatch`] if `plane.len()` does not equal
+/// `width * height`, or [`AlphError::DimensionsOverflow`] if `width *
+/// height` overflows `usize`. A zero-area plane (`width == 0` or
+/// `height == 0`) is valid and yields a single info byte with no bitstream.
+pub fn encode_alpha(plane: &[u8], width: u32, height: u32) -> Result<Vec<u8>, AlphError> {
+    let count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(AlphError::DimensionsOverflow { width, height })?;
+
+    if plane.len() != count {
+        return Err(AlphError::RawLengthMismatch {
+            expected: count,
+            actual: plane.len(),
+        });
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+
+    // Pick the §2.7.1.2 F method whose forward residual is flattest. For a
+    // zero-area plane the residual is empty under every method, so None
+    // (the no-op, smallest info byte) is the natural pick.
+    let mut best_f = AlphFiltering::None;
+    let mut best_residual = forward_filter(plane, w, h, AlphFiltering::None);
+    let mut best_cost = forward_filter_cost(&best_residual);
+
+    for f in [
+        AlphFiltering::Horizontal,
+        AlphFiltering::Vertical,
+        AlphFiltering::Gradient,
+    ] {
+        let residual = forward_filter(plane, w, h, f);
+        let cost = forward_filter_cost(&residual);
+        if cost < best_cost {
+            best_cost = cost;
+            best_f = f;
+            best_residual = residual;
+        }
+    }
+
+    let f_bits = match best_f {
+        AlphFiltering::None => 0u8,
+        AlphFiltering::Horizontal => 1,
+        AlphFiltering::Vertical => 2,
+        AlphFiltering::Gradient => 3,
+    };
+    // Info byte: Rsv=0, P=0, F=best_f, C=0 (raw). MSB-first Rsv|P|F|C.
+    let info_byte = f_bits << 2;
+
+    let mut payload = Vec::with_capacity(1 + best_residual.len());
+    payload.push(info_byte);
+    payload.extend_from_slice(&best_residual);
+    Ok(payload)
+}
+
+/// Encode an alpha plane under one specific §2.7.1.2 filtering method
+/// (raw, compression-method-0), without the [`encode_alpha`] best-filter
+/// search. The returned bytes are the §2.3 `ALPH` chunk payload (info byte
+/// with the given `F` field + raw residual). Exposed so callers that
+/// already know the optimal filter — or want a fixed one for testing /
+/// reproducibility — can skip the four-way sweep; the round-trip guarantee
+/// is identical (`decode_alpha` reconstructs the input plane exactly).
+///
+/// # Errors
+///
+/// Same as [`encode_alpha`]: length-mismatch and dimension-overflow.
+pub fn encode_alpha_with_filter(
+    plane: &[u8],
+    width: u32,
+    height: u32,
+    filtering: AlphFiltering,
+) -> Result<Vec<u8>, AlphError> {
+    let count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(AlphError::DimensionsOverflow { width, height })?;
+
+    if plane.len() != count {
+        return Err(AlphError::RawLengthMismatch {
+            expected: count,
+            actual: plane.len(),
+        });
+    }
+
+    let residual = forward_filter(plane, width as usize, height as usize, filtering);
+    let f_bits = match filtering {
+        AlphFiltering::None => 0u8,
+        AlphFiltering::Horizontal => 1,
+        AlphFiltering::Vertical => 2,
+        AlphFiltering::Gradient => 3,
+    };
+    let info_byte = f_bits << 2;
+
+    let mut payload = Vec::with_capacity(1 + residual.len());
+    payload.push(info_byte);
+    payload.extend_from_slice(&residual);
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,12 +1013,15 @@ mod tests {
 
     /// §2.7.1.2 forward filter `X = (alpha - predictor) mod 256`, the
     /// algebraic inverse of [`inverse_filter`]'s `alpha = (predictor +
-    /// X) % 256`. Reads the *original* plane in scan order; each
-    /// predictor sees only already-emitted neighbours, so on a correct
-    /// decode the predictor the encoder reads equals the one the decoder
-    /// reads from the reconstructed plane. Mirrors RFC 9649 §2.7.1.2
-    /// Figure 11 + the per-method border rules.
-    fn forward_filter(plane: &[u8], w: usize, h: usize, f: AlphFiltering) -> Vec<u8> {
+    /// X) % 256`, written in the simplest per-pixel `match (x, y)` form.
+    /// Kept as the independent oracle the production [`forward_filter`]
+    /// (border-hoisted) is proven byte-for-byte against. Reads the
+    /// *original* plane in scan order; each predictor sees only
+    /// already-emitted neighbours, so on a correct decode the predictor
+    /// the encoder reads equals the one the decoder reads from the
+    /// reconstructed plane. Mirrors RFC 9649 §2.7.1.2 Figure 11 + the
+    /// per-method border rules.
+    fn forward_filter_reference(plane: &[u8], w: usize, h: usize, f: AlphFiltering) -> Vec<u8> {
         let pred = |p: &[u8], x: usize, y: usize| -> i32 {
             if x == 0 && y == 0 {
                 return 0;
@@ -892,5 +1122,154 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The border-hoisted production [`forward_filter`] must equal the
+    /// simple per-pixel [`forward_filter_reference`] byte-for-byte across
+    /// every F method and a spread of even/odd + degenerate dimensions
+    /// (including the §2.7.1.2 border shapes).
+    #[test]
+    fn forward_filter_matches_per_pixel_reference() {
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state >> 16) as u8
+        };
+        for &(w, h) in &[
+            (1usize, 1usize),
+            (1, 7),
+            (7, 1),
+            (2, 2),
+            (3, 4),
+            (5, 5),
+            (16, 9),
+            (13, 13),
+        ] {
+            let plane: Vec<u8> = (0..w * h).map(|_| next()).collect();
+            for f in [
+                AlphFiltering::None,
+                AlphFiltering::Horizontal,
+                AlphFiltering::Vertical,
+                AlphFiltering::Gradient,
+            ] {
+                assert_eq!(
+                    forward_filter(&plane, w, h, f),
+                    forward_filter_reference(&plane, w, h, f),
+                    "forward_filter != reference at {w}x{h} method {f:?}"
+                );
+            }
+        }
+    }
+
+    /// `encode_alpha` → `decode_alpha` is the identity for arbitrary alpha
+    /// planes: whichever §2.7.1.2 filter the cost model selects, the raw
+    /// (method-0) payload reconstructs the exact input plane.
+    #[test]
+    fn encode_alpha_round_trips_to_input_plane() {
+        let mut state: u32 = 0xdead_beef;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        for &(w, h) in &[
+            (1u32, 1u32),
+            (1, 11),
+            (11, 1),
+            (2, 2),
+            (4, 3),
+            (16, 16),
+            (17, 13),
+            (33, 7),
+        ] {
+            let n = (w * h) as usize;
+            // A few content regimes: flat, gradient-ish, and noisy.
+            for plane in [
+                vec![0xffu8; n],                                     // fully opaque
+                (0..n).map(|i| (i % 256) as u8).collect::<Vec<_>>(), // ramp
+                (0..n).map(|_| next()).collect::<Vec<_>>(),          // noise
+            ] {
+                let payload = encode_alpha(&plane, w, h).expect("encode_alpha must succeed");
+                // Payload is info byte + w*h raw residual bytes (method 0).
+                assert_eq!(payload.len(), 1 + n, "method-0 payload length at {w}x{h}");
+                let header = AlphHeader::parse(&payload).unwrap();
+                assert_eq!(header.compression, AlphCompression::None);
+                assert_eq!(header.preprocessing, AlphPreprocessing::None);
+                assert_eq!(header.reserved, 0);
+
+                let decoded = decode_alpha(&payload, w, h).expect("decode_alpha must succeed");
+                assert_eq!(decoded, plane, "encode→decode mismatch at {w}x{h}");
+            }
+        }
+    }
+
+    /// `encode_alpha_with_filter` round-trips under every explicitly
+    /// requested filter, and the selected `F` field is written into the
+    /// info byte.
+    #[test]
+    fn encode_alpha_with_filter_round_trips_each_method() {
+        let w = 9u32;
+        let h = 6u32;
+        let n = (w * h) as usize;
+        let plane: Vec<u8> = (0..n).map(|i| ((i * 31 + 5) & 0xff) as u8).collect();
+        for (f, f_bits) in [
+            (AlphFiltering::None, 0u8),
+            (AlphFiltering::Horizontal, 1),
+            (AlphFiltering::Vertical, 2),
+            (AlphFiltering::Gradient, 3),
+        ] {
+            let payload = encode_alpha_with_filter(&plane, w, h, f).unwrap();
+            let header = AlphHeader::parse(&payload).unwrap();
+            assert_eq!(header.filtering, f, "F field not the requested method");
+            assert_eq!(header.info_byte, f_bits << 2);
+            let decoded = decode_alpha(&payload, w, h).unwrap();
+            assert_eq!(decoded, plane, "round-trip failed for {f:?}");
+        }
+    }
+
+    /// A flat (constant) alpha plane filters to all-zero residual under
+    /// Horizontal / Vertical / Gradient, so the best-filter chooser drops
+    /// to a non-None predictive filter (cost 0 beats raw's nonzero cost on
+    /// any non-zero constant).
+    #[test]
+    fn encode_alpha_prefers_predictive_filter_on_flat_plane() {
+        let w = 8u32;
+        let h = 8u32;
+        let plane = vec![200u8; (w * h) as usize];
+        let payload = encode_alpha(&plane, w, h).unwrap();
+        let header = AlphHeader::parse(&payload).unwrap();
+        assert_ne!(
+            header.filtering,
+            AlphFiltering::None,
+            "a flat non-zero plane should pick a predictive filter (zero residual)"
+        );
+        // The residual after the info byte must be all zero except (0,0).
+        let residual = &payload[1..];
+        assert_eq!(residual[0], 200, "(0,0) stores the raw value");
+        assert!(
+            residual[1..].iter().all(|&r| r == 0),
+            "flat plane residual must be zero past (0,0)"
+        );
+        assert_eq!(decode_alpha(&payload, w, h).unwrap(), plane);
+    }
+
+    /// Length / dimension error surfaces match the decoder's.
+    #[test]
+    fn encode_alpha_rejects_length_mismatch() {
+        let err = encode_alpha(&[0u8; 5], 2, 3).unwrap_err();
+        assert_eq!(
+            err,
+            AlphError::RawLengthMismatch {
+                expected: 6,
+                actual: 5
+            }
+        );
+    }
+
+    /// A zero-area plane is valid and yields a bare info byte (no bitstream).
+    #[test]
+    fn encode_alpha_zero_area_is_bare_info_byte() {
+        let payload = encode_alpha(&[], 0, 5).unwrap();
+        assert_eq!(payload, vec![0u8]); // F=None, C=0 → info byte 0x00
+        assert_eq!(decode_alpha(&payload, 0, 5).unwrap(), Vec::<u8>::new());
     }
 }

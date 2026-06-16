@@ -4,6 +4,10 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- round 322 — public §2.7.1.2 `ALPH` alpha-plane **encoder**: `alph::encode_alpha` runs the forward filter for all four `F` methods (None / Horizontal / Vertical / Gradient) and emits the flattest-residual candidate as a raw (compression-method-0) `ALPH` chunk payload; `alph::encode_alpha_with_filter` pins a chosen method. The forward filter is now a production border-hoisted function (proven byte-for-byte against an independent per-pixel oracle) and is the algebraic inverse of the decode-side inverse filter, so `encode_alpha` → `decode_alpha` is the identity for every selected filter
+
 ### Other
 
 - round 318 FUZZ — add `roundtrip_alpha_filter_lossless` differential oracle for the §2.7.1.2 ALPH **compression-method-1** path (forward-filter → residual packed into a §3 headerless VP8L green channel → method-1 ALPH → decode → byte-identical), exercising the VP8L-decode → green-extract → inverse-filter chain across all four F methods and the §2.7.1.2 border shapes; mirrored by a `decode_method1_lossless_round_trips_all_filters` lib test so the chain is value-pinned in the normal test run

@@ -12,7 +12,12 @@ ANMF). Decoder and encoder are both at production status.
   loop permits (`VP8L` lossless and `VP8 ` lossy, each with an optional
   `ALPH` alpha plane).
 * **Encode** of complete `.webp` files in both lossless (VP8L) and
-  lossy (VP8) modes, plus complete animated `.webp` files.
+  lossy (VP8) modes, plus complete animated `.webp` files. The
+  §2.7.1.2 `ALPH` alpha plane is also encodable directly via
+  [`alph::encode_alpha`] — it sweeps the four `F` filtering methods
+  (None / Horizontal / Vertical / Gradient) and emits the
+  flattest-residual candidate as a raw (compression-method-0) chunk
+  payload that round-trips byte-for-byte through [`alph::decode_alpha`].
 * Decoded pixels land in a tightly-packed `Vec<u8>` of
   `width * height * 4` RGBA bytes — drops directly into
   [`image`](https://crates.io/crates/image)'s `ImageBuffer::from_raw`
