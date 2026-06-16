@@ -4,6 +4,16 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/OxideAV/oxideav-webp/compare/v0.2.2...v0.2.3) - 2026-06-16
+
+### Other
+
+- webp r322 — public §2.7.1.2 ALPH alpha-plane encoder (best-filter, method-0 raw)
+- webp r318 FUZZ — roundtrip_alpha_filter_lossless differential oracle over §2.7.1.2 ALPH compression-method-1 inverse path
+- webp r314 FUZZ — roundtrip_alpha_filter differential oracle over §2.7.1.2 ALPH inverse filter
+- refresh to current status, drop per-round changelog cruft
+- decode lossy (VP8 ) per-frame ANMF bitstreams in animations
+
 ### Added
 
 - round 322 — public §2.7.1.2 `ALPH` alpha-plane **encoder**: `alph::encode_alpha` runs the forward filter for all four `F` methods (None / Horizontal / Vertical / Gradient) and emits the flattest-residual candidate as a raw (compression-method-0) `ALPH` chunk payload; `alph::encode_alpha_with_filter` pins a chosen method. The forward filter is now a production border-hoisted function (proven byte-for-byte against an independent per-pixel oracle) and is the algebraic inverse of the decode-side inverse filter, so `encode_alpha` → `decode_alpha` is the identity for every selected filter
