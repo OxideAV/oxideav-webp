@@ -145,7 +145,7 @@ fn round335_extract_metadata_iccp_returns_the_corpus_icc_profile() {
     // `extended-with-icc-profile` fixture is a lossy `VP8 ` image wrapped
     // in a VP8X container with `has_icc=1` and a 292-byte `ICCP` chunk
     // (its `trace.txt`: `VP8X flags=0x00000020 has_icc=1`, `CHUNK
-    // fourcc=ICCP size=292`). libwebp-style demuxers expose ICC data
+    // fourcc=ICCP size=292`). A conformant WebP demuxer exposes ICC data
     // verbatim without interpreting it; so does this crate.
     let meta = extract_metadata(EXTENDED_WITH_ICC).expect("ICCP fixture metadata extracts");
     let icc = meta.icc.as_deref().expect("ICCP payload present");
