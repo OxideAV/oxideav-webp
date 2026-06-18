@@ -228,7 +228,12 @@ Implementation is derived entirely from the public format specs:
 
 The fixture corpus at `docs/image/webp/fixtures/` is consumed as opaque
 byte streams; end-to-end fixture tests validate against the ARGB pixels
-of each fixture's committed `expected.png`. No third-party codec
+of each fixture's committed `expected.png`, and the §2.7.1 metadata
+aux-chunk extraction paths (`ICCP` / `EXIF` / `XMP `) are each
+value-validated end-to-end — `extract_metadata` over the
+`extended-with-icc-profile` / `extended-with-exif` / `extended-with-xmp`
+fixtures must return the exact embedded payload bytes (length +
+whole-payload digest + chunk-body cross-check). No third-party codec
 library source is consulted.
 
 ## License

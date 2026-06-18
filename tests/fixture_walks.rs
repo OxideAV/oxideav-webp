@@ -28,8 +28,8 @@ use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
 use oxideav_webp::{
     build_vp8x_chunk, build_webp_file, decode_lossless_image, decode_webp, decode_webp_image,
-    encode_webp_lossless, extract_lossless_chunk, extract_lossy_chunk, parse_alph_header,
-    parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
+    encode_webp_lossless, extract_lossless_chunk, extract_lossy_chunk, extract_metadata,
+    parse_alph_header, parse_anim_header, parse_anmf_header, parse_container, parse_vp8x_header,
     read_vp8l_transform_list,
 };
 
@@ -38,6 +38,8 @@ const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
 const LOSSLESS_32X32_RGBA: &[u8] = include_bytes!("data/lossless-32x32-rgba.webp");
 const LOSSLESS_COLOR_INDEXING: &[u8] = include_bytes!("data/lossless-color-indexing-paletted.webp");
 const EXTENDED_WITH_EXIF: &[u8] = include_bytes!("data/extended-with-exif.webp");
+const EXTENDED_WITH_ICC: &[u8] = include_bytes!("data/extended-with-icc-profile.webp");
+const EXTENDED_WITH_XMP: &[u8] = include_bytes!("data/extended-with-xmp.webp");
 const LOSSY_WITH_ALPHA: &[u8] = include_bytes!("data/lossy-with-alpha-128x128.webp");
 const ANIMATED_WITH_ALPHA: &[u8] = include_bytes!("data/animated-with-alpha.webp");
 const LOSSLESS_32X32_RGB: &[u8] = include_bytes!("data/lossless-32x32-rgb.webp");
@@ -99,6 +101,116 @@ fn fixture_extended_with_exif_vp8x_payload_decodes_to_128x128_exif_only() {
     // Producer set every §2.7.1 reserved bit to 0 — has_unknown stays
     // clear, matching the trace report of `flags=0x00000008`.
     assert!(!h.has_unknown);
+}
+
+#[test]
+fn round335_extract_metadata_exif_returns_the_corpus_exif_payload() {
+    // §2.7.1.5 end-to-end EXIF *content* validation (the round-2 test
+    // above only asserted the VP8X has_exif flag + chunk presence; this
+    // pins the bytes `extract_metadata` hands back). The docs-corpus
+    // `extended-with-exif` fixture carries a single 34-byte EXIF chunk
+    // (its `trace.txt` records `CHUNK fourcc=VP8X` + an `EXIF` aux chunk).
+    let meta = extract_metadata(EXTENDED_WITH_EXIF).expect("EXIF fixture metadata extracts");
+    let exif = meta.exif.as_deref().expect("EXIF payload present");
+    // Only EXIF is set on this fixture.
+    assert!(meta.icc.is_none(), "no ICCP chunk on the EXIF fixture");
+    assert!(meta.xmp.is_none(), "no XMP chunk on the EXIF fixture");
+
+    // §2.7.1.5: the EXIF payload is a raw TIFF/Exif blob; this one opens
+    // with the little-endian TIFF byte-order marker "II" (0x49 0x49) and
+    // the 0x002A magic, i.e. `49 49 2A 00`.
+    assert_eq!(exif.len(), 34, "EXIF chunk payload length");
+    assert_eq!(
+        &exif[..4],
+        &[0x49, 0x49, 0x2a, 0x00],
+        "TIFF little-endian header"
+    );
+    // Whole-payload digest lock — extracted bytes equal the chunk bytes
+    // committed in the docs corpus (validator-free: the bytes are their
+    // own ground truth, copied opaque from `fixtures/extended-with-exif`).
+    assert_eq!(fnv1a64(exif), 0x2649_2d6d_ce37_6722);
+
+    // Cross-check: the extracted payload is exactly the raw `EXIF` chunk
+    // body the container walker observes (no header bytes leaked in/out).
+    let c = parse_container(EXTENDED_WITH_EXIF).expect("EXIF fixture parses");
+    let chunk = c
+        .first_chunk_with_fourcc(fourcc::EXIF)
+        .expect("EXIF chunk present");
+    assert_eq!(exif, chunk.payload(EXTENDED_WITH_EXIF));
+}
+
+#[test]
+fn round335_extract_metadata_iccp_returns_the_corpus_icc_profile() {
+    // §2.7.1.4 end-to-end ICCP extraction against the docs corpus. The
+    // `extended-with-icc-profile` fixture is a lossy `VP8 ` image wrapped
+    // in a VP8X container with `has_icc=1` and a 292-byte `ICCP` chunk
+    // (its `trace.txt`: `VP8X flags=0x00000020 has_icc=1`, `CHUNK
+    // fourcc=ICCP size=292`). libwebp-style demuxers expose ICC data
+    // verbatim without interpreting it; so does this crate.
+    let meta = extract_metadata(EXTENDED_WITH_ICC).expect("ICCP fixture metadata extracts");
+    let icc = meta.icc.as_deref().expect("ICCP payload present");
+    assert!(meta.exif.is_none(), "no EXIF chunk on the ICCP fixture");
+    assert!(meta.xmp.is_none(), "no XMP chunk on the ICCP fixture");
+
+    // The VP8X flag byte agrees with the trace (has_icc only).
+    let c = parse_container(EXTENDED_WITH_ICC).expect("ICCP fixture parses");
+    let vp8x = c
+        .first_chunk_with_fourcc(fourcc::VP8X)
+        .expect("VP8X present");
+    let h = parse_vp8x_header(vp8x.payload(EXTENDED_WITH_ICC)).expect("VP8X parses");
+    assert_eq!((h.canvas_width, h.canvas_height), (128, 128));
+    assert!(h.has_iccp);
+    assert!(!h.has_exif && !h.has_xmp && !h.has_alpha && !h.has_animation);
+
+    // Payload length + whole-payload digest lock (extracted bytes == the
+    // corpus `ICCP` chunk body).
+    assert_eq!(icc.len(), 292, "ICCP chunk payload length");
+    assert_eq!(fnv1a64(icc), 0x104a_7b5d_d38a_ffd6);
+    let chunk = c
+        .first_chunk_with_fourcc(fourcc::ICCP)
+        .expect("ICCP chunk present");
+    assert_eq!(icc, chunk.payload(EXTENDED_WITH_ICC));
+}
+
+#[test]
+fn round335_extract_metadata_xmp_returns_the_corpus_xmp_packet() {
+    // §2.7.1.5 end-to-end XMP extraction against the docs corpus. The
+    // `extended-with-xmp` fixture is a lossy `VP8 ` image wrapped in a
+    // VP8X container with `has_xmp=1` and a 306-byte `XMP ` chunk (its
+    // `trace.txt`: `VP8X flags=0x00000004 has_xmp=1`). The XMP payload is
+    // an RDF/XML packet; this crate surfaces it as raw UTF-8 bytes.
+    let meta = extract_metadata(EXTENDED_WITH_XMP).expect("XMP fixture metadata extracts");
+    let xmp = meta.xmp.as_deref().expect("XMP payload present");
+    assert!(meta.icc.is_none(), "no ICCP chunk on the XMP fixture");
+    assert!(meta.exif.is_none(), "no EXIF chunk on the XMP fixture");
+
+    let c = parse_container(EXTENDED_WITH_XMP).expect("XMP fixture parses");
+    let vp8x = c
+        .first_chunk_with_fourcc(fourcc::VP8X)
+        .expect("VP8X present");
+    let h = parse_vp8x_header(vp8x.payload(EXTENDED_WITH_XMP)).expect("VP8X parses");
+    assert_eq!((h.canvas_width, h.canvas_height), (128, 128));
+    assert!(h.has_xmp);
+    assert!(!h.has_iccp && !h.has_exif && !h.has_alpha && !h.has_animation);
+
+    // The packet opens with the standard XMP `<?xpacket begin=` processing
+    // instruction and carries the fixture's single `dc:creator` field
+    // (per `extended-with-xmp/notes.md`), proving the bytes are intact
+    // UTF-8 XML and not truncated.
+    assert_eq!(xmp.len(), 306, "XMP chunk payload length");
+    assert!(
+        xmp.starts_with(b"<?xpacket begin="),
+        "XMP opens with the xpacket PI",
+    );
+    assert!(
+        xmp.windows(b"dc:creator".len()).any(|w| w == b"dc:creator"),
+        "XMP carries the dc:creator field",
+    );
+    assert_eq!(fnv1a64(xmp), 0x1d56_47f4_c563_aca6);
+    let chunk = c
+        .first_chunk_with_fourcc(fourcc::XMP)
+        .expect("XMP chunk present");
+    assert_eq!(xmp, chunk.payload(EXTENDED_WITH_XMP));
 }
 
 #[test]
