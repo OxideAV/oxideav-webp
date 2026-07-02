@@ -4340,6 +4340,97 @@ fn encode_with_color_transform_subtract_green_predictor(
     w.into_bytes()
 }
 
+/// Encode `pixels` with the §4.3 subtract-green transform **chained**
+/// with the §4.1 spatial predictor over the green-decorrelated image —
+/// the round-383 two-transform stack.
+///
+/// The §4.3 pass is header-free (one presence bit + the 2-bit type), so
+/// this chain carries the cheapest possible decorrelation front end: on
+/// content whose red / blue channels track green with a *unit* slope
+/// (the common natural-image case), subtracting green removes the
+/// inter-channel correlation without paying the §4.2 chain's per-block
+/// CTE sub-image bytes, and the §4.1 predictor then removes the spatial
+/// correlation that survives in each channel. The three-transform
+/// §4.2 → §4.3 → §4.1 stack (round 304) only wins when the channel
+/// correlation *deviates* from unit slope enough to repay the CTE
+/// sub-image; this pair covers the complementary regime.
+///
+/// ## Wire / inverse ordering
+///
+/// ```text
+/// optional-transform =
+///   %b1 %b10                            -- §4.3 subtract-green (header-free)
+///   %b1 %b00 3BIT entropy-coded-image   -- §4.1 predictor-tx (sub-image)
+///   %b0                                 -- end of optional-transform list
+/// spatially-coded-image                 -- predictor residuals at full width
+/// ```
+///
+/// The decoder reads subtract-green first and predictor second (neither
+/// subsamples the width), then applies the inverses in reverse read
+/// order — inverse-predictor first (recovering the green-subtracted
+/// image), then add-green — exactly the generic chain
+/// [`crate::vp8l_transform::decode_lossless`] already walks, so no
+/// decoder change is required.
+///
+/// The predictor sub-image is built over the **subtract-green** image
+/// under `pred_strategy` (round-305 sweep); the chooser composes with
+/// `cache_code_bits` over the residual stream's literal tokens,
+/// identically to the other stacked paths.
+fn encode_with_subtract_green_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    cache_code_bits: Option<u32>,
+    pred_strategy: PredictorSubImageStrategy,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+
+    // ---- Transform #1 (read first): §4.3 subtract-green -------------
+    // Header-free: just the presence bit + the 2-bit type. The forward
+    // pass rewrites red/blue against green in place.
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
+    let mut transformed = pixels.to_vec();
+    apply_subtract_green(&mut transformed);
+
+    // ---- Transform #2 (read second): §4.1 predictor-tx --------------
+    // Built over the subtract-green image at full `width × height`
+    // (§4.3 does not subsample, so the decoder's `current_width` still
+    // equals `width` here and matches `ptw`).
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    debug_assert!((2..=9).contains(&size_bits));
+    w.write_bits((size_bits - 2) as u32, 3);
+    let (predictor_image, ptw, _pth) =
+        build_predictor_image_strategy(&transformed, width, height, size_bits, pred_strategy);
+    write_entropy_coded_image_literals(&mut w, &predictor_image);
+
+    // End of optional-transform list (`%b0`).
+    w.write_bit(false);
+
+    // ---- Forward-transform the transformed image into residuals -----
+    let mut residuals = vec![0u32; transformed.len()];
+    apply_forward_predictor(
+        &transformed,
+        &mut residuals,
+        width,
+        height,
+        &predictor_image,
+        ptw,
+        size_bits,
+    );
+
+    // ---- Spatially-coded-image of the residuals at full width -------
+    let mut tokens = tokenize_lz77(&residuals);
+    if let Some(bits) = cache_code_bits {
+        tokens = cacheify_tokens(&tokens, &residuals, bits);
+    }
+    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
+
+    w.into_bytes()
+}
+
 // ---- §6.2.2 multi-meta-prefix (entropy-image) encoder ----------------
 
 /// Default `prefix_bits` candidate the §6.2.2 multi-meta-prefix
@@ -5622,6 +5713,40 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         for cand in pred_candidates {
             if cand.len() < best.len() {
                 best = cand;
+            }
+        }
+
+        // Round 383: §3.5 stacked-transform candidate — §4.3
+        // subtract-green chained with the §4.1 predictor over the
+        // green-decorrelated image. The header-free §4.3 front end
+        // removes unit-slope red/blue-vs-green correlation without the
+        // §4.2 chain's per-block CTE sub-image bytes; the predictor then
+        // removes the surviving spatial correlation. Complements the
+        // round-303/304 chains on natural content whose channel
+        // correlation is close to unit slope. Non-regressing: kept only
+        // when strictly smaller than the running best. Two `size_bits`
+        // are swept — per-region and maximal single-block — each across
+        // the round-305 predictor-strategy and round-148 cache-bits
+        // sweeps.
+        let mut sgp_size_bits = vec![pred_size_bits];
+        if try_pred_single_block {
+            sgp_size_bits.push(pred_single_block_size_bits);
+        }
+        for &sb in &sgp_size_bits {
+            for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                let cand = select_best_cache_bits(|cache_bits| {
+                    encode_with_subtract_green_predictor(
+                        pixels,
+                        width,
+                        height,
+                        sb,
+                        cache_bits,
+                        pred_strategy,
+                    )
+                });
+                if cand.len() < best.len() {
+                    best = cand;
+                }
             }
         }
     }
@@ -9452,6 +9577,149 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round 383: the two-transform §4.3 subtract-green → §4.1 predictor
+    /// stack must round-trip bit-exactly through the decoder. The decoder
+    /// reads subtract-green first and predictor second (neither subsamples
+    /// the width), then applies the inverses last-first — inverse-predictor,
+    /// add-green — recovering the original pixels. Exercise unit-slope
+    /// photo-like content across a default and single-block `size_bits`,
+    /// with and without a residual-stream color cache, across the
+    /// round-305 predictor-strategy sweep.
+    #[test]
+    fn round_383_subtract_green_predictor_round_trips_through_decoder() {
+        let (w, h) = (128u32, 96u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x7ab3_11ce;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (state >> 27) as i32 - 16;
+                let g = ((x + y) % 256) as i32;
+                // Unit-slope channel correlation: r/b track g exactly plus
+                // a small offset + noise — the regime §4.3 targets.
+                let r = (g + 17 + n).clamp(0, 255) as u32;
+                let b = (g - 9 - n).clamp(0, 255) as u32;
+                pixels.push(0xff00_0000 | (r << 16) | ((g as u32) << 8) | b);
+            }
+        }
+        for size_bits in [DEFAULT_PREDICTOR_SIZE_BITS, 7u8] {
+            for cache in [None, Some(4u32), Some(9u32)] {
+                for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
+                    let stream = encode_with_subtract_green_predictor(
+                        &pixels,
+                        w,
+                        h,
+                        size_bits,
+                        cache,
+                        pred_strategy,
+                    );
+                    let header = build_image_header(w, h, false);
+                    let mut payload = header.to_vec();
+                    payload.extend_from_slice(&stream);
+                    let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                        .expect("decode subtract-green+predictor round trip");
+                    assert_eq!(
+                        decoded.pixels(),
+                        pixels.as_slice(),
+                        "round-trip mismatch size_bits={size_bits} cache={cache:?} strategy={pred_strategy:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round 383: the smallest admissible input (exactly `block × block`)
+    /// still round-trips through the subtract-green → predictor stack, and
+    /// non-opaque alpha survives the chain (§4.3 leaves alpha untouched;
+    /// the §4.1 residuals carry it).
+    #[test]
+    fn round_383_subtract_green_predictor_single_block_and_alpha_round_trip() {
+        let block = 1u32 << DEFAULT_PREDICTOR_SIZE_BITS;
+        let (w, h) = (block, block);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let g = (x * 5 + y * 3) % 256;
+                let r = (g + 27) % 256;
+                let b = (g + 180) % 256;
+                let a = 255 - ((x * 7 + y) % 96);
+                pixels.push((a << 24) | (r << 16) | (g << 8) | b);
+            }
+        }
+        let stream = encode_with_subtract_green_predictor(
+            &pixels,
+            w,
+            h,
+            DEFAULT_PREDICTOR_SIZE_BITS,
+            None,
+            PredictorSubImageStrategy::L1,
+        );
+        let header = build_image_header(w, h, true);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+            .expect("decode single-block subtract-green+predictor");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 383: on unit-slope channel-correlated smooth content the
+    /// subtract-green → predictor 2-stack beats the plain single-transform
+    /// predictor path (the header-free §4.3 front end removes the
+    /// red/blue-vs-green correlation the predictor alone cannot), and the
+    /// full super-chooser output is never larger than either.
+    #[test]
+    fn round_383_subtract_green_predictor_beats_plain_predictor_on_unit_slope() {
+        let (w, h) = (96u32, 96u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x0f1e_2d3c;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let n = (state >> 28) as i32 - 8;
+                // Noise lives in green; red / blue track green EXACTLY at
+                // constant per-channel mod-256 offsets. §4.3 collapses the
+                // red / blue planes to constants (near-zero residual mass);
+                // the plain predictor must instead code green's noise in
+                // all three channels.
+                let g = ((x * 2 + y) as i32 + n).rem_euclid(256) as u32;
+                let r = (g + 40) & 0xff;
+                let b = (g + 231) & 0xff;
+                pixels.push(0xff00_0000 | (r << 16) | (g << 8) | b);
+            }
+        }
+
+        let plain_pred = select_best_cache_bits(|cache_bits| {
+            encode_with_predictor(&pixels, w, h, DEFAULT_PREDICTOR_SIZE_BITS, cache_bits, w)
+        });
+        let sg_pred = select_best_cache_bits(|cache_bits| {
+            encode_with_subtract_green_predictor(
+                &pixels,
+                w,
+                h,
+                DEFAULT_PREDICTOR_SIZE_BITS,
+                cache_bits,
+                PredictorSubImageStrategy::L1,
+            )
+        });
+        assert!(
+            sg_pred.len() < plain_pred.len(),
+            "subtract-green+predictor ({}) should beat plain predictor ({}) on unit-slope content",
+            sg_pred.len(),
+            plain_pred.len()
+        );
+
+        // The super-chooser must be at least as small as the new stack and
+        // still round-trip.
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(chosen.len() <= sg_pred.len());
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&chosen);
+        let decoded =
+            crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode chosen stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
     }
 
     /// Round 304: the smallest admissible input (exactly `block × block`)
