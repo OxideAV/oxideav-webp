@@ -1764,20 +1764,24 @@ const DP_LONG_MATCH_INHERIT: usize = 64;
 /// may not be the globally longest match at their position, but every
 /// entry remains a *valid* §5.2.2 copy, which is all the exact-cost
 /// arbiter needs.
-fn compute_dp_matches(pixels: &[u32]) -> Vec<Option<(usize, usize)>> {
+fn compute_dp_matches(pixels: &[u32], image_width: u32) -> Vec<Option<DpMatch>> {
     let n = pixels.len();
-    let mut matches: Vec<Option<(usize, usize)>> = vec![None; n];
+    let mut matches: Vec<Option<DpMatch>> = vec![None; n];
     let mut matcher = Lz77Matcher::new(pixels);
     let mut pos = 0usize;
     while pos < n {
         let m0 = matcher.find(pos);
-        matches[pos] = m0;
+        matches[pos] = m0.map(|(len, dist)| DpMatch::new(len, dist, image_width));
         matcher.insert(pos);
-        if let Some((len, dist)) = m0 {
+        if let Some((len, _)) = m0 {
             if len >= DP_LONG_MATCH_INHERIT {
                 let inherit = len - DP_LONG_MATCH_INHERIT;
+                // The distance-code decomposition is shared by every
+                // inherited entry (same distance); only the length
+                // decomposition changes with `k`.
+                let base = matches[pos].expect("just stored");
                 for k in 1..=inherit {
-                    matches[pos + k] = Some((len - k, dist));
+                    matches[pos + k] = Some(base.with_length(len - k));
                     matcher.insert(pos + k);
                 }
                 pos += inherit + 1;
@@ -1787,6 +1791,55 @@ fn compute_dp_matches(pixels: &[u32]) -> Vec<Option<(usize, usize)>> {
         pos += 1;
     }
     matches
+}
+
+/// One §5.2.2 copy candidate in the round-383 DP match table, with the
+/// cost-model-independent decompositions precomputed (round 388): the
+/// DP inner loop previously re-derived the distance-map code
+/// ([`pixel_distance_to_distance_code`], an up-to-120-entry scan) and
+/// the two [`value_to_prefix`] splits per position per DP call — 24
+/// times per candidate across the §5.2.3 cache-bits sweep — even
+/// though all of them depend only on `(len, dist, stream width)`,
+/// which the [`best_stream_tokens`] memo pins.
+#[derive(Clone, Copy)]
+struct DpMatch {
+    len: u32,
+    dist: u32,
+    /// §5.2.2 length-prefix decomposition of `len`.
+    len_prefix: u16,
+    len_extra_bits: u16,
+    /// §5.2.2 distance-code decomposition of `dist` at the memoized
+    /// stream width (prefix of the *distance code*, i.e. after the
+    /// §5.2.2 distance-map substitution).
+    dist_prefix: u16,
+    dist_extra_bits: u16,
+}
+
+impl DpMatch {
+    fn new(len: usize, dist: usize, image_width: u32) -> Self {
+        let raw_code = pixel_distance_to_distance_code(dist, image_width);
+        let (dist_prefix, dist_extra_bits, _) = value_to_prefix(raw_code);
+        let (len_prefix, len_extra_bits, _) = value_to_prefix(len as u32);
+        Self {
+            len: len as u32,
+            dist: dist as u32,
+            len_prefix: len_prefix as u16,
+            len_extra_bits: len_extra_bits as u16,
+            dist_prefix: dist_prefix as u16,
+            dist_extra_bits: dist_extra_bits as u16,
+        }
+    }
+
+    /// The same distance with a shorter (inherited/truncated) length.
+    fn with_length(self, len: usize) -> Self {
+        let (len_prefix, len_extra_bits, _) = value_to_prefix(len as u32);
+        Self {
+            len: len as u32,
+            len_prefix: len_prefix as u16,
+            len_extra_bits: len_extra_bits as u16,
+            ..self
+        }
+    }
 }
 
 /// Cost (in pass-1 model bits, `u32`) assigned to a symbol the cost
@@ -1819,7 +1872,7 @@ const DP_UNSEEN_SYMBOL_COST: u32 = 17;
 fn dp_refine_tokens(
     pixels: &[u32],
     image_width: u32,
-    matches: &[Option<(usize, usize)>],
+    matches: &[Option<DpMatch>],
     cost_source: &[Token],
     color_cache_size: usize,
 ) -> Vec<Token> {
@@ -1844,6 +1897,18 @@ fn dp_refine_tokens(
     let alpha_len = build_code_lengths(&freqs.alpha);
     let dist_len = build_code_lengths(&freqs.distance);
 
+    // Round 388: the ladder lengths' §5.2.2 decompositions are fixed;
+    // fold the cost model over them once per DP call so the per-
+    // position inner loop below is pure table lookups (the per-match
+    // decompositions were likewise precomputed into [`DpMatch`]).
+    let ladder_bits: Vec<u64> = DP_LENGTH_LADDER
+        .iter()
+        .map(|&l| {
+            let (len_prefix, len_extra, _) = value_to_prefix(l as u32);
+            (cost_of(&green_len, 256 + len_prefix as usize) + len_extra) as u64
+        })
+        .collect();
+
     // ---- Backward DP over token choices.
     // cost[i] = model bits to encode pixels[i..]; choice[i] = 0 for a
     // literal, else the chosen copy length.
@@ -1861,25 +1926,28 @@ fn dp_refine_tokens(
             + cost_of(&alpha_len, a)) as u64;
         let mut best = lit_bits + cost[i + 1];
         let mut best_len = 0u32;
-        if let Some((max_len, dist)) = matches[i] {
-            let raw_code = pixel_distance_to_distance_code(dist, image_width);
-            let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
-            let dist_bits = (cost_of(&dist_len, dist_prefix as usize) + dist_extra) as u64;
-            let mut consider = |len: usize| {
-                let (len_prefix, len_extra, _) = value_to_prefix(len as u32);
-                let len_bits = (cost_of(&green_len, 256 + len_prefix as usize) + len_extra) as u64;
-                let total = len_bits + dist_bits + cost[i + len];
-                if total < best {
-                    best = total;
-                    best_len = len as u32;
-                }
-            };
-            consider(max_len);
-            for &l in DP_LENGTH_LADDER.iter() {
+        if let Some(m) = matches[i] {
+            let dist_bits =
+                (cost_of(&dist_len, m.dist_prefix as usize) + m.dist_extra_bits as u32) as u64;
+            let max_len = m.len as usize;
+            // Full match length (decomposition precomputed).
+            let full_bits =
+                (cost_of(&green_len, 256 + m.len_prefix as usize) + m.len_extra_bits as u32) as u64;
+            let total = full_bits + dist_bits + cost[i + max_len];
+            if total < best {
+                best = total;
+                best_len = m.len;
+            }
+            // Ladder truncations below the full length.
+            for (k, &l) in DP_LENGTH_LADDER.iter().enumerate() {
                 if l >= max_len {
                     break;
                 }
-                consider(l);
+                let total = ladder_bits[k] + dist_bits + cost[i + l];
+                if total < best {
+                    best = total;
+                    best_len = l as u32;
+                }
             }
         }
         cost[i] = best;
@@ -1895,10 +1963,10 @@ fn dp_refine_tokens(
             tokens.push(Token::Literal(pixels[i]));
             i += 1;
         } else {
-            let (_, dist) = matches[i].expect("choice recorded a match");
+            let m = matches[i].expect("choice recorded a match");
             tokens.push(Token::Copy {
                 length: c as usize,
-                distance: dist,
+                distance: m.dist as usize,
             });
             i += c as usize;
         }
@@ -1941,12 +2009,16 @@ fn best_stream_tokens_with_cost(
     /// super-chooser calls this function 12 times per candidate path —
     /// once per §5.2.3 cache-bits value — with an *identical* pixel
     /// buffer; only the cache-dependent cost model and the exact-cost
-    /// arbitration differ. Keyed by full pixel equality (no hashing),
-    /// so a hit is exact and the output is byte-deterministic.
+    /// arbitration differ. Keyed by full pixel equality (no hashing)
+    /// **plus** the stream width (round 388 — the [`DpMatch`] table
+    /// bakes in the width-dependent §5.2.2 distance-code
+    /// decompositions), so a hit is exact and the output is
+    /// byte-deterministic.
     struct PlanMemo {
         pixels: Vec<u32>,
+        width: u32,
         greedy: Vec<Token>,
-        matches: Vec<Option<(usize, usize)>>,
+        matches: Vec<Option<DpMatch>>,
     }
     thread_local! {
         static PLAN_MEMO: RefCell<Option<PlanMemo>> = const { RefCell::new(None) };
@@ -1954,12 +2026,13 @@ fn best_stream_tokens_with_cost(
 
     PLAN_MEMO.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let hit = matches!(&*slot, Some(m) if m.pixels == pixels);
+        let hit = matches!(&*slot, Some(m) if m.width == image_width && m.pixels == pixels);
         if !hit {
             *slot = Some(PlanMemo {
                 pixels: pixels.to_vec(),
+                width: image_width,
                 greedy: tokenize_lz77(pixels),
-                matches: compute_dp_matches(pixels),
+                matches: compute_dp_matches(pixels, image_width),
             });
         }
         let memo = slot.as_ref().expect("memo just populated");
