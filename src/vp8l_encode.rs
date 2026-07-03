@@ -1793,6 +1793,74 @@ fn compute_dp_matches(pixels: &[u32], image_width: u32) -> Vec<Option<DpMatch>> 
     matches
 }
 
+/// Round 388 — the per-position §5.2.2 copy-candidate tables the DP
+/// planner arbitrates over. `primary` is the hash-chain matcher's
+/// longest match ([`compute_dp_matches`]); `left` / `above` are the
+/// fixed-distance candidates ([`compute_special_matches`]) targeting
+/// the cheapest §5.2.2 distance-map codes: `dist = 1` (flat-run RLE)
+/// and `dist = image_width` (the `(0, 1)` "pixel above" 2D
+/// neighbourhood entry). The greedy matcher maximises *length*, so on
+/// photo-like content it routinely prefers a longer match at an
+/// expensive far distance over a slightly shorter row-above match
+/// whose distance code is near-free — candidates the DP can only
+/// weigh if the table carries them.
+struct DpMatchTables {
+    primary: Vec<Option<DpMatch>>,
+    /// One table per special distance, in [`special_distances`] order.
+    special: Vec<Vec<Option<DpMatch>>>,
+}
+
+/// The fixed §5.2.2 distances the DP carries per-position candidates
+/// for (round 388): the immediate scan-line neighbours (`1` = flat-run
+/// RLE, `2`) and the row-above 2D neighbourhood (`width − 1`, `width`,
+/// `width + 1` — the `(1, 1)` / `(0, 1)` / `(−1, 1)` distance-map
+/// entries), i.e. the §5.2.2 distance codes with the smallest map
+/// indices and therefore the cheapest prefix slots. Deduplicated and
+/// clamped to distances the image can actually express.
+fn special_distances(image_width: u32, n: usize) -> Vec<usize> {
+    let w = image_width as usize;
+    let mut out: Vec<usize> = Vec::new();
+    for d in [1usize, 2, w.saturating_sub(1), w, w + 1] {
+        if d >= 1 && d < n && !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Fixed-distance §5.2.2 copy candidates per position (round 388),
+/// one table per [`special_distances`] entry, from the O(n) backward
+/// recurrence `run[i] = eq(i) ? run[i + 1] + 1 : 0` per distance (a
+/// copy at distance `d` starting at `i` stays valid exactly while
+/// `pixels[j] == pixels[j - d]`, including the §5.2.2 overlapping
+/// self-referential case, because each decoded pixel reproduces the
+/// already-decoded pixel `d` back). Lengths cap at the §5.2.2 maximum
+/// the [`DP_LENGTH_LADDER`] tops out at.
+fn compute_special_matches(pixels: &[u32], image_width: u32) -> Vec<Vec<Option<DpMatch>>> {
+    const MAX_LEN: u32 = 4096;
+    let n = pixels.len();
+    let mut tables = Vec::new();
+    for d in special_distances(image_width, n) {
+        // Decomposition template: the distance-code scan runs once
+        // per distance, not once per position.
+        let template = DpMatch::new(1, d, image_width);
+        let mut table: Vec<Option<DpMatch>> = vec![None; n];
+        let mut run = 0u32;
+        for i in (d..n).rev() {
+            run = if pixels[i] == pixels[i - d] {
+                (run + 1).min(MAX_LEN)
+            } else {
+                0
+            };
+            if run > 0 {
+                table[i] = Some(template.with_length(run as usize));
+            }
+        }
+        tables.push(table);
+    }
+    tables
+}
+
 /// One §5.2.2 copy candidate in the round-383 DP match table, with the
 /// cost-model-independent decompositions precomputed (round 388): the
 /// DP inner loop previously re-derived the distance-map code
@@ -1869,10 +1937,11 @@ const DP_UNSEEN_SYMBOL_COST: u32 = 17;
 /// the cost model (only *which* valid partition is chosen); callers
 /// keep the result only when the exact
 /// [`prefix_codes_and_tokens_bits`] mirror says it is smaller.
+#[allow(clippy::too_many_arguments)]
 fn dp_refine_tokens(
     pixels: &[u32],
     image_width: u32,
-    matches: &[Option<DpMatch>],
+    tables: &DpMatchTables,
     cost_source: &[Token],
     color_cache_size: usize,
     cache_hits: Option<&[Option<u16>]>,
@@ -1914,9 +1983,12 @@ fn dp_refine_tokens(
 
     // ---- Backward DP over token choices.
     // cost[i] = model bits to encode pixels[i..]; choice[i] = 0 for a
-    // literal, else the chosen copy length.
+    // literal, else the chosen copy length (with choice_dist[i] the
+    // chosen candidate's distance — round 388, the candidate set is
+    // no longer a single match per position).
     let mut cost = vec![0u64; n + 1];
     let mut choice = vec![0u32; n];
+    let mut choice_dist = vec![0u32; n];
     for i in (0..n).rev() {
         // Round 388 — cache-aware literal pricing: when the §5.2.3
         // cache is enabled, a literal the DP emits at a cache-hit
@@ -1945,7 +2017,17 @@ fn dp_refine_tokens(
         };
         let mut best = lit_bits + cost[i + 1];
         let mut best_len = 0u32;
-        if let Some(m) = matches[i] {
+        let mut best_dist = 0u32;
+        // Round 388: arbitrate over the full candidate set — the
+        // matcher's longest match plus the [`special_distances`]
+        // fixed-distance candidates whose distance codes are the
+        // cheapest §5.2.2 has. Duplicated distances re-evaluate the
+        // same costs and are harmless.
+        for (ci, m) in std::iter::once(tables.primary[i])
+            .chain(tables.special.iter().map(|t| t[i]))
+            .enumerate()
+        {
+            let Some(m) = m else { continue };
             let dist_bits =
                 (cost_of(&dist_len, m.dist_prefix as usize) + m.dist_extra_bits as u32) as u64;
             let max_len = m.len as usize;
@@ -1956,8 +2038,18 @@ fn dp_refine_tokens(
             if total < best {
                 best = total;
                 best_len = m.len;
+                best_dist = m.dist;
             }
-            // Ladder truncations below the full length.
+            // Ladder truncations below the full length — primary
+            // match only (`ci == 0`). The fixed-distance candidates
+            // exist to expose *cheap-distance* runs; their pay-off is
+            // at full run length, and skipping their truncation walks
+            // recovers most of the widened candidate set's wall cost
+            // (corpus-swept: within ±2 bytes of the full-truncation
+            // form, −27% corpus encode time against it).
+            if ci != 0 {
+                continue;
+            }
             for (k, &l) in DP_LENGTH_LADDER.iter().enumerate() {
                 if l >= max_len {
                     break;
@@ -1966,11 +2058,13 @@ fn dp_refine_tokens(
                 if total < best {
                     best = total;
                     best_len = l as u32;
+                    best_dist = m.dist;
                 }
             }
         }
         cost[i] = best;
         choice[i] = best_len;
+        choice_dist[i] = best_dist;
     }
 
     // ---- Forward reconstruction.
@@ -1982,10 +2076,9 @@ fn dp_refine_tokens(
             tokens.push(Token::Literal(pixels[i]));
             i += 1;
         } else {
-            let m = matches[i].expect("choice recorded a match");
             tokens.push(Token::Copy {
                 length: c as usize,
-                distance: m.dist as usize,
+                distance: choice_dist[i] as usize,
             });
             i += c as usize;
         }
@@ -2037,7 +2130,7 @@ fn best_stream_tokens_with_cost(
         pixels: Vec<u32>,
         width: u32,
         greedy: Vec<Token>,
-        matches: Vec<Option<DpMatch>>,
+        tables: DpMatchTables,
     }
     thread_local! {
         static PLAN_MEMO: RefCell<Option<PlanMemo>> = const { RefCell::new(None) };
@@ -2051,7 +2144,10 @@ fn best_stream_tokens_with_cost(
                 pixels: pixels.to_vec(),
                 width: image_width,
                 greedy: tokenize_lz77(pixels),
-                matches: compute_dp_matches(pixels, image_width),
+                tables: DpMatchTables {
+                    primary: compute_dp_matches(pixels, image_width),
+                    special: compute_special_matches(pixels, image_width),
+                },
             });
         }
         let memo = slot.as_ref().expect("memo just populated");
@@ -2088,7 +2184,7 @@ fn best_stream_tokens_with_cost(
         let dp1 = finalize(dp_refine_tokens(
             pixels,
             image_width,
-            &memo.matches,
+            &memo.tables,
             &greedy,
             cache_size,
             cache_hits.as_deref(),
@@ -2102,7 +2198,7 @@ fn best_stream_tokens_with_cost(
         let dp2 = finalize(dp_refine_tokens(
             pixels,
             image_width,
-            &memo.matches,
+            &memo.tables,
             &dp1,
             cache_size,
             cache_hits.as_deref(),
@@ -8673,6 +8769,64 @@ mod tests {
                 rgba.push((state & 0xff) as u8);
             }
         }
+        let file = encode_webp_lossless(&rgba, w, h).unwrap();
+        let decoded = crate::decode_webp(&file).unwrap();
+        assert_eq!(decoded.frames[0].rgba, rgba);
+    }
+
+    /// Round 388 — the DP planner's fixed-distance candidate tables
+    /// ([`special_distances`]: 1, 2, width−1, width, width+1) surface
+    /// row-above / RLE copies the greedy matcher's longest-match rule
+    /// passes over, including *short* copies (length 1–2) at
+    /// near-free distance codes. This fixture makes those candidates
+    /// attractive — vertically repeating rows with one drifting noise
+    /// column, plus a flat band — and pins (a) the full round trip
+    /// through the production decoder and (b) that the DP planner's
+    /// stream actually contains a copy at one of the special
+    /// distances (guarding against the tables silently going dead).
+    #[test]
+    fn special_distance_candidates_round_trip_and_fire() {
+        let (w, h) = (24u32, 24u32);
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut state = 0x8642_1357u32;
+        for y in 0..h {
+            for x in 0..w {
+                let p = if y >= 20 {
+                    0xff10_2030 // flat band → dist-1 runs
+                } else if x == (y % w) {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    0xff00_0000 | (state >> 8) // drifting noise column
+                } else {
+                    // vertically repeating texture → dist-width runs
+                    0xff00_0000 | (((x * 11) % 251) << 8) | ((x * 7) % 253)
+                };
+                pixels.push(p);
+            }
+        }
+
+        // (a) Planner-level: some copy at a special distance fires.
+        let tokens = best_stream_tokens(&pixels, w, None);
+        let specials = special_distances(w, pixels.len());
+        assert!(
+            tokens.iter().any(|t| matches!(
+                t,
+                Token::Copy { distance, .. } if specials.contains(distance)
+            )),
+            "no special-distance copy in the planned stream"
+        );
+
+        // (b) End-to-end: byte-exact round trip through the decoder.
+        let rgba: Vec<u8> = pixels
+            .iter()
+            .flat_map(|&p| {
+                [
+                    ((p >> 16) & 0xff) as u8,
+                    ((p >> 8) & 0xff) as u8,
+                    (p & 0xff) as u8,
+                    ((p >> 24) & 0xff) as u8,
+                ]
+            })
+            .collect();
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
         let decoded = crate::decode_webp(&file).unwrap();
         assert_eq!(decoded.frames[0].rgba, rgba);
