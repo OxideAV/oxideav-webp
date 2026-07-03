@@ -1875,11 +1875,14 @@ fn dp_refine_tokens(
     matches: &[Option<DpMatch>],
     cost_source: &[Token],
     color_cache_size: usize,
+    cache_hits: Option<&[Option<u16>]>,
 ) -> Vec<Token> {
     let n = pixels.len();
     if n == 0 {
         return Vec::new();
     }
+    debug_assert!(cache_hits.map_or(true, |h| h.len() == n));
+    debug_assert!(cache_hits.is_none() == (color_cache_size == 0));
 
     // ---- Pass-1 cost model: per-symbol bit costs from `cost_source`.
     let freqs = count_frequencies(cost_source, color_cache_size, image_width);
@@ -1915,15 +1918,31 @@ fn dp_refine_tokens(
     let mut cost = vec![0u64; n + 1];
     let mut choice = vec![0u32; n];
     for i in (0..n).rev() {
-        let p = pixels[i];
-        let a = ((p >> 24) & 0xff) as usize;
-        let r = ((p >> 16) & 0xff) as usize;
-        let g = ((p >> 8) & 0xff) as usize;
-        let b = (p & 0xff) as usize;
-        let lit_bits = (cost_of(&green_len, g)
-            + cost_of(&red_len, r)
-            + cost_of(&blue_len, b)
-            + cost_of(&alpha_len, a)) as u64;
+        // Round 388 — cache-aware literal pricing: when the §5.2.3
+        // cache is enabled, a literal the DP emits at a cache-hit
+        // position is rewritten into a one-symbol `CacheRef` by the
+        // downstream `cacheify_tokens` pass (cache state is
+        // tokenization-independent — every decoded pixel is inserted,
+        // §5.2.3 — so hit positions are precomputable). Price it as
+        // the GREEN cache symbol it will become instead of the
+        // four-channel literal it won't be.
+        let lit_bits = match cache_hits.and_then(|h| h[i]) {
+            Some(ix) => cost_of(
+                &green_len,
+                256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + ix as usize,
+            ) as u64,
+            None => {
+                let p = pixels[i];
+                let a = ((p >> 24) & 0xff) as usize;
+                let r = ((p >> 16) & 0xff) as usize;
+                let g = ((p >> 8) & 0xff) as usize;
+                let b = (p & 0xff) as usize;
+                (cost_of(&green_len, g)
+                    + cost_of(&red_len, r)
+                    + cost_of(&blue_len, b)
+                    + cost_of(&alpha_len, a)) as u64
+            }
+        };
         let mut best = lit_bits + cost[i + 1];
         let mut best_len = 0u32;
         if let Some(m) = matches[i] {
@@ -2045,6 +2064,24 @@ fn best_stream_tokens_with_cost(
             }
         };
 
+        // Round 388 — per-position §5.2.3 cache-hit table for the DP's
+        // cache-aware literal pricing. Cache state is tokenization-
+        // independent (every decoded pixel is inserted in stream
+        // order), so hit positions and indices are a pure function of
+        // `(pixels, cache_code_bits)` — exactly the update walk
+        // `cacheify_tokens` performs on the chosen stream.
+        let cache_hits: Option<Vec<Option<u16>>> = cache_code_bits.map(|bits| {
+            let mut cache = EncoderColorCache::new(bits);
+            pixels
+                .iter()
+                .map(|&argb| {
+                    let hit = cache.contains(argb).map(|ix| ix as u16);
+                    cache.insert(argb);
+                    hit
+                })
+                .collect()
+        });
+
         let greedy = finalize(memo.greedy.clone());
         let greedy_bits = prefix_codes_and_tokens_bits(&greedy, cache_size, image_width);
 
@@ -2054,6 +2091,7 @@ fn best_stream_tokens_with_cost(
             &memo.matches,
             &greedy,
             cache_size,
+            cache_hits.as_deref(),
         ));
         let dp1_bits = prefix_codes_and_tokens_bits(&dp1, cache_size, image_width);
 
@@ -2067,6 +2105,7 @@ fn best_stream_tokens_with_cost(
             &memo.matches,
             &dp1,
             cache_size,
+            cache_hits.as_deref(),
         ));
         let dp2_bits = prefix_codes_and_tokens_bits(&dp2, cache_size, image_width);
 
