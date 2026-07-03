@@ -797,6 +797,21 @@ impl WriteCode {
         write_normal_code_lengths(w, &self.lengths);
     }
 
+    /// Exact bit cost of [`Self::write_code_lengths`] — the cheaper of
+    /// the §3.7.2.1.1 simple form (when applicable) and the
+    /// §3.7.2.1.2 normal form. Used by the round-383 token-stream cost
+    /// mirror ([`prefix_codes_and_tokens_bits`]).
+    fn code_lengths_bits(&self) -> usize {
+        let normal_bits = normal_form_bits(&self.lengths);
+        if let Some(simple) = self.as_simple_form() {
+            let simple_bits = simple_form_bits(&simple);
+            if simple_bits <= normal_bits {
+                return simple_bits;
+            }
+        }
+        normal_bits
+    }
+
     /// If this code's length table is encodable with the §3.7.2.1.1 simple
     /// form (1 or 2 symbols at length 1, all others 0), return the symbol
     /// list `[symbol0]` or `[symbol0, symbol1]`. Otherwise return `None`.
@@ -1639,6 +1654,335 @@ struct Frequencies {
     blue: Vec<u32>,
     alpha: Vec<u32>,
     distance: Vec<u32>,
+}
+
+// ---- Round 383: cost-priced LZ77 token planning ----------------------
+
+/// Exact bit cost of [`write_prefix_codes_and_tokens`] for `tokens` —
+/// the five §3.7.2 prefix-code tables plus the LZ77-coded image body
+/// (canonical symbol lengths + §5.2.2 extra bits). This is a strict
+/// mirror of the writer, so comparing two token streams by this
+/// function is identical to comparing the byte lengths of the streams
+/// the writer would emit (the surrounding transform/cache/meta-prefix
+/// header bits are the same for both).
+fn prefix_codes_and_tokens_bits(
+    tokens: &[Token],
+    color_cache_size: usize,
+    image_width: u32,
+) -> usize {
+    let freqs = count_frequencies(tokens, color_cache_size, image_width);
+    let green_code = WriteCode::from_freqs(&freqs.green);
+    let red_code = WriteCode::from_freqs(&freqs.red);
+    let blue_code = WriteCode::from_freqs(&freqs.blue);
+    let alpha_code = WriteCode::from_freqs(&freqs.alpha);
+    let dist_code = if freqs.distance.iter().any(|&f| f > 0) {
+        WriteCode::from_freqs(&freqs.distance)
+    } else {
+        WriteCode::empty(40)
+    };
+
+    let mut bits = green_code.code_lengths_bits()
+        + red_code.code_lengths_bits()
+        + blue_code.code_lengths_bits()
+        + alpha_code.code_lengths_bits()
+        + dist_code.code_lengths_bits();
+
+    // Per-symbol cost helper: a single-leaf code writes 0 bits.
+    let sym_bits = |code: &WriteCode, sym: usize| -> usize {
+        if code.single.is_some() {
+            0
+        } else {
+            code.lengths[sym] as usize
+        }
+    };
+
+    for &tok in tokens {
+        match tok {
+            Token::Literal(p) => {
+                let a = ((p >> 24) & 0xff) as usize;
+                let r = ((p >> 16) & 0xff) as usize;
+                let g = ((p >> 8) & 0xff) as usize;
+                let b = (p & 0xff) as usize;
+                bits += sym_bits(&green_code, g)
+                    + sym_bits(&red_code, r)
+                    + sym_bits(&blue_code, b)
+                    + sym_bits(&alpha_code, a);
+            }
+            Token::CacheRef { index } => {
+                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
+                bits += sym_bits(&green_code, sym);
+            }
+            Token::Copy { length, distance } => {
+                let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
+                bits += sym_bits(&green_code, 256 + len_prefix as usize) + len_extra as usize;
+                let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
+                bits += sym_bits(&dist_code, dist_prefix as usize) + dist_extra as usize;
+            }
+        }
+    }
+    bits
+}
+
+/// Copy-length candidates the round-383 DP tokenizer explores per
+/// position: the §5.2.2 length-prefix *band ends* (the longest length a
+/// given prefix symbol + extra-bits budget covers — maximal coverage
+/// per cost step) plus the short lengths below the first bands. The
+/// planner additionally always considers the matcher's full match
+/// length.
+const DP_LENGTH_LADDER: [usize; 22] = [
+    3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
+    4096,
+];
+
+/// Run length at (and above) which the DP tokenizer's match table
+/// stops searching per-position inside the run and inherits
+/// `(len - k, dist)` instead. Bounds the forward match pass at
+/// roughly greedy cost on run-heavy content; the trailing
+/// `DP_LONG_MATCH_INHERIT` positions of every run still get fresh
+/// searches so the DP sees run-crossing alternatives at the boundary.
+const DP_LONG_MATCH_INHERIT: usize = 64;
+
+/// Longest §5.2.2 match per position — the heavy half of the round-383
+/// DP tokenizer, shared across DP iterations and (via the
+/// [`best_stream_tokens`] memo) across the §5.2.3 cache-bits sweep.
+///
+/// Inside a long match the per-position search is both expensive
+/// (every `find` re-extends against the whole run) and redundant — the
+/// run found at `pos` covers `pos + k` at length `len - k` with the
+/// same distance. Positions deep inside a run therefore *inherit* the
+/// run instead of searching, down to a [`DP_LONG_MATCH_INHERIT`]-pixel
+/// tail where fresh searches resume (so the DP can still see
+/// run-crossing alternatives near the run boundary). Inherited entries
+/// may not be the globally longest match at their position, but every
+/// entry remains a *valid* §5.2.2 copy, which is all the exact-cost
+/// arbiter needs.
+fn compute_dp_matches(pixels: &[u32]) -> Vec<Option<(usize, usize)>> {
+    let n = pixels.len();
+    let mut matches: Vec<Option<(usize, usize)>> = vec![None; n];
+    let mut matcher = Lz77Matcher::new(pixels);
+    let mut pos = 0usize;
+    while pos < n {
+        let m0 = matcher.find(pos);
+        matches[pos] = m0;
+        matcher.insert(pos);
+        if let Some((len, dist)) = m0 {
+            if len >= DP_LONG_MATCH_INHERIT {
+                let inherit = len - DP_LONG_MATCH_INHERIT;
+                for k in 1..=inherit {
+                    matches[pos + k] = Some((len - k, dist));
+                    matcher.insert(pos + k);
+                }
+                pos += inherit + 1;
+                continue;
+            }
+        }
+        pos += 1;
+    }
+    matches
+}
+
+/// Cost (in pass-1 model bits, `u32`) assigned to a symbol the cost
+/// source never emitted. Slightly above the 15-bit §3.7.2 maximum code
+/// length so unseen symbols are discouraged but not forbidden — a
+/// refined stream may profitably use a length/distance band the greedy
+/// stream never touched.
+const DP_UNSEEN_SYMBOL_COST: u32 = 17;
+
+/// Round 383 — cost-priced re-tokenization of `pixels` (a shortest-path
+/// parse over the §5.2.2 literal/copy decision graph).
+///
+/// The greedy matcher maximises match *length*; the entropy stage
+/// prices tokens in *bits*. This planner re-parses the pixel stream
+/// against an explicit bit-cost model derived from `cost_source` (the
+/// per-channel Huffman code lengths of a previously produced token
+/// stream — the greedy parse on the first iteration): dynamic
+/// programming from the last pixel backwards, each position choosing
+/// the cheaper of "emit one literal" and "emit a copy of length L" for
+/// the matcher's longest match at that position truncated to each
+/// [`DP_LENGTH_LADDER`] band end. RFC 9649 §3.5's entropy-minimization
+/// license covers the encoder's freedom to pick any token partition
+/// whose copies stay within `1 <= distance <= position`; the decoder
+/// reproduces any such partition exactly.
+///
+/// Returns the refined token stream. Correctness does not depend on
+/// the cost model (only *which* valid partition is chosen); callers
+/// keep the result only when the exact
+/// [`prefix_codes_and_tokens_bits`] mirror says it is smaller.
+fn dp_refine_tokens(
+    pixels: &[u32],
+    image_width: u32,
+    matches: &[Option<(usize, usize)>],
+    cost_source: &[Token],
+    color_cache_size: usize,
+) -> Vec<Token> {
+    let n = pixels.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // ---- Pass-1 cost model: per-symbol bit costs from `cost_source`.
+    let freqs = count_frequencies(cost_source, color_cache_size, image_width);
+    let cost_of = |lengths: &[u8], sym: usize| -> u32 {
+        let l = lengths[sym] as u32;
+        if l == 0 {
+            DP_UNSEEN_SYMBOL_COST
+        } else {
+            l
+        }
+    };
+    let green_len = build_code_lengths(&freqs.green);
+    let red_len = build_code_lengths(&freqs.red);
+    let blue_len = build_code_lengths(&freqs.blue);
+    let alpha_len = build_code_lengths(&freqs.alpha);
+    let dist_len = build_code_lengths(&freqs.distance);
+
+    // ---- Backward DP over token choices.
+    // cost[i] = model bits to encode pixels[i..]; choice[i] = 0 for a
+    // literal, else the chosen copy length.
+    let mut cost = vec![0u64; n + 1];
+    let mut choice = vec![0u32; n];
+    for i in (0..n).rev() {
+        let p = pixels[i];
+        let a = ((p >> 24) & 0xff) as usize;
+        let r = ((p >> 16) & 0xff) as usize;
+        let g = ((p >> 8) & 0xff) as usize;
+        let b = (p & 0xff) as usize;
+        let lit_bits = (cost_of(&green_len, g)
+            + cost_of(&red_len, r)
+            + cost_of(&blue_len, b)
+            + cost_of(&alpha_len, a)) as u64;
+        let mut best = lit_bits + cost[i + 1];
+        let mut best_len = 0u32;
+        if let Some((max_len, dist)) = matches[i] {
+            let raw_code = pixel_distance_to_distance_code(dist, image_width);
+            let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
+            let dist_bits = (cost_of(&dist_len, dist_prefix as usize) + dist_extra) as u64;
+            let mut consider = |len: usize| {
+                let (len_prefix, len_extra, _) = value_to_prefix(len as u32);
+                let len_bits = (cost_of(&green_len, 256 + len_prefix as usize) + len_extra) as u64;
+                let total = len_bits + dist_bits + cost[i + len];
+                if total < best {
+                    best = total;
+                    best_len = len as u32;
+                }
+            };
+            consider(max_len);
+            for &l in DP_LENGTH_LADDER.iter() {
+                if l >= max_len {
+                    break;
+                }
+                consider(l);
+            }
+        }
+        cost[i] = best;
+        choice[i] = best_len;
+    }
+
+    // ---- Forward reconstruction.
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let c = choice[i];
+        if c == 0 {
+            tokens.push(Token::Literal(pixels[i]));
+            i += 1;
+        } else {
+            let (_, dist) = matches[i].expect("choice recorded a match");
+            tokens.push(Token::Copy {
+                length: c as usize,
+                distance: dist,
+            });
+            i += c as usize;
+        }
+    }
+    tokens
+}
+
+/// Round 383 — produce the best token stream for a spatially-coded
+/// image over `pixels`: the greedy §5.2.2 parse (+ §5.2.3 cacheify when
+/// enabled) and up to two cost-priced DP re-parses, scored by the exact
+/// [`prefix_codes_and_tokens_bits`] writer mirror; the byte-cheapest
+/// stream wins, so the result never regresses the greedy baseline.
+///
+/// The second DP iteration re-derives the cost model from the first
+/// refinement's own histogram (the code lengths shift once the token
+/// mix changes); it runs only when the first iteration improved the
+/// exact cost.
+fn best_stream_tokens(
+    pixels: &[u32],
+    image_width: u32,
+    cache_code_bits: Option<u32>,
+) -> Vec<Token> {
+    use std::cell::RefCell;
+
+    /// Single-slot per-thread memo for the two heavy per-pixel-buffer
+    /// passes (the greedy parse and the DP match table). The
+    /// super-chooser calls this function 12 times per candidate path —
+    /// once per §5.2.3 cache-bits value — with an *identical* pixel
+    /// buffer; only the cache-dependent cost model and the exact-cost
+    /// arbitration differ. Keyed by full pixel equality (no hashing),
+    /// so a hit is exact and the output is byte-deterministic.
+    struct PlanMemo {
+        pixels: Vec<u32>,
+        greedy: Vec<Token>,
+        matches: Vec<Option<(usize, usize)>>,
+    }
+    thread_local! {
+        static PLAN_MEMO: RefCell<Option<PlanMemo>> = const { RefCell::new(None) };
+    }
+
+    PLAN_MEMO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let hit = matches!(&*slot, Some(m) if m.pixels == pixels);
+        if !hit {
+            *slot = Some(PlanMemo {
+                pixels: pixels.to_vec(),
+                greedy: tokenize_lz77(pixels),
+                matches: compute_dp_matches(pixels),
+            });
+        }
+        let memo = slot.as_ref().expect("memo just populated");
+
+        let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
+        let finalize = |raw: Vec<Token>| -> Vec<Token> {
+            match cache_code_bits {
+                Some(bits) => cacheify_tokens(&raw, pixels, bits),
+                None => raw,
+            }
+        };
+
+        let greedy = finalize(memo.greedy.clone());
+        let greedy_bits = prefix_codes_and_tokens_bits(&greedy, cache_size, image_width);
+
+        let dp1 = finalize(dp_refine_tokens(
+            pixels,
+            image_width,
+            &memo.matches,
+            &greedy,
+            cache_size,
+        ));
+        let dp1_bits = prefix_codes_and_tokens_bits(&dp1, cache_size, image_width);
+
+        if dp1_bits >= greedy_bits {
+            return greedy;
+        }
+
+        let dp2 = finalize(dp_refine_tokens(
+            pixels,
+            image_width,
+            &memo.matches,
+            &dp1,
+            cache_size,
+        ));
+        let dp2_bits = prefix_codes_and_tokens_bits(&dp2, cache_size, image_width);
+
+        if dp2_bits < dp1_bits {
+            dp2
+        } else {
+            dp1
+        }
+    })
 }
 
 /// Legacy §5.2.2 *scan-line* distance encoding (`distance_code = D + 120`).
@@ -3118,10 +3462,9 @@ fn encode_with_predictor(
     );
 
     // ---- Tokenise + emit the residual spatially-coded-image ----
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
 
     w.into_bytes()
@@ -3175,10 +3518,9 @@ fn encode_with_predictor_slack(
         size_bits,
     );
 
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
 
     w.into_bytes()
@@ -3230,10 +3572,9 @@ fn encode_with_predictor_entropy(
         size_bits,
     );
 
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
 
     w.into_bytes()
@@ -3289,10 +3630,9 @@ fn encode_with_predictor_entropy_subaware(
         size_bits,
     );
 
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
 
     w.into_bytes()
@@ -3873,10 +4213,9 @@ fn encode_with_color_transform_strategy(
     );
 
     // ---- Tokenise + emit the residual spatially-coded-image ----
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
 
     w.into_bytes()
@@ -4236,10 +4575,9 @@ fn encode_with_color_indexing_ordered(
     // identically zero, so the per-channel Huffman codes for those
     // three channels collapse to a 1-symbol prefix code each (almost
     // free header overhead).
-    let mut tokens = tokenize_lz77(&packed_image);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &packed_image, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&packed_image, packed_width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, packed_width);
 
     Some(w.into_bytes())
@@ -4409,10 +4747,9 @@ fn encode_with_color_indexing_predictor_ordered(
     );
 
     // ---- Spatially-coded-image of the residuals at packed_width -----
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, packed_width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, packed_width);
 
     Some(w.into_bytes())
@@ -4527,10 +4864,9 @@ fn encode_with_color_transform_predictor(
     );
 
     // ---- Spatially-coded-image of the residuals at full width -------
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
 
     w.into_bytes()
@@ -4658,10 +4994,9 @@ fn encode_with_color_transform_subtract_green_predictor(
     );
 
     // ---- Spatially-coded-image of the residuals at full width -------
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
 
     w.into_bytes()
@@ -4749,10 +5084,9 @@ fn encode_with_subtract_green_predictor(
     );
 
     // ---- Spatially-coded-image of the residuals at full width -------
-    let mut tokens = tokenize_lz77(&residuals);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &residuals, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&residuals, width, cache_code_bits);
     write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
 
     w.into_bytes()
@@ -5329,11 +5663,13 @@ fn write_meta_prefix_image(
 
     // Build the LZ77 token stream globally (matches the
     // single-group path's token sequence; the group selection happens
-    // per *symbol* during emission, not per *match*).
-    let mut tokens = tokenize_lz77(pixels);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, pixels, bits);
-    }
+    // per *symbol* during emission, not per *match*). Round 383: the
+    // cost-priced planner arbitrates greedy vs DP re-parses on the
+    // single-group cost mirror — a proxy here (the per-group codes
+    // shift the true cost), but the group split below is applied to
+    // whichever stream the proxy picked, so the result stays a valid
+    // §6.2.3 emission either way.
+    let tokens = best_stream_tokens(pixels, width, cache_code_bits);
 
     let buckets = split_tokens_by_group(&tokens, &index, width, actual_groups);
     let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
@@ -5541,10 +5877,9 @@ fn encode_literals_with_options(
     if subtract_green {
         apply_subtract_green(&mut working);
     }
-    let mut tokens = tokenize_lz77(&working);
-    if let Some(bits) = cache_code_bits {
-        tokens = cacheify_tokens(&tokens, &working, bits);
-    }
+    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
+    // arbitrated (see `best_stream_tokens`).
+    let tokens = best_stream_tokens(&working, image_width, cache_code_bits);
     encode_tokens(&tokens, subtract_green, cache_code_bits, image_width)
 }
 
@@ -6889,6 +7224,91 @@ mod tests {
                 "round-trip mismatch on normal-form code"
             );
         }
+    }
+
+    /// Round 383: [`prefix_codes_and_tokens_bits`] must equal the bit
+    /// count [`write_prefix_codes_and_tokens`] actually produces, for
+    /// token streams exercising literals, copies (length + distance
+    /// extra bits), and cache references.
+    #[test]
+    fn round_383_stream_cost_mirror_matches_writer() {
+        // Content with mixed literals + copies + cache hits.
+        let (w, h) = (48u32, 40u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xdead_beefu32;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let p = if y % 3 == 0 {
+                    // Repeat previous row → copies at distance `w`.
+                    0xff00_0000 | ((x % 7) * 30) << 8
+                } else {
+                    0xff00_0000 | ((state >> 8) & 0x00ff_ff00)
+                };
+                pixels.push(p);
+            }
+        }
+        for cache in [None, Some(5u32)] {
+            let mut tokens = tokenize_lz77(&pixels);
+            if let Some(bits) = cache {
+                tokens = cacheify_tokens(&tokens, &pixels, bits);
+            }
+            let cache_size = cache.map(|b| 1usize << b).unwrap_or(0);
+            let predicted = prefix_codes_and_tokens_bits(&tokens, cache_size, w);
+            let mut bw = BitWriter::new();
+            write_prefix_codes_and_tokens(&mut bw, &tokens, cache_size, w);
+            assert_eq!(
+                predicted,
+                bw.bit_position(),
+                "cost mirror mismatch (cache={cache:?})"
+            );
+        }
+    }
+
+    /// Round 383: the cost-priced planner never regresses the greedy
+    /// parse (exact-cost arbitration) and its output round-trips
+    /// through the decoder; on content mixing long cheap runs with
+    /// short expensive matches the DP parse must strictly beat greedy.
+    #[test]
+    fn round_383_dp_planner_beats_greedy_and_round_trips() {
+        // Rows alternate: (a) exact repeats of the previous row (long
+        // cheap copies), (b) noise rows in which the greedy matcher
+        // finds only short matches whose length+distance symbols cost
+        // more than the literals they replace.
+        let (w, h) = (96u32, 96u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state = 0x1234_5678u32;
+        for y in 0..h {
+            for x in 0..w {
+                let p = if y % 2 == 0 {
+                    let g = (x * 3) % 256;
+                    0xff00_0000 | (g << 16) | (g << 8) | g
+                } else {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    0xff00_0000 | ((state >> 8) & 0x00ff_ffff)
+                };
+                pixels.push(p);
+            }
+        }
+
+        let greedy = tokenize_lz77(&pixels);
+        let greedy_bits = prefix_codes_and_tokens_bits(&greedy, 0, w);
+        let planned = best_stream_tokens(&pixels, w, None);
+        let planned_bits = prefix_codes_and_tokens_bits(&planned, 0, w);
+        assert!(
+            planned_bits <= greedy_bits,
+            "planner must never regress greedy: {planned_bits} vs {greedy_bits}"
+        );
+
+        // The planned stream must reproduce the pixels through the real
+        // writer + decoder.
+        let stream = encode_tokens(&planned, false, None, w);
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded =
+            crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode planned stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
     }
 
     /// Round 383: expanding the RLE code-length tokens per the
