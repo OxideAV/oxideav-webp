@@ -28,20 +28,28 @@ and §3.5 stacked-transform candidate (including subtract-green →
 predictor and transform-stacked §6.2.2 multi-group main images) —
 sweeping `size_bits`, the §5.2.3 color cache, §4.4 palette orderings,
 and the §6.2.2 meta-prefix grouping — and emits the byte-shortest
-stream, so adding a candidate can never enlarge the output. Three
-round-383 mechanisms drive the compression density: run-length
-§3.7.2.1.2 code-length tables (codes 16/17/18, chosen per table by
-exact bit cost), cost-priced LZ77 token planning (a shortest-path
-re-parse against per-symbol Huffman prices, kept only when an exact
-writer-cost mirror says it is smaller), and agglomerative
-entropy-merge clustering of the §6.2.2 entropy image (per-block symbol
-histograms over the five §6.2.3 alphabets, one merge chain
-snapshotting every group count). On a 10-image mixed corpus the output
-is smaller than the reference encoder's best effort on 7 images (up to
-−28%) and within 9% on the rest; every stream is re-verified bit-exact
-through a black-box reference decode. The cost models only change
-which spec-legal stream is emitted; round-trips stay bit-exact
-regardless.
+stream, so adding a candidate can never enlarge the output. The
+compression density is driven by run-length §3.7.2.1.2 code-length
+tables (codes 16/17/18, chosen per table by exact bit cost),
+cost-priced LZ77 token planning (a shortest-path re-parse against
+per-symbol Huffman prices, kept only when an exact writer-cost mirror
+says it is smaller — round 388 widened it with cache-aware literal
+pricing and per-position candidate sets at the cheapest §5.2.2
+distances 1/2/w−1/w/w+1), and agglomerative entropy-merge clustering
+of the §6.2.2 entropy image (per-block symbol histograms over the five
+§6.2.3 alphabets, one merge chain snapshotting every group count).
+Round 388 also restructured the maximum-effort sweep so every
+cache-independent pass — transform forward passes, sub-image builds,
+clustering, the DP match table with its §5.2.2 decompositions, and
+each stream's cost tables — is built once and shared across the
+§5.2.3 cache-bits sweep, and candidates are *sized* through an exact
+mirror with only the winner written: corpus encode wall time −44% at
+byte-identical-or-smaller output. On a 10-image mixed corpus the
+output is smaller than the reference encoder's best effort on 9 of 10
+images (up to −28%) and within 2% on the photo-like remainder; every
+stream is re-verified bit-exact through a black-box reference decode.
+The cost models only change which spec-legal stream is emitted;
+round-trips stay bit-exact regardless.
 
 ## Install
 

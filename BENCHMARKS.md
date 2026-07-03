@@ -2521,3 +2521,69 @@ cache sweep).
 * New external-oracle direction-A test pins the round-383 wire shapes
   (multi-group entropy image, palette orderings, stacked chains, DP
   token streams) against the reference decoder binary.
+
+## Round-388 (2026-07-04) — cache-sweep hoists, DP table precompute, and DP candidate sets
+
+Round 388 executes the round-383 follow-ups: recover the encode
+wall-time the r383 density push spent (at unchanged bytes), then use
+part of the recovered budget on two byte-improving DP-planner
+extensions. Measured on a 10-image mixed corpus of the same classes as
+r383 (the six docs-fixture rows are byte-identical continuations of
+the r383 table; the four synthetic rows — gradient ramps, photo-like,
+chart-like A/B — were regenerated this round, so their byte columns
+are internally consistent but not comparable to r383's synthetic
+rows). Wall time is the full ten-image maximum-effort encode on the
+usual aarch64-apple-darwin host.
+
+### Step-by-step corpus movement
+
+| Step | Corpus bytes | Corpus encode wall |
+|---|---:|---:|
+| round-383 encoder (baseline) | 27 974 | 20.3 s |
+| 1. transform forward passes hoisted out of the §5.2.3 cache sweep (`PreparedTransform`) | 27 974 | 17.1 s |
+| 2. size-first cache sweep (exact `plan()` mirror, write winner only) | 27 974 | 16.6 s |
+| 3. clustering + transform chains hoisted out of the §6.2.2 meta-prefix cache sweeps | 27 974 | 15.9 s |
+| 4. §5.2.2 decompositions precomputed into the DP match table (`DpMatch`) | 27 974 | 9.2 s |
+| 5. cache-aware DP literal pricing | 27 908 | 9.1 s |
+| 6. per-position distance-candidate sets (dists 1, 2, w−1, w, w+1) | 27 838 | 12.6 s |
+| 7. shared per-stream cost tables (lengths-only mirror, one `count_frequencies` per stream) | 27 838 | 11.4 s |
+
+Steps 1–4 and 7 are byte-identical by construction (assert-verified on
+every corpus stream); steps 5–6 are byte-improving and non-regressing
+via the unchanged exact-cost arbitration. Net: **bytes −0.49%, wall
+−44%** vs the round-383 encoder.
+
+### Final standing vs the reference encoder's maximum effort
+
+| Image | r388 | reference | ratio |
+|---|---:|---:|---:|
+| 160×120 gradient ramps | 244 | 280 | 0.871 |
+| 128×128 natural tile | 644 | 768 | 0.839 |
+| 32×32 RGB docs fixture | 46 | 56 | 0.821 |
+| 32×32 RGBA docs fixture | 58 | 60 | 0.967 |
+| 64×64 color-cache stress | 158 | 162 | 0.975 |
+| 32×32 paletted fixture | 92 | 102 | 0.902 |
+| 64×64 cross-color fixture | 52 | 72 | 0.722 |
+| 160×120 photo-like (fractal + dither) | 24 654 | 24 202 | 1.019 |
+| 160×120 chart-like A | 640 | 646 | 0.991 |
+| 160×120 chart-like B | 1 250 | 1 290 | 0.969 |
+
+Byte-smaller than the reference encoder's best effort on **9 of 10**
+(r383: 7 of 10); the photo-like remainder is within 1.9%. On the
+docs-fixture rows shared with the r383 table: natural 672 → 644
+(−4.2%), paletted 96 → 92, others already at their r383 values.
+Every output re-verified bit-exact through a black-box reference
+decode on every measurement run.
+
+### Where the wall-time went / remains
+
+A sampling profile after step 7 ranks the remaining self-time:
+`dp_refine_tokens` (the widened backward DP itself), then
+`Lz77Matcher::find` (greedy parse + DP match-table build, one shared
+pass per unique residual buffer), then the per-stream
+`count_frequencies`/`build_code_lengths` cost-table builds. The
+natural next levers: deriving the greedy parse from the memoized
+match table (would halve the matcher passes, but must reproduce the
+lazy-matching parse byte-exactly), and a per-group exact mirror for
+the §6.2.2 meta-prefix sweeps (they still write full streams per
+cache value; the single-group sweep no longer does).
