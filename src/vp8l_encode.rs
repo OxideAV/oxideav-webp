@@ -797,48 +797,55 @@ impl WriteCode {
         write_normal_code_lengths(w, &self.lengths);
     }
 
-    /// Exact bit cost of [`Self::write_code_lengths`] — the cheaper of
-    /// the §3.7.2.1.1 simple form (when applicable) and the
-    /// §3.7.2.1.2 normal form. Used by the round-383 token-stream cost
-    /// mirror ([`prefix_codes_and_tokens_bits`]).
-    fn code_lengths_bits(&self) -> usize {
-        let normal_bits = normal_form_bits(&self.lengths);
-        if let Some(simple) = self.as_simple_form() {
-            let simple_bits = simple_form_bits(&simple);
-            if simple_bits <= normal_bits {
-                return simple_bits;
-            }
-        }
-        normal_bits
-    }
-
     /// If this code's length table is encodable with the §3.7.2.1.1 simple
     /// form (1 or 2 symbols at length 1, all others 0), return the symbol
     /// list `[symbol0]` or `[symbol0, symbol1]`. Otherwise return `None`.
     fn as_simple_form(&self) -> Option<Vec<usize>> {
-        let used: Vec<(usize, u8)> = self
-            .lengths
-            .iter()
-            .enumerate()
-            .filter_map(|(s, &l)| if l != 0 { Some((s, l)) } else { None })
-            .collect();
-        // Simple form requires 1 or 2 used symbols, each at length 1.
-        // §3.7.2.1.1: "code length 1. All other prefix code lengths are
-        // implicitly zeros."
-        if used.is_empty() || used.len() > 2 {
-            return None;
-        }
-        if used.iter().any(|&(_, l)| l != 1) {
-            return None;
-        }
-        // §3.7.2.1.1 first symbol is coded with 1 or 8 bits, so it must
-        // fit in [0..255]; second symbol always 8 bits, [0..255]. Anything
-        // beyond 255 can only be sent via the normal form.
-        if used.iter().any(|&(s, _)| s > 255) {
-            return None;
-        }
-        Some(used.iter().map(|&(s, _)| s).collect())
+        lengths_simple_form(&self.lengths)
     }
+}
+
+/// If a length table is encodable with the §3.7.2.1.1 simple form
+/// (1 or 2 symbols at length 1, all others 0), return the symbol list
+/// `[symbol0]` or `[symbol0, symbol1]`. Otherwise return `None`.
+/// (Round 388: factored out of [`WriteCode`] so the lengths-only
+/// [`CostLengths`] mirror shares the exact writer decision.)
+fn lengths_simple_form(lengths: &[u8]) -> Option<Vec<usize>> {
+    let used: Vec<(usize, u8)> = lengths
+        .iter()
+        .enumerate()
+        .filter_map(|(s, &l)| if l != 0 { Some((s, l)) } else { None })
+        .collect();
+    // Simple form requires 1 or 2 used symbols, each at length 1.
+    // §3.7.2.1.1: "code length 1. All other prefix code lengths are
+    // implicitly zeros."
+    if used.is_empty() || used.len() > 2 {
+        return None;
+    }
+    if used.iter().any(|&(_, l)| l != 1) {
+        return None;
+    }
+    // §3.7.2.1.1 first symbol is coded with 1 or 8 bits, so it must
+    // fit in [0..255]; second symbol always 8 bits, [0..255]. Anything
+    // beyond 255 can only be sent via the normal form.
+    if used.iter().any(|&(s, _)| s > 255) {
+        return None;
+    }
+    Some(used.iter().map(|&(s, _)| s).collect())
+}
+
+/// Exact bit cost of [`WriteCode::write_code_lengths`] for a length
+/// table — the cheaper of the §3.7.2.1.1 simple form (when
+/// applicable) and the §3.7.2.1.2 normal form.
+fn code_lengths_bits_of(lengths: &[u8]) -> usize {
+    let normal_bits = normal_form_bits(lengths);
+    if let Some(simple) = lengths_simple_form(lengths) {
+        let simple_bits = simple_form_bits(&simple);
+        if simple_bits <= normal_bits {
+            return simple_bits;
+        }
+    }
+    normal_bits
 }
 
 /// Precise bit-cost of the §3.7.2.1.1 *simple code length code* for the
@@ -1665,6 +1672,71 @@ struct Frequencies {
 
 // ---- Round 383: cost-priced LZ77 token planning ----------------------
 
+/// One §3.7.2 prefix code's *lengths-only* cost view (round 388): the
+/// exact-cost mirror and the DP pass-1 model need per-symbol code
+/// lengths and the table-write cost, never the canonical code
+/// *values* — so building them skips [`canonical_codes`] (the writer's
+/// [`WriteCode`] still computes values for actual emission).
+struct CostLengths {
+    lengths: Vec<u8>,
+    /// Number of symbols with a non-zero frequency; `1` selects the
+    /// single-leaf form whose symbols cost 0 bits on the wire.
+    used: usize,
+}
+
+impl CostLengths {
+    fn from_freqs(freqs: &[u32]) -> Self {
+        let used = freqs.iter().filter(|&&f| f > 0).count();
+        Self {
+            lengths: build_code_lengths(freqs),
+            used,
+        }
+    }
+
+    /// Exact per-symbol wire cost — 0 for the single-leaf form,
+    /// mirroring [`WriteCode::write_symbol`].
+    fn sym_bits(&self, sym: usize) -> usize {
+        if self.used == 1 {
+            0
+        } else {
+            self.lengths[sym] as usize
+        }
+    }
+
+    /// Exact [`WriteCode::write_code_lengths`] cost (the cheaper of
+    /// the §3.7.2.1.1 simple and §3.7.2.1.2 normal forms).
+    fn code_lengths_bits(&self) -> usize {
+        code_lengths_bits_of(&self.lengths)
+    }
+}
+
+/// The five per-stream [`CostLengths`] tables the exact mirror and
+/// the DP planner's pass-1 cost model share (round 388): one
+/// [`count_frequencies`] + [`build_code_lengths`] pass per token
+/// stream, where the pre-r388 shape re-counted and re-built them
+/// once in the mirror and once more in the next DP iteration's cost
+/// model.
+struct StreamCostTables {
+    green: CostLengths,
+    red: CostLengths,
+    blue: CostLengths,
+    alpha: CostLengths,
+    distance: CostLengths,
+}
+
+impl StreamCostTables {
+    fn build(tokens: &[Token], color_cache_size: usize, image_width: u32) -> Self {
+        let freqs = count_frequencies(tokens, color_cache_size, image_width);
+        Self {
+            green: CostLengths::from_freqs(&freqs.green),
+            red: CostLengths::from_freqs(&freqs.red),
+            blue: CostLengths::from_freqs(&freqs.blue),
+            alpha: CostLengths::from_freqs(&freqs.alpha),
+            distance: CostLengths::from_freqs(&freqs.distance),
+        }
+    }
+}
+
 /// Exact bit cost of [`write_prefix_codes_and_tokens`] for `tokens` —
 /// the five §3.7.2 prefix-code tables plus the LZ77-coded image body
 /// (canonical symbol lengths + §5.2.2 extra bits). This is a strict
@@ -1672,36 +1744,44 @@ struct Frequencies {
 /// function is identical to comparing the byte lengths of the streams
 /// the writer would emit (the surrounding transform/cache/meta-prefix
 /// header bits are the same for both).
+// Round 388: production consumers go through
+// `prefix_codes_and_tokens_bits_from` over shared tables; this
+// build-and-score wrapper is retained for the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn prefix_codes_and_tokens_bits(
     tokens: &[Token],
     color_cache_size: usize,
     image_width: u32,
 ) -> usize {
-    let freqs = count_frequencies(tokens, color_cache_size, image_width);
-    let green_code = WriteCode::from_freqs(&freqs.green);
-    let red_code = WriteCode::from_freqs(&freqs.red);
-    let blue_code = WriteCode::from_freqs(&freqs.blue);
-    let alpha_code = WriteCode::from_freqs(&freqs.alpha);
-    let dist_code = if freqs.distance.iter().any(|&f| f > 0) {
-        WriteCode::from_freqs(&freqs.distance)
+    let tables = StreamCostTables::build(tokens, color_cache_size, image_width);
+    prefix_codes_and_tokens_bits_from(&tables, tokens, image_width)
+}
+
+/// [`prefix_codes_and_tokens_bits`] over prebuilt [`StreamCostTables`]
+/// (round 388) — the arbitration loop builds each stream's tables once
+/// and reuses them here and in the next DP iteration's cost model.
+fn prefix_codes_and_tokens_bits_from(
+    tables: &StreamCostTables,
+    tokens: &[Token],
+    image_width: u32,
+) -> usize {
+    // The writer substitutes the §3.7.2.1.1 single-symbol-0 form for
+    // an all-empty distance table ([`WriteCode::empty`]); mirror its
+    // table cost exactly. (Its per-symbol cost never fires — an empty
+    // distance table means no Copy tokens.)
+    let dist_table_bits = if tables.distance.used == 0 {
+        let mut empty_freqs = vec![0u32; 40];
+        empty_freqs[0] = 1;
+        CostLengths::from_freqs(&empty_freqs).code_lengths_bits()
     } else {
-        WriteCode::empty(40)
+        tables.distance.code_lengths_bits()
     };
 
-    let mut bits = green_code.code_lengths_bits()
-        + red_code.code_lengths_bits()
-        + blue_code.code_lengths_bits()
-        + alpha_code.code_lengths_bits()
-        + dist_code.code_lengths_bits();
-
-    // Per-symbol cost helper: a single-leaf code writes 0 bits.
-    let sym_bits = |code: &WriteCode, sym: usize| -> usize {
-        if code.single.is_some() {
-            0
-        } else {
-            code.lengths[sym] as usize
-        }
-    };
+    let mut bits = tables.green.code_lengths_bits()
+        + tables.red.code_lengths_bits()
+        + tables.blue.code_lengths_bits()
+        + tables.alpha.code_lengths_bits()
+        + dist_table_bits;
 
     for &tok in tokens {
         match tok {
@@ -1710,21 +1790,21 @@ fn prefix_codes_and_tokens_bits(
                 let r = ((p >> 16) & 0xff) as usize;
                 let g = ((p >> 8) & 0xff) as usize;
                 let b = (p & 0xff) as usize;
-                bits += sym_bits(&green_code, g)
-                    + sym_bits(&red_code, r)
-                    + sym_bits(&blue_code, b)
-                    + sym_bits(&alpha_code, a);
+                bits += tables.green.sym_bits(g)
+                    + tables.red.sym_bits(r)
+                    + tables.blue.sym_bits(b)
+                    + tables.alpha.sym_bits(a);
             }
             Token::CacheRef { index } => {
                 let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
-                bits += sym_bits(&green_code, sym);
+                bits += tables.green.sym_bits(sym);
             }
             Token::Copy { length, distance } => {
                 let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
-                bits += sym_bits(&green_code, 256 + len_prefix as usize) + len_extra as usize;
+                bits += tables.green.sym_bits(256 + len_prefix as usize) + len_extra as usize;
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
                 let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
-                bits += sym_bits(&dist_code, dist_prefix as usize) + dist_extra as usize;
+                bits += tables.distance.sym_bits(dist_prefix as usize) + dist_extra as usize;
             }
         }
     }
@@ -1937,13 +2017,10 @@ const DP_UNSEEN_SYMBOL_COST: u32 = 17;
 /// the cost model (only *which* valid partition is chosen); callers
 /// keep the result only when the exact
 /// [`prefix_codes_and_tokens_bits`] mirror says it is smaller.
-#[allow(clippy::too_many_arguments)]
 fn dp_refine_tokens(
     pixels: &[u32],
-    image_width: u32,
     tables: &DpMatchTables,
-    cost_source: &[Token],
-    color_cache_size: usize,
+    cost_model: &StreamCostTables,
     cache_hits: Option<&[Option<u16>]>,
 ) -> Vec<Token> {
     let n = pixels.len();
@@ -1951,10 +2028,10 @@ fn dp_refine_tokens(
         return Vec::new();
     }
     debug_assert!(cache_hits.map_or(true, |h| h.len() == n));
-    debug_assert!(cache_hits.is_none() == (color_cache_size == 0));
 
-    // ---- Pass-1 cost model: per-symbol bit costs from `cost_source`.
-    let freqs = count_frequencies(cost_source, color_cache_size, image_width);
+    // ---- Pass-1 cost model: per-symbol bit costs from the previous
+    // stream's shared [`StreamCostTables`] (round 388 — previously
+    // re-counted + re-built here from the raw token stream).
     let cost_of = |lengths: &[u8], sym: usize| -> u32 {
         let l = lengths[sym] as u32;
         if l == 0 {
@@ -1963,11 +2040,11 @@ fn dp_refine_tokens(
             l
         }
     };
-    let green_len = build_code_lengths(&freqs.green);
-    let red_len = build_code_lengths(&freqs.red);
-    let blue_len = build_code_lengths(&freqs.blue);
-    let alpha_len = build_code_lengths(&freqs.alpha);
-    let dist_len = build_code_lengths(&freqs.distance);
+    let green_len = &cost_model.green.lengths;
+    let red_len = &cost_model.red.lengths;
+    let blue_len = &cost_model.blue.lengths;
+    let alpha_len = &cost_model.alpha.lengths;
+    let dist_len = &cost_model.distance.lengths;
 
     // Round 388: the ladder lengths' §5.2.2 decompositions are fixed;
     // fold the cost model over them once per DP call so the per-
@@ -1977,7 +2054,7 @@ fn dp_refine_tokens(
         .iter()
         .map(|&l| {
             let (len_prefix, len_extra, _) = value_to_prefix(l as u32);
-            (cost_of(&green_len, 256 + len_prefix as usize) + len_extra) as u64
+            (cost_of(green_len, 256 + len_prefix as usize) + len_extra) as u64
         })
         .collect();
 
@@ -2000,7 +2077,7 @@ fn dp_refine_tokens(
         // four-channel literal it won't be.
         let lit_bits = match cache_hits.and_then(|h| h[i]) {
             Some(ix) => cost_of(
-                &green_len,
+                green_len,
                 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + ix as usize,
             ) as u64,
             None => {
@@ -2009,10 +2086,10 @@ fn dp_refine_tokens(
                 let r = ((p >> 16) & 0xff) as usize;
                 let g = ((p >> 8) & 0xff) as usize;
                 let b = (p & 0xff) as usize;
-                (cost_of(&green_len, g)
-                    + cost_of(&red_len, r)
-                    + cost_of(&blue_len, b)
-                    + cost_of(&alpha_len, a)) as u64
+                (cost_of(green_len, g)
+                    + cost_of(red_len, r)
+                    + cost_of(blue_len, b)
+                    + cost_of(alpha_len, a)) as u64
             }
         };
         let mut best = lit_bits + cost[i + 1];
@@ -2029,11 +2106,11 @@ fn dp_refine_tokens(
         {
             let Some(m) = m else { continue };
             let dist_bits =
-                (cost_of(&dist_len, m.dist_prefix as usize) + m.dist_extra_bits as u32) as u64;
+                (cost_of(dist_len, m.dist_prefix as usize) + m.dist_extra_bits as u32) as u64;
             let max_len = m.len as usize;
             // Full match length (decomposition precomputed).
             let full_bits =
-                (cost_of(&green_len, 256 + m.len_prefix as usize) + m.len_extra_bits as u32) as u64;
+                (cost_of(green_len, 256 + m.len_prefix as usize) + m.len_extra_bits as u32) as u64;
             let total = full_bits + dist_bits + cost[i + max_len];
             if total < best {
                 best = total;
@@ -2178,18 +2255,22 @@ fn best_stream_tokens_with_cost(
                 .collect()
         });
 
+        // Round 388: each stream's cost tables are built once and
+        // shared between its exact-cost mirror and the next DP
+        // iteration's pass-1 model (previously each consumer
+        // re-counted frequencies and re-built the length tables).
         let greedy = finalize(memo.greedy.clone());
-        let greedy_bits = prefix_codes_and_tokens_bits(&greedy, cache_size, image_width);
+        let greedy_tables = StreamCostTables::build(&greedy, cache_size, image_width);
+        let greedy_bits = prefix_codes_and_tokens_bits_from(&greedy_tables, &greedy, image_width);
 
         let dp1 = finalize(dp_refine_tokens(
             pixels,
-            image_width,
             &memo.tables,
-            &greedy,
-            cache_size,
+            &greedy_tables,
             cache_hits.as_deref(),
         ));
-        let dp1_bits = prefix_codes_and_tokens_bits(&dp1, cache_size, image_width);
+        let dp1_tables = StreamCostTables::build(&dp1, cache_size, image_width);
+        let dp1_bits = prefix_codes_and_tokens_bits_from(&dp1_tables, &dp1, image_width);
 
         if dp1_bits >= greedy_bits {
             return (greedy, greedy_bits);
@@ -2197,13 +2278,12 @@ fn best_stream_tokens_with_cost(
 
         let dp2 = finalize(dp_refine_tokens(
             pixels,
-            image_width,
             &memo.tables,
-            &dp1,
-            cache_size,
+            &dp1_tables,
             cache_hits.as_deref(),
         ));
-        let dp2_bits = prefix_codes_and_tokens_bits(&dp2, cache_size, image_width);
+        let dp2_tables = StreamCostTables::build(&dp2, cache_size, image_width);
+        let dp2_bits = prefix_codes_and_tokens_bits_from(&dp2_tables, &dp2, image_width);
 
         if dp2_bits < dp1_bits {
             (dp2, dp2_bits)
