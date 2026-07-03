@@ -1147,7 +1147,14 @@ pub const MAX_MATCH: usize = 4096;
 const HASH_BITS: usize = 14;
 /// Cap on chain steps walked per position, bounding the matcher's worst
 /// case on adversarial inputs while keeping the common-case match quality.
-const MAX_CHAIN: usize = 64;
+///
+/// Round 383 raised this 64 → 256 after an A/B sweep on the 10-image
+/// measurement corpus: 256 was byte-smaller than 64 on every image
+/// (chart content −4.7%, natural −1.8%, gradient −2.6%) for ~25% more
+/// matcher time, while 1024 was non-monotone (smaller on two images,
+/// larger on two others — a deeper chain perturbs the greedy parse the
+/// DP planner prices against) and ~40% slower again, so 256 is kept.
+const MAX_CHAIN: usize = 256;
 
 /// A single emitted token in the §5.2.2 LZ77 stream: either a raw ARGB
 /// pixel (a §5.2.1 literal), a §5.2.3 color-cache reference, or a
