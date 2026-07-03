@@ -192,6 +192,131 @@ fn direction_a_our_lossless_encode_is_readable_by_reference_decoder() {
     );
 }
 
+/// Round 383 — direction A over the content regimes that trigger the
+/// round-383 encoder machinery: two-regime content (smooth + noisy →
+/// the §6.2.2 multi-group entropy image from the entropy-merge
+/// partition), palette content (§4.4 color indexing across the
+/// palette-ordering sweep), unit-slope channel-correlated content
+/// (§4.3 subtract-green → §4.1 predictor stack), and run/noise-mixed
+/// content (the cost-priced DP token planner). Each encode must decode
+/// bit-exactly through the reference decoder, proving the new wire
+/// shapes are universally readable.
+#[test]
+fn direction_a_round_383_encoder_paths_are_readable_by_reference_decoder() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH — install the WebP reference tools to exercise");
+        return;
+    };
+
+    let (w, h) = (96u32, 80u32);
+    let mut regimes: Vec<(&str, Vec<u8>)> = Vec::new();
+
+    // (1) Two-regime: smooth gradient top half, noise bottom half.
+    let mut two_regime = Vec::with_capacity((w * h * 4) as usize);
+    let mut state = 0x1357_9bdfu32;
+    for y in 0..h {
+        for x in 0..w {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if y < h / 2 {
+                let g = ((x + 2 * y) % 256) as u8;
+                two_regime.extend_from_slice(&[g, g, g, 0xff]);
+            } else {
+                two_regime.extend_from_slice(&[
+                    (state >> 8) as u8,
+                    (state >> 16) as u8,
+                    state as u8,
+                    0xff,
+                ]);
+            }
+        }
+    }
+    regimes.push(("two-regime", two_regime));
+
+    // (2) Palette: 12 colors in flat regions + dithered stripes.
+    let palette: [[u8; 4]; 12] = [
+        [0x10, 0x20, 0x30, 0xff],
+        [0x40, 0x50, 0x60, 0xff],
+        [0x70, 0x80, 0x90, 0xff],
+        [0xa0, 0xb0, 0xc0, 0xff],
+        [0xd0, 0xe0, 0xf0, 0xff],
+        [0x01, 0x02, 0x03, 0xff],
+        [0xff, 0x00, 0x00, 0xff],
+        [0x00, 0xff, 0x00, 0xff],
+        [0x00, 0x00, 0xff, 0xff],
+        [0xff, 0xff, 0x00, 0xff],
+        [0x00, 0xff, 0xff, 0xff],
+        [0xff, 0x00, 0xff, 0xff],
+    ];
+    let mut paletted = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = if x < w / 2 {
+                (y / 10) as usize % 6
+            } else {
+                6 + (((x ^ y) & 1) as usize) + 2 * ((y / 20) as usize % 3)
+            };
+            paletted.extend_from_slice(&palette[idx]);
+        }
+    }
+    regimes.push(("paletted", paletted));
+
+    // (3) Unit-slope channel correlation with green-carried noise.
+    let mut unit_slope = Vec::with_capacity((w * h * 4) as usize);
+    let mut state2 = 0x0f1e_2d3cu32;
+    for y in 0..h {
+        for x in 0..w {
+            state2 = state2.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let n = (state2 >> 26) as i32 - 32;
+            let g = ((x * 2 + y) as i32 + n).rem_euclid(256) as u8;
+            unit_slope.extend_from_slice(&[g.wrapping_add(40), g, g.wrapping_add(231), 0xff]);
+        }
+    }
+    regimes.push(("unit-slope", unit_slope));
+
+    // (4) Alternating exact-repeat rows and noise rows (DP planner bait).
+    let mut runs_noise = Vec::with_capacity((w * h * 4) as usize);
+    let mut state3 = 0xfeed_beefu32;
+    for y in 0..h {
+        for x in 0..w {
+            if y % 2 == 0 {
+                let g = ((x * 3) % 256) as u8;
+                runs_noise.extend_from_slice(&[g, g, g, 0xff]);
+            } else {
+                state3 = state3.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                runs_noise.extend_from_slice(&[
+                    (state3 >> 8) as u8,
+                    (state3 >> 16) as u8,
+                    state3 as u8,
+                    0xff,
+                ]);
+            }
+        }
+    }
+    regimes.push(("runs-noise", runs_noise));
+
+    let dir = tmp_dir("direction-a-r383");
+    for (tag, src) in regimes {
+        let file = encode_webp_lossless(&src, w, h).expect("encode_webp_lossless");
+        let in_path = dir.join(format!("{tag}.webp"));
+        let out_path = dir.join(format!("{tag}.pam"));
+        std::fs::write(&in_path, &file).expect("write our.webp");
+        let mut cmd = Command::new(&decoder_bin);
+        cmd.arg(&in_path)
+            .arg("-pam")
+            .arg("-o")
+            .arg(&out_path)
+            .arg("-quiet");
+        let _ = run_or_fail(&mut cmd);
+        let pam_bytes = std::fs::read(&out_path).expect("read decoded PAM");
+        let (rgba, ref_w, ref_h, depth) = parse_pam(&pam_bytes);
+        assert_eq!((ref_w, ref_h, depth), (w, h, 4), "{tag}: geometry");
+        assert_eq!(
+            rgba, src,
+            "{tag}: our encode must round-trip bit-exact through the reference decoder"
+        );
+    }
+}
+
 // ───────────── Direction B: our animation encode → reference mux info ───────
 
 /// Parse the reference muxing tool's `-info` output. We only assert on the
