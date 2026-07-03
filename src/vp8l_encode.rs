@@ -1921,6 +1921,19 @@ fn best_stream_tokens(
     image_width: u32,
     cache_code_bits: Option<u32>,
 ) -> Vec<Token> {
+    best_stream_tokens_with_cost(pixels, image_width, cache_code_bits).0
+}
+
+/// [`best_stream_tokens`] returning the winning stream **and** its
+/// exact [`prefix_codes_and_tokens_bits`] body cost (round 388). The
+/// arbitration already computes that cost for every contender; handing
+/// it to the caller lets the §5.2.3 cache-bits sweep size candidates
+/// without re-running the mirror — or the writer.
+fn best_stream_tokens_with_cost(
+    pixels: &[u32],
+    image_width: u32,
+    cache_code_bits: Option<u32>,
+) -> (Vec<Token>, usize) {
     use std::cell::RefCell;
 
     /// Single-slot per-thread memo for the two heavy per-pixel-buffer
@@ -1972,7 +1985,7 @@ fn best_stream_tokens(
         let dp1_bits = prefix_codes_and_tokens_bits(&dp1, cache_size, image_width);
 
         if dp1_bits >= greedy_bits {
-            return greedy;
+            return (greedy, greedy_bits);
         }
 
         let dp2 = finalize(dp_refine_tokens(
@@ -1985,9 +1998,9 @@ fn best_stream_tokens(
         let dp2_bits = prefix_codes_and_tokens_bits(&dp2, cache_size, image_width);
 
         if dp2_bits < dp1_bits {
-            dp2
+            (dp2, dp2_bits)
         } else {
-            dp1
+            (dp1, dp1_bits)
         }
     })
 }
@@ -6065,13 +6078,60 @@ impl PreparedTransform {
         write_spatially_coded_image(&mut w, &tokens, cache_code_bits, self.stream_width);
         w.into_bytes()
     }
+
+    /// Plan the cache-dependent tail for one §5.2.3 choice *without
+    /// writing it* (round 388): returns the winning token stream and
+    /// the exact byte length [`Self::finish`] would produce for it.
+    ///
+    /// The byte length is assembled from exact mirrors of every part
+    /// the writer emits: the already-written prelude bit count, the
+    /// §3.8.3 `color-cache-info` field (1 bit disabled / 5 bits
+    /// enabled), the `meta-prefix` selector bit (`%b0`, single group),
+    /// and the [`prefix_codes_and_tokens_bits`] body mirror the
+    /// round-383 arbitration already computes. The final partial byte
+    /// is zero-padded exactly as [`BitWriter::into_bytes`] pads it.
+    fn plan(&self, cache_code_bits: Option<u32>) -> (Vec<Token>, usize) {
+        let (tokens, body_bits) =
+            best_stream_tokens_with_cost(&self.residuals, self.stream_width, cache_code_bits);
+        let info_bits = match cache_code_bits {
+            Some(_) => 5, // `%b1` + 4-bit code_bits
+            None => 1,    // `%b0`
+        };
+        // + 1 for the single-group `meta-prefix` selector bit.
+        let total_bits = self.prelude.bit_position() + info_bits + 1 + body_bits;
+        (tokens, total_bits.div_ceil(8))
+    }
 }
 
-/// [`select_best_cache_bits`] over a shared [`PreparedTransform`]:
-/// the transform forward passes run once, only the cache-dependent
-/// tail is re-run per sweep value (round 388).
+/// [`select_best_cache_bits`] over a shared [`PreparedTransform`]
+/// (round 388): the transform forward passes run once; each sweep
+/// value is *sized* through the exact [`PreparedTransform::plan`]
+/// mirror and only the winning choice is actually written. Selection
+/// order and tie-breaks are identical to [`select_best_cache_bits`]
+/// (first strictly-smaller candidate wins), and the mirror equality
+/// `plan().1 == finish().len()` is pinned per-value by the
+/// `prepared_plan_len_matches_finish_across_cache_sweep` test plus a
+/// debug assertion on the winner here.
 fn select_best_cache_bits_prepared(prep: &PreparedTransform) -> Vec<u8> {
-    select_best_cache_bits(|cache_bits| prep.finish(cache_bits))
+    let (mut best_tokens, mut best_len) = prep.plan(None);
+    let mut best_cache: Option<u32> = None;
+    for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
+        let (tokens, len) = prep.plan(Some(bits));
+        if len < best_len {
+            best_tokens = tokens;
+            best_len = len;
+            best_cache = Some(bits);
+        }
+    }
+    let mut w = prep.prelude.clone();
+    write_spatially_coded_image(&mut w, &best_tokens, best_cache, prep.stream_width);
+    let bytes = w.into_bytes();
+    debug_assert_eq!(
+        bytes.len(),
+        best_len,
+        "plan() size mirror drifted from the writer"
+    );
+    bytes
 }
 
 /// Sweep §5.2.3 `cache_code_bits ∈ [1..11]` plus the disabled-cache
@@ -6105,6 +6165,11 @@ fn select_best_cache_bits_prepared(prep: &PreparedTransform) -> Vec<u8> {
 /// emitted code-length-table entry; the trade-off between hit rate
 /// and alphabet overhead is non-monotonic, which is why the chooser
 /// sweeps the full range instead of using a single heuristic value.
+// Round 388: production sweeps go through
+// `select_best_cache_bits_prepared`'s size-first mirror; this
+// write-everything sweep is retained as the test suite's brute-force
+// reference (`prepared_plan_len_matches_finish_across_cache_sweep`).
+#[cfg_attr(not(test), allow(dead_code))]
 fn select_best_cache_bits<F>(mut build_with_cache: F) -> Vec<u8>
 where
     F: FnMut(Option<u32>) -> Vec<u8>,
@@ -10658,6 +10723,57 @@ mod tests {
             Some(b) => vec![0u8; 200 - (b as usize)],
         });
         assert_eq!(chosen.len(), 50);
+    }
+
+    /// Round 388 — the size-first prepared sweep's `plan()` mirror must
+    /// equal the writer byte-for-byte on **every** §5.2.3 sweep value,
+    /// not just the winner: `select_best_cache_bits_prepared` picks the
+    /// minimum from planned sizes alone, so a drift on any value could
+    /// flip the selection. Sweeps three contrasting payloads through
+    /// three prepared-candidate shapes (no-transform literals,
+    /// subtract-green literals, §4.1 predictor) and asserts
+    /// `plan(c).1 == finish(c).len()` for all 12 cache choices, plus
+    /// end-to-end equality of the prepared sweep against a brute-force
+    /// write-everything sweep.
+    #[test]
+    fn prepared_plan_len_matches_finish_across_cache_sweep() {
+        let (w, h) = (16u32, 16u32);
+        let mut state = 0x0f1e_2d3cu32;
+        // Mixed payload: flat top (cache/RLE-friendly), noisy bottom.
+        let pixels: Vec<u32> = (0..(w * h))
+            .map(|i| {
+                if i < w * h / 2 {
+                    0xff20_4060
+                } else {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    0xff00_0000 | (state >> 8)
+                }
+            })
+            .collect();
+
+        let preps = [
+            prepare_literals(&pixels, false, w),
+            prepare_literals(&pixels, true, w),
+            prepare_with_predictor(&pixels, w, h, 4, w),
+        ];
+        for (pi, prep) in preps.iter().enumerate() {
+            for cache in
+                std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+            {
+                let (_, planned_len) = prep.plan(cache);
+                let written = prep.finish(cache);
+                assert_eq!(
+                    planned_len,
+                    written.len(),
+                    "prep #{pi}: plan/finish drift at cache {cache:?}"
+                );
+            }
+            // The size-first sweep must reproduce the write-everything
+            // sweep exactly (same bytes, not just the same length).
+            let brute = select_best_cache_bits(|c| prep.finish(c));
+            let planned = select_best_cache_bits_prepared(prep);
+            assert_eq!(brute, planned, "prep #{pi}: sweep selection drift");
+        }
     }
 
     /// On every payload, the round-148 chooser produces a stream at
