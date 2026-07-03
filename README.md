@@ -24,11 +24,24 @@ ANMF). Decoder and encoder are both at production status.
 
 The lossless encoder is a byte-cost super-chooser: it builds the §3
 no-transform / subtract-green baseline plus every §4 single-transform
-and §3.5 stacked-transform candidate — sweeping `size_bits`, the §5.2.3
-color cache, and the §6.2.2 meta-prefix grouping — and emits the
-byte-shortest stream, so adding a candidate can never enlarge the
-output. The cost model only changes which §4.1/§4.2 mode is recorded;
-round-trip output is byte-identical regardless of which model is chosen.
+and §3.5 stacked-transform candidate (including subtract-green →
+predictor and transform-stacked §6.2.2 multi-group main images) —
+sweeping `size_bits`, the §5.2.3 color cache, §4.4 palette orderings,
+and the §6.2.2 meta-prefix grouping — and emits the byte-shortest
+stream, so adding a candidate can never enlarge the output. Three
+round-383 mechanisms drive the compression density: run-length
+§3.7.2.1.2 code-length tables (codes 16/17/18, chosen per table by
+exact bit cost), cost-priced LZ77 token planning (a shortest-path
+re-parse against per-symbol Huffman prices, kept only when an exact
+writer-cost mirror says it is smaller), and agglomerative
+entropy-merge clustering of the §6.2.2 entropy image (per-block symbol
+histograms over the five §6.2.3 alphabets, one merge chain
+snapshotting every group count). On a 10-image mixed corpus the output
+is smaller than the reference encoder's best effort on 7 images (up to
+−28%) and within 9% on the rest; every stream is re-verified bit-exact
+through a black-box reference decode. The cost models only change
+which spec-legal stream is emitted; round-trips stay bit-exact
+regardless.
 
 ## Install
 

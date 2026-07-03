@@ -6757,6 +6757,16 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         }
     }
 
+    // Round 383: §4.4 color-indexing + §6.2.2 multi-meta-prefix stack —
+    // per-region prefix-code groups over the packed-index stream, swept
+    // across palette orderings. Non-regressing: kept only when strictly
+    // smaller.
+    if let Some(cimp_best) = sweep_color_indexing_meta_prefix(pixels, width, height) {
+        if cimp_best.len() < best.len() {
+            best = cimp_best;
+        }
+    }
+
     best
 }
 
@@ -7053,6 +7063,79 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
 /// cost). Larger counts pay 5 more prefix-code tables each, so the
 /// ladder stops at 8.
 const ENTROPY_MERGE_GROUPS_SWEEP: [u32; 5] = [2, 3, 4, 6, 8];
+
+/// Round 383 — §3.5 **color-indexing + §6.2.2 multi-meta-prefix**
+/// stacked sweep: the §4.4 transform (swept over the round-383 palette
+/// orderings) bundles the image into packed indices at the subsampled
+/// width, and the main image is then written with per-region
+/// prefix-code groups from the agglomerative entropy-merge partitions.
+/// On chart / screen-capture palette content the packed-index
+/// statistics differ sharply between regions (flat fills vs dithered
+/// gradients vs text), which a single shared code averages away.
+/// Returns the byte-smallest non-degenerate stream, or `None`.
+fn sweep_color_indexing_meta_prefix(pixels: &[u32], width: u32, height: u32) -> Option<Vec<u8>> {
+    let (palette0, _) = collect_palette(pixels)?;
+    if palette0.is_empty() {
+        return None;
+    }
+    let mut best: Option<Vec<u8>> = None;
+    for &ordering in &PALETTE_ORDERINGS {
+        let palette = order_palette(&palette0, pixels, ordering);
+        let index_of = palette_index_map(&palette);
+        let width_bits = crate::vp8l_transform::color_indexing_width_bits(palette.len());
+        let (packed_image, packed_width) =
+            pack_indices_into_bundled_image(pixels, &index_of, width, height, width_bits);
+
+        // §4.4 transform header (same wire shape as
+        // `encode_with_color_indexing_ordered`).
+        let mut subtraction_encoded = palette.clone();
+        forward_color_table(&mut subtraction_encoded);
+        let write_headers = |w: &mut BitWriter| {
+            w.write_bit(true);
+            w.write_bits(crate::vp8l_stream::TransformType::ColorIndexing as u32, 2);
+            w.write_bits((palette.len() - 1) as u32, 8);
+            write_entropy_coded_image_literals(w, &subtraction_encoded);
+            w.write_bit(false); // end of optional-transform list
+        };
+
+        for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+            let tokens = best_stream_tokens(&packed_image, packed_width, None);
+            for (_, codes) in agglomerative_entropy_assignments(
+                &tokens,
+                packed_width,
+                height,
+                prefix_bits,
+                packed_width,
+                &ENTROPY_MERGE_GROUPS_SWEEP,
+            ) {
+                for cache_opt in std::iter::once(None)
+                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+                {
+                    let mut w = BitWriter::new();
+                    write_headers(&mut w);
+                    if write_meta_prefix_image_with_codes(
+                        &mut w,
+                        &packed_image,
+                        packed_width,
+                        prefix_bits,
+                        codes.clone(),
+                        cache_opt,
+                        packed_width,
+                    )
+                    .is_some()
+                    {
+                        let cand = w.into_bytes();
+                        match &best {
+                            Some(b) if b.len() <= cand.len() => {}
+                            _ => best = Some(cand),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
 
 /// Round 383 — §3.5 transform stack **(subtract-green →) predictor**
 /// chained with a §6.2.2 multi-meta-prefix main image.
@@ -7737,6 +7820,54 @@ mod tests {
                 .expect("decode entropy-merge partition");
             assert_eq!(decoded.pixels(), pixels.as_slice());
         }
+    }
+
+    /// Round 383: the §4.4 color-indexing + §6.2.2 multi-meta-prefix
+    /// stack must round-trip bit-exactly through the decoder — the
+    /// decoder reads the palette transform, then a multi-group main
+    /// image at the packed width, and un-bundles back to full-width
+    /// pixels.
+    #[test]
+    fn round_383_color_indexing_meta_prefix_round_trips() {
+        // Palette content with two regimes: flat fills left, dithered
+        // checkerboard right — 6 colors, packs 2 px/byte.
+        let (w, h) = (64u32, 48u32);
+        let palette = [
+            0xff10_2030u32,
+            0xff40_5060,
+            0xff70_8090,
+            0xffa0_b0c0,
+            0xffd0_e0f0,
+            0xff01_0203,
+        ];
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let idx = if x < w / 2 {
+                    (y / 8) as usize % 3
+                } else {
+                    3 + ((x ^ y) & 1) as usize
+                };
+                pixels.push(palette[idx]);
+            }
+        }
+        let stream = sweep_color_indexing_meta_prefix(&pixels, w, h)
+            .expect("two-regime palette content must yield a non-degenerate partition");
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&stream);
+        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+            .expect("decode color-indexing + meta-prefix stack");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+
+        // The super-chooser output must be no larger and still decode.
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(chosen.len() <= stream.len());
+        let mut payload2 = header.to_vec();
+        payload2.extend_from_slice(&chosen);
+        let decoded2 =
+            crate::vp8l_transform::decode_lossless(&payload2, w, h).expect("decode chosen");
+        assert_eq!(decoded2.pixels(), pixels.as_slice());
     }
 
     /// Round 383: expanding the RLE code-length tokens per the
