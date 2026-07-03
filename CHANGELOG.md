@@ -4,6 +4,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/OxideAV/oxideav-webp/compare/v0.2.2...v0.2.3) - 2026-07-03
+
+### Other
+
+- BENCHMARKS + README: round-388 cache-sweep hoists + DP planner rollup
+- shared lengths-only per-stream cost tables (r388)
+- per-position distance-candidate sets in the DP planner (r388)
+- cache-aware DP literal pricing (r388)
+- precompute §5.2.2 decompositions into the DP match table (r388)
+- hoist clustering + transform chains out of the §6.2.2 meta-prefix cache sweeps (r388)
+- size-first §5.2.3 cache-bits sweep via exact plan() mirror (r388)
+- hoist transform forward passes out of the §5.2.3 cache-bits sweep (r388)
+- round-383 compression-density push — corpus table + wall-time note
+- external-oracle direction A over the round-383 encoder wire shapes
+- raise §5.2.2 matcher MAX_CHAIN 64 → 256 (corpus-swept) (r383)
+- §4.4 color-indexing + §6.2.2 multi-meta-prefix stacked sweep; README encoder narrative (r383)
+- agglomerative entropy-merge clustering for the §6.2.2 entropy image (r383)
+- cost-priced LZ77 token planning with exact writer-cost arbitration (r383)
+- §3.5 predictor(±subtract-green) + §6.2.2 multi-meta-prefix stacked candidate (r383)
+- run-length §3.7.2.1.2 code-length tables + §4.4 palette-ordering sweep (r383)
+- §3.5 stacked subtract-green → predictor two-transform candidate (r383)
+- scrub decorative reference-library naming in r335 ICCP fixture-walk comment
+- round 335 — value-validate §2.7.1 metadata extraction (ICCP/EXIF/XMP) against the docs corpus
+- round 327 — pixel-validate the opaque-RGB lossless animation fixture end-to-end
+- webp r322: end-to-end decode coverage for 4 bit-exact docs fixtures
+- webp r318 FUZZ — roundtrip_alpha_filter_lossless differential oracle over §2.7.1.2 ALPH compression-method-1 inverse path
+- webp r314 FUZZ — roundtrip_alpha_filter differential oracle over §2.7.1.2 ALPH inverse filter
+- refresh to current status, drop per-round changelog cruft
+- decode lossy (VP8 ) per-frame ANMF bitstreams in animations
+
 ### Other
 
 - round 388 — **shared per-stream cost tables**: the exact writer mirror and the next DP iteration's pass-1 cost model consumed the same `count_frequencies` + `build_code_lengths` products yet each rebuilt them per stream per cache value; both now share one lengths-only `StreamCostTables` build (the mirror also stops computing canonical code *values* it never used — `CostLengths` skips `canonical_codes` entirely, with the §3.7.2.1 table-cost and single-leaf decisions factored into lengths-only helpers the writer shares). Byte-identical on the measurement corpus; corpus wall 12.6 s → 11.4 s
