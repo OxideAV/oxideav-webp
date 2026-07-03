@@ -5650,6 +5650,35 @@ fn write_meta_prefix_image(
 
     let codes =
         cluster_blocks_by_histogram_distance(pixels, width, height, prefix_bits, num_groups);
+    write_meta_prefix_image_with_codes(
+        w,
+        pixels,
+        width,
+        prefix_bits,
+        codes,
+        cache_code_bits,
+        image_width,
+    )
+}
+
+/// [`write_meta_prefix_image`] with a caller-supplied §6.2.2 block →
+/// group assignment (round 383) — the entry the agglomerative
+/// entropy-merge sweep uses so one merge chain can feed every group
+/// count without re-clustering. `codes` must have one entry per
+/// `DIV_ROUND_UP(width, block) × DIV_ROUND_UP(height, block)` block in
+/// scan order, compacted so `max(codes) + 1` is the group count.
+#[allow(clippy::too_many_arguments)]
+fn write_meta_prefix_image_with_codes(
+    w: &mut BitWriter,
+    pixels: &[u32],
+    width: u32,
+    prefix_bits: u8,
+    codes: Vec<u16>,
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+) -> Option<()> {
+    let block_side = 1u32 << prefix_bits;
+    let pw = width.div_ceil(block_side);
     let index = EncoderMetaIndex {
         prefix_bits,
         block_width: pw,
@@ -6731,6 +6760,214 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     best
 }
 
+/// Round 383 — generic Shannon entropy of a symbol histogram in
+/// milli-bits (the multi-alphabet analogue of
+/// [`channel_residual_entropy_milli`]): `Σ c·(log2 n − log2 c)` over
+/// the non-zero bins.
+fn hist_entropy_milli(hist: &[u32]) -> u64 {
+    let n: u64 = hist.iter().map(|&c| c as u64).sum();
+    if n == 0 {
+        return 0;
+    }
+    let log2_n = (n as f64).log2();
+    let mut milli_bits: f64 = 0.0;
+    for &count in hist {
+        if count == 0 {
+            continue;
+        }
+        let c_f = count as f64;
+        milli_bits += c_f * (log2_n - c_f.log2());
+    }
+    (milli_bits * 1000.0 + 0.5) as u64
+}
+
+/// Upper bound on the §6.2.2 block count the round-383 agglomerative
+/// clusterer accepts — the pairwise-delta initialisation is quadratic
+/// in the block count, so oversized grids fall back to the round-151
+/// kmeans proxy (the sweep keeps both candidate families anyway).
+const AGGLOMERATIVE_MAX_BLOCKS: usize = 512;
+
+/// Round 383 — agglomerative **entropy-merge** clustering of the §6.2.2
+/// blocks, driven by per-block *token-symbol* histograms.
+///
+/// The round-151 clusterer works on a coarse pixel-value histogram
+/// proxy; on predictor residuals every block's pixel distribution
+/// looks alike (mass piled at 0/255) and the proxy stops separating
+/// regions that differ in the statistics that actually cost bits (the
+/// green literal/length symbols and distance prefixes). This
+/// clusterer histograms the §6.2.3 symbols each block *emits* — the
+/// green channel (literals + length prefixes), red / blue / alpha
+/// literals, and distance prefixes, exactly the five alphabets the
+/// per-group prefix codes will code — and greedily merges the pair of
+/// clusters whose union costs the fewest additional Shannon bits,
+/// recording a snapshot of the assignment at every group count in
+/// `ks`. One merge chain therefore serves the whole `num_groups`
+/// sweep.
+///
+/// `tokens` is a token stream over the image (typically the cache-less
+/// planner output — clustering only guides the *partition*; the
+/// per-cache-bits streams are re-arbitrated downstream). Returns
+/// `(k, assignment)` pairs for each requested `k` that is reachable
+/// (`k <= block_count`), assignments compacted to first-seen order.
+/// Returns an empty vec when the grid is degenerate or oversized.
+fn agglomerative_entropy_assignments(
+    tokens: &[Token],
+    width: u32,
+    height: u32,
+    prefix_bits: u8,
+    image_width: u32,
+    ks: &[u32],
+) -> Vec<(u32, Vec<u16>)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let side = 1u32 << prefix_bits;
+    let bw = width.div_ceil(side) as usize;
+    let bh = height.div_ceil(side) as usize;
+    let block_count = bw * bh;
+    if !(2..=AGGLOMERATIVE_MAX_BLOCKS).contains(&block_count) {
+        return Vec::new();
+    }
+
+    // ---- Per-block symbol histograms (green ‖ red ‖ blue ‖ alpha ‖
+    // distance, concatenated). The token stream is cache-less, so the
+    // green alphabet is the plain 256 + 24.
+    let green_alpha = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES;
+    let dim = green_alpha + 256 * 3 + 40;
+    let (r_off, b_off, a_off, d_off) = (
+        green_alpha,
+        green_alpha + 256,
+        green_alpha + 512,
+        green_alpha + 768,
+    );
+    let mut hists: Vec<Vec<u32>> = vec![vec![0u32; dim]; block_count];
+    let mut pos = 0usize;
+    let wpx = width as usize;
+    for &tok in tokens {
+        let bx = (pos % wpx) >> prefix_bits;
+        let by = (pos / wpx) >> prefix_bits;
+        let h = &mut hists[by * bw + bx];
+        match tok {
+            Token::Literal(p) => {
+                h[((p >> 8) & 0xff) as usize] += 1;
+                h[r_off + ((p >> 16) & 0xff) as usize] += 1;
+                h[b_off + (p & 0xff) as usize] += 1;
+                h[a_off + ((p >> 24) & 0xff) as usize] += 1;
+                pos += 1;
+            }
+            Token::CacheRef { .. } => {
+                debug_assert!(false, "clustering expects a cache-less token stream");
+                pos += 1;
+            }
+            Token::Copy { length, distance } => {
+                let (len_prefix, _, _) = value_to_prefix(length as u32);
+                h[256 + len_prefix as usize] += 1;
+                let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                let (dist_prefix, _, _) = value_to_prefix(raw_code);
+                h[d_off + dist_prefix as usize] += 1;
+                pos += length;
+            }
+        }
+    }
+
+    // ---- Agglomerative merge chain with a lazy-invalidation heap.
+    // Cluster id = block index; merged clusters are marked dead and
+    // union-find `parent` links record the chain. A heap entry records
+    // the generation of both ends; stale entries are discarded on pop.
+    let mut cost: Vec<u64> = hists.iter().map(|h| hist_entropy_milli(h)).collect();
+    let mut generation: Vec<u32> = vec![0; block_count];
+    let mut alive: Vec<bool> = vec![true; block_count];
+    let mut parent: Vec<usize> = (0..block_count).collect();
+
+    let merged_delta = |ha: &[u32], hb: &[u32], ca: u64, cb: u64| -> u64 {
+        let mut union: Vec<u32> = ha.to_vec();
+        for (u, &v) in union.iter_mut().zip(hb.iter()) {
+            *u += v;
+        }
+        hist_entropy_milli(&union).saturating_sub(ca + cb)
+    };
+
+    // (Reverse(delta, i, gen_i, j, gen_j)) — deterministic tie-break on
+    // the (i, j) pair order.
+    type PairEntry = std::cmp::Reverse<(u64, usize, u32, usize, u32)>;
+    let mut heap: BinaryHeap<PairEntry> = BinaryHeap::new();
+    for i in 0..block_count {
+        for j in (i + 1)..block_count {
+            let d = merged_delta(&hists[i], &hists[j], cost[i], cost[j]);
+            heap.push(Reverse((d, i, 0, j, 0)));
+        }
+    }
+
+    fn snapshot(parent: &[usize]) -> Vec<u16> {
+        // Resolve each block's root, then compact to first-seen ids.
+        let root_of = |mut b: usize| {
+            while parent[b] != b {
+                b = parent[b];
+            }
+            b
+        };
+        let mut remap: std::collections::HashMap<usize, u16> = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(parent.len());
+        for b in 0..parent.len() {
+            let r = root_of(b);
+            let next = remap.len() as u16;
+            let id = *remap.entry(r).or_insert(next);
+            out.push(id);
+        }
+        out
+    }
+
+    let want: std::collections::BTreeSet<u32> = ks
+        .iter()
+        .copied()
+        .filter(|&k| k >= 1 && (k as usize) <= block_count)
+        .collect();
+    let mut snapshots: Vec<(u32, Vec<u16>)> = Vec::new();
+    let mut active = block_count;
+    if want.contains(&(active as u32)) {
+        snapshots.push((active as u32, snapshot(&parent)));
+    }
+    let min_k = want.iter().next().copied().unwrap_or(1).max(1) as usize;
+    while active > min_k {
+        // Pop the cheapest still-valid pair.
+        let (i, j) = loop {
+            let Some(Reverse((_, i, gi, j, gj))) = heap.pop() else {
+                // Heap exhausted (cannot happen while active > 1, but
+                // return what we have rather than spin).
+                return snapshots;
+            };
+            if alive[i] && alive[j] && generation[i] == gi && generation[j] == gj {
+                break (i, j);
+            }
+        };
+        // Merge j into i.
+        let hb = std::mem::take(&mut hists[j]);
+        for (u, &v) in hists[i].iter_mut().zip(hb.iter()) {
+            *u += v;
+        }
+        alive[j] = false;
+        parent[j] = i;
+        cost[i] = hist_entropy_milli(&hists[i]);
+        generation[i] += 1;
+        active -= 1;
+
+        // Refresh pair deltas for the merged cluster.
+        for (other, &other_alive) in alive.iter().enumerate() {
+            if other == i || !other_alive {
+                continue;
+            }
+            let (a, b) = if other < i { (other, i) } else { (i, other) };
+            let d = merged_delta(&hists[a], &hists[b], cost[a], cost[b]);
+            heap.push(Reverse((d, a, generation[a], b, generation[b])));
+        }
+
+        if want.contains(&(active as u32)) {
+            snapshots.push((active as u32, snapshot(&parent)));
+        }
+    }
+    snapshots
+}
+
 /// Sweep every `(prefix_bits, num_groups, cache_code_bits)` combination
 /// the §6.2.2 multi-meta-prefix candidate admits and return the smallest
 /// resulting stream, or `None` if no `(prefix_bits, num_groups)` pair
@@ -6769,9 +7006,53 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
                 }
             }
         }
+
+        // Round 383: agglomerative entropy-merge partitions at this
+        // `prefix_bits` — one merge chain snapshots every group count
+        // in the sweep (see [`agglomerative_entropy_assignments`]).
+        let tokens = best_stream_tokens(pixels, width, None);
+        for (_, codes) in agglomerative_entropy_assignments(
+            &tokens,
+            width,
+            height,
+            prefix_bits,
+            width,
+            &ENTROPY_MERGE_GROUPS_SWEEP,
+        ) {
+            for cache_opt in
+                std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+            {
+                let mut w = BitWriter::new();
+                w.write_bit(false); // empty transform list
+                if write_meta_prefix_image_with_codes(
+                    &mut w,
+                    pixels,
+                    width,
+                    prefix_bits,
+                    codes.clone(),
+                    cache_opt,
+                    width,
+                )
+                .is_some()
+                {
+                    let cand = w.into_bytes();
+                    match &best {
+                        Some(b) if b.len() <= cand.len() => {}
+                        _ => best = Some(cand),
+                    }
+                }
+            }
+        }
     }
     best
 }
+
+/// Group counts the round-383 entropy-merge partition snapshots — a
+/// wider ladder than the kmeans sweep's `2..=MAX_META_GROUPS` because
+/// one merge chain serves every count (no per-count re-clustering
+/// cost). Larger counts pay 5 more prefix-code tables each, so the
+/// ladder stops at 8.
+const ENTROPY_MERGE_GROUPS_SWEEP: [u32; 5] = [2, 3, 4, 6, 8];
 
 /// Round 383 — §3.5 transform stack **(subtract-green →) predictor**
 /// chained with a §6.2.2 multi-meta-prefix main image.
@@ -6891,6 +7172,79 @@ fn sweep_predictor_meta_prefix_candidate(
                         num_groups,
                         cache_opt,
                     ) {
+                        match &best {
+                            Some(b) if b.len() <= cand.len() => {}
+                            _ => best = Some(cand),
+                        }
+                    }
+                }
+            }
+        }
+
+        // Round 383: agglomerative entropy-merge partitions over the
+        // §4.1 residuals. The transform chain (and its residuals) is
+        // rebuilt once per `subtract_green`; one merge chain per
+        // `prefix_bits` snapshots every group count in
+        // [`ENTROPY_MERGE_GROUPS_SWEEP`].
+        let mut transformed = pixels.to_vec();
+        if subtract_green {
+            apply_subtract_green(&mut transformed);
+        }
+        let (predictor_image, ptw, _pth) = build_predictor_image_strategy(
+            &transformed,
+            width,
+            height,
+            size_bits,
+            PredictorSubImageStrategy::L1,
+        );
+        let mut residuals = vec![0u32; transformed.len()];
+        apply_forward_predictor(
+            &transformed,
+            &mut residuals,
+            width,
+            height,
+            &predictor_image,
+            ptw,
+            size_bits,
+        );
+        let write_headers = |w: &mut BitWriter| {
+            if subtract_green {
+                w.write_bit(true);
+                w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
+            }
+            w.write_bit(true);
+            w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+            w.write_bits((size_bits - 2) as u32, 3);
+            write_entropy_coded_image_literals(w, &predictor_image);
+            w.write_bit(false);
+        };
+        for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+            let tokens = best_stream_tokens(&residuals, width, None);
+            for (_, codes) in agglomerative_entropy_assignments(
+                &tokens,
+                width,
+                height,
+                prefix_bits,
+                width,
+                &ENTROPY_MERGE_GROUPS_SWEEP,
+            ) {
+                for cache_opt in std::iter::once(None)
+                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+                {
+                    let mut w = BitWriter::new();
+                    write_headers(&mut w);
+                    if write_meta_prefix_image_with_codes(
+                        &mut w,
+                        &residuals,
+                        width,
+                        prefix_bits,
+                        codes.clone(),
+                        cache_opt,
+                        width,
+                    )
+                    .is_some()
+                    {
+                        let cand = w.into_bytes();
                         match &best {
                             Some(b) if b.len() <= cand.len() => {}
                             _ => best = Some(cand),
@@ -7309,6 +7663,80 @@ mod tests {
         let decoded =
             crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode planned stream");
         assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 383: the agglomerative entropy-merge partition must (a)
+    /// snapshot every requested group count with a valid compacted
+    /// assignment, (b) separate content regimes on two-regime input,
+    /// and (c) round-trip bit-exactly through the decoder when written
+    /// via the codes-taking meta-prefix writer.
+    #[test]
+    fn round_383_entropy_merge_partitions_round_trip_and_separate_regimes() {
+        // Left half smooth, right half noisy — two clear symbol regimes.
+        let (w, h) = (64u32, 64u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state = 0xfeed_f00du32;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let p = if x < w / 2 {
+                    0xff00_0000 | (((x + y) % 8) << 8)
+                } else {
+                    0xff00_0000 | ((state >> 8) & 0x00ff_ffff)
+                };
+                pixels.push(p);
+            }
+        }
+        let tokens = tokenize_lz77(&pixels);
+        let prefix_bits = 4u8; // 16-px blocks → 4×4 grid.
+        let snapshots =
+            agglomerative_entropy_assignments(&tokens, w, h, prefix_bits, w, &[2, 3, 4]);
+        assert_eq!(
+            snapshots.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![4, 3, 2],
+            "one snapshot per requested k, in merge order"
+        );
+        for (k, codes) in &snapshots {
+            assert_eq!(codes.len(), 16, "one entry per block");
+            let groups = *codes.iter().max().unwrap() as u32 + 1;
+            assert_eq!(groups, *k, "compacted assignment must have k groups");
+        }
+        // At k=2 the partition must separate the two regimes: every
+        // smooth-half block (columns 0-1) lands in one group, and the
+        // noisy-half blocks (columns 2-3) predominantly land in the
+        // other. (A noisy block whose pixels were mostly swept by long
+        // copies emits few tokens and may merge into the smooth group —
+        // tolerate a single such defector.)
+        let (_, two) = snapshots.iter().find(|(k, _)| *k == 2).unwrap();
+        let smooth_group = two[0];
+        assert!(
+            (0..4).all(|by| two[by * 4] == smooth_group && two[by * 4 + 1] == smooth_group),
+            "smooth half must be coherent: {two:?}"
+        );
+        let noisy_defectors = (0..4)
+            .flat_map(|by| [two[by * 4 + 2], two[by * 4 + 3]])
+            .filter(|&g| g == smooth_group)
+            .count();
+        assert!(
+            noisy_defectors <= 1,
+            "noisy half must predominantly separate: {two:?}"
+        );
+
+        // Written through the codes-taking writer, every snapshot must
+        // decode back to the source pixels.
+        for (_, codes) in snapshots {
+            let mut bw = BitWriter::new();
+            bw.write_bit(false); // empty transform list
+            write_meta_prefix_image_with_codes(&mut bw, &pixels, w, prefix_bits, codes, None, w)
+                .expect("non-degenerate partition");
+            let stream = bw.into_bytes();
+            let header = build_image_header(w, h, false);
+            let mut payload = header.to_vec();
+            payload.extend_from_slice(&stream);
+            let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                .expect("decode entropy-merge partition");
+            assert_eq!(decoded.pixels(), pixels.as_slice());
+        }
     }
 
     /// Round 383: expanding the RLE code-length tokens per the
