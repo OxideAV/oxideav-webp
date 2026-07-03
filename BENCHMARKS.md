@@ -2456,3 +2456,68 @@ to find.)
 * All 440 lib tests pass; `cargo fmt --check` +
   `cargo clippy --all-targets --no-deps -D warnings` clean.
 * The `distance_code` bench still measures the path unchanged.
+
+## Round-383 (2026-07-03) — lossless-encoder compression-density push
+
+Round 383 was a compression round, not a speed round; this note records
+the wall-time consequences so the next PROFILE round has an honest
+baseline.
+
+### What changed (see CHANGELOG for details)
+
+1. Run-length §3.7.2.1.2 code-length tables (three layouts costed per
+   table, cheapest written).
+2. §3.5 subtract-green → predictor stacked candidate.
+3. §4.4 palette-ordering sweep (4 permutations per color-indexing
+   candidate).
+4. Cost-priced LZ77 token planning (greedy vs up-to-two DP re-parses,
+   exact writer-cost arbitration, per-thread memo for the greedy parse
+   + match table across the cache-bits sweep).
+5. (Subtract-green →) predictor + §6.2.2 multi-group main image.
+6. Agglomerative entropy-merge clustering for the entropy image
+   (per-block token-symbol histograms, one merge chain snapshotting
+   the 2..=8 group ladder).
+7. Color-indexing + §6.2.2 multi-group main image.
+8. §5.2.2 matcher `MAX_CHAIN` 64 → 256 (corpus-swept A/B; 1024 was
+   non-monotone and slower).
+
+### Measured compression (10-image mixed corpus, vs the reference
+### encoder's maximum-effort setting, black-box binary)
+
+| Image | before r383 | after r383 | reference | ratio |
+|---|---|---|---|---|
+| 160×120 gradient ramps | 908 | 742 | 810 | 0.916 |
+| 128×128 natural tile | 822 | 672 | 768 | 0.875 |
+| 32×32 RGB docs fixture | 76 | 46 | 56 | 0.821 |
+| 32×32 RGBA docs fixture | 116 | 58 | 60 | 0.966 |
+| 64×64 color-cache stress | 204 | 158 | 162 | 0.975 |
+| 32×32 paletted fixture | 188 | 96 | 102 | 0.941 |
+| 64×64 cross-color fixture | 112 | 52 | 72 | 0.722 |
+| 160×120 photo-like (fractal) | 17990 | 17126 | 15726 | 1.089 |
+| 160×120 chart-like A | 544 | 446 | 428 | 1.042 |
+| 160×120 chart-like B | 2002 | 1934 | 1922 | 1.006 |
+
+Every output re-verified bit-exact through a black-box reference
+decode. Aggregate: −12.8% vs the pre-383 encoder; byte-smaller than
+the reference encoder's best effort on 7 of 10 images.
+
+### Wall-time consequences
+
+The super-chooser gained candidate families and a deeper matcher, so
+maximum-effort encode time grew roughly 1.5–2.5× on 160×120 inputs
+(e.g. photo-like ~1.6 s → ~4.8 s; chart-like ~1.4 s → ~3.5 s on the
+usual aarch64-apple-darwin host). The heavy per-buffer passes (greedy
+parse + DP match table) are memoized across the 12-value cache-bits
+sweep; the residual cost is dominated by re-running the transform
+forward passes per cache-bits value, which is the natural next
+PROFILE-round target (hoist transform construction out of the
+cache sweep).
+
+### Verification
+
+* All 595 tests green; `cargo fmt --check` + `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean; standalone
+  (`--no-default-features`) build unaffected.
+* New external-oracle direction-A test pins the round-383 wire shapes
+  (multi-group entropy image, palette orderings, stacked chains, DP
+  token streams) against the reference decoder binary.
