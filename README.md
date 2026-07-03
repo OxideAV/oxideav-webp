@@ -1,5 +1,7 @@
 # oxideav-webp
 
+[![CI](https://github.com/OxideAV/oxideav-webp/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-webp/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-webp.svg)](https://crates.io/crates/oxideav-webp) [![docs.rs](https://docs.rs/oxideav-webp/badge.svg)](https://docs.rs/oxideav-webp) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM +
 ANMF). Decoder and encoder are both at production status.
 
