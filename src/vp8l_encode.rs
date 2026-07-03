@@ -5786,6 +5786,10 @@ fn build_group_codes(
 /// Returns `None` when the candidate is degenerate (image too small
 /// for the requested block side; clustering collapsed to one group).
 /// The chooser must fall back to the single-group path in those cases.
+// Round 388: production sweeps hoist the cache-independent halves and
+// call `write_meta_prefix_image_with_codes` directly; this one-shot
+// entry is retained for the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_meta_prefix(
     pixels: &[u32],
     width: u32,
@@ -5827,6 +5831,10 @@ fn encode_with_meta_prefix(
 /// when the candidate is degenerate (image too small for the requested
 /// block side, or clustering collapsed to one group).
 #[allow(clippy::too_many_arguments)]
+// Round 388: production sweeps hoist the cache-independent halves and
+// call `write_meta_prefix_image_with_codes` directly; this one-shot
+// entry is retained for the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_meta_prefix_image(
     w: &mut BitWriter,
     pixels: &[u32],
@@ -7270,33 +7278,48 @@ fn agglomerative_entropy_assignments(
 fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Option<Vec<u8>> {
     let mut best: Option<Vec<u8>> = None;
     for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+        let block_side = 1u32 << prefix_bits;
+        let pw = width.div_ceil(block_side);
+        let ph = height.div_ceil(block_side);
         for num_groups in 2..=MAX_META_GROUPS {
-            // Per-(prefix_bits, num_groups), sweep the cache sizes;
-            // some shapes are degenerate (None returned). Track the
-            // best non-degenerate candidate.
-            let mut shape_best: Option<Vec<u8>> = None;
+            // Same degenerate-shape gate `write_meta_prefix_image`
+            // applies: too few blocks for the requested group count.
+            if (pw * ph) < num_groups {
+                continue;
+            }
+            // Round 388: the §6.2.2 kmeans partition depends only on
+            // (pixels, prefix_bits, num_groups) — hoist it out of the
+            // cache sweep instead of re-clustering per cache value
+            // (previously via `encode_with_meta_prefix`, 12× per
+            // shape).
+            let codes = cluster_blocks_by_histogram_distance(
+                pixels,
+                width,
+                height,
+                prefix_bits,
+                num_groups,
+            );
             for cache_opt in
                 std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
             {
-                if let Some(cand) = encode_with_meta_prefix(
+                let mut w = BitWriter::new();
+                w.write_bit(false); // empty transform list
+                if write_meta_prefix_image_with_codes(
+                    &mut w,
                     pixels,
                     width,
-                    height,
                     prefix_bits,
-                    num_groups,
+                    codes.clone(),
                     cache_opt,
                     width,
-                ) {
-                    match &shape_best {
-                        Some(s) if s.len() <= cand.len() => {}
-                        _ => shape_best = Some(cand),
+                )
+                .is_some()
+                {
+                    let cand = w.into_bytes();
+                    match &best {
+                        Some(b) if b.len() <= cand.len() => {}
+                        _ => best = Some(cand),
                     }
-                }
-            }
-            if let Some(cand) = shape_best {
-                match &best {
-                    Some(b) if b.len() <= cand.len() => {}
-                    _ => best = Some(cand),
                 }
             }
         }
@@ -7440,6 +7463,10 @@ fn sweep_color_indexing_meta_prefix(pixels: &[u32], width: u32, height: u32) -> 
 /// keeps the candidate's cost bounded; the single-group paths already
 /// sweep the wider strategy set).
 #[allow(clippy::too_many_arguments)]
+// Round 388: production sweeps hoist the cache-independent halves and
+// call `write_meta_prefix_image_with_codes` directly; this one-shot
+// entry is retained for the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_predictor_meta_prefix(
     pixels: &[u32],
     width: u32,
@@ -7524,35 +7551,12 @@ fn sweep_predictor_meta_prefix_candidate(
     }
     let mut best: Option<Vec<u8>> = None;
     for subtract_green in [false, true] {
-        for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
-            for num_groups in 2..=MAX_META_GROUPS {
-                for cache_opt in std::iter::once(None)
-                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
-                {
-                    if let Some(cand) = encode_with_predictor_meta_prefix(
-                        pixels,
-                        width,
-                        height,
-                        subtract_green,
-                        size_bits,
-                        prefix_bits,
-                        num_groups,
-                        cache_opt,
-                    ) {
-                        match &best {
-                            Some(b) if b.len() <= cand.len() => {}
-                            _ => best = Some(cand),
-                        }
-                    }
-                }
-            }
-        }
-
-        // Round 383: agglomerative entropy-merge partitions over the
-        // §4.1 residuals. The transform chain (and its residuals) is
-        // rebuilt once per `subtract_green`; one merge chain per
-        // `prefix_bits` snapshots every group count in
-        // [`ENTROPY_MERGE_GROUPS_SWEEP`].
+        // Round 388: the transform chain (§4.3 forward pass, §4.1
+        // sub-image + residuals) depends only on `subtract_green` —
+        // build it once per branch and share it between the kmeans and
+        // entropy-merge partition sweeps below. Previously the kmeans
+        // half re-ran the whole chain per (prefix_bits, num_groups,
+        // cache) tuple via `encode_with_predictor_meta_prefix`.
         let mut transformed = pixels.to_vec();
         if subtract_green {
             apply_subtract_green(&mut transformed);
@@ -7585,6 +7589,55 @@ fn sweep_predictor_meta_prefix_candidate(
             write_entropy_coded_image_literals(w, &predictor_image);
             w.write_bit(false);
         };
+
+        for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+            let block_side = 1u32 << prefix_bits;
+            let pw = width.div_ceil(block_side);
+            let ph = height.div_ceil(block_side);
+            for num_groups in 2..=MAX_META_GROUPS {
+                // Same degenerate-shape gate `write_meta_prefix_image`
+                // applies.
+                if (pw * ph) < num_groups {
+                    continue;
+                }
+                // Round 388: the kmeans partition over the residuals
+                // is cache-independent — cluster once per shape.
+                let codes = cluster_blocks_by_histogram_distance(
+                    &residuals,
+                    width,
+                    height,
+                    prefix_bits,
+                    num_groups,
+                );
+                for cache_opt in std::iter::once(None)
+                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+                {
+                    let mut w = BitWriter::new();
+                    write_headers(&mut w);
+                    if write_meta_prefix_image_with_codes(
+                        &mut w,
+                        &residuals,
+                        width,
+                        prefix_bits,
+                        codes.clone(),
+                        cache_opt,
+                        width,
+                    )
+                    .is_some()
+                    {
+                        let cand = w.into_bytes();
+                        match &best {
+                            Some(b) if b.len() <= cand.len() => {}
+                            _ => best = Some(cand),
+                        }
+                    }
+                }
+            }
+        }
+
+        // Round 383: agglomerative entropy-merge partitions over the
+        // §4.1 residuals; one merge chain per `prefix_bits` snapshots
+        // every group count in [`ENTROPY_MERGE_GROUPS_SWEEP`].
         for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
             let tokens = best_stream_tokens(&residuals, width, None);
             for (_, codes) in agglomerative_entropy_assignments(
