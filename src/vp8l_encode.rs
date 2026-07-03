@@ -3428,6 +3428,10 @@ const DEFAULT_PREDICTOR_SIZE_BITS: u8 = 4;
 /// the §4.1 top-left-only border rule, so the transform body cannot
 /// produce a meaningful residual). The caller should fall back to
 /// the no-transform candidate for trivially small images.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_predictor(
     pixels: &[u32],
     width: u32,
@@ -3436,6 +3440,19 @@ fn encode_with_predictor(
     cache_code_bits: Option<u32>,
     image_width: u32,
 ) -> Vec<u8> {
+    prepare_with_predictor(pixels, width, height, size_bits, image_width).finish(cache_code_bits)
+}
+
+/// Cache-independent half of [`encode_with_predictor`] (round 388):
+/// §4.1 sub-image construction + forward residual pass, shared across
+/// the §5.2.3 cache-bits sweep.
+fn prepare_with_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    image_width: u32,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     // ---- §3.8.2 / §7.2 optional-transform: predictor-tx ----
@@ -3468,13 +3485,11 @@ fn encode_with_predictor(
         size_bits,
     );
 
-    // ---- Tokenise + emit the residual spatially-coded-image ----
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: image_width,
+    }
 }
 
 /// Round-160 *slack-cost* variant of [`encode_with_predictor`].
@@ -3492,6 +3507,10 @@ fn encode_with_predictor(
 /// compares the slack candidates against `slack == 0`, so a slack
 /// budget that hurts overall byte cost on a given input is
 /// non-selecting (the strict candidate wins on byte length).
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_predictor_slack(
     pixels: &[u32],
     width: u32,
@@ -3501,6 +3520,20 @@ fn encode_with_predictor_slack(
     image_width: u32,
     slack: u64,
 ) -> Vec<u8> {
+    prepare_with_predictor_slack(pixels, width, height, size_bits, image_width, slack)
+        .finish(cache_code_bits)
+}
+
+/// Cache-independent half of [`encode_with_predictor_slack`]
+/// (round 388).
+fn prepare_with_predictor_slack(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    image_width: u32,
+    slack: u64,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     w.write_bit(true);
@@ -3525,12 +3558,11 @@ fn encode_with_predictor_slack(
         size_bits,
     );
 
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: image_width,
+    }
 }
 
 /// Round-161 *Shannon-entropy bit-cost* variant of
@@ -3547,6 +3579,10 @@ fn encode_with_predictor_slack(
 /// candidate against the L1-proxy candidates (round-159 strict tie-
 /// break and round-160 slack variants), so on fixtures where the L1
 /// proxy genuinely wins, the entropy candidate is non-selecting.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_predictor_entropy(
     pixels: &[u32],
     width: u32,
@@ -3555,6 +3591,19 @@ fn encode_with_predictor_entropy(
     cache_code_bits: Option<u32>,
     image_width: u32,
 ) -> Vec<u8> {
+    prepare_with_predictor_entropy(pixels, width, height, size_bits, image_width)
+        .finish(cache_code_bits)
+}
+
+/// Cache-independent half of [`encode_with_predictor_entropy`]
+/// (round 388).
+fn prepare_with_predictor_entropy(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    image_width: u32,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     w.write_bit(true);
@@ -3579,12 +3628,11 @@ fn encode_with_predictor_entropy(
         size_bits,
     );
 
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: image_width,
+    }
 }
 
 /// Round 162 — *sub-image-aware* Shannon-entropy bit-cost predictor
@@ -3604,6 +3652,10 @@ fn encode_with_predictor_entropy(
 /// image weighting hurts overall byte cost, the round-162 candidate
 /// is non-selecting and the path strictly extends the encoder's
 /// option set rather than redirecting it.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_predictor_entropy_subaware(
     pixels: &[u32],
     width: u32,
@@ -3613,6 +3665,27 @@ fn encode_with_predictor_entropy_subaware(
     image_width: u32,
     lambda_milli: u64,
 ) -> Vec<u8> {
+    prepare_with_predictor_entropy_subaware(
+        pixels,
+        width,
+        height,
+        size_bits,
+        image_width,
+        lambda_milli,
+    )
+    .finish(cache_code_bits)
+}
+
+/// Cache-independent half of
+/// [`encode_with_predictor_entropy_subaware`] (round 388).
+fn prepare_with_predictor_entropy_subaware(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    image_width: u32,
+    lambda_milli: u64,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     w.write_bit(true);
@@ -3637,12 +3710,11 @@ fn encode_with_predictor_entropy_subaware(
         size_bits,
     );
 
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: image_width,
+    }
 }
 
 // ---- §3.5.2 / §4.2 forward color-transform encoder ------------------
@@ -4152,6 +4224,10 @@ const DEFAULT_COLOR_TRANSFORM_SIZE_BITS: u8 = 4;
 /// pixel side on both dimensions so the sub-resolution image has more
 /// than one block; smaller images fall back to the no-transform
 /// candidates.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_color_transform(
     pixels: &[u32],
     width: u32,
@@ -4178,6 +4254,10 @@ fn encode_with_color_transform(
 /// round-trip-identical regardless of strategy: the cost model only
 /// changes which per-block CTE is *recorded*, and the decoder's §4.2
 /// inverse re-applies whatever CTE the sub-image carries.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_color_transform_strategy(
     pixels: &[u32],
     width: u32,
@@ -4187,6 +4267,21 @@ fn encode_with_color_transform_strategy(
     image_width: u32,
     strategy: ColorTransformStrategy,
 ) -> Vec<u8> {
+    prepare_with_color_transform_strategy(pixels, width, height, size_bits, image_width, strategy)
+        .finish(cache_code_bits)
+}
+
+/// Cache-independent half of [`encode_with_color_transform_strategy`]
+/// (round 388): §4.2 sub-image construction + forward color pass,
+/// shared across the §5.2.3 cache-bits sweep.
+fn prepare_with_color_transform_strategy(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    image_width: u32,
+    strategy: ColorTransformStrategy,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     // ---- §3.8.2 / §7.2 optional-transform: color-tx ----
@@ -4219,13 +4314,11 @@ fn encode_with_color_transform_strategy(
         size_bits,
     );
 
-    // ---- Tokenise + emit the residual spatially-coded-image ----
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, image_width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, image_width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: image_width,
+    }
 }
 
 // ---- §4.4 color-indexing transform encoder --------------------------
@@ -4534,6 +4627,21 @@ fn encode_with_color_indexing_ordered(
     cache_code_bits: Option<u32>,
     ordering: PaletteOrdering,
 ) -> Option<Vec<u8>> {
+    Some(
+        prepare_with_color_indexing_ordered(pixels, width, height, ordering)?
+            .finish(cache_code_bits),
+    )
+}
+
+/// Cache-independent half of [`encode_with_color_indexing_ordered`]
+/// (round 388): palette collection/ordering, §4.4 table write and
+/// index bundling, shared across the §5.2.3 cache-bits sweep.
+fn prepare_with_color_indexing_ordered(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    ordering: PaletteOrdering,
+) -> Option<PreparedTransform> {
     let (palette, index_of) = collect_palette(pixels)?;
     if palette.is_empty() {
         return None;
@@ -4575,19 +4683,18 @@ fn encode_with_color_indexing_ordered(
     w.write_bit(false);
 
     // ---- Spatially-coded-image at the *subsampled* width ------------
-    // After §4.4, `image_width` is `DIV_ROUND_UP(width, 1 <<
+    // After §4.4, the stream width is `DIV_ROUND_UP(width, 1 <<
     // width_bits)`; that is the width the entropy stage threads
     // through the §5.2.2 distance-code chooser. Pixel values are the
     // packed-green-channel bytes whose red/blue/alpha channels are
     // identically zero, so the per-channel Huffman codes for those
     // three channels collapse to a 1-symbol prefix code each (almost
     // free header overhead).
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&packed_image, packed_width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, packed_width);
-
-    Some(w.into_bytes())
+    Some(PreparedTransform {
+        prelude: w,
+        residuals: packed_image,
+        stream_width: packed_width,
+    })
 }
 
 /// Encode `pixels` with the §4.4 color-indexing transform **chained**
@@ -4678,6 +4785,31 @@ fn encode_with_color_indexing_predictor_ordered(
     pred_strategy: PredictorSubImageStrategy,
     ordering: PaletteOrdering,
 ) -> Option<Vec<u8>> {
+    Some(
+        prepare_with_color_indexing_predictor_ordered(
+            pixels,
+            width,
+            height,
+            size_bits,
+            pred_strategy,
+            ordering,
+        )?
+        .finish(cache_code_bits),
+    )
+}
+
+/// Cache-independent half of
+/// [`encode_with_color_indexing_predictor_ordered`] (round 388):
+/// palette + bundling + §4.1 sub-image + forward residual pass over
+/// the packed image, shared across the §5.2.3 cache-bits sweep.
+fn prepare_with_color_indexing_predictor_ordered(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    pred_strategy: PredictorSubImageStrategy,
+    ordering: PaletteOrdering,
+) -> Option<PreparedTransform> {
     let (palette, index_of) = collect_palette(pixels)?;
     if palette.is_empty() {
         return None;
@@ -4753,13 +4885,11 @@ fn encode_with_color_indexing_predictor_ordered(
         size_bits,
     );
 
-    // ---- Spatially-coded-image of the residuals at packed_width -----
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, packed_width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, packed_width);
-
-    Some(w.into_bytes())
+    Some(PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: packed_width,
+    })
 }
 
 /// Encode `pixels` with the §4.2 cross-color transform **chained** with
@@ -4808,6 +4938,10 @@ fn encode_with_color_indexing_predictor_ordered(
 /// `size_bits - 2` header). The caller is responsible for gating on
 /// `width >= block && height >= block` so both sub-images carry at least
 /// one full block square; the chooser does this before calling.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_color_transform_predictor(
     pixels: &[u32],
     width: u32,
@@ -4816,6 +4950,19 @@ fn encode_with_color_transform_predictor(
     cache_code_bits: Option<u32>,
     pred_strategy: PredictorSubImageStrategy,
 ) -> Vec<u8> {
+    prepare_with_color_transform_predictor(pixels, width, height, size_bits, pred_strategy)
+        .finish(cache_code_bits)
+}
+
+/// Cache-independent half of [`encode_with_color_transform_predictor`]
+/// (round 388).
+fn prepare_with_color_transform_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    pred_strategy: PredictorSubImageStrategy,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     // ---- Transform #1 (read first): §4.2 color-tx -------------------
@@ -4870,13 +5017,11 @@ fn encode_with_color_transform_predictor(
         size_bits,
     );
 
-    // ---- Spatially-coded-image of the residuals at full width -------
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: width,
+    }
 }
 
 /// Encode `pixels` with a **three-transform** §3.5 stack: §4.2 cross-color
@@ -4933,6 +5078,10 @@ fn encode_with_color_transform_predictor(
 /// own 3-bit `size_bits - 2` header. The caller gates on
 /// `width >= block && height >= block` so both sub-images carry at least one
 /// full block square.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_color_transform_subtract_green_predictor(
     pixels: &[u32],
     width: u32,
@@ -4941,6 +5090,26 @@ fn encode_with_color_transform_subtract_green_predictor(
     cache_code_bits: Option<u32>,
     pred_strategy: PredictorSubImageStrategy,
 ) -> Vec<u8> {
+    prepare_with_color_transform_subtract_green_predictor(
+        pixels,
+        width,
+        height,
+        size_bits,
+        pred_strategy,
+    )
+    .finish(cache_code_bits)
+}
+
+/// Cache-independent half of
+/// [`encode_with_color_transform_subtract_green_predictor`]
+/// (round 388).
+fn prepare_with_color_transform_subtract_green_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    pred_strategy: PredictorSubImageStrategy,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     // ---- Transform #1 (read first): §4.2 color-tx -------------------
@@ -5000,13 +5169,11 @@ fn encode_with_color_transform_subtract_green_predictor(
         size_bits,
     );
 
-    // ---- Spatially-coded-image of the residuals at full width -------
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: width,
+    }
 }
 
 /// Encode `pixels` with the §4.3 subtract-green transform **chained**
@@ -5045,6 +5212,10 @@ fn encode_with_color_transform_subtract_green_predictor(
 /// under `pred_strategy` (round-305 sweep); the chooser composes with
 /// `cache_code_bits` over the residual stream's literal tokens,
 /// identically to the other stacked paths.
+// Round 388: production paths go through the `prepare_*` half +
+// `PreparedTransform::finish`; this one-shot wrapper is retained for
+// the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_with_subtract_green_predictor(
     pixels: &[u32],
     width: u32,
@@ -5053,6 +5224,19 @@ fn encode_with_subtract_green_predictor(
     cache_code_bits: Option<u32>,
     pred_strategy: PredictorSubImageStrategy,
 ) -> Vec<u8> {
+    prepare_with_subtract_green_predictor(pixels, width, height, size_bits, pred_strategy)
+        .finish(cache_code_bits)
+}
+
+/// Cache-independent half of [`encode_with_subtract_green_predictor`]
+/// (round 388).
+fn prepare_with_subtract_green_predictor(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    pred_strategy: PredictorSubImageStrategy,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     // ---- Transform #1 (read first): §4.3 subtract-green -------------
@@ -5090,13 +5274,11 @@ fn encode_with_subtract_green_predictor(
         size_bits,
     );
 
-    // ---- Spatially-coded-image of the residuals at full width -------
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&residuals, width, cache_code_bits);
-    write_spatially_coded_image(&mut w, &tokens, cache_code_bits, width);
-
-    w.into_bytes()
+    PreparedTransform {
+        prelude: w,
+        residuals,
+        stream_width: width,
+    }
 }
 
 // ---- §6.2.2 multi-meta-prefix (entropy-image) encoder ----------------
@@ -5840,16 +6022,56 @@ pub fn encode_argb_literals_with_width(pixels: &[u32], image_width: u32) -> Vec<
     // large-palette photo-like images favour wider caches (fewer hash
     // collisions). Sweeping is the only way to pick the best per
     // payload without an analytical model.
-    let mut best = select_best_cache_bits(|cache_bits| {
-        encode_literals_with_options(pixels, false, cache_bits, image_width)
-    });
-    let sg_best = select_best_cache_bits(|cache_bits| {
-        encode_literals_with_options(pixels, true, cache_bits, image_width)
-    });
+    let mut best = select_best_cache_bits_prepared(&prepare_literals(pixels, false, image_width));
+    let sg_best = select_best_cache_bits_prepared(&prepare_literals(pixels, true, image_width));
     if sg_best.len() < best.len() {
         best = sg_best;
     }
     best
+}
+
+/// Round 388 — a transform-*prepared* encode candidate: the §3.8.2
+/// optional-transform prelude (presence/type bits + any sub-image
+/// bodies) already written into a [`BitWriter`], plus the
+/// forward-transformed residual buffer the spatially-coded-image will
+/// cover. Both halves are independent of the §5.2.3 color-cache
+/// choice, so the round-148 cache-bits sweep can share one
+/// preparation across all 12 sweep values instead of re-running the
+/// transform forward passes (sub-image construction + residual
+/// build) per value — the round-383 BENCHMARKS note flagged exactly
+/// that re-run as the dominant residual encode cost.
+///
+/// [`finish`](Self::finish) is byte-identical to the pre-r388 shape:
+/// it clones the prelude and appends the cache-dependent tail
+/// (token-plan arbitration + §3.8.3 emission).
+struct PreparedTransform {
+    /// §3.8.2 optional-transform list, already terminated with `%b0`.
+    prelude: BitWriter,
+    /// Pixels the spatially-coded-image encodes (residuals for
+    /// transform candidates, [possibly packed] literals otherwise).
+    residuals: Vec<u32>,
+    /// Width threaded into the §5.2.2 distance-code chooser — the
+    /// §4.4 packed width for color-indexing candidates, the canvas
+    /// width otherwise.
+    stream_width: u32,
+}
+
+impl PreparedTransform {
+    /// Append the cache-dependent tail for one §5.2.3 choice and
+    /// return the full candidate stream.
+    fn finish(&self, cache_code_bits: Option<u32>) -> Vec<u8> {
+        let mut w = self.prelude.clone();
+        let tokens = best_stream_tokens(&self.residuals, self.stream_width, cache_code_bits);
+        write_spatially_coded_image(&mut w, &tokens, cache_code_bits, self.stream_width);
+        w.into_bytes()
+    }
+}
+
+/// [`select_best_cache_bits`] over a shared [`PreparedTransform`]:
+/// the transform forward passes run once, only the cache-dependent
+/// tail is re-run per sweep value (round 388).
+fn select_best_cache_bits_prepared(prep: &PreparedTransform) -> Vec<u8> {
+    select_best_cache_bits(|cache_bits| prep.finish(cache_bits))
 }
 
 /// Sweep §5.2.3 `cache_code_bits ∈ [1..11]` plus the disabled-cache
@@ -5909,14 +6131,30 @@ fn encode_literals_with_options(
     cache_code_bits: Option<u32>,
     image_width: u32,
 ) -> Vec<u8> {
+    prepare_literals(pixels, subtract_green, image_width).finish(cache_code_bits)
+}
+
+/// Cache-independent half of [`encode_literals_with_options`]
+/// (round 388): the (optional) §4.3 forward pass + §3.8.2 header,
+/// shared across the §5.2.3 cache-bits sweep. The emitted prelude is
+/// identical to [`encode_tokens`]'s header path.
+fn prepare_literals(pixels: &[u32], subtract_green: bool, image_width: u32) -> PreparedTransform {
     let mut working = pixels.to_vec();
+    let mut w = BitWriter::new();
     if subtract_green {
         apply_subtract_green(&mut working);
+        // §3.8.2 optional-transform: present bit + 2-bit type (see
+        // `encode_tokens` for the bit-order note).
+        w.write_bit(true);
+        w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
     }
-    // Round 383: greedy parse vs cost-priced DP re-parses, exact-cost
-    // arbitrated (see `best_stream_tokens`).
-    let tokens = best_stream_tokens(&working, image_width, cache_code_bits);
-    encode_tokens(&tokens, subtract_green, cache_code_bits, image_width)
+    // End-of-list terminator.
+    w.write_bit(false);
+    PreparedTransform {
+        prelude: w,
+        residuals: working,
+        stream_width: image_width,
+    }
 }
 
 /// Encode an ARGB image with the literal-only, no-transform path: every
@@ -6304,9 +6542,9 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // Round 148: per `size_bits`, sweep §5.2.3
         // `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline
         // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
-        let mut pred_candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
-            encode_with_predictor(pixels, width, height, pred_size_bits, cache_bits, width)
-        })];
+        let mut pred_candidates: Vec<Vec<u8>> = vec![select_best_cache_bits_prepared(
+            &prepare_with_predictor(pixels, width, height, pred_size_bits, width),
+        )];
         // Round 160: add §4.1 slack-cost tie-break candidates.
         // `slack > 0` lets the per-block chooser swap to the
         // preferred-neighbour mode at a small residual-cost
@@ -6324,17 +6562,9 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             2 * pred_block_pixels,
             4 * pred_block_pixels,
         ] {
-            pred_candidates.push(select_best_cache_bits(|cache_bits| {
-                encode_with_predictor_slack(
-                    pixels,
-                    width,
-                    height,
-                    pred_size_bits,
-                    cache_bits,
-                    width,
-                    slack,
-                )
-            }));
+            pred_candidates.push(select_best_cache_bits_prepared(
+                &prepare_with_predictor_slack(pixels, width, height, pred_size_bits, width, slack),
+            ));
         }
         // Round 161: add the Shannon-entropy bit-cost candidate at
         // the per-region `size_bits`. Per-block mode is chosen by
@@ -6347,9 +6577,9 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // keeps both the entropy and L1 candidates and emits the
         // byte-shortest stream so the round-161 path cannot
         // regress against the round-160 baseline.
-        pred_candidates.push(select_best_cache_bits(|cache_bits| {
-            encode_with_predictor_entropy(pixels, width, height, pred_size_bits, cache_bits, width)
-        }));
+        pred_candidates.push(select_best_cache_bits_prepared(
+            &prepare_with_predictor_entropy(pixels, width, height, pred_size_bits, width),
+        ));
         // Round 162: add the *sub-image-aware* Shannon-entropy
         // candidate at the per-region `size_bits` across a small
         // lambda sweep. Per-block mode is chosen on a joint cost
@@ -6374,29 +6604,25 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // image's mass dominates and converging the mode set pays
         // back through a much smaller §7.2 prefix-code header.
         for lambda_milli in [4_000u64, 16_000u64, 64_000u64, 256_000u64] {
-            pred_candidates.push(select_best_cache_bits(|cache_bits| {
-                encode_with_predictor_entropy_subaware(
+            pred_candidates.push(select_best_cache_bits_prepared(
+                &prepare_with_predictor_entropy_subaware(
                     pixels,
                     width,
                     height,
                     pred_size_bits,
-                    cache_bits,
                     width,
                     lambda_milli,
-                )
-            }));
+                ),
+            ));
         }
         if try_pred_single_block {
-            pred_candidates.push(select_best_cache_bits(|cache_bits| {
-                encode_with_predictor(
-                    pixels,
-                    width,
-                    height,
-                    pred_single_block_size_bits,
-                    cache_bits,
-                    width,
-                )
-            }));
+            pred_candidates.push(select_best_cache_bits_prepared(&prepare_with_predictor(
+                pixels,
+                width,
+                height,
+                pred_single_block_size_bits,
+                width,
+            )));
             // Round-160 slack-cost candidates also at the single-
             // block size_bits. A single block has one predictor-
             // image entry, so the slack-cost variant degenerates to
@@ -6412,17 +6638,16 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                 2 * single_pred_block_pixels,
                 4 * single_pred_block_pixels,
             ] {
-                pred_candidates.push(select_best_cache_bits(|cache_bits| {
-                    encode_with_predictor_slack(
+                pred_candidates.push(select_best_cache_bits_prepared(
+                    &prepare_with_predictor_slack(
                         pixels,
                         width,
                         height,
                         pred_single_block_size_bits,
-                        cache_bits,
                         width,
                         slack,
-                    )
-                }));
+                    ),
+                ));
             }
             // Round 161: also evaluate the Shannon-entropy candidate
             // at the single-block size_bits. With one block the hint
@@ -6432,16 +6657,15 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             // bit cost" — still a strict improvement over the L1
             // proxy on fixtures whose distribution skews the
             // ordering between the two metrics.
-            pred_candidates.push(select_best_cache_bits(|cache_bits| {
-                encode_with_predictor_entropy(
+            pred_candidates.push(select_best_cache_bits_prepared(
+                &prepare_with_predictor_entropy(
                     pixels,
                     width,
                     height,
                     pred_single_block_size_bits,
-                    cache_bits,
                     width,
-                )
-            }));
+                ),
+            ));
         }
         for cand in pred_candidates {
             if cand.len() < best.len() {
@@ -6467,16 +6691,13 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         }
         for &sb in &sgp_size_bits {
             for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
-                let cand = select_best_cache_bits(|cache_bits| {
-                    encode_with_subtract_green_predictor(
-                        pixels,
-                        width,
-                        height,
-                        sb,
-                        cache_bits,
-                        pred_strategy,
-                    )
-                });
+                let cand = select_best_cache_bits_prepared(&prepare_with_subtract_green_predictor(
+                    pixels,
+                    width,
+                    height,
+                    sb,
+                    pred_strategy,
+                ));
                 if cand.len() < best.len() {
                     best = cand;
                 }
@@ -6507,9 +6728,16 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // Round 148: per `size_bits`, sweep §5.2.3
         // `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline
         // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
-        let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits(|cache_bits| {
-            encode_with_color_transform(pixels, width, height, ctx_size_bits, cache_bits, width)
-        })];
+        let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits_prepared(
+            &prepare_with_color_transform_strategy(
+                pixels,
+                width,
+                height,
+                ctx_size_bits,
+                width,
+                ColorTransformStrategy::L1,
+            ),
+        )];
         // Round 308: §4.2 entropy-cost per-block CTE candidate at the
         // per-region `size_bits`. Where the L1 chooser above scores
         // each candidate by the folded residual magnitude, this one
@@ -6520,44 +6748,42 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // the byte-shortest stream, so this candidate cannot regress
         // against the L1 path, and round-trip output is identical
         // regardless of which CTE the cost model records.
-        candidates.push(select_best_cache_bits(|cache_bits| {
-            encode_with_color_transform_strategy(
+        candidates.push(select_best_cache_bits_prepared(
+            &prepare_with_color_transform_strategy(
                 pixels,
                 width,
                 height,
                 ctx_size_bits,
-                cache_bits,
                 width,
                 ColorTransformStrategy::Entropy,
-            )
-        }));
+            ),
+        ));
         if try_single_block {
-            candidates.push(select_best_cache_bits(|cache_bits| {
-                encode_with_color_transform(
+            candidates.push(select_best_cache_bits_prepared(
+                &prepare_with_color_transform_strategy(
                     pixels,
                     width,
                     height,
                     single_block_size_bits,
-                    cache_bits,
                     width,
-                )
-            }));
+                    ColorTransformStrategy::L1,
+                ),
+            ));
             // Round 308: entropy-cost CTE candidate at the single-block
             // `size_bits`. With one block the histogram is the whole
             // image's per-channel residual distribution, so the entropy
             // metric selects the single CTE whose red / blue residual
             // streams carry the cheapest §5.x prefix codes.
-            candidates.push(select_best_cache_bits(|cache_bits| {
-                encode_with_color_transform_strategy(
+            candidates.push(select_best_cache_bits_prepared(
+                &prepare_with_color_transform_strategy(
                     pixels,
                     width,
                     height,
                     single_block_size_bits,
-                    cache_bits,
                     width,
                     ColorTransformStrategy::Entropy,
-                )
-            }));
+                ),
+            ));
         }
         for cand in candidates {
             if cand.len() < best.len() {
@@ -6588,16 +6814,14 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // byte-shortest candidate is kept.
         for &sb in &ctp_size_bits {
             for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
-                let cand = select_best_cache_bits(|cache_bits| {
-                    encode_with_color_transform_predictor(
+                let cand =
+                    select_best_cache_bits_prepared(&prepare_with_color_transform_predictor(
                         pixels,
                         width,
                         height,
                         sb,
-                        cache_bits,
                         pred_strategy,
-                    )
-                });
+                    ));
                 if cand.len() < best.len() {
                     best = cand;
                 }
@@ -6623,16 +6847,15 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // Round 305: sweep the predictor-sub-image strategy here too.
         for &sb in &ctp_size_bits {
             for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
-                let cand = select_best_cache_bits(|cache_bits| {
-                    encode_with_color_transform_subtract_green_predictor(
+                let cand = select_best_cache_bits_prepared(
+                    &prepare_with_color_transform_subtract_green_predictor(
                         pixels,
                         width,
                         height,
                         sb,
-                        cache_bits,
                         pred_strategy,
-                    )
-                });
+                    ),
+                );
                 if cand.len() < best.len() {
                     best = cand;
                 }
@@ -6658,10 +6881,9 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // numeric baseline stays in the sweep and the byte-shortest
         // stream wins.
         for &ordering in &PALETTE_ORDERINGS {
-            let ci_best = select_best_cache_bits(|cache_bits| {
-                encode_with_color_indexing_ordered(pixels, width, height, cache_bits, ordering)
-                    .expect("palette feasibility already confirmed")
-            });
+            let prep = prepare_with_color_indexing_ordered(pixels, width, height, ordering)
+                .expect("palette feasibility already confirmed");
+            let ci_best = select_best_cache_bits_prepared(&prep);
             if ci_best.len() < best.len() {
                 best = ci_best;
             }
@@ -6701,31 +6923,21 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                 // packed-index image (see
                 // [`encode_with_color_indexing_predictor_ordered`]).
                 for &ordering in &PALETTE_ORDERINGS {
-                    let mut got_candidate = false;
-                    let cand = select_best_cache_bits(|cache_bits| {
-                        match encode_with_color_indexing_predictor_ordered(
-                            pixels,
-                            width,
-                            height,
-                            sb,
-                            cache_bits,
-                            pred_strategy,
-                            ordering,
-                        ) {
-                            Some(bytes) => {
-                                got_candidate = true;
-                                bytes
-                            }
-                            // Packed image too small for this `size_bits`.
-                            // Emit a sentinel longer than the running best
-                            // so the cache sweep discards it;
-                            // `got_candidate` stays false and the outer
-                            // comparison is skipped.
-                            None => vec![0u8; best.len() + 1],
+                    // `None` = packed image too small for this
+                    // `size_bits`; the single-transform candidate
+                    // already covers the input.
+                    if let Some(prep) = prepare_with_color_indexing_predictor_ordered(
+                        pixels,
+                        width,
+                        height,
+                        sb,
+                        pred_strategy,
+                        ordering,
+                    ) {
+                        let cand = select_best_cache_bits_prepared(&prep);
+                        if cand.len() < best.len() {
+                            best = cand;
                         }
-                    });
-                    if got_candidate && cand.len() < best.len() {
-                        best = cand;
                     }
                 }
             }
