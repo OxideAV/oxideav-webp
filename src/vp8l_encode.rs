@@ -5259,6 +5259,48 @@ fn encode_with_meta_prefix(
     cache_code_bits: Option<u32>,
     image_width: u32,
 ) -> Option<Vec<u8>> {
+    let mut w = BitWriter::new();
+
+    // §3.8.2 optional-transform list: empty (no transforms in this
+    // candidate). The round-383
+    // [`sweep_predictor_meta_prefix_candidate`] stacks §4.3 / §4.1
+    // atop the multi-prefix path.
+    w.write_bit(false);
+
+    write_meta_prefix_image(
+        &mut w,
+        pixels,
+        width,
+        height,
+        prefix_bits,
+        num_groups,
+        cache_code_bits,
+        image_width,
+    )?;
+
+    Some(w.into_bytes())
+}
+
+/// Write the §3.8.3 / §7.3 *spatially-coded-image* body with a §6.2.2
+/// multi-meta-prefix entropy image over `pixels` (round-383 refactor of
+/// [`encode_with_meta_prefix`]'s tail so transform-stacked callers can
+/// reuse it). The caller has already written the §3.8.2
+/// optional-transform list; `pixels` are whatever the last transform
+/// left behind (raw ARGB for the transform-free path, §4.1 residuals
+/// for the stacked path). Returns `None` — with `w` **unmodified** —
+/// when the candidate is degenerate (image too small for the requested
+/// block side, or clustering collapsed to one group).
+#[allow(clippy::too_many_arguments)]
+fn write_meta_prefix_image(
+    w: &mut BitWriter,
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    prefix_bits: u8,
+    num_groups: u32,
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+) -> Option<()> {
     debug_assert!((2..=9).contains(&prefix_bits));
     debug_assert!((1..=MAX_META_GROUPS).contains(&num_groups));
 
@@ -5297,13 +5339,6 @@ fn encode_with_meta_prefix(
     let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
     let group_codes = build_group_codes(&buckets, cache_size, image_width);
 
-    let mut w = BitWriter::new();
-
-    // §3.8.2 optional-transform list: empty (no transforms in this
-    // candidate). Future revisions can stack §4.1 / §4.2 / §4.4 atop
-    // the multi-prefix path; for now we keep the candidate small.
-    w.write_bit(false);
-
     // §3.8.3 / §7.3 spatially-coded-image:
     //   color-cache-info meta-prefix data
     //
@@ -5326,13 +5361,13 @@ fn encode_with_meta_prefix(
     // red+green; the literal-only writer feeds the decoder's
     // `decode_entropy_coded_image` path exactly.
     let entropy_image = index.entropy_image_argb();
-    write_entropy_coded_image_literals(&mut w, &entropy_image);
+    write_entropy_coded_image_literals(w, &entropy_image);
 
     // §6.2.2 `num_prefix_groups` prefix-code groups, in canonical
     // group-index order (group 0 first, then group 1, …).
     for group in &group_codes {
         for code in group.iter() {
-            code.write_code_lengths(&mut w);
+            code.write_code_lengths(w);
         }
     }
 
@@ -5364,28 +5399,28 @@ fn encode_with_meta_prefix(
                 let r = ((p >> 16) & 0xff) as usize;
                 let g_ch = ((p >> 8) & 0xff) as usize;
                 let b = (p & 0xff) as usize;
-                green_code.write_symbol(&mut w, g_ch);
-                red_code.write_symbol(&mut w, r);
-                blue_code.write_symbol(&mut w, b);
-                alpha_code.write_symbol(&mut w, a);
+                green_code.write_symbol(w, g_ch);
+                red_code.write_symbol(w, r);
+                blue_code.write_symbol(w, b);
+                alpha_code.write_symbol(w, a);
                 pos += 1;
             }
             Token::CacheRef { index: ix } => {
                 debug_assert!(cache_size > 0, "CacheRef requires an enabled cache");
                 let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + ix as usize;
-                green_code.write_symbol(&mut w, sym);
+                green_code.write_symbol(w, sym);
                 pos += 1;
             }
             Token::Copy { length, distance } => {
-                write_lz77_value(&mut w, green_code, 256, length as u32);
+                write_lz77_value(w, green_code, 256, length as u32);
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
-                write_lz77_value(&mut w, dist_code, 0, raw_code);
+                write_lz77_value(w, dist_code, 0, raw_code);
                 pos += length;
             }
         }
     }
 
-    Some(w.into_bytes())
+    Some(())
 }
 
 /// Encode an ARGB image to a VP8L *image-stream* (the bytes that follow the
@@ -6345,6 +6380,19 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         }
     }
 
+    // Round 383: §3.5 (subtract-green →) predictor stack with a §6.2.2
+    // multi-meta-prefix main image. On photo-like content the predictor
+    // makes the stream compressible and the per-region prefix-code
+    // groups then adapt to spatially-varying residual statistics —
+    // neither the transform-free meta-prefix candidate above nor the
+    // single-group predictor paths can reach this combination.
+    // Non-regressing: kept only when strictly smaller.
+    if let Some(pmp_best) = sweep_predictor_meta_prefix_candidate(pixels, width, height) {
+        if pmp_best.len() < best.len() {
+            best = pmp_best;
+        }
+    }
+
     best
 }
 
@@ -6383,6 +6431,136 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
                 match &best {
                     Some(b) if b.len() <= cand.len() => {}
                     _ => best = Some(cand),
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Round 383 — §3.5 transform stack **(subtract-green →) predictor**
+/// chained with a §6.2.2 multi-meta-prefix main image.
+///
+/// The round-151 meta-prefix candidate ran transform-free, so on
+/// photo-like content — where the §4.1 predictor is what makes the
+/// residual stream compressible in the first place — it could never
+/// win. This candidate writes the (optional §4.3 +) §4.1 transform
+/// headers exactly as the single-group stacked paths do, then hands the
+/// *residual* image to [`write_meta_prefix_image`]: the entropy image's
+/// per-region prefix-code groups adapt to spatially-varying residual
+/// statistics (busy vs smooth regions) that a single shared code
+/// averages away.
+///
+/// Returns `None` when the image is too small for a predictor block or
+/// the clustering degenerates. The predictor sub-image is built with
+/// the L1 strategy at the default per-region `size_bits` (the sweep
+/// keeps the candidate's cost bounded; the single-group paths already
+/// sweep the wider strategy set).
+#[allow(clippy::too_many_arguments)]
+fn encode_with_predictor_meta_prefix(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    subtract_green: bool,
+    size_bits: u8,
+    prefix_bits: u8,
+    num_groups: u32,
+    cache_code_bits: Option<u32>,
+) -> Option<Vec<u8>> {
+    let block = 1u32 << size_bits;
+    if width < block || height < block {
+        return None;
+    }
+
+    // Forward-transform: optional §4.3 subtract-green, then the §4.1
+    // predictor over the (possibly green-decorrelated) image.
+    let mut transformed = pixels.to_vec();
+    if subtract_green {
+        apply_subtract_green(&mut transformed);
+    }
+    let (predictor_image, ptw, _pth) = build_predictor_image_strategy(
+        &transformed,
+        width,
+        height,
+        size_bits,
+        PredictorSubImageStrategy::L1,
+    );
+    let mut residuals = vec![0u32; transformed.len()];
+    apply_forward_predictor(
+        &transformed,
+        &mut residuals,
+        width,
+        height,
+        &predictor_image,
+        ptw,
+        size_bits,
+    );
+
+    let mut w = BitWriter::new();
+    // ---- §3.8.2 optional-transform list -----------------------------
+    if subtract_green {
+        w.write_bit(true);
+        w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
+    }
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    debug_assert!((2..=9).contains(&size_bits));
+    w.write_bits((size_bits - 2) as u32, 3);
+    write_entropy_coded_image_literals(&mut w, &predictor_image);
+    w.write_bit(false);
+
+    // ---- Multi-group spatially-coded-image over the residuals -------
+    write_meta_prefix_image(
+        &mut w,
+        &residuals,
+        width,
+        height,
+        prefix_bits,
+        num_groups,
+        cache_code_bits,
+        width,
+    )?;
+
+    Some(w.into_bytes())
+}
+
+/// Sweep the round-383 predictor (± subtract-green) + multi-meta-prefix
+/// candidate over `(subtract_green, prefix_bits, num_groups,
+/// cache_code_bits)` and return the byte-smallest non-degenerate
+/// stream, or `None` when every shape degenerates. Mirrors
+/// [`sweep_meta_prefix_candidate`]'s shape handling.
+fn sweep_predictor_meta_prefix_candidate(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+    let block = 1u32 << size_bits;
+    if width < block || height < block {
+        return None;
+    }
+    let mut best: Option<Vec<u8>> = None;
+    for subtract_green in [false, true] {
+        for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+            for num_groups in 2..=MAX_META_GROUPS {
+                for cache_opt in std::iter::once(None)
+                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+                {
+                    if let Some(cand) = encode_with_predictor_meta_prefix(
+                        pixels,
+                        width,
+                        height,
+                        subtract_green,
+                        size_bits,
+                        prefix_bits,
+                        num_groups,
+                        cache_opt,
+                    ) {
+                        match &best {
+                            Some(b) if b.len() <= cand.len() => {}
+                            _ => best = Some(cand),
+                        }
+                    }
                 }
             }
         }
@@ -10208,6 +10386,120 @@ mod tests {
         // still round-trip.
         let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
         assert!(chosen.len() <= sg_pred.len());
+        let header = build_image_header(w, h, false);
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(&chosen);
+        let decoded =
+            crate::vp8l_transform::decode_lossless(&payload, w, h).expect("decode chosen stream");
+        assert_eq!(decoded.pixels(), pixels.as_slice());
+    }
+
+    /// Round 383: the (subtract-green →) predictor + multi-meta-prefix
+    /// stack must round-trip bit-exactly through the decoder across the
+    /// shape sweep — the decoder reads the §3.8.2 transform list, then a
+    /// §6.2.2 entropy image + per-group prefix codes for the main image,
+    /// applies the inverse predictor (and add-green when present), and
+    /// must recover the source pixels.
+    #[test]
+    fn round_383_predictor_meta_prefix_round_trips_through_decoder() {
+        // Two-regime content: smooth gradient left half, noisy right
+        // half — the per-region statistics diverge, so clustering does
+        // not collapse.
+        let (w, h) = (96u32, 64u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x5ee0_7a11;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let p = if x < w / 2 {
+                    let g = (x * 2 + y) % 256;
+                    0xff00_0000 | (g << 16) | (g << 8) | g
+                } else {
+                    let n = state >> 24;
+                    let g = (x + y) % 256;
+                    0xff00_0000 | ((n & 0xff) << 16) | (g << 8) | ((n >> 3) & 0xff)
+                };
+                pixels.push(p);
+            }
+        }
+        let mut round_tripped = 0usize;
+        for subtract_green in [false, true] {
+            for &prefix_bits in &[4u8, 5] {
+                for num_groups in 2..=3u32 {
+                    for cache in [None, Some(6u32)] {
+                        let Some(stream) = encode_with_predictor_meta_prefix(
+                            &pixels,
+                            w,
+                            h,
+                            subtract_green,
+                            DEFAULT_PREDICTOR_SIZE_BITS,
+                            prefix_bits,
+                            num_groups,
+                            cache,
+                        ) else {
+                            continue;
+                        };
+                        let header = build_image_header(w, h, false);
+                        let mut payload = header.to_vec();
+                        payload.extend_from_slice(&stream);
+                        let decoded = crate::vp8l_transform::decode_lossless(&payload, w, h)
+                            .expect("decode predictor+meta-prefix round trip");
+                        assert_eq!(
+                            decoded.pixels(),
+                            pixels.as_slice(),
+                            "round-trip mismatch sg={subtract_green} prefix_bits={prefix_bits} groups={num_groups} cache={cache:?}"
+                        );
+                        round_tripped += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            round_tripped >= 8,
+            "expected most shapes to be non-degenerate on two-regime content, got {round_tripped}"
+        );
+    }
+
+    /// Round 383: on two-regime content (smooth vs busy halves) the
+    /// predictor + multi-meta-prefix stack must beat the single-group
+    /// predictor path — the per-region prefix-code groups adapt to the
+    /// diverging residual statistics — and the super-chooser must be at
+    /// least as small as both and still round-trip.
+    #[test]
+    fn round_383_predictor_meta_prefix_beats_single_group_on_two_regime_content() {
+        let (w, h) = (128u32, 96u32);
+        let mut pixels: Vec<u32> = Vec::with_capacity((w * h) as usize);
+        let mut state: u32 = 0x9e37_79b1;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let p = if y < h / 2 {
+                    // Smooth: near-zero predictor residuals.
+                    let g = (x + 2 * y) % 256;
+                    0xff00_0000 | (g << 16) | (g << 8) | g
+                } else {
+                    // Busy: wide random residuals across all channels.
+                    let r = (state >> 8) & 0xff;
+                    let g = (state >> 16) & 0xff;
+                    let b = state & 0xff;
+                    0xff00_0000 | (r << 16) | (g << 8) | b
+                };
+                pixels.push(p);
+            }
+        }
+        let single_group = select_best_cache_bits(|cache_bits| {
+            encode_with_predictor(&pixels, w, h, DEFAULT_PREDICTOR_SIZE_BITS, cache_bits, w)
+        });
+        let multi_group = sweep_predictor_meta_prefix_candidate(&pixels, w, h)
+            .expect("two-regime content must yield a non-degenerate clustering");
+        assert!(
+            multi_group.len() < single_group.len(),
+            "predictor+meta-prefix ({}) should beat single-group predictor ({}) on two-regime content",
+            multi_group.len(),
+            single_group.len()
+        );
+        let chosen = encode_argb_with_predictor_chooser(&pixels, w, h);
+        assert!(chosen.len() <= multi_group.len());
         let header = build_image_header(w, h, false);
         let mut payload = header.to_vec();
         payload.extend_from_slice(&chosen);
