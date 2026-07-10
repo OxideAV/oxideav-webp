@@ -30,21 +30,25 @@
 //! 24-bit canvas dimensions, and the §4 / §6 entropy stream — keeping the
 //! §2.6 lossless façade hot.
 //!
-//! ## Scope carve-out — the §2.5 sibling lossy decoder
+//! ## The §2.5 lossy legs (live as of round 408)
 //!
 //! The §2.5 `VP8 ` *lossy* decode is routed out of this crate into the
 //! `oxideav-vp8` sibling (`decode_lossy_image` →
 //! `vp8_decode::decode_lossy_rgba` → `oxideav_vp8::decode_vp8`). An early
 //! version of this harness drove that path and immediately surfaced a
-//! **panic inside the sibling decoder** (an `oxideav-vp8` inverse-DCT
-//! residual overflow at `inverse_transform.rs`) on malformed lossy input —
-//! a genuine DoS, but a defect *below this crate's boundary* that a
-//! webp-only commit may not fix, and one `catch_unwind` cannot contain
-//! because cargo-fuzz builds with `panic = "abort"`. Until the sibling is
-//! hardened, any non-animated input routing to the sibling lossy decoder
-//! (a `VP8 ` chunk with no `VP8L`) is **skipped** before the decode below,
-//! so this crate's scheduled Fuzz workflow stays honest about its own
-//! contract. The cross-crate finding is recorded in the round-288 report.
+//! panic inside the sibling decoder (a §14.4 inverse-DCT residual
+//! overflow on hostile post-dequant coefficients) — a defect below this
+//! crate's boundary that `catch_unwind` could not contain because
+//! cargo-fuzz builds with `panic = "abort"`, so the lossy legs were
+//! gated out from round 288 onward. The sibling fixed the overflow on
+//! its master (the §14.4 scalar pass now wraps in the 32-bit domain the
+//! spec listing defines, byte-exact), so the gate is **removed**: a
+//! non-animated `VP8 `-only input now runs the full still-vs-published
+//! differential below, and the corpus is seeded with the in-tree §2.5
+//! lossy fixtures so the mutator starts on the lossy success path too.
+//! Note the sibling fix ships in the first `oxideav-vp8` release after
+//! 0.2.5; a fuzz build resolving an older published sibling can still
+//! reproduce the (fixed-on-master) overflow abort.
 //!
 //! ## The differential contract
 //!
@@ -126,28 +130,6 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let is_animated = c.first_chunk_with_fourcc(container::fourcc::ANIM).is_some();
-
-    // The §2.5 `VP8 ` *lossy* decode is routed to the `oxideav-vp8` sibling
-    // crate (`decode_lossy_image` → `vp8_decode::decode_lossy_rgba` →
-    // `oxideav_vp8::decode_vp8`). A malformed lossy bitstream can currently
-    // **panic inside the sibling decoder** (an `oxideav-vp8` inverse-DCT
-    // residual overflow at `inverse_transform.rs`) — a real DoS this harness
-    // surfaced, but a defect *below this crate's boundary* that a webp-only
-    // commit may not fix, and one that `catch_unwind` cannot contain because
-    // cargo-fuzz builds with `panic = "abort"`. Until the sibling is
-    // hardened, an input that routes to the sibling lossy decoder
-    // (a `VP8 ` chunk with no `VP8L`, non-animated) is skipped from the
-    // decode below so this crate's scheduled Fuzz workflow stays honest
-    // about *its own* contract. The §2.6 lossless still path, the §2.3
-    // container walk, the §2.7.1.2 `ALPH` overlay (on the VP8L form), and
-    // the still-vs-published differential are all fully in-crate and
-    // exercised. See the round-288 report for the cross-crate followup.
-    let routes_to_sibling_lossy = !is_animated
-        && c.first_chunk_with_fourcc(container::fourcc::VP8L).is_none()
-        && c.first_chunk_with_fourcc(container::fourcc::VP8).is_some();
-    if routes_to_sibling_lossy {
-        return;
-    }
 
     let low = decode_webp_image(data);
     let published = decode_webp(data);
