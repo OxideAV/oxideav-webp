@@ -827,3 +827,20 @@ path = "fuzz_targets/compose_animation.rs"
 test = false
 doc = false
 bench = false
+
+# Round-408 consistency oracle on the public chunk-routing façade
+# (`extract_lossless_chunk` / `extract_lossy_chunk` /
+# `read_vp8l_transform_list`) over one attacker-controlled buffer:
+# container-refusal propagation (walker Err ⇒ every wrapper Err),
+# presence routing (`Ok(None)` exactly when the FourCC is absent), a
+# §3.4 / §7.1 wire-byte re-derivation of every accepted lossless-handle
+# field (signature, 14+14+1+3 LSB-first unpack, [1, 16384] dimension
+# window, payload-slice echo), a routed-vs-standalone §9.1 field
+# differential on the lossy handle, and a routed-vs-manual §4
+# transform-list read differential positioned past the §3.4 header.
+[[bin]]
+name = "extract_routing"
+path = "fuzz_targets/extract_routing.rs"
+test = false
+doc = false
+bench = false
