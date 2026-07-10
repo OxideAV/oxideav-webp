@@ -1748,6 +1748,60 @@ struct Frequencies {
     distance: Vec<u32>,
 }
 
+impl Frequencies {
+    /// All-zero tables for a GREEN alphabet of
+    /// `256 + 24 + color_cache_size` symbols (round 409 — shared by
+    /// [`count_frequencies`] and the §6.2.2 plan mirror's fused
+    /// per-group counting walk).
+    fn new(color_cache_size: usize) -> Self {
+        let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + color_cache_size;
+        Self {
+            green: vec![0u32; green_alphabet],
+            red: vec![0u32; 256],
+            blue: vec![0u32; 256],
+            alpha: vec![0u32; 256],
+            distance: vec![0u32; 40],
+        }
+    }
+
+    /// Accumulate one token's wire symbols (the per-token body of
+    /// [`count_frequencies`], factored out in round 409 so the §6.2.2
+    /// plan mirror can count per-group tables in a single walk without
+    /// materialising per-group token buckets).
+    #[inline]
+    fn count_token(&mut self, tok: Token, image_width: u32) {
+        match tok {
+            Token::Literal(p) => {
+                let a = ((p >> 24) & 0xff) as usize;
+                let r = ((p >> 16) & 0xff) as usize;
+                let g = ((p >> 8) & 0xff) as usize;
+                let b = (p & 0xff) as usize;
+                self.green[g] += 1;
+                self.red[r] += 1;
+                self.blue[b] += 1;
+                self.alpha[a] += 1;
+            }
+            Token::CacheRef { index } => {
+                // §5.2.3: GREEN symbol is `256 + 24 + index`.
+                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
+                debug_assert!(sym < self.green.len());
+                self.green[sym] += 1;
+            }
+            Token::Copy { length, distance } => {
+                // §5.2.2: length is a GREEN symbol `256 + length_prefix`.
+                let (len_prefix, _, _) = value_to_prefix(length as u32);
+                self.green[256 + len_prefix as usize] += 1;
+                // Distance prefix code (#5). Width-aware chooser picks the
+                // smaller of scan-line `D + 120` and any §5.2.2 distance-map
+                // code reconstructing to `D` for `image_width`.
+                let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                let (dist_prefix, _, _) = value_to_prefix(raw_code);
+                self.distance[dist_prefix as usize] += 1;
+            }
+        }
+    }
+}
+
 // ---- Round 383: cost-priced LZ77 token planning ----------------------
 
 /// One §3.7.2 prefix code's *lengths-only* cost view (round 388): the
@@ -1825,7 +1879,12 @@ struct StreamCostTables {
 
 impl StreamCostTables {
     fn build(tokens: &[Token], color_cache_size: usize, image_width: u32) -> Self {
-        let freqs = count_frequencies(tokens, color_cache_size, image_width);
+        Self::from_frequencies(&count_frequencies(tokens, color_cache_size, image_width))
+    }
+
+    /// [`Self::build`] over pre-counted tables (round 409 — the §6.2.2
+    /// plan mirror counts all groups' tables in one walk).
+    fn from_frequencies(freqs: &Frequencies) -> Self {
         Self {
             green: CostLengths::from_freqs(&freqs.green),
             red: CostLengths::from_freqs(&freqs.red),
@@ -2506,44 +2565,9 @@ pub fn pixel_distance_to_distance_code(distance: usize, image_width: u32) -> u32
 /// possibly match at width 1, so all row-style matches fall back to the
 /// scan-line `D + 120` form.
 fn count_frequencies(tokens: &[Token], color_cache_size: usize, image_width: u32) -> Frequencies {
-    let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + color_cache_size;
-    let mut freqs = Frequencies {
-        green: vec![0u32; green_alphabet],
-        red: vec![0u32; 256],
-        blue: vec![0u32; 256],
-        alpha: vec![0u32; 256],
-        distance: vec![0u32; 40],
-    };
+    let mut freqs = Frequencies::new(color_cache_size);
     for &tok in tokens {
-        match tok {
-            Token::Literal(p) => {
-                let a = ((p >> 24) & 0xff) as usize;
-                let r = ((p >> 16) & 0xff) as usize;
-                let g = ((p >> 8) & 0xff) as usize;
-                let b = (p & 0xff) as usize;
-                freqs.green[g] += 1;
-                freqs.red[r] += 1;
-                freqs.blue[b] += 1;
-                freqs.alpha[a] += 1;
-            }
-            Token::CacheRef { index } => {
-                // §5.2.3: GREEN symbol is `256 + 24 + index`.
-                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
-                debug_assert!(sym < green_alphabet);
-                freqs.green[sym] += 1;
-            }
-            Token::Copy { length, distance } => {
-                // §5.2.2: length is a GREEN symbol `256 + length_prefix`.
-                let (len_prefix, _, _) = value_to_prefix(length as u32);
-                freqs.green[256 + len_prefix as usize] += 1;
-                // Distance prefix code (#5). Width-aware chooser picks the
-                // smaller of scan-line `D + 120` and any §5.2.2 distance-map
-                // code reconstructing to `D` for `image_width`.
-                let raw_code = pixel_distance_to_distance_code(distance, image_width);
-                let (dist_prefix, _, _) = value_to_prefix(raw_code);
-                freqs.distance[dist_prefix as usize] += 1;
-            }
-        }
+        freqs.count_token(tok, image_width);
     }
     freqs
 }
@@ -6316,20 +6340,23 @@ fn plan_meta_prefix_image_with_codes(
     entropy_image_bits: &mut Option<usize>,
 ) -> Option<usize> {
     let block_side = 1u32 << prefix_bits;
-    let pw = width.div_ceil(block_side);
-    let index = EncoderMetaIndex {
-        prefix_bits,
-        block_width: pw,
-        codes: codes.to_vec(),
-    };
-    let actual_groups = index.num_groups();
+    let pw = width.div_ceil(block_side) as usize;
+    let actual_groups = codes.iter().copied().max().map_or(0, |c| c as usize + 1);
     if actual_groups < 2 {
         // Same degenerate gate as the writer.
         return None;
     }
+    // §6.2.2 group selection for the pixel at scan position `pos` —
+    // the [`EncoderMetaIndex::group_for`] rule over the borrowed
+    // `codes` slice (no `to_vec` per sweep value).
+    let wpx = width as usize;
+    let group_for = |pos: usize| -> usize {
+        let bx = (pos % wpx) >> prefix_bits;
+        let by = (pos / wpx) >> prefix_bits;
+        codes[by * pw + bx] as usize
+    };
 
     let tokens = best_stream_tokens(pixels, width, cache_code_bits);
-    let buckets = split_tokens_by_group(&tokens, &index, width, actual_groups);
     let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
 
     // color-cache-info (`%b0` or `%b1 4BIT`) + meta-prefix `%b1` +
@@ -6340,16 +6367,80 @@ fn plan_meta_prefix_image_with_codes(
     } + 1
         + 3;
     // §6.2.2 entropy image — partition-dependent, cache-independent.
-    bits += *entropy_image_bits
-        .get_or_insert_with(|| entropy_coded_image_literals_bits(&index.entropy_image_argb()));
+    bits += *entropy_image_bits.get_or_insert_with(|| {
+        let entropy_image: Vec<u32> = codes
+            .iter()
+            .map(|&c| {
+                // Meta code in red+green per §6.2.2 (see
+                // [`EncoderMetaIndex::entropy_image_argb`]).
+                let lo = (c & 0xff) as u32;
+                let hi = ((c >> 8) & 0xff) as u32;
+                (hi << 16) | (lo << 8)
+            })
+            .collect();
+        entropy_coded_image_literals_bits(&entropy_image)
+    });
+
     // Per-group prefix-code tables + the group's token symbols. The
     // writer emits all group tables first and then the tokens in
     // stream order; the total is the same as summing each group's
-    // table header + its bucket's token bits (the buckets partition
-    // the token stream).
-    for bucket in &buckets {
-        let tables = StreamCostTables::build(bucket, cache_size, image_width);
-        bits += prefix_codes_and_tokens_bits_from(&tables, bucket, image_width);
+    // table header + its token bits (the groups partition the token
+    // stream). Round 409: fused two-walk form — one walk counts every
+    // group's frequency tables in place (no per-group token buckets),
+    // the second prices each token against its group's built tables;
+    // the per-group sums are identical to the previous
+    // bucket-then-score shape.
+    let mut group_freqs: Vec<Frequencies> = (0..actual_groups)
+        .map(|_| Frequencies::new(cache_size))
+        .collect();
+    let mut pos = 0usize;
+    for &tok in &tokens {
+        group_freqs[group_for(pos)].count_token(tok, image_width);
+        pos += match tok {
+            Token::Literal(_) | Token::CacheRef { .. } => 1usize,
+            Token::Copy { length, .. } => length,
+        };
+    }
+    let group_tables: Vec<StreamCostTables> = group_freqs
+        .iter()
+        .map(StreamCostTables::from_frequencies)
+        .collect();
+    for tables in &group_tables {
+        bits += tables.green.code_lengths_bits()
+            + tables.red.code_lengths_bits()
+            + tables.blue.code_lengths_bits()
+            + tables.alpha.code_lengths_bits()
+            + tables.distance.code_lengths_bits();
+    }
+    let mut pos = 0usize;
+    for &tok in &tokens {
+        let tables = &group_tables[group_for(pos)];
+        match tok {
+            Token::Literal(p) => {
+                let a = ((p >> 24) & 0xff) as usize;
+                let r = ((p >> 16) & 0xff) as usize;
+                let g = ((p >> 8) & 0xff) as usize;
+                let b = (p & 0xff) as usize;
+                bits += tables.green.sym_bits(g)
+                    + tables.red.sym_bits(r)
+                    + tables.blue.sym_bits(b)
+                    + tables.alpha.sym_bits(a);
+                pos += 1;
+            }
+            Token::CacheRef { index } => {
+                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
+                bits += tables.green.sym_bits(sym);
+                pos += 1;
+            }
+            Token::Copy { length, distance } => {
+                let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
+                bits += tables.green.sym_bits(256 + len_prefix as usize) + len_extra as usize;
+                let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
+                bits += tables.distance.sym_bits(dist_prefix as usize) + dist_extra as usize;
+                pos += length;
+            }
+        }
     }
     Some(bits)
 }

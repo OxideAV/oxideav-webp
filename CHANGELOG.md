@@ -43,6 +43,16 @@ All notable changes to `oxideav-webp` are recorded here.
   so the full extension walk is skipped). Corpus wall 3.54 s → 2.90 s
   (−70% cumulative this round; digests unchanged throughout).
 
+- *(vp8l_encode)* fused §6.2.2 plan-mirror walks (round 409,
+  byte-identical): the meta-prefix size mirror counts every group's
+  frequency tables in one token walk (no per-group bucket
+  materialisation, no per-sweep-value `codes.to_vec()`) and prices
+  tokens against the built tables in a second walk — replacing the
+  split-buckets → per-bucket count → per-bucket score triple walk.
+  `Frequencies::count_token` / `StreamCostTables::from_frequencies`
+  factored out and shared with `count_frequencies`. Corpus wall
+  2.90 s → 2.80 s.
+
 ### Fixed
 
 - *(vp8l_encode)* degenerate §3.7.2 prefix-code tables no longer emit
