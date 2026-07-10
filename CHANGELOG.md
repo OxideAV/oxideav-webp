@@ -22,6 +22,27 @@ All notable changes to `oxideav-webp` are recorded here.
   in the three meta-prefix sweep functions (same stream every
   iteration).
 
+- *(vp8l_encode)* **size-first §6.2.2 meta-prefix sweeps** (round 409):
+  the three meta-prefix sweep functions now price every
+  `(prefix_bits, partition, cache)` candidate through the exact
+  `plan_meta_prefix_image_with_codes` size mirror (per-partition
+  entropy-image cost memo + per-group lengths-only tables) and write
+  only the winning tuple, instead of materialising a full candidate
+  stream per tuple. Same enumeration order and keep-first tie-break;
+  mirror identity pinned by the `meta_plan_mirror_matches_written_bytes`
+  test and a debug assertion at each winner write. Byte-identical on
+  the 10-image corpus; wall 4.48 s → 3.54 s.
+
+- *(vp8l_encode)* DP-planner + matcher micro-optimizations (round 409),
+  both byte-identical: `dp_refine_tokens` folds the unseen-symbol
+  substitution into flat per-alphabet `u32` cost tables once per call
+  and unrolls the per-position (primary ‖ specials) candidate chain
+  into explicit blocks with unchanged arbitration order;
+  `Lz77Matcher::find` adds a strictly-longer quick-reject (a candidate
+  mismatching at offset `best_len` cannot displace the running best,
+  so the full extension walk is skipped). Corpus wall 3.54 s → 2.90 s
+  (−70% cumulative this round; digests unchanged throughout).
+
 ### Fixed
 
 - *(vp8l_encode)* degenerate §3.7.2 prefix-code tables no longer emit

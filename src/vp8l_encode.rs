@@ -1323,15 +1323,27 @@ impl<'a> Lz77Matcher<'a> {
         while cand >= 0 && steps < MAX_CHAIN {
             let c = cand as usize;
             // Candidates were all inserted at positions < pos.
-            let mut len = 0usize;
-            while len < max_len && p[c + len] == p[pos + len] {
-                len += 1;
-            }
-            if len > best_len {
-                best_len = len;
-                best_dist = pos - c;
-                if len >= max_len {
-                    break;
+            //
+            // Round 409 quick-reject: only a strictly longer match can
+            // displace the running best, so a candidate that mismatches
+            // at offset `best_len` extends to at most `best_len` pixels
+            // and can be skipped without the full extension walk. The
+            // probe is in-bounds (`best_len < max_len <= n - pos`, and
+            // `c < pos`), and skipped candidates could never update
+            // `best_len`/`best_dist` or trigger the `len >= max_len`
+            // early break, so the walk's result — and the emitted
+            // byte stream — is unchanged.
+            if best_len == 0 || p[c + best_len] == p[pos + best_len] {
+                let mut len = 0usize;
+                while len < max_len && p[c + len] == p[pos + len] {
+                    len += 1;
+                }
+                if len > best_len {
+                    best_len = len;
+                    best_dist = pos - c;
+                    if len >= max_len {
+                        break;
+                    }
                 }
             }
             cand = self.prev[c];
@@ -2113,19 +2125,28 @@ fn dp_refine_tokens(
     // ---- Pass-1 cost model: per-symbol bit costs from the previous
     // stream's shared [`StreamCostTables`] (round 388 — previously
     // re-counted + re-built here from the raw token stream).
-    let cost_of = |lengths: &[u8], sym: usize| -> u32 {
-        let l = lengths[sym] as u32;
-        if l == 0 {
-            DP_UNSEEN_SYMBOL_COST
-        } else {
-            l
-        }
+    // Round 409: the unseen-symbol substitution is folded into flat
+    // `u32` cost tables once per DP call (alphabets are at most
+    // 256 + 24 + 2048 entries — trivial against the O(n) walk below),
+    // so the per-position inner loop indexes branch-free tables
+    // instead of re-testing `length == 0` per lookup.
+    let expand_costs = |lengths: &[u8]| -> Vec<u32> {
+        lengths
+            .iter()
+            .map(|&l| {
+                if l == 0 {
+                    DP_UNSEEN_SYMBOL_COST
+                } else {
+                    l as u32
+                }
+            })
+            .collect()
     };
-    let green_len = &cost_model.green.lengths;
-    let red_len = &cost_model.red.lengths;
-    let blue_len = &cost_model.blue.lengths;
-    let alpha_len = &cost_model.alpha.lengths;
-    let dist_len = &cost_model.distance.lengths;
+    let green_cost = expand_costs(&cost_model.green.lengths);
+    let red_cost = expand_costs(&cost_model.red.lengths);
+    let blue_cost = expand_costs(&cost_model.blue.lengths);
+    let alpha_cost = expand_costs(&cost_model.alpha.lengths);
+    let dist_cost = expand_costs(&cost_model.distance.lengths);
 
     // Round 388: the ladder lengths' §5.2.2 decompositions are fixed;
     // fold the cost model over them once per DP call so the per-
@@ -2135,7 +2156,7 @@ fn dp_refine_tokens(
         .iter()
         .map(|&l| {
             let (len_prefix, len_extra, _) = value_to_prefix(l as u32);
-            (cost_of(green_len, 256 + len_prefix as usize) + len_extra) as u64
+            (green_cost[256 + len_prefix as usize] + len_extra) as u64
         })
         .collect();
 
@@ -2157,20 +2178,16 @@ fn dp_refine_tokens(
         // the GREEN cache symbol it will become instead of the
         // four-channel literal it won't be.
         let lit_bits = match cache_hits.and_then(|h| h[i]) {
-            Some(ix) => cost_of(
-                green_len,
-                256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + ix as usize,
-            ) as u64,
+            Some(ix) => {
+                green_cost[256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + ix as usize] as u64
+            }
             None => {
                 let p = pixels[i];
                 let a = ((p >> 24) & 0xff) as usize;
                 let r = ((p >> 16) & 0xff) as usize;
                 let g = ((p >> 8) & 0xff) as usize;
                 let b = (p & 0xff) as usize;
-                (cost_of(green_len, g)
-                    + cost_of(red_len, r)
-                    + cost_of(blue_len, b)
-                    + cost_of(alpha_len, a)) as u64
+                (green_cost[g] + red_cost[r] + blue_cost[b] + alpha_cost[a]) as u64
             }
         };
         let mut best = lit_bits + cost[i + 1];
@@ -2180,18 +2197,17 @@ fn dp_refine_tokens(
         // matcher's longest match plus the [`special_distances`]
         // fixed-distance candidates whose distance codes are the
         // cheapest §5.2.2 has. Duplicated distances re-evaluate the
-        // same costs and are harmless.
-        for (ci, m) in std::iter::once(tables.primary[i])
-            .chain(tables.special.iter().map(|t| t[i]))
-            .enumerate()
-        {
-            let Some(m) = m else { continue };
-            let dist_bits =
-                (cost_of(dist_len, m.dist_prefix as usize) + m.dist_extra_bits as u32) as u64;
+        // same costs and are harmless. Round 409: the chained
+        // iterator over (primary ‖ specials) is unrolled into two
+        // explicit blocks — same candidate order, same tie-breaks
+        // (strict `<` keeps the earlier candidate), no per-position
+        // iterator-state overhead.
+        if let Some(m) = tables.primary[i] {
+            let dist_bits = (dist_cost[m.dist_prefix as usize] + m.dist_extra_bits as u32) as u64;
             let max_len = m.len as usize;
             // Full match length (decomposition precomputed).
             let full_bits =
-                (cost_of(green_len, 256 + m.len_prefix as usize) + m.len_extra_bits as u32) as u64;
+                (green_cost[256 + m.len_prefix as usize] + m.len_extra_bits as u32) as u64;
             let total = full_bits + dist_bits + cost[i + max_len];
             if total < best {
                 best = total;
@@ -2199,15 +2215,12 @@ fn dp_refine_tokens(
                 best_dist = m.dist;
             }
             // Ladder truncations below the full length — primary
-            // match only (`ci == 0`). The fixed-distance candidates
-            // exist to expose *cheap-distance* runs; their pay-off is
-            // at full run length, and skipping their truncation walks
+            // match only. The fixed-distance candidates exist to
+            // expose *cheap-distance* runs; their pay-off is at full
+            // run length, and skipping their truncation walks
             // recovers most of the widened candidate set's wall cost
             // (corpus-swept: within ±2 bytes of the full-truncation
             // form, −27% corpus encode time against it).
-            if ci != 0 {
-                continue;
-            }
             for (k, &l) in DP_LENGTH_LADDER.iter().enumerate() {
                 if l >= max_len {
                     break;
@@ -2218,6 +2231,18 @@ fn dp_refine_tokens(
                     best_len = l as u32;
                     best_dist = m.dist;
                 }
+            }
+        }
+        for t in &tables.special {
+            let Some(m) = t[i] else { continue };
+            let dist_bits = (dist_cost[m.dist_prefix as usize] + m.dist_extra_bits as u32) as u64;
+            let full_bits =
+                (green_cost[256 + m.len_prefix as usize] + m.len_extra_bits as u32) as u64;
+            let total = full_bits + dist_bits + cost[i + m.len as usize];
+            if total < best {
+                best = total;
+                best_len = m.len;
+                best_dist = m.dist;
             }
         }
         cost[i] = best;
