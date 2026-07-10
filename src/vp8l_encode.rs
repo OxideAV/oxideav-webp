@@ -1831,10 +1831,10 @@ impl StreamCostTables {
 /// function is identical to comparing the byte lengths of the streams
 /// the writer would emit (the surrounding transform/cache/meta-prefix
 /// header bits are the same for both).
-// Round 388: production consumers go through
-// `prefix_codes_and_tokens_bits_from` over shared tables; this
-// build-and-score wrapper is retained for the test suite.
-#[cfg_attr(not(test), allow(dead_code))]
+// Round 388: the arbitration loop goes through
+// `prefix_codes_and_tokens_bits_from` over shared tables; round 409
+// re-adopted this build-and-score wrapper for the §6.2.2 size-first
+// mirror's entropy-image pricing.
 fn prefix_codes_and_tokens_bits(
     tokens: &[Token],
     color_cache_size: usize,
@@ -6246,6 +6246,89 @@ fn write_meta_prefix_image(
     )
 }
 
+/// Round 409 — exact bit cost of [`write_entropy_coded_image_literals`]
+/// for `pixels`: the `%b0` cache-info bit plus the literal-only
+/// prefix-codes-and-tokens body. Used by the §6.2.2 size-first sweep
+/// mirror to price the entropy image (and by extension any
+/// `entropy-coded-image` sub-body) without writing it.
+fn entropy_coded_image_literals_bits(pixels: &[u32]) -> usize {
+    let tokens: Vec<Token> = pixels.iter().map(|&p| Token::Literal(p)).collect();
+    // 1 = the `%b0` color-cache-info bit; the literal-only stream uses
+    // no cache (`color_cache_size = 0`) and emits no Copy tokens
+    // (`image_width = 1` is the trivial value), mirroring the writer.
+    1 + prefix_codes_and_tokens_bits(&tokens, 0, 1)
+}
+
+/// Round 409 — exact **size mirror** of
+/// [`write_meta_prefix_image_with_codes`]: returns the total bit count
+/// the writer would append, or `None` exactly when the writer would
+/// decline (partition collapsed to fewer than two groups). The §6.2.2
+/// sweeps previously wrote a full candidate stream per
+/// `(prefix_bits, partition, cache)` tuple and kept the byte-smallest;
+/// with the plan mirror they *size* every tuple and write only the
+/// winner — the same size-first shape the round-388
+/// [`PreparedTransform::plan`] mirror gave the single-group cache
+/// sweep.
+///
+/// `entropy_image_bits` is a per-partition memo slot for the §6.2.2
+/// entropy image's [`write_entropy_coded_image_literals`] cost — the
+/// entropy image depends only on the partition, not the cache choice,
+/// so the 12-value cache sweep prices it once. Pass a fresh
+/// `&mut None` per `codes` value.
+///
+/// Mirror identity (`(header_bits + plan).div_ceil(8)` equals the
+/// written stream's byte length for every non-degenerate tuple) is
+/// pinned by the `meta_plan_mirror_matches_written_bytes` test plus
+/// debug assertions at each sweep's winner write.
+#[allow(clippy::too_many_arguments)]
+fn plan_meta_prefix_image_with_codes(
+    pixels: &[u32],
+    width: u32,
+    prefix_bits: u8,
+    codes: &[u16],
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+    entropy_image_bits: &mut Option<usize>,
+) -> Option<usize> {
+    let block_side = 1u32 << prefix_bits;
+    let pw = width.div_ceil(block_side);
+    let index = EncoderMetaIndex {
+        prefix_bits,
+        block_width: pw,
+        codes: codes.to_vec(),
+    };
+    let actual_groups = index.num_groups();
+    if actual_groups < 2 {
+        // Same degenerate gate as the writer.
+        return None;
+    }
+
+    let tokens = best_stream_tokens(pixels, width, cache_code_bits);
+    let buckets = split_tokens_by_group(&tokens, &index, width, actual_groups);
+    let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
+
+    // color-cache-info (`%b0` or `%b1 4BIT`) + meta-prefix `%b1` +
+    // 3-bit `prefix_bits - 2`.
+    let mut bits = match cache_code_bits {
+        Some(_) => 5,
+        None => 1,
+    } + 1
+        + 3;
+    // §6.2.2 entropy image — partition-dependent, cache-independent.
+    bits += *entropy_image_bits
+        .get_or_insert_with(|| entropy_coded_image_literals_bits(&index.entropy_image_argb()));
+    // Per-group prefix-code tables + the group's token symbols. The
+    // writer emits all group tables first and then the tokens in
+    // stream order; the total is the same as summing each group's
+    // table header + its bucket's token bits (the buckets partition
+    // the token stream).
+    for bucket in &buckets {
+        let tables = StreamCostTables::build(bucket, cache_size, image_width);
+        bits += prefix_codes_and_tokens_bits_from(&tables, bucket, image_width);
+    }
+    Some(bits)
+}
+
 /// [`write_meta_prefix_image`] with a caller-supplied §6.2.2 block →
 /// group assignment (round 383) — the entry the agglomerative
 /// entropy-merge sweep uses so one merge chain can feed every group
@@ -7649,12 +7732,47 @@ fn agglomerative_entropy_assignments(
 /// resulting stream, or `None` if no `(prefix_bits, num_groups)` pair
 /// produced a non-degenerate stream (i.e. the image was too small for any
 /// multi-block split, or every clustering collapsed to a single group).
+/// Round 409 — a §6.2.2 size-first sweep's running winner: the planned
+/// candidate byte length plus everything needed to re-write the
+/// winning stream (`prefix_bits`, the block → group partition, the
+/// §5.2.3 cache choice).
+type MetaSweepPick = (usize, u8, Vec<u16>, Option<u32>);
+
 fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Option<Vec<u8>> {
-    let mut best: Option<Vec<u8>> = None;
+    // Round 409 — size-first sweep: every `(prefix_bits, partition,
+    // cache)` tuple is priced through the exact
+    // [`plan_meta_prefix_image_with_codes`] mirror and only the winner
+    // is written. Selection order and the keep-first tie-break are
+    // identical to the previous write-everything sweep (first
+    // strictly-smaller candidate wins).
+    let mut best: Option<MetaSweepPick> = None;
     // Round 409: the cache-less partition-guide stream is independent
     // of `prefix_bits` — build it once for every entropy-merge chain
     // below instead of re-fetching (and re-cloning) per sweep value.
     let guide_tokens = best_stream_tokens(pixels, width, None);
+    // The `%b0` empty-transform-list header bit every candidate pays.
+    const HEADER_BITS: usize = 1;
+    let consider = |best: &mut Option<MetaSweepPick>, prefix_bits: u8, codes: &[u16]| {
+        let mut ent_bits = None;
+        for cache_opt in
+            std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+        {
+            if let Some(bits) = plan_meta_prefix_image_with_codes(
+                pixels,
+                width,
+                prefix_bits,
+                codes,
+                cache_opt,
+                width,
+                &mut ent_bits,
+            ) {
+                let cand_len = (HEADER_BITS + bits).div_ceil(8);
+                if best.as_ref().map_or(true, |(b, ..)| cand_len < *b) {
+                    *best = Some((cand_len, prefix_bits, codes.to_vec(), cache_opt));
+                }
+            }
+        }
+    };
     for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
         let block_side = 1u32 << prefix_bits;
         let pw = width.div_ceil(block_side);
@@ -7677,29 +7795,7 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
                 prefix_bits,
                 num_groups,
             );
-            for cache_opt in
-                std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
-            {
-                let mut w = BitWriter::new();
-                w.write_bit(false); // empty transform list
-                if write_meta_prefix_image_with_codes(
-                    &mut w,
-                    pixels,
-                    width,
-                    prefix_bits,
-                    codes.clone(),
-                    cache_opt,
-                    width,
-                )
-                .is_some()
-                {
-                    let cand = w.into_bytes();
-                    match &best {
-                        Some(b) if b.len() <= cand.len() => {}
-                        _ => best = Some(cand),
-                    }
-                }
-            }
+            consider(&mut best, prefix_bits, &codes);
         }
 
         // Round 383: agglomerative entropy-merge partitions at this
@@ -7713,32 +7809,23 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
             width,
             &ENTROPY_MERGE_GROUPS_SWEEP,
         ) {
-            for cache_opt in
-                std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
-            {
-                let mut w = BitWriter::new();
-                w.write_bit(false); // empty transform list
-                if write_meta_prefix_image_with_codes(
-                    &mut w,
-                    pixels,
-                    width,
-                    prefix_bits,
-                    codes.clone(),
-                    cache_opt,
-                    width,
-                )
-                .is_some()
-                {
-                    let cand = w.into_bytes();
-                    match &best {
-                        Some(b) if b.len() <= cand.len() => {}
-                        _ => best = Some(cand),
-                    }
-                }
-            }
+            consider(&mut best, prefix_bits, &codes);
         }
     }
-    best
+
+    // Write the winning tuple only.
+    let (planned_len, prefix_bits, codes, cache_opt) = best?;
+    let mut w = BitWriter::new();
+    w.write_bit(false); // empty transform list
+    write_meta_prefix_image_with_codes(&mut w, pixels, width, prefix_bits, codes, cache_opt, width)
+        .expect("winning shape passed the plan gate");
+    let bytes = w.into_bytes();
+    debug_assert_eq!(
+        bytes.len(),
+        planned_len,
+        "§6.2.2 plan mirror drifted from the writer"
+    );
+    Some(bytes)
 }
 
 /// Group counts the round-383 entropy-merge partition snapshots — a
@@ -7762,7 +7849,12 @@ fn sweep_color_indexing_meta_prefix(pixels: &[u32], width: u32, height: u32) -> 
     if palette0.is_empty() {
         return None;
     }
-    let mut best: Option<Vec<u8>> = None;
+    // Round 409 — size-first sweep (see [`sweep_meta_prefix_candidate`]):
+    // candidates are priced through the exact plan mirror; only the
+    // winning `(ordering, prefix_bits, partition, cache)` tuple is
+    // written. Same enumeration order + keep-first tie-break as the
+    // previous write-everything sweep.
+    let mut best: Option<(PaletteOrdering, MetaSweepPick)> = None;
     for &ordering in &PALETTE_ORDERINGS {
         let palette = order_palette(&palette0, pixels, ordering);
         let index_of = palette_index_map(&palette);
@@ -7771,16 +7863,12 @@ fn sweep_color_indexing_meta_prefix(pixels: &[u32], width: u32, height: u32) -> 
             pack_indices_into_bundled_image(pixels, &index_of, width, height, width_bits);
 
         // §4.4 transform header (same wire shape as
-        // `encode_with_color_indexing_ordered`).
+        // `encode_with_color_indexing_ordered`), priced once per
+        // ordering: present bit + 2-bit type + 8-bit palette length +
+        // the palette's entropy-coded-image body + the end-of-list bit.
         let mut subtraction_encoded = palette.clone();
         forward_color_table(&mut subtraction_encoded);
-        let write_headers = |w: &mut BitWriter| {
-            w.write_bit(true);
-            w.write_bits(crate::vp8l_stream::TransformType::ColorIndexing as u32, 2);
-            w.write_bits((palette.len() - 1) as u32, 8);
-            write_entropy_coded_image_literals(w, &subtraction_encoded);
-            w.write_bit(false); // end of optional-transform list
-        };
+        let header_bits = 1 + 2 + 8 + entropy_coded_image_literals_bits(&subtraction_encoded) + 1;
 
         // Round 409: the packed-index partition-guide stream is
         // independent of `prefix_bits` — build it once per ordering.
@@ -7794,33 +7882,62 @@ fn sweep_color_indexing_meta_prefix(pixels: &[u32], width: u32, height: u32) -> 
                 packed_width,
                 &ENTROPY_MERGE_GROUPS_SWEEP,
             ) {
+                let mut ent_bits = None;
                 for cache_opt in std::iter::once(None)
                     .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
                 {
-                    let mut w = BitWriter::new();
-                    write_headers(&mut w);
-                    if write_meta_prefix_image_with_codes(
-                        &mut w,
+                    if let Some(bits) = plan_meta_prefix_image_with_codes(
                         &packed_image,
                         packed_width,
                         prefix_bits,
-                        codes.clone(),
+                        &codes,
                         cache_opt,
                         packed_width,
-                    )
-                    .is_some()
-                    {
-                        let cand = w.into_bytes();
-                        match &best {
-                            Some(b) if b.len() <= cand.len() => {}
-                            _ => best = Some(cand),
+                        &mut ent_bits,
+                    ) {
+                        let cand_len = (header_bits + bits).div_ceil(8);
+                        if best.as_ref().map_or(true, |(_, (b, ..))| cand_len < *b) {
+                            best =
+                                Some((ordering, (cand_len, prefix_bits, codes.clone(), cache_opt)));
                         }
                     }
                 }
             }
         }
     }
-    best
+
+    // Re-derive the winning ordering's packed image and write it.
+    let (ordering, (planned_len, prefix_bits, codes, cache_opt)) = best?;
+    let palette = order_palette(&palette0, pixels, ordering);
+    let index_of = palette_index_map(&palette);
+    let width_bits = crate::vp8l_transform::color_indexing_width_bits(palette.len());
+    let (packed_image, packed_width) =
+        pack_indices_into_bundled_image(pixels, &index_of, width, height, width_bits);
+    let mut subtraction_encoded = palette.clone();
+    forward_color_table(&mut subtraction_encoded);
+    let mut w = BitWriter::new();
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::ColorIndexing as u32, 2);
+    w.write_bits((palette.len() - 1) as u32, 8);
+    write_entropy_coded_image_literals(&mut w, &subtraction_encoded);
+    w.write_bit(false); // end of optional-transform list
+    write_meta_prefix_image_with_codes(
+        &mut w,
+        &packed_image,
+        packed_width,
+        prefix_bits,
+        codes,
+        cache_opt,
+        packed_width,
+    )
+    .expect("winning shape passed the plan gate");
+    let bytes = w.into_bytes();
+    debug_assert_eq!(
+        bytes.len(),
+        planned_len,
+        "§6.2.2 color-indexing plan mirror drifted from the writer"
+    );
+    Some(bytes)
 }
 
 /// Round 383 — §3.5 transform stack **(subtract-green →) predictor**
@@ -7928,7 +8045,12 @@ fn sweep_predictor_meta_prefix_candidate(
     if width < block || height < block {
         return None;
     }
-    let mut best: Option<Vec<u8>> = None;
+    // Round 409 — size-first sweep (see [`sweep_meta_prefix_candidate`]):
+    // candidates are priced through the exact plan mirror; only the
+    // winning `(subtract_green, prefix_bits, partition, cache)` tuple
+    // is written. Same enumeration order + keep-first tie-break as the
+    // previous write-everything sweep.
+    let mut best: Option<(bool, MetaSweepPick)> = None;
     for subtract_green in [false, true] {
         // Round 388: the transform chain (§4.3 forward pass, §4.1
         // sub-image + residuals) depends only on `subtract_green` —
@@ -7957,17 +8079,40 @@ fn sweep_predictor_meta_prefix_candidate(
             ptw,
             size_bits,
         );
-        let write_headers = |w: &mut BitWriter| {
-            if subtract_green {
-                w.write_bit(true);
-                w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
-            }
-            w.write_bit(true);
-            w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
-            w.write_bits((size_bits - 2) as u32, 3);
-            write_entropy_coded_image_literals(w, &predictor_image);
-            w.write_bit(false);
-        };
+        // Header cost, priced once per branch: optional §4.3
+        // subtract-green (3 bits) + §4.1 predictor present/type bits
+        // (3) + 3-bit `size_bits - 2` + the predictor sub-image's
+        // entropy-coded-image body + the end-of-list bit.
+        let header_bits = if subtract_green { 3 } else { 0 }
+            + 3
+            + 3
+            + entropy_coded_image_literals_bits(&predictor_image)
+            + 1;
+        let consider =
+            |best: &mut Option<(bool, MetaSweepPick)>, prefix_bits: u8, codes: &[u16]| {
+                let mut ent_bits = None;
+                for cache_opt in std::iter::once(None)
+                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+                {
+                    if let Some(bits) = plan_meta_prefix_image_with_codes(
+                        &residuals,
+                        width,
+                        prefix_bits,
+                        codes,
+                        cache_opt,
+                        width,
+                        &mut ent_bits,
+                    ) {
+                        let cand_len = (header_bits + bits).div_ceil(8);
+                        if best.as_ref().map_or(true, |(_, (b, ..))| cand_len < *b) {
+                            *best = Some((
+                                subtract_green,
+                                (cand_len, prefix_bits, codes.to_vec(), cache_opt),
+                            ));
+                        }
+                    }
+                }
+            };
 
         for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
             let block_side = 1u32 << prefix_bits;
@@ -7988,29 +8133,7 @@ fn sweep_predictor_meta_prefix_candidate(
                     prefix_bits,
                     num_groups,
                 );
-                for cache_opt in std::iter::once(None)
-                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
-                {
-                    let mut w = BitWriter::new();
-                    write_headers(&mut w);
-                    if write_meta_prefix_image_with_codes(
-                        &mut w,
-                        &residuals,
-                        width,
-                        prefix_bits,
-                        codes.clone(),
-                        cache_opt,
-                        width,
-                    )
-                    .is_some()
-                    {
-                        let cand = w.into_bytes();
-                        match &best {
-                            Some(b) if b.len() <= cand.len() => {}
-                            _ => best = Some(cand),
-                        }
-                    }
-                }
+                consider(&mut best, prefix_bits, &codes);
             }
         }
 
@@ -8029,33 +8152,61 @@ fn sweep_predictor_meta_prefix_candidate(
                 width,
                 &ENTROPY_MERGE_GROUPS_SWEEP,
             ) {
-                for cache_opt in std::iter::once(None)
-                    .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
-                {
-                    let mut w = BitWriter::new();
-                    write_headers(&mut w);
-                    if write_meta_prefix_image_with_codes(
-                        &mut w,
-                        &residuals,
-                        width,
-                        prefix_bits,
-                        codes.clone(),
-                        cache_opt,
-                        width,
-                    )
-                    .is_some()
-                    {
-                        let cand = w.into_bytes();
-                        match &best {
-                            Some(b) if b.len() <= cand.len() => {}
-                            _ => best = Some(cand),
-                        }
-                    }
-                }
+                consider(&mut best, prefix_bits, &codes);
             }
         }
     }
-    best
+
+    // Re-derive the winning branch's transform chain and write it.
+    let (subtract_green, (planned_len, prefix_bits, codes, cache_opt)) = best?;
+    let mut transformed = pixels.to_vec();
+    if subtract_green {
+        apply_subtract_green(&mut transformed);
+    }
+    let (predictor_image, ptw, _pth) = build_predictor_image_strategy(
+        &transformed,
+        width,
+        height,
+        size_bits,
+        PredictorSubImageStrategy::L1,
+    );
+    let mut residuals = vec![0u32; transformed.len()];
+    apply_forward_predictor(
+        &transformed,
+        &mut residuals,
+        width,
+        height,
+        &predictor_image,
+        ptw,
+        size_bits,
+    );
+    let mut w = BitWriter::new();
+    if subtract_green {
+        w.write_bit(true);
+        w.write_bits(crate::vp8l_stream::TransformType::SubtractGreen as u32, 2);
+    }
+    w.write_bit(true);
+    w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
+    w.write_bits((size_bits - 2) as u32, 3);
+    write_entropy_coded_image_literals(&mut w, &predictor_image);
+    w.write_bit(false);
+    write_meta_prefix_image_with_codes(
+        &mut w,
+        &residuals,
+        width,
+        prefix_bits,
+        codes,
+        cache_opt,
+        width,
+    )
+    .expect("winning shape passed the plan gate");
+    let bytes = w.into_bytes();
+    debug_assert_eq!(
+        bytes.len(),
+        planned_len,
+        "§6.2.2 predictor plan mirror drifted from the writer"
+    );
+    Some(bytes)
 }
 
 /// Encode an ARGB image to a **bare** §2.6 / §3.4 `VP8L` bitstream — the
@@ -13249,6 +13400,89 @@ mod tests {
                 pixels.as_slice(),
                 "round-trip failed for prefix_bits={pb}"
             );
+        }
+    }
+
+    /// Round 409 — the §6.2.2 size-first sweep prices candidates
+    /// through [`plan_meta_prefix_image_with_codes`] alone, so a
+    /// mirror drift on **any** `(prefix_bits, partition, cache)` tuple
+    /// could flip the sweep's selection. Sweeps two contrasting
+    /// payloads across every `prefix_bits`, both partition families
+    /// (kmeans + entropy-merge snapshots), and all 12 cache choices,
+    /// asserting the planned bit count rounds to exactly the writer's
+    /// byte length (both prefixed with the same 1-bit empty transform
+    /// list the transform-free sweep pays), and that plan/write agree
+    /// on the degenerate `None` gate.
+    #[test]
+    fn meta_plan_mirror_matches_written_bytes() {
+        let w = 64u32;
+        let h = 64u32;
+        for pixels in [two_region_bimodal_image(w, h), two_region_noisy_image(w, h)] {
+            let guide_tokens = best_stream_tokens(&pixels, w, None);
+            for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+                let mut partitions: Vec<Vec<u16>> = Vec::new();
+                for num_groups in 2..=MAX_META_GROUPS {
+                    partitions.push(cluster_blocks_by_histogram_distance(
+                        &pixels,
+                        w,
+                        h,
+                        prefix_bits,
+                        num_groups,
+                    ));
+                }
+                for (_, codes) in agglomerative_entropy_assignments(
+                    &guide_tokens,
+                    w,
+                    h,
+                    prefix_bits,
+                    w,
+                    &ENTROPY_MERGE_GROUPS_SWEEP,
+                ) {
+                    partitions.push(codes);
+                }
+                for codes in &partitions {
+                    let mut ent_bits = None;
+                    for cache_opt in std::iter::once(None)
+                        .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+                    {
+                        let planned = plan_meta_prefix_image_with_codes(
+                            &pixels,
+                            w,
+                            prefix_bits,
+                            codes,
+                            cache_opt,
+                            w,
+                            &mut ent_bits,
+                        );
+                        let mut writer = BitWriter::new();
+                        writer.write_bit(false); // empty transform list
+                        let wrote = write_meta_prefix_image_with_codes(
+                            &mut writer,
+                            &pixels,
+                            w,
+                            prefix_bits,
+                            codes.clone(),
+                            cache_opt,
+                            w,
+                        );
+                        match (planned, wrote) {
+                            (Some(bits), Some(())) => {
+                                assert_eq!(
+                                    (1 + bits).div_ceil(8),
+                                    writer.into_bytes().len(),
+                                    "plan/write drift (prefix_bits={prefix_bits}, cache={cache_opt:?})"
+                                );
+                            }
+                            (None, None) => {}
+                            (p, wr) => panic!(
+                                "plan/write gate disagreement (prefix_bits={prefix_bits}, \
+                                 cache={cache_opt:?}): plan={p:?}, wrote={:?}",
+                                wr.is_some()
+                            ),
+                        }
+                    }
+                }
+            }
         }
     }
 
