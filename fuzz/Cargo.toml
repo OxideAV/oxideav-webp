@@ -844,3 +844,23 @@ path = "fuzz_targets/extract_routing.rs"
 test = false
 doc = false
 bench = false
+
+# Round-408 round-trip oracle over the encoder's *parameterised* entry
+# points, with the parameters themselves fuzz-driven: the caller-fixed
+# §3.4 alpha_is_used bit on `encode_vp8l_argb_with` (emitted 5-byte
+# header re-derived byte-for-byte + full decode-back), the production
+# width-threaded `encode_argb_literals_with_width` decoded headerless at
+# the caller geometry, and the width-less forced-path literal entries
+# (chooser / literal-only / subtract-green-forced / cache-forced at a
+# fuzz-chosen §5.2.3 cache_code_bits ∈ [1, 11]) decoded headerless at
+# the self-consistent (1, N) framing their width-1 §5.2.2 distance codes
+# are defined against. Every decode must reproduce the input ARGB
+# exactly — VP8L is lossless at every parameter point, not just at the
+# public façade's chooser winner — plus a determinism replay on the
+# cache-forced form.
+[[bin]]
+name = "encode_params_roundtrip"
+path = "fuzz_targets/encode_params_roundtrip.rs"
+test = false
+doc = false
+bench = false

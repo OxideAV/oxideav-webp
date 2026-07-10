@@ -4,6 +4,31 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- *(vp8l_encode)* degenerate §3.7.2 prefix-code tables no longer emit
+  undecodable streams (round-408 fuzz find, `encode_params_roundtrip`,
+  4-byte reproducer). An all-identical-pixel image encoded with a §5.2.3
+  color cache tokenizes to nothing but cache references (pixel value 0
+  even skips the first literal — slot 0 of the zero-initialized cache
+  already holds color 0), leaving two table shapes the writer emitted as
+  Kraft-incomplete normal-form tables every compliant reader (this
+  crate's included) rejects: the **all-zero** red/blue/alpha tables (no
+  literal ever emitted) and a **lone GREEN symbol above 255** (one
+  repeated cache reference, `256 + 24 + index`), which the §3.7.2.1.1
+  simple form's 8-bit symbol fields cannot carry. `WriteCode::from_freqs`
+  now substitutes the single-symbol-0 form for all-zero tables (the fix
+  the group writers already applied to distance — now uniform across all
+  five codes) and promotes an oversized lone symbol to a two-leaf table
+  (phantom length-1 slot at unused symbol 0; the real symbol costs 1 bit
+  instead of 0). The `CostLengths` size mirror prices both promotions
+  identically, keeping the round-388 `plan()`/`finish()` byte-exact
+  contract. Public-surface impact: `encode_argb_literals_color_cache`
+  (any forced-cache caller) produced undecodable bytes; the auto-choosing
+  façades (`encode_webp_lossless`, `encode_vp8l_argb`) were shielded in
+  practice because the broken candidates priced large and always lost the
+  sweep, but the sweep now prices and emits them correctly either way.
+
 ### Other
 
 - Add `compose_animation` structure-aware fuzz target: raw attacker-assembled

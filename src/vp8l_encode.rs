@@ -726,6 +726,43 @@ pub fn value_to_prefix(value: u32) -> (u32, u32, u32) {
     (prefix_code, extra_bits, extra_value)
 }
 
+/// If `freqs` has exactly one used symbol and that symbol exceeds the
+/// §3.7.2.1.1 simple-form 8-bit symbol ceiling (255), return it.
+///
+/// A single-leaf prefix code is only expressible on the wire through
+/// the §3.7.2.1.1 *simple* form (whose symbol fields are at most
+/// 8 bits); the §3.7.2.1.2 *normal* form cannot describe it — a lone
+/// length-1 leaf is Kraft-incomplete, which a compliant reader (this
+/// crate's included) rejects. GREEN is the only alphabet wide enough
+/// to hit this: an image whose every token is the same §5.2.3 cache
+/// reference (e.g. all-`0x00000000` pixels resolved against the
+/// zero-initialized cache) leaves one used symbol at `256 + 24 +
+/// index > 255`. Such a code must be *promoted* to a two-leaf table
+/// (see the callers) instead of emitted as an undecodable stream.
+fn single_used_symbol_above_simple_ceiling(freqs: &[u32]) -> Option<usize> {
+    let mut used = freqs.iter().enumerate().filter(|&(_, &f)| f > 0);
+    let (symbol, _) = used.next()?;
+    if used.next().is_none() && symbol > 255 {
+        Some(symbol)
+    } else {
+        None
+    }
+}
+
+/// Two-leaf promotion of a single-leaf code the §3.7.2.1.1 simple form
+/// cannot carry (see [`single_used_symbol_above_simple_ceiling`]): the
+/// real symbol plus a phantom length-1 slot at (unused) symbol 0. The
+/// phantom never appears in the token stream; the real symbol costs
+/// 1 bit on the wire instead of 0, and the emitted §3.7.2.1.2 normal
+/// form is Kraft-complete.
+fn promoted_two_leaf_lengths(alphabet_size: usize, symbol: usize) -> Vec<u8> {
+    debug_assert!(symbol != 0 && symbol < alphabet_size);
+    let mut lengths = vec![0u8; alphabet_size];
+    lengths[0] = 1;
+    lengths[symbol] = 1;
+    lengths
+}
+
 /// A built prefix code ready for symbol emission: per-symbol length + code.
 #[derive(Debug, Clone)]
 struct WriteCode {
@@ -738,7 +775,36 @@ struct WriteCode {
 impl WriteCode {
     /// Build a [`WriteCode`] from symbol frequencies over an alphabet of
     /// `alphabet_size` symbols.
+    ///
+    /// Two degenerate shapes are promoted to decodable wire forms here
+    /// (round 408, both fuzz-surfaced through the all-`CacheRef` token
+    /// stream an all-identical-pixel image produces against the
+    /// zero-initialized §5.2.3 cache):
+    ///
+    /// * an **all-zero** frequency table (the alphabet never appears in
+    ///   the token stream — e.g. red/blue/alpha when no literal is
+    ///   emitted) becomes the §3.7.2.1.1 single-symbol-0 form via
+    ///   [`WriteCode::empty`], the same substitution the group writers
+    ///   already made for the unused distance code;
+    /// * a **lone used symbol above 255** (only reachable on GREEN)
+    ///   becomes the two-leaf table — see
+    ///   [`single_used_symbol_above_simple_ceiling`].
     fn from_freqs(freqs: &[u32]) -> Self {
+        if !freqs.is_empty() && freqs.iter().all(|&f| f == 0) {
+            return Self::empty(freqs.len());
+        }
+        // A lone used symbol past the simple-form ceiling cannot be
+        // emitted as a 0-bit single-leaf code (no wire form carries
+        // it); promote to the two-leaf table so the stream decodes.
+        if let Some(symbol) = single_used_symbol_above_simple_ceiling(freqs) {
+            let lengths = promoted_two_leaf_lengths(freqs.len(), symbol);
+            let codes = canonical_codes(&lengths);
+            return Self {
+                lengths,
+                codes,
+                single: None,
+            };
+        }
         let used: Vec<usize> = (0..freqs.len()).filter(|&s| freqs[s] > 0).collect();
         let single = if used.len() == 1 { Some(used[0]) } else { None };
         let lengths = build_code_lengths(freqs);
@@ -1686,6 +1752,27 @@ struct CostLengths {
 
 impl CostLengths {
     fn from_freqs(freqs: &[u32]) -> Self {
+        // Mirror of [`WriteCode::from_freqs`]'s two degenerate-shape
+        // promotions, keeping the `plan()` size mirror byte-exact
+        // with the writer: an all-zero table is priced as the
+        // §3.7.2.1.1 single-symbol-0 form ([`WriteCode::empty`]), and
+        // a lone used symbol past the §3.7.2.1.1 simple-form ceiling
+        // as the promoted two-leaf table (1 bit per symbol + the
+        // normal-form table cost).
+        if !freqs.is_empty() && freqs.iter().all(|&f| f == 0) {
+            let mut single_zero = vec![0u32; freqs.len()];
+            single_zero[0] = 1;
+            return Self {
+                lengths: build_code_lengths(&single_zero),
+                used: 1,
+            };
+        }
+        if let Some(symbol) = single_used_symbol_above_simple_ceiling(freqs) {
+            return Self {
+                lengths: promoted_two_leaf_lengths(freqs.len(), symbol),
+                used: 2,
+            };
+        }
         let used = freqs.iter().filter(|&&f| f > 0).count();
         Self {
             lengths: build_code_lengths(freqs),
@@ -1765,23 +1852,17 @@ fn prefix_codes_and_tokens_bits_from(
     tokens: &[Token],
     image_width: u32,
 ) -> usize {
-    // The writer substitutes the §3.7.2.1.1 single-symbol-0 form for
-    // an all-empty distance table ([`WriteCode::empty`]); mirror its
-    // table cost exactly. (Its per-symbol cost never fires — an empty
-    // distance table means no Copy tokens.)
-    let dist_table_bits = if tables.distance.used == 0 {
-        let mut empty_freqs = vec![0u32; 40];
-        empty_freqs[0] = 1;
-        CostLengths::from_freqs(&empty_freqs).code_lengths_bits()
-    } else {
-        tables.distance.code_lengths_bits()
-    };
-
+    // Round 408: the writer's §3.7.2.1.1 single-symbol-0 substitution
+    // for an all-empty table moved inside `from_freqs` (both the
+    // `WriteCode` writer and the `CostLengths` mirror), so every
+    // table's cost below already prices the substituted form — for
+    // distance and for the red / blue / alpha alphabets an
+    // all-CacheRef token stream leaves unused alike.
     let mut bits = tables.green.code_lengths_bits()
         + tables.red.code_lengths_bits()
         + tables.blue.code_lengths_bits()
         + tables.alpha.code_lengths_bits()
-        + dist_table_bits;
+        + tables.distance.code_lengths_bits();
 
     for &tok in tokens {
         match tok {
@@ -6010,43 +6091,22 @@ fn build_group_codes(
     color_cache_size: usize,
     image_width: u32,
 ) -> Vec<[WriteCode; 5]> {
-    let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + color_cache_size;
     buckets
         .iter()
         .map(|bucket| {
             let freqs = count_frequencies(bucket, color_cache_size, image_width);
-            // `empty(N)` produces a valid one-leaf code over an
-            // alphabet of size `N` (the §3.7.2.1.1 single-symbol-0
-            // form). For each channel, fall back to it when no
-            // symbols were emitted in this bucket — the decoder
-            // accepts the resulting one-leaf code without ever
-            // consuming a symbol from it.
-            let green = if freqs.green.iter().any(|&f| f > 0) {
-                WriteCode::from_freqs(&freqs.green)
-            } else {
-                WriteCode::empty(green_alphabet)
-            };
-            let red = if freqs.red.iter().any(|&f| f > 0) {
-                WriteCode::from_freqs(&freqs.red)
-            } else {
-                WriteCode::empty(256)
-            };
-            let blue = if freqs.blue.iter().any(|&f| f > 0) {
-                WriteCode::from_freqs(&freqs.blue)
-            } else {
-                WriteCode::empty(256)
-            };
-            let alpha = if freqs.alpha.iter().any(|&f| f > 0) {
-                WriteCode::from_freqs(&freqs.alpha)
-            } else {
-                WriteCode::empty(256)
-            };
-            let dist = if freqs.distance.iter().any(|&f| f > 0) {
-                WriteCode::from_freqs(&freqs.distance)
-            } else {
-                WriteCode::empty(40)
-            };
-            [green, red, blue, alpha, dist]
+            // A channel with no emitted symbols in this bucket comes
+            // back all-zero; `from_freqs` substitutes the §3.7.2.1.1
+            // single-symbol-0 one-leaf form for it (round 408: the
+            // substitution moved inside `from_freqs`), which the
+            // decoder accepts without ever consuming a symbol.
+            [
+                WriteCode::from_freqs(&freqs.green),
+                WriteCode::from_freqs(&freqs.red),
+                WriteCode::from_freqs(&freqs.blue),
+                WriteCode::from_freqs(&freqs.alpha),
+                WriteCode::from_freqs(&freqs.distance),
+            ]
         })
         .collect()
 }
@@ -6687,13 +6747,12 @@ fn write_prefix_codes_and_tokens(
     let blue_code = WriteCode::from_freqs(&freqs.blue);
     let alpha_code = WriteCode::from_freqs(&freqs.alpha);
     // Prefix #5 (distance): if no backward references were emitted, the
-    // frequency table is all-zero → `from_freqs` yields the empty code,
-    // which `WriteCode` serialises as the §3.7.2.1.1 single-symbol-0 form.
-    let dist_code = if freqs.distance.iter().any(|&f| f > 0) {
-        WriteCode::from_freqs(&freqs.distance)
-    } else {
-        WriteCode::empty(40)
-    };
+    // frequency table is all-zero → `from_freqs` substitutes the empty
+    // code, serialised as the §3.7.2.1.1 single-symbol-0 form. (Round
+    // 408: the substitution moved inside `from_freqs`, so red / blue /
+    // alpha get it too — an all-CacheRef token stream emits no literal
+    // and leaves all three channel alphabets unused.)
+    let dist_code = WriteCode::from_freqs(&freqs.distance);
 
     // data = prefix-codes lz77-coded-image.
     // prefix-code-group = 5 prefix codes, in bitstream order:
@@ -8131,6 +8190,119 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let decoded = PrefixCode::read(&mut r, 40).unwrap();
         assert_eq!(decoded.single_symbol(), Some(0));
+    }
+
+    /// Round-408 fuzz regression (`encode_params_roundtrip`, 4-byte
+    /// crash input `28 28 5d 5d`): `from_freqs` over an **all-zero**
+    /// frequency table must substitute the §3.7.2.1.1 single-symbol-0
+    /// form rather than emit an all-zero normal-form table no reader
+    /// accepts. An all-`CacheRef` token stream (every pixel resolved
+    /// against the zero-initialized §5.2.3 cache) leaves the red /
+    /// blue / alpha alphabets exactly this shape.
+    #[test]
+    fn from_freqs_substitutes_single_symbol_zero_for_all_zero_table() {
+        let code = WriteCode::from_freqs(&vec![0u32; 256]);
+        let mut w = BitWriter::new();
+        code.write_code_lengths(&mut w);
+        let table_bits = w.bit_position();
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        let decoded = PrefixCode::read(&mut r, 256).unwrap();
+        assert_eq!(decoded.single_symbol(), Some(0));
+
+        // The cost mirror prices the same substituted form.
+        assert_eq!(
+            CostLengths::from_freqs(&vec![0u32; 256]).code_lengths_bits(),
+            table_bits,
+        );
+    }
+
+    /// Round-408 fuzz regression (same crash input): a **lone used
+    /// symbol above 255** — GREEN when the whole image is one repeated
+    /// §5.2.3 cache reference — fits neither §3.7.2.1 wire form as a
+    /// single leaf (the simple form's symbol fields are 8-bit; a lone
+    /// length-1 leaf in the normal form is Kraft-incomplete), so
+    /// `from_freqs` must promote it to the two-leaf table and the
+    /// emitted table + symbols must round-trip through this crate's
+    /// own §6.2.1 reader.
+    #[test]
+    fn from_freqs_promotes_lone_symbol_above_255_to_two_leaf_code() {
+        let green_alphabet = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + 2;
+        let mut freqs = vec![0u32; green_alphabet];
+        freqs[280] = 7; // a repeated cache-ref green symbol
+        let code = WriteCode::from_freqs(&freqs);
+
+        let mut w = BitWriter::new();
+        code.write_code_lengths(&mut w);
+        code.write_symbol(&mut w, 280);
+        code.write_symbol(&mut w, 280);
+        let table_and_symbol_bits = w.bit_position();
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let decoded = PrefixCode::read(&mut r, green_alphabet).unwrap();
+        assert_eq!(decoded.single_symbol(), None, "two-leaf, not single-leaf");
+        assert_eq!(decoded.read_symbol(&mut r).unwrap(), 280);
+        assert_eq!(decoded.read_symbol(&mut r).unwrap(), 280);
+        assert_eq!(r.bit_position(), table_and_symbol_bits);
+
+        // The cost mirror prices the same promoted table + 1-bit symbols.
+        let mirror = CostLengths::from_freqs(&freqs);
+        assert_eq!(
+            mirror.code_lengths_bits() + 2 * mirror.sym_bits(280),
+            table_and_symbol_bits,
+        );
+    }
+
+    /// Round-408 fuzz regression, end to end: an all-identical-pixel
+    /// image with a **forced** §5.2.3 color cache tokenizes to (almost)
+    /// nothing but cache references; the emitted stream must decode
+    /// back exactly at every legal `cache_code_bits`. Pixel value 0
+    /// hits the fresh-cache corner (slot 0 of the zero-initialized
+    /// cache already holds color 0, so even the *first* token is a
+    /// `CacheRef` and no literal is ever emitted).
+    #[test]
+    fn forced_cache_all_identical_pixels_roundtrip() {
+        for pixel in [0u32, 0xff20_4060] {
+            for n in [1usize, 2, 81] {
+                for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
+                    let pixels = vec![pixel; n];
+                    let stream = encode_argb_literals_color_cache(&pixels, bits);
+                    let image = crate::vp8l_transform::decode_lossless_headerless(
+                        &stream, 1, n as u32,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("pixel {pixel:#010x} n={n} bits={bits}: undecodable stream: {e:?}")
+                    });
+                    assert_eq!(
+                        image.pixels(),
+                        &pixels[..],
+                        "pixel {pixel:#010x} n={n} bits={bits}: lossless contract",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The round-388 `plan()` size mirror must stay byte-exact with the
+    /// writer across the round-408 degenerate-table promotions: sweep
+    /// the cache choices over an all-identical-pixel image (all-CacheRef
+    /// token streams at every enabled cache size).
+    #[test]
+    fn plan_len_matches_finish_on_all_cache_ref_streams() {
+        let pixels = vec![0u32; 64];
+        let prep = prepare_literals(&pixels, false, 8);
+        for cache in
+            std::iter::once(None).chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+        {
+            let (_, planned_len) = prep.plan(cache);
+            let written = prep.finish(cache);
+            assert_eq!(
+                planned_len,
+                written.len(),
+                "plan/finish drift at cache {cache:?} on an all-CacheRef stream",
+            );
+        }
     }
 
     // ---- §3.7.2.1.1 simple code length code chooser ----

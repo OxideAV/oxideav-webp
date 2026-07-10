@@ -219,7 +219,12 @@ fall into three groups:
   `parse_anim`, `parse_alph`, `parse_transform_list`,
   `parse_meta_prefix`) cross-checking every decoded field against the
   bytes the parser observed and every error branch against its refusal
-  trigger.
+  trigger, plus `extract_routing`, which drives the public
+  chunk-routing façade (`extract_lossless_chunk` / `extract_lossy_chunk`
+  / `read_vp8l_transform_list`) over one buffer and cross-checks it
+  against the layers it stitches together (refusal propagation,
+  presence routing, §3.4/§9.1 wire-byte re-derivations, and a
+  routed-vs-manual §4 read differential).
 * **Inner decode primitives** — `decode_argb`, `decode_lossless`,
   `decode_entropy_image`, `decode_entropy_coded_image`, `prefix_code`,
   `prefix_code_group`, `read_symbol_lut_diff`, `distance_code`,
@@ -228,18 +233,36 @@ fall into three groups:
 * **Structure-aware hostility harnesses** — `compose_animation` assembles
   *raw* attacker-controlled RIFF/WEBP/VP8X/ANIM/ANMF containers whose
   §2.7.1.1 `ANMF` header fields (offsets, `Frame W/H`, dispose/blend info
-  byte, duration) are free to contradict the valid inner `VP8L` bitstream,
+  byte, duration) are free to contradict the valid inner bitstream (per
+  frame either a valid `VP8L` stream or a fuzz-mutated §2.5 `VP8 ` key
+  frame — the only harness reaching the compositor's lossy sub-chunk leg),
   driving the §2.7.2 compositor's defensive branches — out-of-canvas rect
   rejection + offset overflow, canvas over/under-cover, zero-frame `ANIM`,
   missing `VP8X`, every dispose×blend combination at adversarial placements,
   and a raw-bytes `ALPH` overlay — and asserts the §2.7.1.1 flat-canvas
-  carrier invariant plus decode determinism on every survivor.
+  carrier invariant, the §2.7.1.1 field carry (durations, loop count,
+  background colour) and decode determinism on every survivor.
+* **Parameterised encoder oracle** — `encode_params_roundtrip` makes the
+  encoder *parameters* fuzz input (caller-fixed §3.4 `alpha_is_used`,
+  forced subtract-green, forced §5.2.3 `cache_code_bits ∈ [1, 11]`,
+  width-threaded vs width-less literal entries) and asserts the exact
+  lossless round trip at every parameter point, not just at the public
+  façade's chooser winner.
+
+The `decode` / `decode_still_paths` still-image targets run the §2.5
+`VP8 ` lossy legs too (unskipped in round 408 after the sibling
+`oxideav-vp8` decoder fixed its §14.4 inverse-DCT overflow on master),
+so hostile lossy bitstreams reach the sibling decoder through this
+crate's public entry points, seeded from the committed lossy fixtures.
 
 Sustained ASan campaigns are crash-free; several targets surfaced (and
 the crate fixed) real defenses — eager-allocation OOM bounds on
 adversarial canvas / image dimensions, a `BitReader::bits_remaining`
-underflow, and a distance-code add-overflow. Run any target with
-(nightly + `cargo-fuzz`):
+underflow, a distance-code add-overflow, and (round 408, surfaced by
+`encode_params_roundtrip` within minutes of its first run) two
+degenerate §3.7.2 prefix-code table shapes the encoder emitted as
+Kraft-incomplete, undecodable streams on all-cache-reference token
+streams. Run any target with (nightly + `cargo-fuzz`):
 
 ```text
 cargo +nightly fuzz run <target> --manifest-path crates/oxideav-webp/fuzz/Cargo.toml
