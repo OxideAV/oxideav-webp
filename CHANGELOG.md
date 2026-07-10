@@ -53,6 +53,15 @@ All notable changes to `oxideav-webp` are recorded here.
   factored out and shared with `count_frequencies`. Corpus wall
   2.90 s → 2.80 s.
 
+- *(vp8l_encode)* hit-table §5.2.3 cacheify (round 409,
+  byte-identical): the plan arbitration's `finalize` replays the
+  precomputed per-position cache-hit table
+  (`cacheify_tokens_with_hits`) instead of re-walking the stateful
+  cache per candidate stream — cache state before a position depends
+  only on the pixel prefix, not the token partition. The stateful
+  `cacheify_tokens` is retained as the test-suite reference, pinned by
+  `cacheify_with_hits_matches_stateful_cacheify`.
+
 ### Fixed
 
 - *(vp8l_encode)* degenerate §3.7.2 prefix-code tables no longer emit

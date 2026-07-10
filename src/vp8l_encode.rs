@@ -1688,6 +1688,11 @@ impl EncoderColorCache {
 /// `pixels` provides the underlying pixel sequence for backward
 /// references (needed to know which colors a `Copy` token covers so
 /// the cache state stays in sync).
+// Round 409: production streams go through `cacheify_tokens_with_hits`
+// over the plan memo's precomputed hit table; this stateful walk is
+// retained as the test suite's reference
+// (`cacheify_with_hits_matches_stateful_cacheify` et al.).
+#[cfg_attr(not(test), allow(dead_code))]
 fn cacheify_tokens(tokens: &[Token], pixels: &[u32], code_bits: u32) -> Vec<Token> {
     let mut cache = EncoderColorCache::new(code_bits);
     let mut out = Vec::with_capacity(tokens.len());
@@ -1733,6 +1738,52 @@ fn cacheify_tokens(tokens: &[Token], pixels: &[u32], code_bits: u32) -> Vec<Toke
         pixels.len(),
         "cacheify_tokens: token stream covered {pos} of {} pixels",
         pixels.len()
+    );
+    out
+}
+
+/// [`cacheify_tokens`] over a precomputed per-position §5.2.3 hit
+/// table (round 409). The cache state before scan position `p` depends
+/// only on `pixels[0..p]` — every decoded pixel is inserted in stream
+/// order regardless of the token partition covering it — so a
+/// `Literal` at position `p` rewrites to a `CacheRef` **iff**
+/// `hits[p]` recorded a hit with that index. This replays the
+/// stateful walk's exact decisions without re-hashing every pixel per
+/// candidate stream; equality with [`cacheify_tokens`] is pinned by
+/// the `cacheify_with_hits_matches_stateful_cacheify` test.
+///
+/// `hits` must be the table built by walking `pixels` through an
+/// [`EncoderColorCache`] of the same `code_bits` (see the plan memo in
+/// [`best_stream_tokens_with_cost`]).
+fn cacheify_tokens_with_hits(tokens: &[Token], hits: &[Option<u16>]) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut pos = 0usize;
+    for &tok in tokens {
+        match tok {
+            Token::Literal(argb) => {
+                match hits[pos] {
+                    Some(ix) => out.push(Token::CacheRef { index: ix as u32 }),
+                    None => out.push(Token::Literal(argb)),
+                }
+                pos += 1;
+            }
+            Token::CacheRef { .. } => {
+                // Mirror `cacheify_tokens`: pass through defensively
+                // (the matcher / DP streams never pre-emit these).
+                out.push(tok);
+                pos += 1;
+            }
+            Token::Copy { length, .. } => {
+                out.push(tok);
+                pos += length;
+            }
+        }
+    }
+    debug_assert_eq!(
+        pos,
+        hits.len(),
+        "cacheify_tokens_with_hits: token stream covered {pos} of {} pixels",
+        hits.len()
     );
     out
 }
@@ -2420,12 +2471,6 @@ fn best_stream_tokens_with_cost(
         }
 
         let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
-        let finalize = |raw: Vec<Token>| -> Vec<Token> {
-            match cache_code_bits {
-                Some(bits) => cacheify_tokens(&raw, pixels, bits),
-                None => raw,
-            }
-        };
 
         // Round 388 — per-position §5.2.3 cache-hit table for the DP's
         // cache-aware literal pricing. Cache state is tokenization-
@@ -2444,6 +2489,18 @@ fn best_stream_tokens_with_cost(
                 })
                 .collect()
         });
+
+        // Round 409: the same tokenization-independence means the
+        // §5.2.3 rewrite itself can replay the precomputed hit table
+        // instead of re-walking the cache state per candidate stream
+        // (`cacheify_tokens_with_hits` == `cacheify_tokens`, pinned by
+        // `cacheify_with_hits_matches_stateful_cacheify`).
+        let finalize = |raw: Vec<Token>| -> Vec<Token> {
+            match cache_hits.as_deref() {
+                Some(hits) => cacheify_tokens_with_hits(&raw, hits),
+                None => raw,
+            }
+        };
 
         // Round 388: each stream's cost tables are built once and
         // shared between its exact-cost mirror and the next DP
@@ -9995,6 +10052,49 @@ mod tests {
         let cache = EncoderColorCache::new(8);
         let idx = cache.hash(argb) as u32;
         assert_eq!(out[2], Token::CacheRef { index: idx });
+    }
+
+    /// Round 409 — `cacheify_tokens_with_hits` (the production rewrite
+    /// over the plan memo's precomputed hit table) must reproduce the
+    /// stateful `cacheify_tokens` walk exactly: same `CacheRef`
+    /// positions, same indices, same pass-throughs. Sweeps a
+    /// cache-friendly repetitive buffer and an LCG-noise buffer through
+    /// both the greedy tokenizer's stream and a literal-only stream,
+    /// across every §5.2.3 `code_bits`.
+    #[test]
+    fn cacheify_with_hits_matches_stateful_cacheify() {
+        let mut state = 0x600d_cafeu32;
+        let repetitive: Vec<u32> = (0..512)
+            .map(|i| 0xff00_0000 | (((i % 7) * 30) << 8))
+            .collect();
+        let noise: Vec<u32> = (0..512)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                0xff00_0000 | (state >> 8)
+            })
+            .collect();
+        for pixels in [&repetitive, &noise] {
+            let greedy = tokenize_lz77(pixels);
+            let literals: Vec<Token> = pixels.iter().map(|&p| Token::Literal(p)).collect();
+            for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
+                let mut cache = EncoderColorCache::new(bits);
+                let hits: Vec<Option<u16>> = pixels
+                    .iter()
+                    .map(|&argb| {
+                        let hit = cache.contains(argb).map(|ix| ix as u16);
+                        cache.insert(argb);
+                        hit
+                    })
+                    .collect();
+                for stream in [&greedy, &literals] {
+                    assert_eq!(
+                        cacheify_tokens_with_hits(stream, &hits),
+                        cacheify_tokens(stream, pixels, bits),
+                        "hit-table cacheify drifted (code_bits={bits})"
+                    );
+                }
+            }
+        }
     }
 
     /// Forcing the color-cache path on a repetitive 16-color palette
