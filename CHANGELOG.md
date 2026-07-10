@@ -4,6 +4,17 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Other
+
+- Add `compose_animation` structure-aware fuzz target: raw attacker-assembled
+  RIFF/WEBP/VP8X/ANIM/ANMF containers with every §2.7.1.1 ANMF header field
+  fuzz-controlled and free to contradict the valid inner VP8L bitstream, driving
+  the §2.7.2 compositor's defensive branches (out-of-canvas rect rejection +
+  offset overflow, canvas over/under-cover, zero-frame ANIM, missing VP8X, every
+  dispose×blend combo at adversarial placements, raw-bytes ALPH overlay). Asserts
+  the §2.7.1.1 flat-canvas carrier invariant + decode determinism. Crash-free
+  across a sustained ASan campaign.
+
 ## [0.2.3](https://github.com/OxideAV/oxideav-webp/compare/v0.2.2...v0.2.3) - 2026-07-03
 
 ### Other

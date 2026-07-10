@@ -799,3 +799,22 @@ path = "fuzz_targets/roundtrip_alpha_filter_lossless.rs"
 test = false
 doc = false
 bench = false
+
+# Structure-aware hostility harness for the §2.7.1.1 / §2.7.2 animation
+# compositor (`decode_webp` → `decode_animation`), fed raw attacker-
+# assembled RIFF/WEBP/VP8X/ANIM/ANMF containers rather than encoder
+# output. Every ANMF header field (offsets, Frame W/H, dispose/blend
+# info byte, duration) is fuzz-controlled and free to contradict the
+# valid inner VP8L bitstream, driving the defensive branches the
+# encoder-fed roundtrip harnesses never reach: out-of-canvas rect
+# rejection + checked_add offset overflow, canvas over/under-cover, the
+# MAX_DECODE_DIMENSION cap, zero-frame ANIM, missing VP8X, every
+# dispose×blend combo at adversarial placements, and a raw-bytes ALPH
+# overlay. Asserts the universal §2.7.1.1 flat-canvas carrier invariant
+# + decode determinism (a DoS/hostility harness, not a pixel oracle).
+[[bin]]
+name = "compose_animation"
+path = "fuzz_targets/compose_animation.rs"
+test = false
+doc = false
+bench = false

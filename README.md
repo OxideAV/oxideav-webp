@@ -225,6 +225,15 @@ fall into three groups:
   `prefix_code_group`, `read_symbol_lut_diff`, `distance_code`,
   `color_cache`, `backward_reference`, `meta_prefix_index`, the
   inverse-transform passes, and `decode_alph`.
+* **Structure-aware hostility harnesses** — `compose_animation` assembles
+  *raw* attacker-controlled RIFF/WEBP/VP8X/ANIM/ANMF containers whose
+  §2.7.1.1 `ANMF` header fields (offsets, `Frame W/H`, dispose/blend info
+  byte, duration) are free to contradict the valid inner `VP8L` bitstream,
+  driving the §2.7.2 compositor's defensive branches — out-of-canvas rect
+  rejection + offset overflow, canvas over/under-cover, zero-frame `ANIM`,
+  missing `VP8X`, every dispose×blend combination at adversarial placements,
+  and a raw-bytes `ALPH` overlay — and asserts the §2.7.1.1 flat-canvas
+  carrier invariant plus decode determinism on every survivor.
 
 Sustained ASan campaigns are crash-free; several targets surfaced (and
 the crate fixed) real defenses — eager-allocation OOM bounds on
