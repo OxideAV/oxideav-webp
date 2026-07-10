@@ -5,8 +5,12 @@
 Cargo.lock
 
 # cargo-fuzz writes a per-target corpus under fuzz/corpus/ on every run;
-# these are generated artifacts, not source.
-/fuzz/corpus/
+# these are generated artifacts, not source — EXCEPT the committed
+# regression seeds under fuzz/corpus/<target>/seeds/, which must not be
+# both tracked and ignored (release-plz refuses a working tree with
+# tracked-and-ignored files).
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/seeds/
 
 # cargo-fuzz writes crash / OOM / slow-unit reproducers under
 # fuzz/artifacts/ — generated, not source.
