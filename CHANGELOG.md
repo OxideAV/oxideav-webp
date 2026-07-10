@@ -4,6 +4,24 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- *(vp8l_encode)* per-§5.2.3-cache-choice **plan memo** (round 409): the
+  per-thread single-slot memo that already shared the greedy parse and
+  the DP match tables across the cache-bits sweep now also caches each
+  cache choice's finished `(token stream, exact body cost)`. The §6.2.2
+  meta-prefix sweeps arbitrate the same `(pixels, width, cache)` plan
+  once per `(prefix_bits, partition)` shape — up to ~30 replays of a
+  pure function whose two cost-priced DP re-parses dominated the encode
+  profile (~46% of corpus self-time). Emitted bytes are identical by
+  construction (memoization of a deterministic function; pinned by the
+  new `plan_memo_hits_and_eviction_are_transparent` eviction test and
+  byte-digest-verified on the 10-image measurement corpus). Corpus
+  encode wall time: 9.54 s → 4.48 s (−53%). The cache-less
+  partition-guide stream is also hoisted out of the `prefix_bits` loops
+  in the three meta-prefix sweep functions (same stream every
+  iteration).
+
 ### Fixed
 
 - *(vp8l_encode)* degenerate §3.7.2 prefix-code tables no longer emit

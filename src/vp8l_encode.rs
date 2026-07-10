@@ -2284,11 +2284,26 @@ fn best_stream_tokens_with_cost(
     /// bakes in the width-dependent §5.2.2 distance-code
     /// decompositions), so a hit is exact and the output is
     /// byte-deterministic.
+    ///
+    /// Round 409: the memo additionally caches the **finished plan per
+    /// §5.2.3 cache choice** (`plans`, slot 0 = no cache, slot `b` =
+    /// `cache_code_bits = b`). The §6.2.2 meta-prefix sweeps call this
+    /// function once per `(prefix_bits, partition, cache)` tuple — up
+    /// to ~30 times per cache value on the same buffer — and the whole
+    /// greedy-vs-DP arbitration below is a pure function of
+    /// `(pixels, width, cache_code_bits)`, so every repeat returned an
+    /// identical stream after re-running the two DP re-parses and
+    /// three exact-cost mirrors. The r409 profile attributed ~46% of
+    /// corpus-encode self-time to exactly those redundant
+    /// [`dp_refine_tokens`] replays.
     struct PlanMemo {
         pixels: Vec<u32>,
         width: u32,
         greedy: Vec<Token>,
         tables: DpMatchTables,
+        /// Winning `(tokens, exact body bits→cost)` per §5.2.3 cache
+        /// choice; index 0 = disabled cache, 1..=11 = `code_bits`.
+        plans: [Option<(Vec<Token>, usize)>; 12],
     }
     thread_local! {
         static PLAN_MEMO: RefCell<Option<PlanMemo>> = const { RefCell::new(None) };
@@ -2306,9 +2321,19 @@ fn best_stream_tokens_with_cost(
                     primary: compute_dp_matches(pixels, image_width),
                     special: compute_special_matches(pixels, image_width),
                 },
+                plans: std::array::from_fn(|_| None),
             });
         }
-        let memo = slot.as_ref().expect("memo just populated");
+        let memo = slot.as_mut().expect("memo just populated");
+
+        // Round 409: per-cache plan hit — the arbitration below is
+        // deterministic in `(pixels, width, cache_code_bits)`, so the
+        // memoized winner is byte-for-byte what a recompute returns.
+        let plan_slot = cache_code_bits.map_or(0usize, |b| b as usize);
+        debug_assert!(plan_slot < 12);
+        if let Some((tokens, bits)) = memo.plans[plan_slot].as_ref() {
+            return (tokens.clone(), *bits);
+        }
 
         let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
         let finalize = |raw: Vec<Token>| -> Vec<Token> {
@@ -2353,24 +2378,26 @@ fn best_stream_tokens_with_cost(
         let dp1_tables = StreamCostTables::build(&dp1, cache_size, image_width);
         let dp1_bits = prefix_codes_and_tokens_bits_from(&dp1_tables, &dp1, image_width);
 
-        if dp1_bits >= greedy_bits {
-            return (greedy, greedy_bits);
-        }
-
-        let dp2 = finalize(dp_refine_tokens(
-            pixels,
-            &memo.tables,
-            &dp1_tables,
-            cache_hits.as_deref(),
-        ));
-        let dp2_tables = StreamCostTables::build(&dp2, cache_size, image_width);
-        let dp2_bits = prefix_codes_and_tokens_bits_from(&dp2_tables, &dp2, image_width);
-
-        if dp2_bits < dp1_bits {
-            (dp2, dp2_bits)
+        let winner = if dp1_bits >= greedy_bits {
+            (greedy, greedy_bits)
         } else {
-            (dp1, dp1_bits)
-        }
+            let dp2 = finalize(dp_refine_tokens(
+                pixels,
+                &memo.tables,
+                &dp1_tables,
+                cache_hits.as_deref(),
+            ));
+            let dp2_tables = StreamCostTables::build(&dp2, cache_size, image_width);
+            let dp2_bits = prefix_codes_and_tokens_bits_from(&dp2_tables, &dp2, image_width);
+
+            if dp2_bits < dp1_bits {
+                (dp2, dp2_bits)
+            } else {
+                (dp1, dp1_bits)
+            }
+        };
+        memo.plans[plan_slot] = Some(winner.clone());
+        winner
     })
 }
 
@@ -7624,6 +7651,10 @@ fn agglomerative_entropy_assignments(
 /// multi-block split, or every clustering collapsed to a single group).
 fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Option<Vec<u8>> {
     let mut best: Option<Vec<u8>> = None;
+    // Round 409: the cache-less partition-guide stream is independent
+    // of `prefix_bits` — build it once for every entropy-merge chain
+    // below instead of re-fetching (and re-cloning) per sweep value.
+    let guide_tokens = best_stream_tokens(pixels, width, None);
     for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
         let block_side = 1u32 << prefix_bits;
         let pw = width.div_ceil(block_side);
@@ -7674,9 +7705,8 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
         // Round 383: agglomerative entropy-merge partitions at this
         // `prefix_bits` — one merge chain snapshots every group count
         // in the sweep (see [`agglomerative_entropy_assignments`]).
-        let tokens = best_stream_tokens(pixels, width, None);
         for (_, codes) in agglomerative_entropy_assignments(
-            &tokens,
+            &guide_tokens,
             width,
             height,
             prefix_bits,
@@ -7752,10 +7782,12 @@ fn sweep_color_indexing_meta_prefix(pixels: &[u32], width: u32, height: u32) -> 
             w.write_bit(false); // end of optional-transform list
         };
 
+        // Round 409: the packed-index partition-guide stream is
+        // independent of `prefix_bits` — build it once per ordering.
+        let guide_tokens = best_stream_tokens(&packed_image, packed_width, None);
         for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
-            let tokens = best_stream_tokens(&packed_image, packed_width, None);
             for (_, codes) in agglomerative_entropy_assignments(
-                &tokens,
+                &guide_tokens,
                 packed_width,
                 height,
                 prefix_bits,
@@ -7985,10 +8017,12 @@ fn sweep_predictor_meta_prefix_candidate(
         // Round 383: agglomerative entropy-merge partitions over the
         // §4.1 residuals; one merge chain per `prefix_bits` snapshots
         // every group count in [`ENTROPY_MERGE_GROUPS_SWEEP`].
+        // Round 409: the residual partition-guide stream is
+        // independent of `prefix_bits` — build it once per branch.
+        let guide_tokens = best_stream_tokens(&residuals, width, None);
         for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
-            let tokens = best_stream_tokens(&residuals, width, None);
             for (_, codes) in agglomerative_entropy_assignments(
-                &tokens,
+                &guide_tokens,
                 width,
                 height,
                 prefix_bits,
@@ -11344,6 +11378,60 @@ mod tests {
             let brute = select_best_cache_bits(|c| prep.finish(c));
             let planned = select_best_cache_bits_prepared(prep);
             assert_eq!(brute, planned, "prep #{pi}: sweep selection drift");
+        }
+    }
+
+    /// Round 409 — the per-cache plan memo must be transparent: a hit
+    /// returns byte-for-byte what a fresh compute returns, and
+    /// eviction (a different buffer displacing the single memo slot)
+    /// followed by re-population reproduces the pre-eviction plans
+    /// exactly. Interleaves two contrasting buffers through the full
+    /// §5.2.3 sweep, twice, in opposite cache orders (so the second
+    /// round of buffer A mixes memo hits with a re-populated memo) and
+    /// asserts every `(tokens, cost)` pair is stable.
+    #[test]
+    fn plan_memo_hits_and_eviction_are_transparent() {
+        let (w, h) = (16u32, 16u32);
+        let mut state = 0x0f1e_2d3cu32;
+        let a: Vec<u32> = (0..(w * h))
+            .map(|i| {
+                if i < w * h / 2 {
+                    0xff20_4060
+                } else {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    0xff00_0000 | (state >> 8)
+                }
+            })
+            .collect();
+        let b: Vec<u32> = (0..(w * h)).map(|i| 0xff00_0000 | (i * 37)).collect();
+
+        let sweep: Vec<Option<u32>> = std::iter::once(None)
+            .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+            .collect();
+        let plans_a: Vec<_> = sweep
+            .iter()
+            .map(|&c| best_stream_tokens_with_cost(&a, w, c))
+            .collect();
+        // Evict A's memo slot with B, populating B's plans.
+        let plans_b: Vec<_> = sweep
+            .iter()
+            .map(|&c| best_stream_tokens_with_cost(&b, w, c))
+            .collect();
+        // Re-populate A (fresh compute after eviction) in reverse
+        // cache order, then B again; every plan must be unchanged.
+        for (&c, expected) in sweep.iter().zip(plans_a.iter()).rev() {
+            assert_eq!(
+                &best_stream_tokens_with_cost(&a, w, c),
+                expected,
+                "buffer A plan drifted after eviction (cache {c:?})"
+            );
+        }
+        for (&c, expected) in sweep.iter().zip(plans_b.iter()) {
+            assert_eq!(
+                &best_stream_tokens_with_cost(&b, w, c),
+                expected,
+                "buffer B plan drifted after eviction (cache {c:?})"
+            );
         }
     }
 
