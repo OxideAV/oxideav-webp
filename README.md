@@ -46,7 +46,16 @@ clustering, the DP match table with its §5.2.2 decompositions, and
 each stream's cost tables — is built once and shared across the
 §5.2.3 cache-bits sweep, and candidates are *sized* through an exact
 mirror with only the winner written: corpus encode wall time −44% at
-byte-identical-or-smaller output. On a 10-image mixed corpus the
+byte-identical-or-smaller output. Round 409 extended both ideas to
+the whole chooser at **byte-identical output** (every corpus digest
+unchanged): the winning token plan is memoized per §5.2.3 cache choice
+(the §6.2.2 meta-prefix sweeps re-arbitrated the same plan up to ~30×
+per shape), the meta-prefix sweeps are sized through an exact
+per-group mirror with only the winner written, and the DP inner loop /
+hash-chain matcher / §5.2.3 rewrite were tightened — corpus encode
+wall −70% on top of r388 (9.5 s → 2.8 s; e2e criterion −74% on the
+256×256 gradient, −68% on the 128×128 natural tile; encoder-in-loop
+fuzz throughput ~4×). On a 10-image mixed corpus the
 output is smaller than the reference encoder's best effort on 9 of 10
 images (up to −28%) and within 2% on the photo-like remainder; every
 stream is re-verified bit-exact through a black-box reference decode.

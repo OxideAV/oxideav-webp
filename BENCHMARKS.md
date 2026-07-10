@@ -43,6 +43,7 @@ the medians are still stable to a few percent.
 | `benches/alpha_decode.rs` | `decode_alpha_plane_e2e`, `decode_alpha_lossless_extracted`, `inverse_filter_{none,horizontal,vertical,gradient}_128x128` | §2.7.1.2 `ALPH` alpha-plane decode — the rank-1 webp-owned cost on the lossy path (≈52% of lossy e2e in the round-289 map, previously sized only by subtraction). Public `decode_alpha_plane` e2e over the committed fixture; `alph::decode_alpha` on the extracted `ALPH` payload (RIFF walk removed); and the §2.7.1.2 Stage-2 inverse-filter per-pixel loop in isolation, one cell per `F` method via synthetic uncompressed payloads. Splits the r289 rank-1 bucket: container walk ≈1 µs, the rest is the headerless VP8L lossless decode (already covered by `read_symbol` / `lossless_decode*`) |
 | `benches/meta_prefix_cluster.rs` | `meta_prefix_cluster_content_256/{bimodal,gradient,uniform}`, `meta_prefix_cluster_groups_256/{2,3,4}`, `meta_prefix_cluster_size/{128,256,384}` | Encoder-side §6.2.2 entropy-image block-clustering heuristic (`cluster_blocks_by_histogram_distance`) behind `encode_with_meta_prefix`. Coarse-RGB-histogram (16 bins/channel → 48-dim/block) Lloyd's k-means over the `1 << prefix_bits`-aligned blocks: a per-pixel feature-binning pass, deterministic farthest-point seeding, an up-to-8-pass assignment/update loop, and a compaction onto a contiguous group range. The RFC-defined entropy image is a decoder construct; this is the *encoder's* partition chooser, previously sized only by subtraction inside the `lossless_encode` e2e. Three altitudes: content regime (bimodal split / smooth gradient / uniform single-group early-out), `num_groups ∈ {2,3,4}`, and image side ∈ {128,256,384} px |
 | `benches/backward_reference.rs` | `apply_backward_reference_{nonoverlap_d64_l64,overlap_partial_d4_l64,rle_dist1_l64,manyruns_512_short}` | Decoder-side §5.2.2 `apply_backward_reference` — the LZ77 copy-back that replays one chosen run into the decoded ARGB buffer (`decode_one_symbol`'s length-symbol branch). The `lz77_match` / `lz77_chain` benches measure the *encoder's* hash-chain matcher that **finds** a run; the decoder copy-back that **replays** it had no isolated harness. Four cells isolate the §5.2.2 walk's `dist`/`length` regimes: non-overlap (`dist >= length`, settled-source region copy), partial overlap (`dist = 4 < length = 64`, self-referential read-after-append window repeat), `dist == 1` RLE flat-colour fill (tightest dependency chain), and a 512-element fragmented stream of short runs (per-call entry/guard cost). Each cell `clone`s an LCG-filled literal prefix in `iter_batched` setup so the function's append starts from a fresh buffer outside the measured interval |
+| `benches/anim_encode.rs` | `anim_encode_{lossless,delta,auto}_4f_48` | §2.7.1.1 animation *encode* path (`build_animated_webp`) — the encode mirror of `anim_decode` (round 409): the dirty-rect diff against the previous canvas, the `Auto` mode's keyframe-vs-delta arbitration (two full inner VP8L encodes per frame), and the `ANMF`/`ANIM`/`VP8X` container assembly. Three cells drive one deterministic 4-frame 48×48 moving-square timeline (LCG-textured background + a 12×12 square stepping 8 px/frame) through each `AnimFrameMode` |
 | `benches/distance_code.rs` | `distance_code_{dist1_rle,dist_row_above,dist_small_neighbor,dist_large_nomatch}` | Encoder-side §5.2.2 `pixel_distance_to_distance_code` — the distance-code chooser run (at least) twice per emitted LZ77 backward reference (once in `count_frequencies` to build the DISTANCE frequency table, once in the emit loop). It scans `DISTANCE_MAP` for the smallest distance-map code `c ∈ 1..=120` reconstructing to `D` for the image width, falling back to the scan-line code `D + 120` when none matches (round 301 added a smallest-code early-out that returns on the first match instead of always walking all 120 entries; the matching cells now cost a partial scan, the genuine no-match cell still walks all 120). The `lz77_match` / `lz77_chain` benches time the matcher that *finds* a run and `value_to_prefix` the per-symbol prefix split; the distance→code mapping between them had no isolated harness. Four cells fix `image_width = 256` and vary `distance`: `dist1_rle` (flat-colour RLE, multiple clamp-to-1 map hits), `dist_row_above` (`distance == width`, the `(0,1)` "pixel above" match at index 0 → code 1, cheapest), `dist_small_neighbor` (`distance = 2`, close horizontal neighbour matched mid-scan), and `dist_large_nomatch` (`distance = 70_000`, no map entry matches → full 120-scan + scan-line fallback). Each cell runs an inner loop of 1024 chooser calls, XOR-accumulating the codes |
 
 ## Round-170 baseline (pre-optimization)
@@ -2587,3 +2588,111 @@ match table (would halve the matcher passes, but must reproduce the
 lazy-matching parse byte-exactly), and a per-group exact mirror for
 the §6.2.2 meta-prefix sweeps (they still write full streams per
 cache value; the single-group sweep no longer does).
+
+## Round-409 (2026-07-10) — encoder wall-time round: plan memo, §6.2.2 size-first mirror, DP/matcher micro-passes
+
+Round 409 is a pure speed round under a hard byte-identity guard:
+every optimization below leaves the emitted stream byte-for-byte
+unchanged (FNV-64 digests of all 10 corpus outputs pinned before/after
+every step; the six docs-fixture byte counts in the README's density
+table are untouched). It executes the second round-388 follow-up (the
+per-group exact mirror for the §6.2.2 sweeps) and retires most of the
+redundancy the first one pointed at, by memoizing plans instead of
+deriving the greedy parse from the match table.
+
+Corpus = the 10-image mixed set (six committed docs fixtures decoded
+and re-encoded + four deterministic synthetics: gradient ramps,
+photo-like fractal + dither, chart-like A/B at 160×120), maximum-effort
+encode, release build, usual aarch64-apple-darwin host.
+
+### Step-by-step corpus movement
+
+| Step | Corpus wall | Δ vs prev |
+|---|---:|---:|
+| round-408 encoder (baseline) | 9.54 s | — |
+| 1. per-§5.2.3-cache plan memo (+ guide-stream hoists) | 4.48 s | **−53%** |
+| 2. §6.2.2 size-first sweep mirror (`plan_meta_prefix_image_with_codes`) | 3.54 s | **−21%** |
+| 3. DP flat cost tables + explicit candidate blocks; matcher quick-reject | 2.90 s | **−18%** |
+| 4. fused plan-mirror token walks (no bucket materialisation) | 2.80 s | −3.5% |
+| 5. hit-table §5.2.3 cacheify in `finalize` | ~2.80 s | noise |
+
+Net: **−70%** corpus encode wall at identical bytes.
+
+### What each step was
+
+1. **Plan memo.** The r388 per-thread memo shared the greedy parse +
+   DP match tables across the cache-bits sweep, but every
+   `best_stream_tokens(pixels, width, cache)` call still re-ran the
+   greedy-vs-DP arbitration (two `dp_refine_tokens` re-parses + three
+   exact-cost mirrors). The §6.2.2 sweeps issue that call once per
+   `(prefix_bits, partition, cache)` tuple — the r409 baseline profile
+   attributed ~46% of corpus self-time to the redundant DP replays
+   alone. The memo now caches the winning `(tokens, cost)` per cache
+   choice (12 slots); repeats are clones. Pure-function memoization ⇒
+   byte-identical; eviction/hit transparency pinned by
+   `plan_memo_hits_and_eviction_are_transparent`.
+2. **Size-first §6.2.2 sweeps.** All three meta-prefix sweep functions
+   priced every candidate through the new exact mirror
+   (`plan_meta_prefix_image_with_codes`: per-partition entropy-image
+   cost memo + per-group lengths-only tables + per-token group-priced
+   symbol bits) and write only the winning tuple — the same shape the
+   r388 `PreparedTransform::plan` mirror gave the single-group sweep.
+   Mirror identity pinned by `meta_plan_mirror_matches_written_bytes`
+   plus a `debug_assert_eq!` at every winner write.
+3. **DP + matcher micro-passes.** `dp_refine_tokens` folds the
+   unseen-symbol substitution into flat per-alphabet `u32` cost tables
+   once per call and unrolls the chained (primary ‖ specials)
+   candidate iterator into explicit blocks (same arbitration order);
+   `Lz77Matcher::find` quick-rejects candidates that mismatch at
+   offset `best_len` (they cannot strictly beat the running best, so
+   the full extension walk is skipped — the walk's result is
+   provably unchanged).
+4. **Fused mirror walks.** The mirror's split-buckets → per-bucket
+   count → per-bucket score triple walk became two walks with no
+   bucket materialisation (`Frequencies::count_token` +
+   `StreamCostTables::from_frequencies`, shared with
+   `count_frequencies`).
+5. **Hit-table cacheify.** `finalize` replays the DP's precomputed
+   per-position §5.2.3 hit table (`cacheify_tokens_with_hits`) instead
+   of re-walking the stateful cache per candidate stream; the stateful
+   `cacheify_tokens` stays as the test reference, equality pinned by
+   `cacheify_with_hits_matches_stateful_cacheify`.
+
+### End-to-end criterion movement (r408 encoder → r409, `--quick`)
+
+| Bench | r408 | r409 | Δ |
+|---|---:|---:|---:|
+| `lossless_encode_rgba_256` | 5.62 s | **1.45 s** | **−74.2%** |
+| `lossless_encode_natural_128` | 918.7 ms | **297.3 ms** | **−67.8%** |
+
+(The r170 numbers earlier in this file predate the r383 density push
+that deliberately spent wall time on compression; these rows re-anchor
+the e2e bench at the current encoder.)
+
+Encoder-in-loop fuzz throughput (`encode_params_roundtrip`, ASan +
+debug-assertions, 45 s bounded runs on the same corpus state):
+4 exec/s → **17 exec/s** (~4×).
+
+### New bench: `anim_encode`
+
+`benches/anim_encode.rs` closes the animation *encode* inventory gap
+(decode side covered since r283): `build_animated_webp` over a
+deterministic 4-frame 48×48 moving-square timeline, one cell per
+`AnimFrameMode`. r409 medians: `lossless` 598 ms, `delta` 244 ms,
+`auto` 685 ms per timeline — the `Auto` cell is the upper bound (it
+encodes both the keyframe and the dirty-rect delta per frame and keeps
+the byte-smaller stream).
+
+### Where the remaining wall-time is
+
+The post-step-5 profile ranks: `dp_refine_tokens` (~24%, now the
+legitimate 12-plans-per-unique-buffer work), `Lz77Matcher::find`
+(~6%, one greedy + one match-table pass per unique buffer), then the
+per-`(shape, cache)` mirror walks and the per-candidate §4.1/§4.2
+sub-image choosers. The remaining structural lever is still the
+r388-flagged fused greedy-parse/match-table pass (saves most of one
+matcher pass per unique buffer, but must reproduce the lazy-matching
+parse byte-exactly, including true `find` results at probe positions
+inside inherited run interiors — the DP table must keep its inherited
+entries while the greedy consumer sees fresh searches); expected
+payoff is now bounded by the ~6% `find` share.
