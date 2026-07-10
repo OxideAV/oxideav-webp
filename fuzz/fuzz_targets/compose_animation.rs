@@ -37,35 +37,65 @@
 //!     overlay;
 //!   * `zero`-duration frames and arbitrary 24-bit durations.
 //!
-//! The inner per-frame bitstream is always a *valid* §2.6 `VP8L` stream
+//! The inner per-frame bitstream is either a *valid* §2.6 `VP8L` stream
 //! (built with `encode_vp8l_argb` from a fuzz-drawn pixel pool) so the
 //! mutator spends its budget on the container/compositor framing rather
-//! than re-deriving a decodable entropy stream — but the `ANMF` header
-//! fields wrapping it are fully attacker-controlled and free to
-//! contradict the bitstream's own §3.4 dimensions.
+//! than re-deriving a decodable entropy stream, or — as of round 408,
+//! now that the sibling `oxideav-vp8` decoder's §14.4 inverse-DCT
+//! overflow is fixed on its master — a §2.5 `VP8 ` lossy key frame
+//! lifted from the committed fixture corpus, optionally fuzz-XORed
+//! outside its §9.1 dimension words (so the sibling's entropy decode +
+//! reconstruction see hostile bytes *inside an animation* while the
+//! declared frame stays tiny). Either way the `ANMF` header fields
+//! wrapping the bitstream are fully attacker-controlled and free to
+//! contradict the bitstream's own dimensions. This is the only harness
+//! that reaches `decode_animation`'s `VP8 ` sub-chunk leg (the
+//! `find_subchunk(.., VP8)` branch and its `ALPH`-over-lossy overlay).
 //!
 //! ## Contract under test
 //!
 //! `decode_webp` must **always return a `Result`** on any assembled
 //! byte string — no panic, no debug-build integer overflow, no
 //! out-of-bounds canvas index, no allocation sized by an unbounded
-//! header field. On `Ok`, the §2.7.1.1 flat-canvas carrier invariant
-//! holds on every composited frame: `rgba.len() == width * height * 4`,
-//! every frame carries the canvas dimensions, and the decode is
-//! deterministic over the same bytes. This harness asserts only those
-//! universal invariants — it is a hostility/DoS harness, not a
-//! pixel-equality oracle (that role is covered by `roundtrip_anim_modes`
-//! over well-formed input).
+//! header field. On `Ok`:
+//!
+//! * the §2.7.1.1 flat-canvas carrier invariant holds on every
+//!   composited frame: `rgba.len() == width * height * 4` and every
+//!   frame carries the canvas dimensions;
+//! * the §2.7.1.1 **field carry** holds — exactly one composited frame
+//!   per emitted `ANMF` chunk, each frame's `duration_ms` echoing that
+//!   `ANMF` header's 24-bit duration verbatim, `anim_loop_count`
+//!   echoing the `ANIM` 16-bit loop count, and `anim_background_rgba`
+//!   echoing the `ANIM` background colour re-ordered from its §2.7.1.1
+//!   on-disk BGRA bytes to the carried `[R, G, B, A]`;
+//! * the decode is deterministic over the same bytes.
+//!
+//! Beyond the field carry this asserts only universal invariants — it
+//! is a hostility/DoS harness, not a pixel-equality oracle (that role
+//! is covered by `roundtrip_anim_modes` over well-formed input).
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_webp::container::fourcc;
-use oxideav_webp::{decode_webp, encode_vp8l_argb};
+use oxideav_webp::{decode_webp, encode_vp8l_argb, extract_lossy_chunk};
 
 /// Canvas / frame dimension ceiling — keeps every assembled animation's
 /// working set tiny so iterations stay millisecond-scale.
 const MAX_DIM: u32 = 48;
 /// Frame-count ceiling.
 const MAX_FRAMES: usize = 5;
+
+/// Committed §2.5 simple-lossy fixture: a 1×1 `VP8 ` key frame whose
+/// chunk payload seeds the lossy sub-frame leg below. 1×1 keeps the
+/// sibling decode millisecond-scale at any placement.
+const LOSSY_FIXTURE: &[u8] = include_bytes!("../../tests/data/lossy-1x1.webp");
+
+/// Extract the §2.5 `VP8 ` chunk payload out of [`LOSSY_FIXTURE`].
+fn lossy_fixture_bitstream() -> Vec<u8> {
+    let chunk = extract_lossy_chunk(LOSSY_FIXTURE)
+        .expect("committed lossy fixture must parse")
+        .expect("committed lossy fixture must carry a VP8 chunk");
+    chunk.bitstream().to_vec()
+}
 
 /// A little-cursor byte reader over the fuzz buffer.
 struct Reader<'a> {
@@ -153,6 +183,11 @@ fuzz_target!(|data: &[u8]| {
     anim.extend_from_slice(&loop_count.to_le_bytes());
     push_chunk(&mut body, fourcc::ANIM, &anim);
 
+    // §2.7.1.1 durations of the ANMF chunks actually emitted, in on-disk
+    // order — the field-carry oracle below checks each decoded frame's
+    // `duration_ms` echoes its header verbatim.
+    let mut emitted_durations: Vec<u32> = Vec::new();
+
     for _ in 0..frame_count {
         // §2.7.1.1 ANMF header fields — every one attacker-controlled.
         // Frame X/Y are stored halved; the decoder doubles them, so the
@@ -170,26 +205,54 @@ fuzz_target!(|data: &[u8]| {
         let duration = u32::from(r.u16()); // includes zero-duration.
         let info = r.u8(); // Reserved | B (blend) | D (dispose).
         let add_alph = info & 0b0100_0000 != 0;
+        // Bit 5 of the info byte selects the §2.5 lossy sub-frame leg
+        // (the info byte still goes on the wire verbatim, so the decoder
+        // sees the same reserved-bit hostility either way).
+        let lossy_frame = info & 0b0010_0000 != 0;
 
-        // Valid inner §2.6 VP8L bitstream from a fuzz-drawn pixel pool.
-        let pixel_count = (sub_w * sub_h) as usize;
-        let mut argb = Vec::with_capacity(pixel_count);
-        for i in 0..pixel_count {
-            let seed = r.data.get(r.pos + (i & 0x7)).copied().unwrap_or(0);
-            argb.push(0xFF00_0000 | (u32::from(seed) * 0x0001_0101));
-        }
-        let Ok(vp8l) = encode_vp8l_argb(&argb, sub_w, sub_h) else {
-            continue;
+        let bitstream_fourcc;
+        let bitstream = if lossy_frame {
+            // §2.5 lossy leg: the committed 1×1 key-frame bitstream,
+            // fuzz-XORed at up to 4 positions *outside* the §9.1
+            // dimension words (bytes 6..10) so the sibling decoder sees
+            // hostile entropy/partition bytes while the declared frame
+            // stays 1×1 (a mutated dimension word would let the mutator
+            // spend the iteration budget on multi-second 16383²
+            // reconstructions instead of the compositor under test).
+            bitstream_fourcc = fourcc::VP8;
+            let mut vp8 = lossy_fixture_bitstream();
+            for _ in 0..usize::from(r.u8()) % 5 {
+                let pos = usize::from(r.u16()) % vp8.len();
+                if !(6..10).contains(&pos) {
+                    vp8[pos] ^= r.u8();
+                }
+            }
+            vp8
+        } else {
+            // §2.6 lossless leg: a valid VP8L bitstream from a
+            // fuzz-drawn pixel pool.
+            bitstream_fourcc = fourcc::VP8L;
+            let pixel_count = (sub_w * sub_h) as usize;
+            let mut argb = Vec::with_capacity(pixel_count);
+            for i in 0..pixel_count {
+                let seed = r.data.get(r.pos + (i & 0x7)).copied().unwrap_or(0);
+                argb.push(0xFF00_0000 | (u32::from(seed) * 0x0001_0101));
+            }
+            let Ok(vp8l) = encode_vp8l_argb(&argb, sub_w, sub_h) else {
+                continue;
+            };
+            vp8l
         };
 
-        // Frame Data sub-RIFF: optional ALPH (raw fuzz bytes) + VP8L.
+        // Frame Data sub-RIFF: optional ALPH (raw fuzz bytes) + the
+        // VP8L or VP8 bitstream chunk.
         let mut frame_data: Vec<u8> = Vec::new();
         if add_alph {
             let alph_len = usize::from(r.u8()) % 24;
             let alph_payload = r.take(alph_len).to_vec();
             push_chunk(&mut frame_data, fourcc::ALPH, &alph_payload);
         }
-        push_chunk(&mut frame_data, fourcc::VP8L, &vp8l);
+        push_chunk(&mut frame_data, bitstream_fourcc, &bitstream);
 
         // 16-byte §2.7.1.1 ANMF header + Frame Data.
         let mut anmf: Vec<u8> = Vec::with_capacity(16 + frame_data.len());
@@ -201,6 +264,7 @@ fuzz_target!(|data: &[u8]| {
         anmf.push(info);
         anmf.extend_from_slice(&frame_data);
         push_chunk(&mut body, fourcc::ANMF, &anmf);
+        emitted_durations.push(duration);
     }
 
     // Wrap the body in the §2.4 RIFF/WEBP file header.
@@ -214,6 +278,28 @@ fuzz_target!(|data: &[u8]| {
     let Ok(img) = decode_webp(&file) else {
         return;
     };
+
+    // §2.7.1.1 field carry: exactly one composited frame per emitted ANMF
+    // chunk (a per-frame failure fails the whole decode, so an Ok decode
+    // composited them all), each echoing its header's 24-bit duration; the
+    // ANIM loop count and background colour (on-disk BGRA re-ordered to the
+    // carried [R, G, B, A]) ride through verbatim.
+    assert_eq!(
+        img.frames.len(),
+        emitted_durations.len(),
+        "compose_animation: an Ok decode composites exactly one frame per ANMF chunk",
+    );
+    assert_eq!(
+        img.anim_loop_count,
+        Some(loop_count),
+        "compose_animation: the §2.7.1.1 ANIM loop count must carry through",
+    );
+    assert_eq!(
+        img.anim_background_rgba,
+        Some([bg[2], bg[1], bg[0], bg[3]]),
+        "compose_animation: the §2.7.1.1 ANIM background colour must carry \
+         through, BGRA on disk re-ordered to RGBA",
+    );
 
     // §2.7.1.1 flat-canvas carrier invariant on every composited frame.
     for (i, frame) in img.frames.iter().enumerate() {
@@ -230,6 +316,10 @@ fuzz_target!(|data: &[u8]| {
             (frame.width, frame.height),
             (img.width, img.height),
             "compose_animation frame {i}: every composited frame is a full-canvas snapshot",
+        );
+        assert_eq!(
+            frame.duration_ms, emitted_durations[i],
+            "compose_animation frame {i}: duration_ms must echo the ANMF header verbatim",
         );
     }
 

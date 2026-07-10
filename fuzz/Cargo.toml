@@ -808,13 +808,19 @@ bench = false
 # assembled RIFF/WEBP/VP8X/ANIM/ANMF containers rather than encoder
 # output. Every ANMF header field (offsets, Frame W/H, dispose/blend
 # info byte, duration) is fuzz-controlled and free to contradict the
-# valid inner VP8L bitstream, driving the defensive branches the
-# encoder-fed roundtrip harnesses never reach: out-of-canvas rect
-# rejection + checked_add offset overflow, canvas over/under-cover, the
-# MAX_DECODE_DIMENSION cap, zero-frame ANIM, missing VP8X, every
-# dispose×blend combo at adversarial placements, and a raw-bytes ALPH
-# overlay. Asserts the universal §2.7.1.1 flat-canvas carrier invariant
-# + decode determinism (a DoS/hostility harness, not a pixel oracle).
+# valid inner bitstream — per-frame either a valid VP8L stream or (round
+# 408, post-sibling-fix) the committed §2.5 1×1 lossy key frame
+# fuzz-XORed outside its §9.1 dimension words, the only harness reaching
+# `decode_animation`'s `VP8 ` sub-chunk leg — driving the defensive
+# branches the encoder-fed roundtrip harnesses never reach:
+# out-of-canvas rect rejection + checked_add offset overflow, canvas
+# over/under-cover, the MAX_DECODE_DIMENSION cap, zero-frame ANIM,
+# missing VP8X, every dispose×blend combo at adversarial placements, and
+# a raw-bytes ALPH overlay over either bitstream kind. Asserts the
+# universal §2.7.1.1 flat-canvas carrier invariant, the §2.7.1.1
+# field carry (one frame per ANMF with duration_ms echoing its header;
+# ANIM loop count + BGRA→RGBA background carried verbatim) + decode
+# determinism (a DoS/hostility harness, not a pixel oracle).
 [[bin]]
 name = "compose_animation"
 path = "fuzz_targets/compose_animation.rs"
