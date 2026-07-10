@@ -149,6 +149,14 @@ harness = false
 name = "anim_decode"
 harness = false
 
+# Round-409: §2.7.1.1 animation *encode* path (`build_animated_webp`) —
+# the encode mirror of `anim_decode`: dirty-rect diffing, the `Auto`
+# keyframe-vs-delta arbitration, and ANMF/ANIM/VP8X assembly, one cell
+# per `AnimFrameMode` over a fixed 4-frame moving-square timeline.
+[[bench]]
+name = "anim_encode"
+harness = false
+
 [[bench]]
 name = "metadata_walk"
 harness = false
