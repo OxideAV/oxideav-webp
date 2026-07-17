@@ -264,6 +264,8 @@ impl Encoder for WebpVp8LossyEncoder {
 /// same message used by the framework-trait factories. Used by the
 /// standalone-side tests so they can assert the same intent without
 /// pulling `oxideav-core`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn unsupported_for_standalone() -> WebpError {
     WebpError::Unsupported
 }

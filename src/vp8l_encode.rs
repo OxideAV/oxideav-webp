@@ -241,14 +241,20 @@ use crate::build::{self, ImageKind};
 /// The largest code length a VP8L canonical prefix code may use (§3.7.2.1.2
 /// stores literal code lengths in `[0..15]`). Mirrors
 /// [`crate::vp8l_prefix::MAX_CODE_LENGTH`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MAX_CODE_LENGTH: usize = 15;
 
 /// §3.7.2.1.2 `kCodeLengthCodes`: the 19-symbol code-length-code alphabet.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const NUM_CODE_LENGTH_CODES: usize = 19;
 
 /// §3.7.2.1.2 `kCodeLengthCodeOrder`: the order the (up to 19)
 /// code-length-code lengths are transmitted in. Identical to the decoder's
 /// [`crate::vp8l_prefix::CODE_LENGTH_CODE_ORDER`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const CODE_LENGTH_CODE_ORDER: [usize; NUM_CODE_LENGTH_CODES] = [
     17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 ];
@@ -310,6 +316,8 @@ const MAX_DIMENSION: u32 = 1 << 14;
 /// multi-bit write lays the value's bit 0 down first, so a subsequent
 /// `read_bits(n)` returns it unchanged.
 #[derive(Debug, Default, Clone)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct BitWriter {
     bytes: Vec<u8>,
     bit_pos: usize,
@@ -386,6 +394,8 @@ impl BitWriter {
 /// so the emitted length tables are bit-identical; only the cost drops
 /// (O(n log n) sort + O(n) merge, versus 3(n-1) heap operations of
 /// O(log n) swaps each).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     let n = freqs.len();
     let mut lengths = vec![0u8; n];
@@ -647,6 +657,8 @@ fn build_clc_code_lengths(clc_freq: &[u32]) -> Vec<u8> {
 /// canonical rule the decoder's [`crate::vp8l_prefix::PrefixCode`] reads:
 /// symbols ordered by `(length, value)`, codes assigned sequentially, read
 /// most-significant-bit-first within a code.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn canonical_codes(lengths: &[u8]) -> Vec<u32> {
     let mut bl_count = [0u32; MAX_CODE_LENGTH + 1];
     for &l in lengths {
@@ -700,6 +712,8 @@ pub fn canonical_codes(lengths: &[u8]) -> Vec<u32> {
 /// ```
 ///
 /// so feeding `extra_value` back through that formula yields `value`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn value_to_prefix(value: u32) -> (u32, u32, u32) {
     debug_assert!(value >= 1, "LZ77 length/distance values are 1-based");
     if value <= 4 {
@@ -1208,11 +1222,15 @@ fn write_normal_code_lengths(w: &mut BitWriter, lengths: &[u8]) {
 /// match of fewer than this many pixels rarely pays for the length +
 /// distance prefix codes versus emitting the pixels as literals, so short
 /// runs stay literal.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MIN_MATCH: usize = 3;
 
 /// Largest backward-reference run the §5.2.2 length prefix coding admits
 /// (the spec note: "The maximum backward reference length is limited to
 /// 4096."). A longer repeat is split into consecutive matches.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MAX_MATCH: usize = 4096;
 
 /// Number of low bits of the rolling pixel hash → hash-chain head buckets.
@@ -1596,8 +1614,12 @@ fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
 /// `2..=2048` entries. Mirrors
 /// [`crate::meta_prefix::COLOR_CACHE_BITS_MIN`] /
 /// [`crate::meta_prefix::COLOR_CACHE_BITS_MAX`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const COLOR_CACHE_BITS_MIN: u32 = 1;
 /// See [`COLOR_CACHE_BITS_MIN`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const COLOR_CACHE_BITS_MAX: u32 = 11;
 
 /// The default `color_cache_code_bits` the chooser evaluates when a
@@ -1611,6 +1633,8 @@ pub const COLOR_CACHE_BITS_MAX: u32 = 11;
 /// value: as of round 148 it sweeps every `cache_code_bits ∈ [1..11]`
 /// per the §5.2.3 range and emits the smallest stream. See
 /// [`select_best_cache_bits`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const DEFAULT_COLOR_CACHE_BITS: u32 = 8;
 
 /// §5.2.3 color-cache helper used by the encoder. Mirrors the decoder's
@@ -2588,6 +2612,8 @@ fn distance_to_code(distance: usize) -> u32 {
 ///
 /// Panics in debug builds when `distance == 0` (callers guarantee
 /// `1 <= distance <= position` per §5.2.2's backward-reference invariant).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn pixel_distance_to_distance_code(distance: usize, image_width: u32) -> u32 {
     debug_assert!(distance >= 1, "§5.2.2 distance must be >= 1");
     let width_i32 = image_width as i32;
@@ -2651,6 +2677,8 @@ fn write_lz77_value(w: &mut BitWriter, code: &WriteCode, symbol_base: usize, val
 /// `blue := (blue - green) & 0xff` (the §3.5.3 inverse is `+ green & 0xff`,
 /// so subtracting on the encode side and adding back on the decode side is
 /// a perfect round trip modulo 256).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn apply_subtract_green(pixels: &mut [u32]) {
     for px in pixels.iter_mut() {
         let a = (*px >> 24) & 0xff;
@@ -2796,6 +2824,8 @@ fn predictor_predict(mode: u8, l: u32, t: u32, tr: u32, tl: u32) -> u32 {
 /// multiple pixels per iteration (mirroring the `to_rgba_simd`
 /// precedent under the `simd` feature).
 #[inline]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn predictor_subtract(original: u32, pred: u32) -> u32 {
     let a = ((original >> 24) & 0xff).wrapping_sub((pred >> 24) & 0xff) & 0xff;
     let r = ((original >> 16) & 0xff).wrapping_sub((pred >> 16) & 0xff) & 0xff;
@@ -4367,6 +4397,8 @@ fn channel_magnitude(v: u32) -> u32 {
 /// chooser walk directly (same shelf as [`predictor_subtract`] /
 /// [`apply_subtract_green`]); encoder callers go through
 /// `build_color_image`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn pick_block_cte(
     pixels: &[u32],
     width: usize,
@@ -6011,6 +6043,8 @@ fn seed_cluster_centroids(features: &[u32], block_count: usize, num_groups: u32)
 /// Exposed `pub` (like [`pick_block_cte`]) so the `meta_prefix_cluster`
 /// criterion bench can drive this §6.2.2 entropy-image kernel in
 /// isolation. Not part of the crate's documented stable surface.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn cluster_blocks_by_histogram_distance(
     pixels: &[u32],
     width: u32,
@@ -6646,6 +6680,8 @@ fn write_meta_prefix_image_with_codes(
 /// [`crate::vp8l_decode::DecodedImage::pixels`] produces. The returned
 /// bytes, prefixed with the image-header and wrapped in RIFF/WEBP framing,
 /// decode back to `pixels` exactly.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
     // Width-less entry: feed `image_width = 1`, which disables the §5.2.2
     // distance-map chooser (no map entry reconstructs to a "row" distance
@@ -6663,6 +6699,8 @@ pub fn encode_argb_literals(pixels: &[u32]) -> Vec<u8> {
 /// [`encode_vp8l_argb`]) uses this entry; the no-width
 /// [`encode_argb_literals`] is retained for test callers that exercise
 /// the entropy stage without spatial structure.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_argb_literals_with_width(pixels: &[u32], image_width: u32) -> Vec<u8> {
     debug_assert!(image_width >= 1);
     // For each `(subtract_green)` choice, evaluate the no-cache
@@ -6865,6 +6903,8 @@ fn prepare_literals(pixels: &[u32], subtract_green: bool, image_width: u32) -> P
 /// pixel becomes a §5.2.1 ARGB literal and no §3.8.2 transform is written.
 /// Retained as the baseline the round-119 size-reduction test compares the
 /// LZ77 path against; [`encode_argb_literals`] is the default entry point.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_argb_literals_only(pixels: &[u32]) -> Vec<u8> {
     let tokens: Vec<Token> = pixels.iter().map(|&p| Token::Literal(p)).collect();
     // Literal-only stream emits no Copy tokens, so `image_width` is
@@ -6877,6 +6917,8 @@ pub fn encode_argb_literals_only(pixels: &[u32]) -> Vec<u8> {
 /// round-120 size-reduction comparison test to measure the transform's
 /// effect on a natural-image-like fixture; production callers use
 /// [`encode_argb_literals`] which picks the smaller of the two paths.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_argb_literals_subtract_green(pixels: &[u32]) -> Vec<u8> {
     let mut sg_pixels = pixels.to_vec();
     apply_subtract_green(&mut sg_pixels);
@@ -6891,6 +6933,8 @@ pub fn encode_argb_literals_subtract_green(pixels: &[u32]) -> Vec<u8> {
 /// effect from the subtract-green chooser; production callers use
 /// [`encode_argb_literals`] which picks the smallest of the four
 /// path combinations.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_argb_literals_color_cache(pixels: &[u32], cache_code_bits: u32) -> Vec<u8> {
     debug_assert!((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&cache_code_bits));
     // Width-less test entry: pass 1 (the chooser falls back to scan-line).
@@ -7113,6 +7157,8 @@ fn build_image_header(width: u32, height: u32, alpha_is_used: bool) -> [u8; 5] {
 /// transform, no §3.8.3 color cache, a single meta-prefix code, and a
 /// literal-only image (no LZ77 backward references). The §3.7.2 prefix
 /// codes are built per-image from the pixel data.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, EncodeError> {
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(EncodeError::InvalidDimensions { width, height });
@@ -8397,6 +8443,8 @@ fn sweep_predictor_meta_prefix_candidate(
 /// [`build::build_webp_file`] with [`ImageKind::Lossless`]) yields a complete
 /// `.webp`. Encoding path matches [`encode_webp_lossless`]: no §3.8.2
 /// transform, no §3.8.3 color cache, single meta-prefix code, literal-only.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_vp8l_argb(pixels: &[u32], width: u32, height: u32) -> Result<Vec<u8>, EncodeError> {
     let alpha_is_used = pixels.iter().any(|&p| (p >> 24) & 0xff != 0xff);
     encode_vp8l_argb_with(pixels, width, height, alpha_is_used)
@@ -8413,6 +8461,8 @@ pub fn encode_vp8l_argb(pixels: &[u32], width: u32, height: u32) -> Result<Vec<u
 /// `false` on an image with non-opaque pixels still round-trips because the
 /// alpha values are carried in the §3.7.3 ARGB literals regardless of the
 /// header bit.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_vp8l_argb_with(
     pixels: &[u32],
     width: u32,

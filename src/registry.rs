@@ -53,6 +53,8 @@ use crate::{
 /// Stable on-wire identifier this crate registers under in the codec
 /// registry. The single canonical value the framework uses to look up
 /// a WebP decoder is `"webp"`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const CODEC_ID_STR: &str = "webp";
 
 /// Bridge crate-local errors to the framework-wide `oxideav_core::Error`
@@ -115,6 +117,8 @@ fn decoded_webp_to_video_frame(img: DecodedWebp, pts: Option<i64>) -> VideoFrame
 /// Preserved for callers that already build [`VideoFrame`]s directly
 /// without going through the [`Decoder`] trait (e.g. container demuxers
 /// that want to drop a still WebP picture into a video stream).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_webp_to_frame(bytes: &[u8], pts: Option<i64>) -> oxideav_core::Result<VideoFrame> {
     let img = decode_webp_image(bytes)?;
     Ok(decoded_webp_to_video_frame(img, pts))
@@ -304,6 +308,8 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
 /// The dual-API counterpart of [`make_encoder`] — the registry path uses the
 /// no-metadata form, while a direct caller that wants to embed an ICC
 /// profile / Exif / XMP block constructs the encoder through this factory.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn make_encoder_with_metadata(
     params: &CodecParameters,
     metadata: WebpMetadataOwned,
@@ -347,6 +353,8 @@ pub fn make_encoder_with_metadata(
 /// output auto-promotes to the extended `VP8X` layout when the frame carries
 /// alpha or the encoder was constructed with non-empty metadata.
 #[derive(Debug)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct WebpVp8lEncoder {
     output_params: CodecParameters,
     width: u32,
@@ -407,6 +415,8 @@ impl Encoder for WebpVp8lEncoder {
 /// Preserved alongside the [`Encoder`] trait impl for callers that already
 /// build [`VideoFrame`]s directly and want a one-shot `.webp` without the
 /// trait plumbing (the dual-API direct path).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_vp8l_frame(
     frame: &VideoFrame,
     width: u32,
@@ -429,6 +439,8 @@ pub fn encode_vp8l_frame(
 /// wraps a WebP still-image payload under that tag; everyday WebP
 /// files live inside `RIFF/WEBP` and are routed via the file-extension
 /// hook installed by [`register_containers`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("webp_sw")
         .with_intra_only(true)
@@ -465,6 +477,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 /// container walking via [`crate::parse_container`] directly rather
 /// than via a separate `Demuxer` registration, so only the extension
 /// hook is installed here.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_extension("webp", CODEC_ID_STR);
 }
@@ -472,6 +486,8 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// Unified registration entry point: install both the WebP decoder
 /// factory and the `.webp` extension hint into the supplied
 /// [`RuntimeContext`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
     register_containers(&mut ctx.containers);

@@ -79,6 +79,8 @@ use crate::container::{fourcc, FourCc};
 /// `Minus One` field — `2^24` (because the on-disk value is `dim - 1`
 /// and the field is 24 bits wide, the largest representable dim is
 /// `0x00FF_FFFF + 1 = 0x0100_0000`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MAX_VP8X_CANVAS_DIM: u32 = 0x0100_0000;
 
 /// Maximum payload bytes a single §2.3 chunk can carry. The `Size`
@@ -87,6 +89,8 @@ pub const MAX_VP8X_CANVAS_DIM: u32 = 0x0100_0000;
 /// `0x00` pad byte. We additionally subtract 1 to leave room for that
 /// pad byte without overflowing `u32` when callers compute total chunk
 /// sizes downstream. (Practical WebP files are nowhere near this.)
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MAX_CHUNK_PAYLOAD: u32 = u32::MAX - 1;
 
 /// Which §2.4 / §2.5 / §2.6 / §2.7 file layout [`build_webp_file`]
@@ -432,6 +436,8 @@ pub fn build_webp_file(
 /// extended-layout file. A caller with no metadata to embed and no
 /// alpha to declare should use [`build_webp_file`] directly instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct FileMetadata<'a> {
     /// §2.7.1.4 `ICCP` ICC color-profile payload to embed, or `None` to
     /// omit the chunk. The writer sets the §2.7.1 `I` flag iff
@@ -506,6 +512,8 @@ impl FileMetadata<'_> {
 /// automatically. The pad byte is *not* counted in the chunk's `Size`
 /// field and *is* counted in the §2.4 file `File Size` total, mirroring
 /// what [`crate::container::parse`] expects on the read side.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn build_webp_file_with_metadata(
     payload: &[u8],
     image_kind: ImageKind,

@@ -54,12 +54,16 @@ use crate::vp8l_stream::{BitReader, BitReaderEof};
 
 /// §6.2.1: the number of code-length-code symbols (the small alphabet
 /// used by the *normal* code length code).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const NUM_CODE_LENGTH_CODES: usize = 19;
 
 /// §6.2.1 `kCodeLengthCodeOrder`: the order in which the (up to 19)
 /// code-length-code lengths are transmitted. The first
 /// `num_code_lengths` entries here are read; the remaining positions
 /// keep their implicit length 0.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const CODE_LENGTH_CODE_ORDER: [usize; NUM_CODE_LENGTH_CODES] = [
     17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 ];
@@ -67,6 +71,8 @@ pub const CODE_LENGTH_CODE_ORDER: [usize; NUM_CODE_LENGTH_CODES] = [
 /// The largest code length a VP8L canonical prefix code may use. The
 /// spec stores literal code lengths in the `[0..15]` range, so 15 bits
 /// is the hard ceiling.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MAX_CODE_LENGTH: usize = 15;
 
 /// Width (in bits) of the primary [`PrefixCode::read_symbol`] lookup
@@ -566,6 +572,8 @@ impl PrefixCode {
 /// Returns a `Vec<u8>` of length `alphabet_size` (lengths for symbols
 /// at or beyond `max_symbol` are 0). Dispatches on the leading
 /// simple/normal flag.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn read_code_lengths(
     reader: &mut BitReader<'_>,
     alphabet_size: usize,

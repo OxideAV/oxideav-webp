@@ -140,6 +140,8 @@ impl DisposalMethod {
 
 /// Errors raised by the §2.7.1.1 ANMF header parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum AnmfError {
     /// The chunk payload is shorter than the 16-byte fixed header
     /// laid out in Figure 9 (5 × 24-bit fields + 1 info byte). The
@@ -179,6 +181,8 @@ impl std::error::Error for AnmfError {}
 /// * `height` is `1 + Frame Height Minus One`.
 /// * `duration_ms` is the literal `Frame Duration` (already in ms).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct AnmfHeader {
     /// X coordinate of the upper-left corner of the frame, in
     /// canvas pixels. Equal to `Frame X * 2` per §2.7.1.1.

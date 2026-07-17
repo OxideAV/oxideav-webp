@@ -10,7 +10,11 @@
 //! because it depends on the `oxideav_core::Encoder` trait.
 
 #[cfg(feature = "registry")]
-pub use crate::registry::{make_encoder, make_encoder_with_metadata, WebpVp8lEncoder};
+pub use crate::registry::make_encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[cfg(feature = "registry")]
+#[doc(hidden)]
+pub use crate::registry::{make_encoder_with_metadata, WebpVp8lEncoder};
 
 /// Result alias for this module's entry points — `Result<T, WebpError>`.
 pub use crate::error::Result;

@@ -53,7 +53,10 @@ pub fn decode(buf: &[u8]) -> Result<Vp8lImage, crate::WebpError> {
 // `Result<Vec<u8>, WebpError>` (the coarse published error type), not
 // the rich internal [`crate::vp8l_encode::EncodeError`]. Re-export the
 // crate-root wrappers that already do that conversion.
-pub use crate::{encode_vp8l_argb, encode_vp8l_argb_with, encode_vp8l_argb_with_metadata};
+pub use crate::encode_vp8l_argb;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub use crate::{encode_vp8l_argb_with, encode_vp8l_argb_with_metadata};
 
 /// A fully decoded VP8L bitstream: dimensions, ARGB pixels in scan
 /// order, and the §3.4 `alpha_is_used` header bit.
@@ -103,6 +106,8 @@ impl Vp8lImage {
     /// Reachable as the SIMD-path fallback when the `simd` feature is
     /// off, and as the direct entry point for tests that need to
     /// pin the scalar path independently of the build feature set.
+    // internal — exposed for tests/fuzz; not part of the stable API
+    #[doc(hidden)]
     pub fn to_rgba_scalar(&self) -> Vec<u8> {
         let n = self.pixels.len();
         let mut out = vec![0u8; n * 4];
@@ -124,6 +129,8 @@ impl Vp8lImage {
     /// little-endian on-wire ARGB byte layout
     /// `[B0, G0, R0, A0, B1, G1, R1, A1, …]` to the published
     /// `[R0, G0, B0, A0, R1, G1, B1, A1, …]` output layout.
+    // internal — exposed for tests/fuzz; not part of the stable API
+    #[doc(hidden)]
     #[cfg(feature = "simd")]
     pub fn to_rgba_simd(&self) -> Vec<u8> {
         use core::simd::{simd_swizzle, u8x16};
@@ -219,8 +226,11 @@ pub mod transform {
 /// shape resolves. The richer error is reachable via the
 /// [`EncodeError`] re-export on this module.
 pub mod encoder {
+    pub use crate::encode_vp8l_argb;
     pub use crate::vp8l_encode::EncodeError;
-    pub use crate::{encode_vp8l_argb, encode_vp8l_argb_with};
+    // internal — exposed for tests/fuzz; not part of the stable API
+    #[doc(hidden)]
+    pub use crate::encode_vp8l_argb_with;
 }
 
 #[cfg(test)]

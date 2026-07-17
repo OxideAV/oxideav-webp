@@ -523,6 +523,8 @@ pub fn inverse_color_table(color_table: &mut [u32]) {
 /// §4 transform-list reader ([`crate::vp8l_stream`]) and the §4.4
 /// forward color-indexing encoder ([`crate::vp8l_encode`]) both
 /// delegate here, as does [`inverse_color_indexing`] below.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn color_indexing_width_bits(color_table_size: usize) -> u8 {
     if color_table_size <= 2 {
         3

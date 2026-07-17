@@ -6,6 +6,13 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(docs)* Marked the crate's internal-only public surface `#[doc(hidden)]`
+  (module-level for wholly-internal modules, item-level in mixed modules)
+  so `cargo-semver-checks` no longer treats internals exposed for
+  tests/fuzz as stable API. Attributes and comments only — no signature,
+  visibility, or behavioural change; the published 0.1.2 decode/encode/
+  animation/registry surface is untouched.
+
 - *(vp8l_encode)* per-§5.2.3-cache-choice **plan memo** (round 409): the
   per-thread single-slot memo that already shared the greedy parse and
   the DP match tables across the cache-bits sweep now also caches each

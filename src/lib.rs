@@ -135,7 +135,11 @@
 // and the `simd` cargo feature in `Cargo.toml`.
 #![cfg_attr(feature = "simd", feature(portable_simd))]
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod alph;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod anim;
 pub mod anim_encode;
 pub mod anmf;
@@ -147,19 +151,31 @@ pub mod encoder;
 pub mod encoder_anim;
 pub mod encoder_vp8;
 pub mod error;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod meta_prefix;
 #[cfg(feature = "registry")]
 pub mod registry;
 pub mod riff;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vp8_chunk;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vp8_decode;
 pub mod vp8l;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vp8l_chunk;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vp8l_decode;
 pub mod vp8l_encode;
 pub mod vp8l_prefix;
 pub mod vp8l_stream;
 pub mod vp8l_transform;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vp8x;
 
 #[cfg(feature = "registry")]
@@ -173,6 +189,8 @@ pub use registry::WebpDecoder;
 
 /// Crate-local error type.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum Error {
     /// A code path that has not been wired up yet in this round.
     NotImplemented,
@@ -219,6 +237,8 @@ pub enum Error {
 
 /// Which image kind [`decode_webp`] declined to decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum UnsupportedKind {
     /// The file's image data is a §2.5 `VP8 ` lossy bitstream that the
     /// caller has chosen to route out-of-crate.
@@ -358,6 +378,8 @@ impl From<vp8l_encode::EncodeError> for Error {
 /// Walk a `RIFF/WEBP` container per RFC 9649 §2.3–§2.7 and return
 /// the structural chunk list. This is the round-1 surface: it does
 /// not decode any payload.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_container(bytes: &[u8]) -> Result<container::WebpContainer, Error> {
     container::parse(bytes).map_err(Into::into)
 }
@@ -371,6 +393,8 @@ pub fn parse_container(bytes: &[u8]) -> Result<container::WebpContainer, Error> 
 /// FourCC is [`container::fourcc::VP8X`], borrow its payload via
 /// [`container::WebpChunk::payload`], and hand that slice to this
 /// function.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_vp8x_header(payload: &[u8]) -> Result<vp8x::Vp8xHeader, Error> {
     vp8x::Vp8xHeader::parse(payload).map_err(Into::into)
 }
@@ -383,6 +407,8 @@ pub fn parse_vp8x_header(payload: &[u8]) -> Result<vp8x::Vp8xHeader, Error> {
 /// whose FourCC is [`container::fourcc::ALPH`]. Only the first byte
 /// is consumed by this layer; the rest of the payload is the alpha
 /// bitstream proper, which is decoded by [`alph::decode_alpha`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_alph_header(payload: &[u8]) -> Result<alph::AlphHeader, Error> {
     alph::AlphHeader::parse(payload).map_err(Into::into)
 }
@@ -406,6 +432,8 @@ pub fn parse_alph_header(payload: &[u8]) -> Result<alph::AlphHeader, Error> {
 /// This handles the **still-image** alpha path. Per-frame (`ANMF`)
 /// alpha planes are addressed by walking the `ANMF` frame data with
 /// [`alph::decode_alpha`] directly, using the frame dimensions.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_alpha_plane(bytes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
     let c = container::parse(bytes)?;
     let alph_chunk = match c.first_chunk_with_fourcc(container::fourcc::ALPH) {
@@ -435,6 +463,8 @@ pub fn decode_alpha_plane(bytes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
 ///
 /// The argument is the 6-byte chunk payload — the BGRA background
 /// colour followed by the little-endian u16 loop count.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_anim_header(payload: &[u8]) -> Result<anim::AnimHeader, Error> {
     anim::AnimHeader::parse(payload).map_err(Into::into)
 }
@@ -447,6 +477,8 @@ pub fn parse_anim_header(payload: &[u8]) -> Result<anim::AnimHeader, Error> {
 /// FourCC is [`container::fourcc::ANMF`]. Only the first 16 bytes
 /// are consumed; the remainder is the per-frame `Frame Data`
 /// sub-RIFF, which is not decoded here.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_anmf_header(payload: &[u8]) -> Result<anmf::AnmfHeader, Error> {
     anmf::AnmfHeader::parse(payload).map_err(Into::into)
 }
@@ -454,6 +486,8 @@ pub fn parse_anmf_header(payload: &[u8]) -> Result<anmf::AnmfHeader, Error> {
 /// Assemble a `RIFF/WEBP` file around a single bitstream payload per
 /// RFC 9649 §2.4 + §2.5 / §2.6 / §2.7. Convenience wrapper over
 /// [`build::build_webp_file`] returning the crate-wide [`Error`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn build_webp_file(
     payload: &[u8],
     image_kind: build::ImageKind,
@@ -466,6 +500,8 @@ pub fn build_webp_file(
 /// Build the 10-byte §2.7.1 `VP8X` chunk payload (flags + reserved +
 /// canvas dims). Convenience wrapper over [`build::build_vp8x_chunk`]
 /// returning the crate-wide [`Error`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn build_vp8x_chunk(
     canvas_width: u32,
     canvas_height: u32,
@@ -489,6 +525,8 @@ pub fn build_vp8x_chunk(
 /// This is the round-6 routing API — `oxideav-webp` deliberately
 /// does **not** take a runtime dependency on `oxideav-vp8`; the
 /// caller picks which VP8 decoder consumes the borrowed payload.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn extract_lossy_chunk(bytes: &[u8]) -> Result<Option<vp8_chunk::WebpLossyChunk<'_>>, Error> {
     let c = container::parse(bytes)?;
     vp8_chunk::extract_lossy(bytes, &c).map_err(Into::into)
@@ -510,6 +548,8 @@ pub fn extract_lossy_chunk(bytes: &[u8]) -> Result<Option<vp8_chunk::WebpLossyCh
 /// does **not** take a runtime dependency on a VP8L decoder; the
 /// caller picks which lossless-WebP decoder consumes the borrowed
 /// payload.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn extract_lossless_chunk(
     bytes: &[u8],
 ) -> Result<Option<vp8l_chunk::WebpLosslessChunk<'_>>, Error> {
@@ -531,6 +571,8 @@ pub fn extract_lossless_chunk(
 /// `color_table_size`) but does **not** decode the §5 entropy-coded
 /// transform bodies or image data — those are returned-to boundaries
 /// for the next layer.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn read_vp8l_transform_list(bytes: &[u8]) -> Result<Option<vp8l_stream::TransformList>, Error> {
     let c = container::parse(bytes)?;
     let chunk = match vp8l_chunk::extract_lossless(bytes, &c)? {
@@ -555,6 +597,8 @@ pub fn read_vp8l_transform_list(bytes: &[u8]) -> Result<Option<vp8l_stream::Tran
 /// returned [`vp8l_decode::DecodedImage`] holds `width * height` ARGB
 /// pixels in scan-line order, each `(alpha << 24) | (red << 16) |
 /// (green << 8) | blue`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_lossless_image(bytes: &[u8]) -> Result<Option<vp8l_decode::DecodedImage>, Error> {
     let c = container::parse(bytes)?;
     let chunk = match vp8l_chunk::extract_lossless(bytes, &c)? {
@@ -585,6 +629,8 @@ const MAX_DECODE_DIMENSION: u32 = 1 << 14;
 /// (`oxideav_core::PixelFormat::Rgba`) the workspace's image crates
 /// emit, so a `VideoFrame` wrapper is a single 1-plane copy away.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct DecodedWebp {
     /// Image width in pixels (the §2.7.1 `VP8X` canvas width, or the
     /// §3.4 `VP8L` image width for a simple-lossless file).
@@ -617,6 +663,8 @@ pub struct DecodedWebp {
 ///
 /// Animations and header-only files (no `VP8L`/`VP8 ` chunk) return
 /// [`Error::Unsupported`]`(`[`UnsupportedKind::NoImageData`]`)`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_webp_image(bytes: &[u8]) -> Result<DecodedWebp, Error> {
     let c = container::parse(bytes)?;
 
@@ -800,6 +848,8 @@ impl<'a> WebpMetadata<'a> {
 /// codec-parameters struct without borrowing the caller's buffers. Convert
 /// to the borrowed form for an encode call with [`Self::as_borrowed`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct WebpMetadataOwned {
     /// §2.7.1.4 `ICCP` ICC color-profile payload to embed, if any.
     pub icc: Option<Vec<u8>>,
@@ -1401,6 +1451,8 @@ fn metadata_from_container(bytes: &[u8], c: &container::WebpContainer) -> WebpFi
 /// / color-indexing transforms and §3.8.3 color cache. The §3.7.2 canonical
 /// prefix codes are built per-image from the pixel frequencies. See
 /// [`vp8l_encode::encode_webp_lossless`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
     vp8l_encode::encode_webp_lossless(rgba, width, height).map_err(Into::into)
 }
@@ -1439,6 +1491,8 @@ pub fn encode_vp8l_argb(argb: &[u32], width: u32, height: u32) -> Result<Vec<u8>
 /// header bit verbatim instead of being scanned from the pixels. The alpha
 /// values are carried in the §3.7.3 ARGB literals regardless of the bit, so
 /// the round trip is exact either way.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_vp8l_argb_with(
     argb: &[u32],
     width: u32,
@@ -1468,6 +1522,8 @@ pub fn encode_vp8l_argb_with(
 /// `has_alpha`. Decoding the result through [`decode_webp`] reproduces the
 /// input pixels exactly; [`extract_metadata`] reads back the embedded
 /// ICC / Exif / XMP payloads.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn encode_vp8l_argb_with_metadata(
     width: u32,
     height: u32,

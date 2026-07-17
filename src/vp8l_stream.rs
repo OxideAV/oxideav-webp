@@ -250,6 +250,8 @@ impl<'a> BitReader<'a> {
 /// The four §4 transform types. The discriminant matches the on-wire
 /// 2-bit `TransformType` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum TransformType {
     /// §4.1 predictor (spatial) transform.
     Predictor = 0,
@@ -279,6 +281,8 @@ impl TransformType {
 /// fixed-size fields. The entropy-coded body (sub-resolution image or
 /// color table) is **not** decoded here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum Transform {
     /// §4.1 predictor transform. `size_bits = ReadBits(3) + 2`; the
     /// per-block prediction modes live in a sub-resolution image that
@@ -331,6 +335,8 @@ impl Transform {
 
 /// Errors raised while reading the §4 transform list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum TransformListError {
     /// The bit reader hit EOF mid-field.
     Eof(BitReaderEof),
@@ -370,6 +376,8 @@ impl std::error::Error for TransformListError {}
 /// transform-presence bit was consumed) or at the start of the first
 /// §5-encoded transform body.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct TransformList {
     /// Transforms in read order.
     transforms: Vec<Transform>,
