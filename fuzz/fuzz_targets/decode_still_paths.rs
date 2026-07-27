@@ -88,9 +88,118 @@
 //! conversion, the §2.6 VP8L lossless decode, or the §2.7.1.2 `ALPH`
 //! overlay; an assertion failure is a real divergence between the two
 //! public decode contracts.
+//!
+//! ## Iteration cost bound (round 432)
+//!
+//! The §3.4 `VP8L` 14-bit dimension fields can declare up to
+//! 16384 × 16384 pixels, and a §5.2.2 backward-reference stream expands
+//! a ~120-byte file into that many decoded pixels *legally* — the
+//! round-432 campaign surfaced exactly that: a 135-byte mutant (now the
+//! committed seed `seeds/declared-dims-bomb`) declaring ~10^8 pixels
+//! decoded successfully into ~380 MiB of RGBA, and because
+//! this harness holds up to three decoded surfaces at once (the
+//! low-level result, the published result, and the determinism replay)
+//! the iteration blew libFuzzer's 2 GiB RSS limit. That is a
+//! decompression-ratio property of the format, not a decoder defect —
+//! the library already rejects per-side dimensions above its
+//! `MAX_DECODE_DIMENSION` ceiling before allocating (round 286), and a
+//! 16384 × 16384 still is a spec-valid file a general-purpose decoder
+//! must not refuse.
+//!
+//! So, like the `decode_lossless_image` / `decode_alpha_plane` sibling
+//! harnesses, a cheap structural pre-pass sums every pixel allocation
+//! the container *declares* before any decode runs: the top-level §2.6
+//! `VP8L` and §2.5 `VP8 ` still dimensions, the §2.7.1 `VP8X` canvas
+//! multiplied by one-plus-the-`ANMF`-count (the §2.7.1.1 compositor
+//! snapshots the full canvas per frame), and each `ANMF` frame's own
+//! §2.6 / §2.5 sub-bitstream dimensions (each frame decodes at the
+//! *bitstream's* declared size before the canvas-fit check). When the
+//! sum exceeds `MAX_DECLARED_PIXELS` the iteration bails without
+//! decoding at all — unlike the single-copy `decode_lossless_image`
+//! harness there is no cheap way to "still drive the façade for the
+//! Result contract" here, because the over-budget allocation *is* the
+//! success path of the two façades under test.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::{container, decode_webp, decode_webp_image, DecodedWebp};
+use oxideav_webp::{
+    anmf, container, decode_webp, decode_webp_image, vp8_chunk, vp8l_chunk, vp8x, DecodedWebp,
+};
+
+/// Declared-pixel budget for one fuzz iteration, summed across every
+/// §2.6 / §2.5 / §2.7.1 / §2.7.1.1 dimension declaration in the file.
+/// 1 << 22 (~4.2 M pixels) caps a single decoded RGBA surface at
+/// ~16.8 MiB; with the up-to-three live surfaces this harness holds the
+/// worst-case iteration stays two orders of magnitude under libFuzzer's
+/// 2 GiB RSS limit while every committed fixture (all well under a
+/// megapixel, animations included) still runs the full differential.
+const MAX_DECLARED_PIXELS: u64 = 1 << 22;
+
+/// Sum every pixel allocation the §2.3 container declares up front, so
+/// the decode tail can be gated before any header-sized buffer exists.
+/// Sources that fail their cheap structural parse contribute nothing:
+/// the real decoder refuses those before allocating pixels.
+fn declared_pixel_load(bytes: &[u8], c: &container::WebpContainer) -> u64 {
+    let mut load: u64 = 0;
+
+    // §2.6 top-level VP8L still image: width * height ARGB pixels.
+    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8L) {
+        if let Ok(h) = vp8l_chunk::WebpLosslessChunk::from_payload(chunk.payload(bytes)) {
+            load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
+        }
+    }
+
+    // §2.5 top-level VP8 still image (the §9.1 keyframe header dims).
+    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8) {
+        if let Ok(h) = vp8_chunk::WebpLossyChunk::from_payload(chunk.payload(bytes)) {
+            load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
+        }
+    }
+
+    // §2.7.1 VP8X canvas: the §2.7.1.1 compositor allocates one full
+    // canvas plus one full-canvas snapshot per ANMF frame.
+    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8X) {
+        if let Ok(h) = vp8x::Vp8xHeader::parse(chunk.payload(bytes)) {
+            let canvas = u64::from(h.canvas_width) * u64::from(h.canvas_height);
+            let frames = c.chunks_with_fourcc(container::fourcc::ANMF).count() as u64;
+            load = load.saturating_add(canvas.saturating_mul(frames + 1));
+        }
+    }
+
+    // §2.7.1.1 ANMF frame data: each frame decodes its own §2.6 / §2.5
+    // sub-bitstream at the *bitstream's* declared dimensions before the
+    // canvas-fit check runs. The walk mirrors the decoder's strict §2.3
+    // padded sub-chunk traversal (stop on any truncated declaration).
+    for anmf_chunk in c.chunks_with_fourcc(container::fourcc::ANMF) {
+        let payload = anmf_chunk.payload(bytes);
+        let Ok(header) = anmf::AnmfHeader::parse(payload) else {
+            continue;
+        };
+        let mut fd = &payload[header.frame_data_offset()..];
+        while fd.len() >= 8 {
+            let fourcc: [u8; 4] = fd[0..4].try_into().expect("4-byte slice");
+            let size = u32::from_le_bytes(fd[4..8].try_into().expect("4-byte slice")) as usize;
+            let Some(sub) = fd.get(8..8usize.saturating_add(size)) else {
+                break;
+            };
+            if fourcc == container::fourcc::VP8L {
+                if let Ok(h) = vp8l_chunk::WebpLosslessChunk::from_payload(sub) {
+                    load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
+                }
+            } else if fourcc == container::fourcc::VP8 {
+                if let Ok(h) = vp8_chunk::WebpLossyChunk::from_payload(sub) {
+                    load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
+                }
+            }
+            let advance = 8usize.saturating_add(size).saturating_add(size & 1);
+            if advance > fd.len() {
+                break;
+            }
+            fd = &fd[advance..];
+        }
+    }
+
+    load
+}
 
 /// Re-check the §2.5 / §2.6 flat-buffer carrier invariant on a decoded
 /// still image: `rgba.len() == width * height * 4`, non-empty iff both
@@ -130,6 +239,15 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let is_animated = c.first_chunk_with_fourcc(container::fourcc::ANIM).is_some();
+
+    // Round-432 iteration cost bound: bail before decoding when the
+    // file's own headers declare more pixels than the per-iteration
+    // budget (see the module docs) — the over-budget allocation is the
+    // *success* path of both façades, so there is no cheap Result-only
+    // drive above the budget.
+    if declared_pixel_load(data, &c) > MAX_DECLARED_PIXELS {
+        return;
+    }
 
     let low = decode_webp_image(data);
     let published = decode_webp(data);

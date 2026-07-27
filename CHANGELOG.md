@@ -6,6 +6,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(fuzz)* round-432 depth round on the fuzz harness set; no library
+  code change. Scheduled-CI budgets are now weighted by measured
+  per-target exec/s (the encoder-in-loop round-trip oracles and the
+  whole-file decode façades run at 5..25 exec/s under the
+  address-sanitized build and previously got the same ~48 s daily slice
+  as the 10^4..10^6 exec/s parsers — all of it consumed by corpus
+  replay): the Fuzz workflow shim passes an explicit weighted target
+  list (4 slices each for the eight slow targets, 2 for
+  `roundtrip_alpha_filter_lossless`, 1 for the 28 fast ones) over a
+  5400 s budget, `roundtrip_lossless` caps its fuzz-driven canvas at
+  32 × 32 (every §4 transform election stays reachable; a 64 × 64
+  iteration cost ~200 ms under ASan), and `decode_still_paths` gates
+  its decode tail on the sum of every pixel dimension the container
+  declares (`MAX_DECLARED_PIXELS = 1 << 22`, mirroring the
+  `decode_lossless_image` / `decode_alpha_plane` precedent). That gate
+  fixes the finding of the round's bounded campaign across all 37
+  targets: a 135-byte spec-legal §5.2.2 backward-reference bomb
+  (committed as seed `fuzz/corpus/decode_still_paths/seeds/
+  declared-dims-bomb`) declaring ~10^8 pixels decoded into ~380 MiB of
+  RGBA per surface and blew libFuzzer's 2 GiB RSS limit across the
+  harness's three live decode surfaces — a decompression-ratio property
+  of the format, not a decoder defect (the library's round-286
+  `MAX_DECODE_DIMENSION` per-side ceiling is intact, and a
+  16384 × 16384 still is a file a general-purpose decoder must accept).
+  The fuzz lockfile was re-resolved onto `oxideav-vp8` 0.2.6, the first
+  published sibling carrying the §14.4 inverse-DCT wrapping fix, so the
+  `decode_still_paths` §2.5 lossy legs (unskipped since round 408) can
+  no longer reproduce the historical overflow abort on a
+  published-sibling build.
+
 - *(docs)* Marked the crate's internal-only public surface `#[doc(hidden)]`
   (module-level for wholly-internal modules, item-level in mixed modules)
   so `cargo-semver-checks` no longer treats internals exposed for
