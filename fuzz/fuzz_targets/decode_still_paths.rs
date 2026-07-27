@@ -46,9 +46,9 @@
 //! non-animated `VP8 `-only input now runs the full still-vs-published
 //! differential below, and the corpus is seeded with the in-tree §2.5
 //! lossy fixtures so the mutator starts on the lossy success path too.
-//! Note the sibling fix ships in the first `oxideav-vp8` release after
-//! 0.2.5; a fuzz build resolving an older published sibling can still
-//! reproduce the (fixed-on-master) overflow abort.
+//! The sibling fix is published as of `oxideav-vp8` 0.2.6 (round 432
+//! re-resolved the fuzz lockfile onto it); only a fuzz build pinned to
+//! 0.2.5 or older can still reproduce the historical overflow abort.
 //!
 //! ## The differential contract
 //!

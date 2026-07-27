@@ -461,9 +461,9 @@ cargo-fuzz = true
 # (wrapping 32-bit §14.4 arithmetic, byte-exact), so round 408 removed
 # the gate — non-animated `VP8 `-only inputs now run the full
 # still-vs-published differential, seeded from the in-tree §2.5 lossy
-# fixtures. The fix ships in the first `oxideav-vp8` release after
-# 0.2.5; a fuzz build resolving an older published sibling can still
-# reproduce the fixed-on-master overflow abort.
+# fixtures. The fix is published as of `oxideav-vp8` 0.2.6 (round 432
+# re-resolved the fuzz lockfile onto it); only a fuzz build resolving
+# 0.2.5 or older can still reproduce the historical overflow abort.
 
 [dependencies]
 libfuzzer-sys = "0.4"

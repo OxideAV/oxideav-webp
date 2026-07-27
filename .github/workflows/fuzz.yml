@@ -1,12 +1,40 @@
 name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The reusable
-# workflow auto-discovers every target under fuzz/fuzz_targets/ and
-# splits the 30-minute total budget evenly across them (thirty
-# targets as of round 292, ~60 s each, corpus persisted across runs via
-# actions/cache). `libwebp-dev` is installed for any black-box
-# cross-validation harness that may dlopen the reference decoder at
-# runtime.
+# workflow runs each entry of the `targets` list for an equal slice of
+# `time_budget_seconds` (budget / number-of-entries), persisting the
+# libfuzzer corpus across runs via actions/cache.
+#
+# Round-432 budget tuning: the harness set is heavily bimodal. Most
+# targets are standalone parsers / pure-function oracles that run at
+# 10^4..10^6 exec/s under the address-sanitized build, but the
+# encoder-in-loop round-trip oracles and the whole-file decode façades
+# measure in the 5..25 exec/s range (a full §4/§5/§6 encode chooser or a
+# capped-canvas whole-file decode per iteration), so under the previous
+# flat 1800 s / 37-target split (~48 s per target) those targets spent
+# their entire scheduled slice replaying the accumulated corpus and made
+# no mutation progress. The explicit list below therefore weights the
+# slow targets by *repeating* them (each repetition is one more equal
+# slice; corpus additions land on disk between slices, so repeated
+# slices of one target compose into one longer campaign within a run):
+#
+#   * 4 slices — the eight measured-slow targets (local apple-silicon
+#     ASan exec/s in parentheses): roundtrip_lossless (5, pre-cap),
+#     roundtrip_anim_modes (10), compose_animation (12),
+#     encode_params_roundtrip (15), roundtrip_metadata (21),
+#     decode_still_paths (22), decode_lossless_image (23),
+#     roundtrip_animated (25).
+#   * 2 slices — roundtrip_alpha_filter_lossless (212).
+#   * 1 slice — the remaining 28 targets (>= ~3000 exec/s each).
+#
+# 62 slices over a 5400 s budget is ~87 s per slice: ~348 s/day for each
+# slow target (vs ~48 s before) and still ~87 s/day for each fast one.
+#
+# MAINTENANCE: the explicit `targets` list bypasses the reusable
+# workflow's auto-discovery — a NEW fuzz target under fuzz/fuzz_targets/
+# must also be appended to the list below or the schedule will skip it.
+# The list is comma-separated with NO whitespace around commas (the
+# reusable workflow splits on bare commas).
 
 on:
   schedule:
@@ -17,6 +45,6 @@ jobs:
   fuzz:
     uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
     with:
-      extra_packages_apt: "libwebp-dev"
-      time_budget_seconds: 1800
+      time_budget_seconds: 5400
+      targets: "backward_reference,color_cache,decode,decode_alph,decode_alpha_plane,decode_argb,decode_entropy_coded_image,decode_entropy_image,decode_lossless,decode_lossless_lut,distance_code,extract_metadata,extract_routing,inverse_predictor_color,inverse_subtract_green_indexing,meta_prefix_index,parse_alph,parse_anim,parse_anmf,parse_container,parse_meta_prefix,parse_transform_list,parse_vp8_chunk,parse_vp8x,prefix_code,prefix_code_group,read_symbol_lut_diff,roundtrip_alpha_filter,roundtrip_alpha_filter_lossless,roundtrip_alpha_filter_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_anim_modes,roundtrip_anim_modes,roundtrip_anim_modes,roundtrip_anim_modes,compose_animation,compose_animation,compose_animation,compose_animation,encode_params_roundtrip,encode_params_roundtrip,encode_params_roundtrip,encode_params_roundtrip,roundtrip_metadata,roundtrip_metadata,roundtrip_metadata,roundtrip_metadata,decode_still_paths,decode_still_paths,decode_still_paths,decode_still_paths,decode_lossless_image,decode_lossless_image,decode_lossless_image,decode_lossless_image,roundtrip_animated,roundtrip_animated,roundtrip_animated,roundtrip_animated"
     secrets: inherit
