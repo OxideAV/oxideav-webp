@@ -86,7 +86,11 @@
 //! §3.4 5-byte header read) and, when the **declared** `width * height`
 //! exceeds `MAX_PIXELS = 1 << 16` (65 536 pixels, worst-case 256 KiB ARGB
 //! intermediate), runs only that cheap structural path and returns before
-//! the full §4/§5/§6 decode. The container-walk + chunk-selection +
+//! the full §4/§5/§6 decode — without driving the façade at all (round
+//! 432: a spec-legal §5.2.2 stream can back a ~10^8-pixel declaration
+//! from a 38-byte file, so an over-budget drive is an OOM, not a cheap
+//! refusal; see the over-budget arm below and the committed
+//! `seeds/lz77-bomb-12168x8192`). The container-walk + chunk-selection +
 //! header-read surface is still fully exercised on every input; only the
 //! quadratic-allocation full-decode tail is gated by a declared-pixel
 //! budget the §3.4 header makes observable up front.
@@ -124,12 +128,19 @@ fuzz_target!(|data: &[u8]| {
     let declared_height = chunk.height();
     let declared_pixels = u64::from(declared_width) * u64::from(declared_height);
     if declared_pixels > MAX_PIXELS {
-        // Still drive the façade for the Result contract — the §3.4
-        // header parsed, but the full decode would over-allocate for a
-        // fuzz iteration. The decoder may either succeed (and the budget
-        // was the harness's, not the decoder's, concern) or refuse on the
-        // entropy stream; either way it must return rather than panic.
-        let _ = decode_lossless_image(data);
+        // Round 432: do NOT drive the façade above the budget. An
+        // earlier revision still called `decode_lossless_image` here
+        // "for the Result contract", assuming an over-declared header
+        // would be refused cheaply on the entropy stream — but a
+        // spec-legal §5.2.2 backward-reference stream can *back* the
+        // full declaration: the round-432 campaign minimised a 38-byte
+        // file (seed `seeds/lz77-bomb-12168x8192`) declaring
+        // 12168 × 8192 ≈ 10^8 pixels that decodes successfully in ~16 s
+        // and ~2.4 GiB peak RSS under the address-sanitized build,
+        // tripping libFuzzer's RSS limit and slow-unit reporting. The
+        // over-budget allocation is the *success* path of the façade, so
+        // above the budget the iteration ends at the cheap structural
+        // pre-pass (which stays fully exercised on every input).
         return;
     }
 

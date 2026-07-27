@@ -20,16 +20,27 @@ All notable changes to `oxideav-webp` are recorded here.
   iteration cost ~200 ms under ASan), and `decode_still_paths` gates
   its decode tail on the sum of every pixel dimension the container
   declares (`MAX_DECLARED_PIXELS = 1 << 22`, mirroring the
-  `decode_lossless_image` / `decode_alpha_plane` precedent). That gate
-  fixes the finding of the round's bounded campaign across all 37
-  targets: a 135-byte spec-legal §5.2.2 backward-reference bomb
-  (committed as seed `fuzz/corpus/decode_still_paths/seeds/
-  declared-dims-bomb`) declaring ~10^8 pixels decoded into ~380 MiB of
-  RGBA per surface and blew libFuzzer's 2 GiB RSS limit across the
-  harness's three live decode surfaces — a decompression-ratio property
-  of the format, not a decoder defect (the library's round-286
-  `MAX_DECODE_DIMENSION` per-side ceiling is intact, and a
-  16384 × 16384 still is a file a general-purpose decoder must accept).
+  `decode_lossless_image` / `decode_alpha_plane` precedent). The
+  round's bounded campaign across all 37 targets surfaced one finding
+  class, spec-legal §5.2.2 backward-reference decompression bombs — a
+  135-byte file declaring ~10^8 pixels OOM'd the three-live-surface
+  `decode_still_paths` differential, and a minimised 38-byte file
+  (12168 × 8192 declared, decodes successfully in ~16 s / ~2.4 GiB
+  under ASan) OOM'd `decode_lossless_image`'s over-budget
+  "drive-for-the-Result-contract" arm, disproving that arm's assumption
+  that an over-declared header is refused cheaply. Not a decoder defect
+  (the round-286 `MAX_DECODE_DIMENSION` per-side ceiling is intact, and
+  a 16384 × 16384 still is a file a general-purpose decoder must
+  accept), so the fix is harness-side: a shared
+  `declared_pixel_load` helper (new `fuzz/src/lib.rs`) sums every
+  dimension declaration a container makes observable (VP8L §3.4, VP8
+  §9.1, VP8X canvas × frames+1, per-ANMF sub-bitstreams) and now gates
+  `decode`, `decode_still_paths`, and (VP8L-only, no over-budget drive)
+  `decode_lossless_image`; `decode_alpha_plane`'s existing gate also
+  covers its §9.1 fallback dimension source. The bombs are committed as
+  regression seeds under `fuzz/corpus/decode_still_paths/seeds/` and
+  `fuzz/corpus/decode_lossless_image/seeds/` (all replay at ~40 MB RSS
+  in milliseconds through the gates).
   The fuzz lockfile was re-resolved onto `oxideav-vp8` 0.2.6, the first
   published sibling carrying the §14.4 inverse-DCT wrapping fix, so the
   `decode_still_paths` §2.5 lossy legs (unskipped since round 408) can

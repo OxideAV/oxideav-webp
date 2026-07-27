@@ -48,20 +48,25 @@
 //!
 //! The §2.7.1 `VP8X` canvas fields are 24-bit each, so a malformed
 //! header can declare a plane up to 2^24 × 2^24 (capped by the §2.7.1
-//! Width × Height ≤ 2^32 − 1 rule) — far larger than any real still.
-//! The raw §2.7.1.2 form is self-limiting (`decode_alpha` rejects a
-//! raw bitstream whose length is not exactly `width * height` before
-//! allocating), and the headerless lossless form caps its eager pixel
-//! reservation, so a tiny payload with a huge declared canvas surfaces
-//! an error rather than an OOM. To keep the scheduled Fuzz workflow off
-//! the deliberate large-canvas allocation entirely, a cheap structural
-//! pre-pass reads the §2.7.1 `VP8X` canvas dimensions (when present)
-//! and skips the decode when the declared `width * height` exceeds
-//! `1 << 20` pixels; such inputs are not representative still images
-//! and the dimension caps are unit-tested separately.
+//! Width × Height ≤ 2^32 − 1 rule) — far larger than any real still —
+//! and the §2.5 `VP8 ` §9.1 fallback source is 14-bit per side (up to
+//! 16384²). The raw §2.7.1.2 form is self-limiting (`decode_alpha`
+//! rejects a raw bitstream whose length is not exactly
+//! `width * height` before allocating), and the headerless lossless
+//! form caps its *eager* pixel reservation — but a spec-legal §5.2.2
+//! backward-reference stream can *back* a huge declaration from a tiny
+//! payload (round 432 minimised a 38-byte ~10^8-pixel example on the
+//! `decode_lossless_image` façade), so a successful decode, not just an
+//! error, is reachable above any memory budget. A cheap structural
+//! pre-pass therefore reads whichever dimension source
+//! `decode_alpha_plane` would use (`VP8X` canvas when present, else the
+//! §9.1 keyframe header) and skips the decode when the declared
+//! `width * height` exceeds `1 << 20` pixels; such inputs are not
+//! representative still images and the dimension caps are unit-tested
+//! separately.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::{container, decode_alpha_plane, vp8x};
+use oxideav_webp::{container, decode_alpha_plane, vp8_chunk, vp8x};
 
 /// Declared-pixel ceiling above which the full decode tail is skipped.
 /// A real still alpha plane is far below this; the §2.7.1 24-bit canvas
@@ -70,16 +75,29 @@ const MAX_DECODE_PIXELS: u64 = 1 << 20;
 
 fuzz_target!(|data: &[u8]| {
     // Cheap structural pre-pass: if the file parses as a §2.3 container
-    // and carries a §2.7.1 `VP8X` whose declared canvas would size a
-    // plane beyond the gate, skip the decode tail (the dimension caps
-    // are unit-tested; the scheduled Fuzz workflow should not spend its
-    // budget on the deliberate large-canvas path). A file that does not
-    // even parse, or carries no parseable `VP8X`, falls through to the
+    // and declares plane dimensions beyond the gate, skip the decode
+    // tail (the dimension caps are unit-tested; the scheduled Fuzz
+    // workflow should not spend its budget on the deliberate
+    // large-plane path). `decode_alpha_plane` resolves the plane
+    // dimensions from the §2.7.1 `VP8X` canvas when present, else from
+    // the §2.5 `VP8 ` §9.1 keyframe header — both sources are gated
+    // (round 432 closed the VP8-sourced hole: the §9.1 14-bit fields
+    // can declare up to 16384², and a §2.7.1.2 lossless-compressed
+    // `ALPH` stream can legally back a ~10^8-pixel plane the way the
+    // `decode_lossless_image` campaign bomb did). A file that does not
+    // even parse, or resolves no dimensions, falls through to the
     // decode below for the Result contract.
     if let Ok(c) = container::parse(data) {
         if let Some(vp8x_chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8X) {
             if let Ok(hdr) = vp8x::Vp8xHeader::parse(vp8x_chunk.payload(data)) {
                 let pixels = u64::from(hdr.canvas_width) * u64::from(hdr.canvas_height);
+                if pixels > MAX_DECODE_PIXELS {
+                    return;
+                }
+            }
+        } else if let Some(vp8) = c.first_chunk_with_fourcc(container::fourcc::VP8) {
+            if let Ok(hdr) = vp8_chunk::WebpLossyChunk::from_payload(vp8.payload(data)) {
+                let pixels = u64::from(hdr.width()) * u64::from(hdr.height());
                 if pixels > MAX_DECODE_PIXELS {
                     return;
                 }
