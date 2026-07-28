@@ -271,7 +271,24 @@ underflow, a distance-code add-overflow, and (round 408, surfaced by
 `encode_params_roundtrip` within minutes of its first run) two
 degenerate §3.7.2 prefix-code table shapes the encoder emitted as
 Kraft-incomplete, undecodable streams on all-cache-reference token
-streams. Run any target with (nightly + `cargo-fuzz`):
+streams.
+
+Round 432 added a *declared-pixel-load* budget shared by the whole-file
+decode harnesses (`fuzz/src/lib.rs`): a spec-legal §5.2.2
+backward-reference stream can expand a ~40-byte chunk into ~10^8
+decoded pixels (a minimised 38-byte example — now a committed seed —
+decodes in ~16 s at ~2.4 GiB peak RSS under ASan), so `decode`,
+`decode_still_paths`, `decode_lossless_image`, and `decode_alpha_plane`
+skip iterations whose containers *declare* more pixels (across VP8L /
+VP8 / VP8X-canvas-×-frames / per-`ANMF` sub-bitstream headers) than a
+fuzz iteration can afford; the library itself intentionally accepts
+those files (only per-side dimensions are capped). The scheduled Fuzz
+workflow also weights its daily per-target slices by measured exec/s —
+the encoder-in-loop oracles run four slices each where the
+10^4..10^6 exec/s parsers run one (see `.github/workflows/fuzz.yml` for
+the measured numbers).
+
+Run any target with (nightly + `cargo-fuzz`):
 
 ```text
 cargo +nightly fuzz run <target> --manifest-path crates/oxideav-webp/fuzz/Cargo.toml

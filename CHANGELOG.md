@@ -13,9 +13,10 @@ All notable changes to `oxideav-webp` are recorded here.
   address-sanitized build and previously got the same ~48 s daily slice
   as the 10^4..10^6 exec/s parsers — all of it consumed by corpus
   replay): the Fuzz workflow shim passes an explicit weighted target
-  list (4 slices each for the eight slow targets, 2 for
-  `roundtrip_alpha_filter_lossless`, 1 for the 28 fast ones) over a
-  5400 s budget, `roundtrip_lossless` caps its fuzz-driven canvas at
+  list (4 slices each for the six encoder-in-loop slow targets, 2 for
+  `roundtrip_alpha_filter_lossless`, 1 for the 30 fast ones — the two
+  decode façades left the slow tier once their decode tails were gated,
+  below) over a 5400 s budget, `roundtrip_lossless` caps its fuzz-driven canvas at
   32 × 32 (every §4 transform election stays reachable; a 64 × 64
   iteration cost ~200 ms under ASan), and `decode_still_paths` gates
   its decode tail on the sum of every pixel dimension the container
@@ -40,7 +41,11 @@ All notable changes to `oxideav-webp` are recorded here.
   covers its §9.1 fallback dimension source. The bombs are committed as
   regression seeds under `fuzz/corpus/decode_still_paths/seeds/` and
   `fuzz/corpus/decode_lossless_image/seeds/` (all replay at ~40 MB RSS
-  in milliseconds through the gates).
+  in milliseconds through the gates). Campaign totals: ~960 s per
+  slow/medium target, ~230 s per fast target, ~4.3 h wall clock; no
+  library-level crash, panic, or oracle divergence — the decoder and
+  encoder survived every differential (round-trip, still-vs-published,
+  compositor-vs-simulation, LUT-vs-reference) unscathed.
   The fuzz lockfile was re-resolved onto `oxideav-vp8` 0.2.6, the first
   published sibling carrying the §14.4 inverse-DCT wrapping fix, so the
   `decode_still_paths` §2.5 lossy legs (unskipped since round 408) can
