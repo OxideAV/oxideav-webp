@@ -3494,6 +3494,32 @@ fn build_predictor_image_with_slack(
     (img, tw, th)
 }
 
+/// Memoized `log2` over integer operands (round 440).
+///
+/// Every Shannon-cost accumulator in this module (`block_mode_entropy_cost`,
+/// `sub_image_mode_cost_delta_milli`, `channel_residual_entropy_milli`,
+/// `hist_entropy_milli`) evaluates `log2` on *integer* histogram counts
+/// and totals; the per-bin libm calls showed up as ~4% of corpus-encode
+/// self-time in the round-440 profile. The table is filled with exactly
+/// the values the direct `(i as f64).log2()` call returns — the same
+/// pure function on the same operands — so every cost the choosers
+/// compare is bit-identical to the uncached form and the chosen streams
+/// are byte-identical (slot 0 keeps the `-inf` the direct call yields;
+/// no caller reaches it, since zero bins are skipped and totals are
+/// `>= 1`). Operands past the table fall back to the direct call.
+const LOG2_INT_TABLE_LEN: usize = 1 << 16;
+
+#[inline]
+fn log2_int(v: u64) -> f64 {
+    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| (0..LOG2_INT_TABLE_LEN).map(|i| (i as f64).log2()).collect());
+    if v < LOG2_INT_TABLE_LEN as u64 {
+        table[v as usize]
+    } else {
+        (v as f64).log2()
+    }
+}
+
 /// Round 161 *Shannon-entropy bit-cost* per-mode cost function.
 ///
 /// Where [`block_mode_cost`] sums the folded L1 magnitude of the
@@ -3552,8 +3578,7 @@ fn block_mode_entropy_cost(
     // `−log2(c/N)` to keep the per-bin operand non-negative (zero
     // when c = N, growing as c shrinks) which is friendly to the
     // accumulator.
-    let n_f = n as f64;
-    let log2_n = n_f.log2();
+    let log2_n = log2_int(n as u64);
     let mut milli_bits: f64 = 0.0;
     for channel_hist in &hist {
         for &count in channel_hist.iter() {
@@ -3562,7 +3587,7 @@ fn block_mode_entropy_cost(
             }
             let c_f = count as f64;
             // Per-bin contribution to N·H: c·log2(N/c).
-            milli_bits += c_f * (log2_n - c_f.log2());
+            milli_bits += c_f * (log2_n - log2_int(u64::from(count)));
         }
     }
     // Scale to milli-bits and round to nearest.
@@ -3713,21 +3738,23 @@ fn sub_image_mode_cost_delta_milli(hist: &[u32; 14], total: u32, mode: u8) -> u6
     // makes the result bit-for-bit deterministic across IEEE-754
     // log2 implementations to within ±1 milli-bit, which is finer
     // than any per-symbol cost ordering.
-    let n_old = total as f64;
-    let n_new = (total + 1) as f64;
-    let log2_n_old = if total > 0 { n_old.log2() } else { 0.0 };
-    let log2_n_new = n_new.log2();
+    let log2_n_old = if total > 0 {
+        log2_int(u64::from(total))
+    } else {
+        0.0
+    };
+    let log2_n_new = log2_int(u64::from(total) + 1);
     let mut mass_old: f64 = 0.0;
     let mut mass_new: f64 = 0.0;
     for (m, &c) in hist.iter().enumerate() {
         let c_after = if m == mode as usize { c + 1 } else { c };
         if c > 0 {
             let c_f = c as f64;
-            mass_old += c_f * (log2_n_old - c_f.log2());
+            mass_old += c_f * (log2_n_old - log2_int(u64::from(c)));
         }
         if c_after > 0 {
             let c_f = c_after as f64;
-            mass_new += c_f * (log2_n_new - c_f.log2());
+            mass_new += c_f * (log2_n_new - log2_int(u64::from(c_after)));
         }
     }
     let delta = (mass_new - mass_old).max(0.0);
@@ -4651,15 +4678,14 @@ fn channel_residual_entropy_milli(hist: &[u32; 256]) -> u64 {
     if n == 0 {
         return 0;
     }
-    let n_f = n as f64;
-    let log2_n = n_f.log2();
+    let log2_n = log2_int(u64::from(n));
     let mut milli_bits: f64 = 0.0;
     for &count in hist.iter() {
         if count == 0 {
             continue;
         }
         let c_f = count as f64;
-        milli_bits += c_f * (log2_n - c_f.log2());
+        milli_bits += c_f * (log2_n - log2_int(u64::from(count)));
     }
     (milli_bits * 1000.0 + 0.5) as u64
 }
@@ -7845,14 +7871,14 @@ fn hist_entropy_milli(hist: &[u32]) -> u64 {
     if n == 0 {
         return 0;
     }
-    let log2_n = (n as f64).log2();
+    let log2_n = log2_int(n);
     let mut milli_bits: f64 = 0.0;
     for &count in hist {
         if count == 0 {
             continue;
         }
         let c_f = count as f64;
-        milli_bits += c_f * (log2_n - c_f.log2());
+        milli_bits += c_f * (log2_n - log2_int(u64::from(count)));
     }
     (milli_bits * 1000.0 + 0.5) as u64
 }

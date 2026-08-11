@@ -6,6 +6,20 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(vp8l_encode)* **memoized integer `log2` for the Shannon-cost
+  choosers** (round 440, output-invariant): the four entropy-cost
+  accumulators (`block_mode_entropy_cost`,
+  `sub_image_mode_cost_delta_milli`, `channel_residual_entropy_milli`,
+  `hist_entropy_milli`) evaluate `log2` only on integer histogram
+  counts/totals; a lazily-built 2^16-entry table now answers those
+  calls (~4% of corpus-encode self-time went to the per-bin libm calls
+  in the round-440 profile). The table is filled with exactly the
+  values the direct call returns — same pure function, same operands —
+  so every compared cost, every chooser decision, and every emitted
+  byte is identical (golden-hash-verified on the full 29-output
+  corpus). Encode corpus wall 4.65 s → 4.56 s (−2%), animation-encode
+  timeline 1.24 s → 1.16 s (−6%).
+
 - *(vp8l_encode)* **closed-form §5.2.2 distance-code chooser**
   (round 440, output-invariant): `pixel_distance_to_distance_code` no
   longer scans the 120-entry `DISTANCE_MAP` — a compile-time inverse
