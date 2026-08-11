@@ -6,6 +6,28 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(vp8l_encode)* **closed-form §5.2.2 distance-code chooser**
+  (round 440, output-invariant): `pixel_distance_to_distance_code` no
+  longer scans the 120-entry `DISTANCE_MAP` — a compile-time inverse
+  table over the map's fixed `(xi ∈ [-8, 8], yi ∈ [0, 7])`
+  neighbourhood answers each of the ≤ 8 possible `(distance − yi·W)`
+  columns directly, keeping the smallest matching code (provably the
+  same code the ascending reference scan returns; uniqueness and
+  bounds are compile-time-asserted). Widths `< 9`, where §5.2.2
+  reconstruction clamping can collapse several entries onto
+  `distance = 1`, keep the reference scan. The chooser runs at least
+  twice per emitted backward reference (frequency count + emit) and
+  once per `Copy` token per §6.2.2 mirror walk; the no-match regime
+  (large distances on photo-like content — previously a full 120-entry
+  scan) drops ~17× (`distance_code_dist_large_nomatch` 48 µs →
+  2.8 µs / 1024 calls). Golden-hash guard: FNV-64 digests of all 15
+  corpus decode outputs, 11 max-effort encode outputs, and 3 animation
+  encodes are byte-identical before/after; the
+  `distance_chooser_early_out_matches_full_scan` oracle sweep now also
+  pins the `width = 8 / 9 / 10` clamp-threshold boundary. Measurement
+  corpus (7 re-encoded docs fixtures + 4 deterministic synthetics,
+  max-effort): encode wall 4.91 s → 4.65 s (−5%).
+
 - *(fuzz)* round-432 depth round on the fuzz harness set; no library
   code change. Scheduled-CI budgets are now weighted by measured
   per-target exec/s (the encoder-in-loop round-trip oracles and the

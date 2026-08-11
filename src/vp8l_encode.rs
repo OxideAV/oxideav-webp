@@ -2610,12 +2610,65 @@ fn distance_to_code(distance: usize) -> u32 {
 /// decoder produces the exact same pixel distance and the round-trip
 /// stays bit-exact.
 ///
+/// # Closed-form inversion (round 440)
+///
+/// The map's neighbourhood is small and fixed
+/// (`xi ∈ [`[`DIST_MAP_X_MIN`]`, `[`DIST_MAP_X_MAX`]`]`,
+/// `yi ∈ [0, `[`DIST_MAP_Y_MAX`]`]`), so instead of scanning all 120
+/// entries the chooser solves for the candidates directly: for each of
+/// the 8 possible `yi` values, `xi = distance - yi * W` is the only
+/// column that could reconstruct to `distance`, and a compile-time
+/// inverse table ([`DIST_MAP_INVERSE`]) answers whether `(xi, yi)` is a
+/// map entry and which code it carries. The smallest matching code over
+/// the ≤ 8 probes is exactly the code the ascending reference scan
+/// returns (codes are unique per entry, verified at compile time). The
+/// probe loop is only valid when no entry's reconstruction clamps
+/// (`xi + yi * W < 1` → 1): every map entry has `yi >= 1 || xi >= 1`
+/// (compile-time-asserted), so for `W >= 9` the reconstruction
+/// `xi + yi * W >= min(xi, W - 8) >= 1` never clamps and the closed form
+/// is exact. Widths `< 9` (where multiple clamped entries can collapse
+/// onto `distance == 1`) keep the reference scan.
+///
 /// Panics in debug builds when `distance == 0` (callers guarantee
 /// `1 <= distance <= position` per §5.2.2's backward-reference invariant).
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub fn pixel_distance_to_distance_code(distance: usize, image_width: u32) -> u32 {
     debug_assert!(distance >= 1, "§5.2.2 distance must be >= 1");
+    if image_width < DIST_MAP_MIN_UNCLAMPED_WIDTH {
+        return distance_code_reference_scan(distance, image_width);
+    }
+    let w = i64::from(image_width);
+    let d = distance as i64;
+    // Smallest matching map code across the ≤ 8 per-row probes;
+    // 0 = no match. `xi = d - yi * w` strictly decreases as `yi` grows,
+    // so once it falls below the map's minimum column the remaining rows
+    // cannot match either.
+    let mut best = 0u8;
+    for (yi, row) in DIST_MAP_INVERSE.iter().enumerate() {
+        let xi = d - (yi as i64) * w;
+        if xi < DIST_MAP_X_MIN {
+            break;
+        }
+        if xi <= DIST_MAP_X_MAX {
+            let code = row[(xi - DIST_MAP_X_MIN) as usize];
+            if code != 0 && (best == 0 || code < best) {
+                best = code;
+            }
+        }
+    }
+    if best != 0 {
+        return u32::from(best);
+    }
+    distance as u32 + crate::vp8l_decode::NUM_DISTANCE_MAP_CODES as u32
+}
+
+/// Reference §5.2.2 distance-code chooser: the ascending full scan over
+/// [`crate::vp8l_decode::DISTANCE_MAP`] with the round-301 first-match
+/// early-out. Kept as the exact-semantics fallback for widths small
+/// enough that reconstruction clamping (`xi + yi * W < 1` → 1) can
+/// fire, and as the equivalence oracle for the closed-form fast path.
+fn distance_code_reference_scan(distance: usize, image_width: u32) -> u32 {
     let width_i32 = image_width as i32;
     for (idx, &(xi, yi)) in crate::vp8l_decode::DISTANCE_MAP.iter().enumerate() {
         // The decoder computes `xi + yi * W` and clamps to 1. Match the
@@ -2631,6 +2684,51 @@ pub fn pixel_distance_to_distance_code(distance: usize, image_width: u32) -> u32
         }
     }
     distance as u32 + crate::vp8l_decode::NUM_DISTANCE_MAP_CODES as u32
+}
+
+/// Smallest column (`xi`) any §5.2.2 distance-map entry uses.
+const DIST_MAP_X_MIN: i64 = -8;
+/// Largest column (`xi`) any §5.2.2 distance-map entry uses.
+const DIST_MAP_X_MAX: i64 = 8;
+/// Largest row (`yi`) any §5.2.2 distance-map entry uses.
+const DIST_MAP_Y_MAX: i64 = 7;
+/// Smallest image width at which no §5.2.2 map entry's reconstruction
+/// clamps (`xi + yi * W >= 1` for every entry): rows with `yi >= 1`
+/// reconstruct to at least `W + DIST_MAP_X_MIN = W - 8 >= 1`, and the
+/// `yi = 0` entries all have `xi >= 1` (compile-time-asserted in
+/// [`build_dist_map_inverse`]).
+const DIST_MAP_MIN_UNCLAMPED_WIDTH: u32 = 9;
+
+/// Compile-time inverse of [`crate::vp8l_decode::DISTANCE_MAP`]:
+/// `DIST_MAP_INVERSE[yi][xi - DIST_MAP_X_MIN]` is the 1-based distance
+/// code whose map entry is `(xi, yi)`, or `0` when no entry uses that
+/// offset.
+static DIST_MAP_INVERSE: [[u8; (DIST_MAP_X_MAX - DIST_MAP_X_MIN + 1) as usize];
+    (DIST_MAP_Y_MAX + 1) as usize] = build_dist_map_inverse();
+
+const fn build_dist_map_inverse(
+) -> [[u8; (DIST_MAP_X_MAX - DIST_MAP_X_MIN + 1) as usize]; (DIST_MAP_Y_MAX + 1) as usize] {
+    let mut lut =
+        [[0u8; (DIST_MAP_X_MAX - DIST_MAP_X_MIN + 1) as usize]; (DIST_MAP_Y_MAX + 1) as usize];
+    let mut i = 0;
+    while i < crate::vp8l_decode::NUM_DISTANCE_MAP_CODES {
+        let (x, y) = crate::vp8l_decode::DISTANCE_MAP[i];
+        let (x, y) = (x as i64, y as i64);
+        // The closed-form prober's bounds must cover every entry.
+        assert!(x >= DIST_MAP_X_MIN && x <= DIST_MAP_X_MAX);
+        assert!(y >= 0 && y <= DIST_MAP_Y_MAX);
+        // `yi = 0` rows must not clamp at any width (see
+        // `DIST_MAP_MIN_UNCLAMPED_WIDTH`).
+        assert!(y >= 1 || x >= 1);
+        let row = y as usize;
+        let col = (x - DIST_MAP_X_MIN) as usize;
+        // Entries must be unique offsets, or "smallest matching code"
+        // would depend on scan order.
+        assert!(lut[row][col] == 0);
+        lut[row][col] = (i + 1) as u8;
+        i += 1;
+    }
+    lut
 }
 
 /// Accumulate the per-symbol frequencies for a token stream so the entropy
@@ -10362,8 +10460,11 @@ mod tests {
 
         // Widths spanning width-1 (no spatial structure), narrow, typical
         // tile, and a wide row so the clamp-to-1 and large-distance
-        // regimes are all exercised.
-        for &width in &[1u32, 2, 16, 128, 256, 1024] {
+        // regimes are all exercised. 8 / 9 / 10 straddle
+        // `DIST_MAP_MIN_UNCLAMPED_WIDTH`, the round-440 boundary between
+        // the reference scan (clamping possible) and the closed-form
+        // inverse-LUT prober.
+        for &width in &[1u32, 2, 8, 9, 10, 16, 128, 256, 1024] {
             // Distance 1..=400 covers every clamp-to-1 hit, every
             // single-row / multi-row map distance for these widths, and
             // a long tail that has no map representation (scan-line
