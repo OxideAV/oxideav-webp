@@ -6,6 +6,15 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(vp8l_encode)* **block-compare LZ77 extension walk** (round 440,
+  output-invariant): `Lz77Matcher::find`'s match-extension loop
+  XOR-folds four pixel pairs per step (no per-pixel data-dependent
+  branch; adjacent 32-bit loads merge) and locates the first differing
+  lane on a block mismatch, computing exactly the per-pixel walk's
+  length. Golden-hash-verified byte-identical on the full corpus.
+  `lz77_chain` cells −1.5..−4.5% (deep_period2 3.72 ms → 3.55 ms),
+  corpus encode wall 4.56 s → 4.51 s (−1%).
+
 - *(vp8l_encode)* **memoized integer `log2` for the Shannon-cost
   choosers** (round 440, output-invariant): the four entropy-cost
   accumulators (`block_mode_entropy_cost`,

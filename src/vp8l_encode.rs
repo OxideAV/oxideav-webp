@@ -1352,9 +1352,40 @@ impl<'a> Lz77Matcher<'a> {
             // early break, so the walk's result — and the emitted
             // byte stream — is unchanged.
             if best_len == 0 || p[c + best_len] == p[pos + best_len] {
+                // Round 440: block-compare extension walk. XOR-fold four
+                // pixel pairs per step so the loop carries no
+                // per-pixel data-dependent branch (ILP-friendly, and the
+                // compiler can merge the adjacent 32-bit loads); on a
+                // block mismatch, locate the first differing lane and
+                // stop. The computed length is exactly the per-pixel
+                // walk's: the first mismatching offset is found either
+                // by the lane scan or the per-pixel tail below.
                 let mut len = 0usize;
-                while len < max_len && p[c + len] == p[pos + len] {
-                    len += 1;
+                let mut mismatched = false;
+                while len + 4 <= max_len {
+                    let x0 = p[c + len] ^ p[pos + len];
+                    let x1 = p[c + len + 1] ^ p[pos + len + 1];
+                    let x2 = p[c + len + 2] ^ p[pos + len + 2];
+                    let x3 = p[c + len + 3] ^ p[pos + len + 3];
+                    if (x0 | x1 | x2 | x3) != 0 {
+                        len += if x0 != 0 {
+                            0
+                        } else if x1 != 0 {
+                            1
+                        } else if x2 != 0 {
+                            2
+                        } else {
+                            3
+                        };
+                        mismatched = true;
+                        break;
+                    }
+                    len += 4;
+                }
+                if !mismatched {
+                    while len < max_len && p[c + len] == p[pos + len] {
+                        len += 1;
+                    }
                 }
                 if len > best_len {
                     best_len = len;
