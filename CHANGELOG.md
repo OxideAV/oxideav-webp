@@ -6,6 +6,13 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(docs)* round-440 rollup: `BENCHMARKS.md` gains the round-440
+  section (step-by-step corpus movement, per-bench before/after, the
+  two measured-and-dropped candidates, and the remaining-wall-time
+  ranking); the README's encoder-performance paragraph is extended
+  with the round-440 net numbers (encode corpus −13% at byte-identical
+  output on top of r409; decoder §4.1 realistic cell −22%).
+
 - *(vp8l_encode)* **shared prepass for the §6.2.2 mirror's token
   walks** (round 440, output-invariant): each
   `plan_meta_prefix_image_with_codes` call ran two walks over the plan

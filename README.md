@@ -60,7 +60,21 @@ output is smaller than the reference encoder's best effort on 9 of 10
 images (up to −28%) and within 2% on the photo-like remainder; every
 stream is re-verified bit-exact through a black-box reference decode.
 The cost models only change which spec-legal stream is emitted;
-round-trips stay bit-exact regardless.
+round-trips stay bit-exact regardless. Round 440 continued at strictly
+byte-identical output (FNV-64 golden digests over every corpus decode,
+max-effort encode, and animation output pinned before/after each
+step): a closed-form §5.2.2 distance-code chooser (compile-time
+inverse of the distance map; the no-match scan regime drops ~17×),
+memoized integer `log2` in the Shannon-cost choosers, a block-compare
+LZ77 extension walk, a fused matcher pass (the greedy parse records
+its probes; the DP match-table build replays them instead of re-running
+a second full hash-chain search), a shared prepass for the §6.2.2
+mirror's two token walks, and block-run const-generic dispatch in the
+decoder's §4.1 inverse predictor. Encoder measurement-corpus wall
+−13% on top of r409 (e2e criterion −16% on the 256×256 gradient,
+−10% on the natural tile, −11% on a 512×512 photo-like tile);
+animation encode −13..−20% per mode; decode −22% on the realistic
+16×16-block inverse-predictor cell (−2% e2e lossless).
 
 ## Install
 

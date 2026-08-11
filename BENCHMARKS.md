@@ -2696,3 +2696,121 @@ parse byte-exactly, including true `find` results at probe positions
 inside inherited run interiors — the DP table must keep its inherited
 entries while the greedy consumer sees fresh searches); expected
 payoff is now bounded by the ~6% `find` share.
+
+## Round-440 (2026-08-11) — output-invariant micro-optimisation round: encoder hot paths + decoder §4.1
+
+Round 440 is another pure speed round under the hard byte-identity
+guard: FNV-64 golden digests of all 29 corpus outputs (15 decode
+outputs over the committed fixture set, 11 max-effort encode outputs —
+7 re-encoded docs fixtures + 4 deterministic synthetics — and the
+3-mode animation-encode timeline) were pinned before and re-verified
+after every step; all are unchanged. Baseline is the round-409/432
+encoder; usual aarch64-apple-darwin host, release build, quiet-window
+medians (the machine was shared with parallel agent workloads, so
+±2% is measurement noise — every kept step was re-measured or
+A/B-swapped against the committed parent).
+
+### Step-by-step corpus movement
+
+Corpus = the 11-image max-effort set above (heavier photo-like
+synthetic than r409's, so the absolute wall is not comparable to the
+r409 table).
+
+| Step | Corpus wall | Δ vs prev |
+|---|---:|---:|
+| round-439 state (baseline) | 4.91 s | — |
+| 1. closed-form §5.2.2 distance-code chooser | 4.65 s | −5% |
+| 2. memoized integer `log2` in Shannon costs | 4.56 s | −2% |
+| 3. block-compare LZ77 extension walk | 4.51 s | −1% |
+| 4. fused greedy/DP matcher pass | 4.43 s | −2% (−11% on 512×512 photo) |
+| 5. §6.2.2 mirror shared token-walk prepass | 4.25 s | −2.5% |
+
+Net: **−13% corpus encode wall** at identical bytes (the fused pass's
+pay-off grows with image size: −11% on a 512×512 photo-like tile).
+Animation encode: `anim_encode_{lossless,delta,auto}_4f_48`
+598/244/685 ms (r409) → **481/212/564 ms** (−13..−20%).
+
+### What each step was
+
+1. **Distance-code chooser closed form.** The up-to-120-entry
+   `DISTANCE_MAP` scan in `pixel_distance_to_distance_code` became a
+   compile-time inverse LUT over the map's fixed
+   `(xi ∈ [−8, 8], yi ∈ [0, 7])` neighbourhood: ≤ 8 per-row probes
+   (`xi = D − yi·W`), smallest matching code — provably the code the
+   ascending scan returns (uniqueness + bounds compile-time-asserted).
+   Widths < 9 (reconstruction clamping possible) keep the reference
+   scan, which also stays as the test oracle with new width-8/9/10
+   boundary coverage. `distance_code_dist_large_nomatch` (the regime
+   photo content lives in) 48 µs → 2.8 µs per 1024 calls (~17×).
+2. **Integer-`log2` memo.** The four Shannon-cost accumulators only
+   take `log2` of integer histogram counts; a lazily-built 2^16-entry
+   table (filled by the same pure call) serves them. ~4% of corpus
+   self-time had been the per-bin libm calls.
+3. **Block-compare extension walk.** `Lz77Matcher::find`'s
+   match-extension loop XOR-folds four pixel pairs per step
+   (branch-free interior) and lane-scans on a block mismatch; identical
+   lengths. `lz77_chain` cells −1.5..−4.5%.
+4. **Fused matcher pass** — the r388/r409-flagged follow-up. Both the
+   greedy parse and `compute_dp_matches` call `find(p)` under the
+   identical all-`j < p`-inserted chain discipline, so `find(p)` is a
+   pure function of `(pixels, p)`: the greedy parse records every
+   probe (`tokenize_lz77_recorded`), and the DP table build replays
+   recorded positions instead of re-searching, with fresh searches
+   only where the greedy never probed (match interiors). Replay
+   equality is `debug_assert`ed per position and pinned by
+   `recorded_probes_reproduce_fresh_dp_match_table`.
+5. **§6.2.2 mirror prepass.** `plan_meta_prefix_image_with_codes`'s
+   two token walks each re-derived per-token group (a `div` + `mod`
+   per token) and per-`Copy` §5.2.2 decompositions; one shared prepass
+   (incremental block coordinates + the same pure helpers) now feeds
+   both walks.
+
+Two further candidates were built, measured, and **dropped** for not
+paying: compacting the DP special-candidate tables from
+`Option<DpMatch>` (20 B) to bare run lengths (4 B), and a `u32`
+suffix-cost DP specialization — both hash-identical but flat-to-worse
+on this host (the DP inner loop is arbitration-bound, not
+bandwidth-bound, at these image sizes).
+
+### Decoder: §4.1 inverse predictor block-run dispatch
+
+The interior reconstruction loop paid an out-of-line `predict` call
+plus a 14-way mode dispatch per pixel although the mode is constant
+across each transform block. The dispatch is hoisted to block-run
+granularity (const-generic monomorphized inner loops, left-neighbour
+carried in a register); reconstruction is bit-identical (existing
+random-content oracle + golden digests).
+
+| Bench | before | after | Δ |
+|---|---:|---:|---:|
+| `inverse_predictor_blocks16_mixed_256x256` | 227.9 µs | 178.1 µs | **−22%** |
+| `lossless_decode_argb_256` | 520.2 µs | 508.6 µs | −2% |
+
+(The `size_bits = 0` mode-pinned cells — 1-pixel blocks, below the
+on-wire §4.1 `size_bits ∈ [2, 9]` floor — dispatch per pixel in both
+shapes and shift within ±6%.)
+
+### End-to-end criterion movement (r409 → r440, `--quick`)
+
+| Bench | r409 | r440 | Δ |
+|---|---:|---:|---:|
+| `lossless_encode_rgba_256` | 1.45 s | **1.22 s** | **−16%** |
+| `lossless_encode_natural_128` | 297.3 ms | **268.0 ms** | **−10%** |
+| `anim_encode_lossless_4f_48` | 598 ms | **481 ms** | −20% |
+| `anim_encode_delta_4f_48` | 244 ms | **212 ms** | −13% |
+| `anim_encode_auto_4f_48` | 685 ms | **564 ms** | −18% |
+
+### Where the remaining wall-time is
+
+The post-round profile ranks `dp_refine_tokens` (~27%, the legitimate
+12-plans-per-unique-buffer arbitration), `Lz77Matcher::find` (~11%,
+now one fused pass + the DP's interior-tail searches),
+`Frequencies::count_token` (~6%, the single-group count/price pair —
+a shared-decomposition variant for the arbitration path was measured
+flat and dropped; the walks are too short to amortize the row
+materialisation), then the §4.1/§6.2.2 chooser entropy sweeps. The
+structural levers left are all inside the DP arbitration itself
+(fewer replays would change which stream is *sized* first, not the
+bytes, but the exact-mirror ordering is what keeps the sweep
+output-deterministic — any cut there needs the same
+memoized-pure-function argument the r409/r440 steps used).
