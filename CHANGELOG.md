@@ -6,6 +6,24 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(vp8l_encode)* **fused matcher pass for the plan build** (round 440,
+  output-invariant — the second round-388 structural follow-up): the
+  greedy parse and the DP match-table build each ran a full §5.2.2
+  hash-chain search over the same pixel buffer. Both maintain the
+  identical chain discipline — every `find(p)` observes exactly the
+  positions `j < p` inserted — so `find(p)` is a pure function of
+  `(pixels, p)`; the greedy parse now records every probe result
+  (`tokenize_lz77_recorded`) and `compute_dp_matches_with_probes`
+  replays the recorded positions instead of re-searching them, with
+  fresh searches only where the greedy never probed (match interiors).
+  Replay equality is `debug_assert`ed per position and pinned by the
+  new `recorded_probes_reproduce_fresh_dp_match_table` test (noise,
+  RLE runs past the inherit threshold, row-period repeats, lazy-swap
+  content); the golden corpus digests are byte-identical. 512×512
+  photo-like encode 7.74 s → 6.88 s (−11%); measurement-corpus encode
+  wall 4.51 s → 4.43 s (−2%; small tiles have proportionally lighter
+  matcher passes).
+
 - *(vp8l_encode)* **block-compare LZ77 extension walk** (round 440,
   output-invariant): `Lz77Matcher::find`'s match-extension loop
   XOR-folds four pixel pairs per step (no per-pixel data-dependent

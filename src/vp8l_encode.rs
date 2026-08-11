@@ -1429,7 +1429,63 @@ impl<'a> Lz77Matcher<'a> {
 /// *partition* shifts by up to three pixels — so round-trips remain
 /// bit-exact and the existing test suite continues to pass.
 fn tokenize_lz77(pixels: &[u32]) -> Vec<Token> {
-    tokenize_lz77_inner(pixels, LAZY_DEPTH_DEFAULT)
+    tokenize_lz77_impl(pixels, LAZY_DEPTH_DEFAULT, None)
+}
+
+/// One recorded greedy matcher probe (round 440): the result
+/// `Lz77Matcher::find(p)` returned during the greedy parse, indexed by
+/// `p`. Both the greedy parse and [`compute_dp_matches`] maintain the
+/// same chain discipline — every `find(p)` call observes exactly the
+/// positions `j < p` inserted (the lazy probes insert `pos..pos + k`
+/// before probing `pos + k`, and the bookkeeping inserts every
+/// remaining covered position before the parse advances past it) — so
+/// `find(p)` is a pure function of `(pixels, p)` and a probe recorded
+/// by one pass can be replayed verbatim by the other.
+#[derive(Clone, Copy)]
+struct FindProbe {
+    /// `u32::MAX` = this position was never probed; `0` = probed, no
+    /// match (below `MIN_MATCH`); otherwise the match length.
+    len: u32,
+    dist: u32,
+}
+
+impl FindProbe {
+    const NOT_PROBED: Self = Self {
+        len: u32::MAX,
+        dist: 0,
+    };
+
+    #[inline]
+    fn record(r: Option<(usize, usize)>) -> Self {
+        match r {
+            Some((len, dist)) => Self {
+                len: len as u32,
+                dist: dist as u32,
+            },
+            None => Self { len: 0, dist: 0 },
+        }
+    }
+
+    #[inline]
+    fn replay(self) -> Option<(usize, usize)> {
+        debug_assert!(self.len != u32::MAX);
+        if self.len == 0 {
+            None
+        } else {
+            Some((self.len as usize, self.dist as usize))
+        }
+    }
+}
+
+/// [`tokenize_lz77`] that additionally records every `find` probe the
+/// greedy parse issues (round 440), so [`compute_dp_matches`] can skip
+/// re-searching the recorded positions — fusing most of one full
+/// hash-chain pass out of the per-unique-buffer plan build. The token
+/// stream is exactly [`tokenize_lz77`]'s.
+fn tokenize_lz77_recorded(pixels: &[u32]) -> (Vec<Token>, Vec<FindProbe>) {
+    let mut probes = vec![FindProbe::NOT_PROBED; pixels.len()];
+    let tokens = tokenize_lz77_impl(pixels, LAZY_DEPTH_DEFAULT, Some(&mut probes));
+    (tokens, probes)
 }
 
 /// Production lazy-match depth used by [`tokenize_lz77`]. Round 156
@@ -1488,14 +1544,40 @@ const DEPTH4_GUARD_THRESHOLD: u32 = 6;
 /// Values `>= 4` are clamped to `4`. The A/B regression tests
 /// in this module use `0`, `1`, `2`, and `3` to compare against the
 /// r155, r156, r157, and r158 baselines.
+// Test-only since round 440: production goes through
+// [`tokenize_lz77`] / [`tokenize_lz77_recorded`]; the per-depth A/B
+// regression tests still drive explicit depths.
+#[cfg(test)]
 fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
+    tokenize_lz77_impl(pixels, lazy_depth, None)
+}
+
+/// Body of [`tokenize_lz77_inner`], optionally recording each `find`
+/// probe result by position (round 440 — see [`FindProbe`]). Recording
+/// is observation-only: the parse, its matcher bookkeeping, and the
+/// emitted tokens are identical with and without it.
+fn tokenize_lz77_impl(
+    pixels: &[u32],
+    lazy_depth: u32,
+    mut probes: Option<&mut [FindProbe]>,
+) -> Vec<Token> {
     let n = pixels.len();
     let mut matcher = Lz77Matcher::new(pixels);
     let mut tokens = Vec::new();
     let mut pos = 0usize;
     let depth = lazy_depth.min(4);
+    // Record a probe result without disturbing the parse.
+    macro_rules! record {
+        ($p:expr, $r:expr) => {
+            if let Some(rec) = probes.as_deref_mut() {
+                rec[$p] = FindProbe::record($r);
+            }
+        };
+    }
     while pos < n {
-        if let Some((len_a, dist_a)) = matcher.find(pos) {
+        let found = matcher.find(pos);
+        record!(pos, found);
+        if let Some((len_a, dist_a)) = found {
             // Lazy lookahead. The matcher's hash chains do not yet
             // include `pos` (matches at `pos` only reference positions
             // strictly before `pos`), so to give the `pos + 1` probe a
@@ -1513,7 +1595,9 @@ fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
             let inserted_pos = depth >= 1 && len_a < MAX_MATCH && pos + 1 < n;
             if inserted_pos {
                 matcher.insert(pos);
-                if let Some((len_b, dist_b)) = matcher.find(pos + 1) {
+                let found_b = matcher.find(pos + 1);
+                record!(pos + 1, found_b);
+                if let Some((len_b, dist_b)) = found_b {
                     if len_b > best_len {
                         best_len = len_b;
                         best_dist = dist_b;
@@ -1530,7 +1614,9 @@ fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
             let inserted_pos1 = depth >= 2 && best_len < MAX_MATCH && pos + 2 < n;
             if inserted_pos1 {
                 matcher.insert(pos + 1);
-                if let Some((len_c, dist_c)) = matcher.find(pos + 2) {
+                let found_c = matcher.find(pos + 2);
+                record!(pos + 2, found_c);
+                if let Some((len_c, dist_c)) = found_c {
                     if len_c > best_len {
                         best_len = len_c;
                         best_dist = dist_c;
@@ -1547,7 +1633,9 @@ fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
             let inserted_pos2 = depth >= 3 && best_len < MAX_MATCH && pos + 3 < n;
             if inserted_pos2 {
                 matcher.insert(pos + 2);
-                if let Some((len_d, dist_d)) = matcher.find(pos + 3) {
+                let found_d = matcher.find(pos + 3);
+                record!(pos + 3, found_d);
+                if let Some((len_d, dist_d)) = found_d {
                     if len_d > best_len {
                         best_len = len_d;
                         best_dist = dist_d;
@@ -1588,7 +1676,9 @@ fn tokenize_lz77_inner(pixels: &[u32], lazy_depth: u32) -> Vec<Token> {
                 && pos + 4 < n;
             if inserted_pos3 {
                 matcher.insert(pos + 3);
-                if let Some((len_e, dist_e)) = matcher.find(pos + 4) {
+                let found_e = matcher.find(pos + 4);
+                record!(pos + 4, found_e);
+                if let Some((len_e, dist_e)) = found_e {
                     if len_e > best_len {
                         best_len = len_e;
                         best_dist = dist_e;
@@ -2102,13 +2192,46 @@ const DP_LONG_MATCH_INHERIT: usize = 64;
 /// may not be the globally longest match at their position, but every
 /// entry remains a *valid* §5.2.2 copy, which is all the exact-cost
 /// arbiter needs.
+// Test-only since round 440: the production plan build always has a
+// recorded-probe table; the probe-free form remains the fused pass's
+// equivalence oracle.
+#[cfg(test)]
 fn compute_dp_matches(pixels: &[u32], image_width: u32) -> Vec<Option<DpMatch>> {
+    compute_dp_matches_with_probes(pixels, image_width, &[])
+}
+
+/// [`compute_dp_matches`] with a recorded-probe table from the greedy
+/// parse (round 440 — see [`FindProbe`]). Positions the greedy parse
+/// already probed replay the recorded result instead of re-walking the
+/// hash chain; both passes call `find(p)` under the identical
+/// all-`j < p`-inserted chain discipline, so the replayed value equals
+/// the fresh search's (`debug_assert`ed per replay, and pinned by
+/// `recorded_probes_reproduce_fresh_dp_match_table`). The matcher and
+/// its insert schedule are unchanged — fresh searches still serve the
+/// positions the greedy skipped (match interiors past the lazy
+/// probes), so the produced table is identical entry-for-entry.
+fn compute_dp_matches_with_probes(
+    pixels: &[u32],
+    image_width: u32,
+    probes: &[FindProbe],
+) -> Vec<Option<DpMatch>> {
     let n = pixels.len();
     let mut matches: Vec<Option<DpMatch>> = vec![None; n];
     let mut matcher = Lz77Matcher::new(pixels);
     let mut pos = 0usize;
     while pos < n {
-        let m0 = matcher.find(pos);
+        let m0 = match probes.get(pos) {
+            Some(&p) if p.len != u32::MAX => {
+                let replayed = p.replay();
+                debug_assert_eq!(
+                    replayed,
+                    matcher.find(pos),
+                    "recorded probe diverged from fresh search at {pos}"
+                );
+                replayed
+            }
+            _ => matcher.find(pos),
+        };
         matches[pos] = m0.map(|(len, dist)| DpMatch::new(len, dist, image_width));
         matcher.insert(pos);
         if let Some((len, _)) = m0 {
@@ -2207,7 +2330,7 @@ fn compute_special_matches(pixels: &[u32], image_width: u32) -> Vec<Vec<Option<D
 /// times per candidate across the §5.2.3 cache-bits sweep — even
 /// though all of them depend only on `(len, dist, stream width)`,
 /// which the [`best_stream_tokens`] memo pins.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct DpMatch {
     len: u32,
     dist: u32,
@@ -2503,12 +2626,17 @@ fn best_stream_tokens_with_cost(
         let mut slot = slot.borrow_mut();
         let hit = matches!(&*slot, Some(m) if m.width == image_width && m.pixels == pixels);
         if !hit {
+            // Round 440: one fused matcher pass — the greedy parse
+            // records its probes and the DP match-table build replays
+            // them, so the per-unique-buffer plan build no longer runs
+            // two full hash-chain searches over the same pixels.
+            let (greedy, probes) = tokenize_lz77_recorded(pixels);
             *slot = Some(PlanMemo {
                 pixels: pixels.to_vec(),
                 width: image_width,
-                greedy: tokenize_lz77(pixels),
+                greedy,
                 tables: DpMatchTables {
-                    primary: compute_dp_matches(pixels, image_width),
+                    primary: compute_dp_matches_with_probes(pixels, image_width, &probes),
                     special: compute_special_matches(pixels, image_width),
                 },
                 plans: std::array::from_fn(|_| None),
@@ -10547,6 +10675,73 @@ mod tests {
         assert_eq!(code, 1, "row distance must collapse to map code 1");
         // And legacy scan-line code is the bigger alternative.
         assert_eq!(distance_to_code(width as usize), width + 120);
+    }
+
+    /// Round 440 fused matcher pass: the greedy parse's recorded
+    /// `find` probes, replayed into [`compute_dp_matches_with_probes`],
+    /// must reproduce the fresh two-pass build entry-for-entry — and
+    /// the recording itself must not perturb the greedy token stream.
+    /// Both passes call `find(p)` under the identical
+    /// all-`j < p`-inserted chain discipline, which is what makes the
+    /// probe a pure function of position; this test pins that claim on
+    /// content that exercises every probe regime: literal-heavy noise
+    /// (misses at almost every position), short and long flat runs
+    /// (`dist = 1`, including a > [`DP_LONG_MATCH_INHERIT`] run so the
+    /// inherit path skips fresh searches), row-period repeats
+    /// (`dist = width`), and lazy-probe swap opportunities.
+    #[test]
+    fn recorded_probes_reproduce_fresh_dp_match_table() {
+        let width = 32u32;
+        let mut pixels: Vec<u32> = Vec::new();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u32
+        };
+        // Two rows of noise (literal misses).
+        for _ in 0..64 {
+            pixels.push(0xff00_0000 | (rng() & 0x00ff_ffff));
+        }
+        // A long flat run (> DP_LONG_MATCH_INHERIT) — RLE + inherit.
+        pixels.extend(std::iter::repeat_n(0xff11_2233u32, 100));
+        // A row that repeats the previous row (dist = width matches).
+        let row: Vec<u32> = pixels[pixels.len() - 32..].to_vec();
+        pixels.extend_from_slice(&row);
+        // Short repeats with 1-pixel offsets to trigger lazy swaps.
+        for k in 0..64usize {
+            let idx = pixels.len() - 33 - (k % 7);
+            let p = pixels[idx];
+            pixels.push(if k % 9 == 0 {
+                0xff00_0000 | (rng() & 0x00ff_ffff)
+            } else {
+                p
+            });
+        }
+        // Tail noise.
+        for _ in 0..32 {
+            pixels.push(0xff00_0000 | (rng() & 0x00ff_ffff));
+        }
+
+        let (recorded_tokens, probes) = tokenize_lz77_recorded(&pixels);
+        assert_eq!(
+            recorded_tokens,
+            tokenize_lz77(&pixels),
+            "recording must not perturb the greedy parse"
+        );
+        assert!(
+            probes.iter().any(|p| p.len != u32::MAX && p.len > 0),
+            "test premise: at least one recorded hit"
+        );
+        assert!(
+            probes.iter().any(|p| p.len == u32::MAX),
+            "test premise: at least one unprobed position (match interior)"
+        );
+
+        let fresh = compute_dp_matches(&pixels, width);
+        let fused = compute_dp_matches_with_probes(&pixels, width, &probes);
+        assert_eq!(fresh, fused, "fused match table diverged from fresh");
     }
 
     /// A distance with no §5.2.2 map representation at the chosen width
