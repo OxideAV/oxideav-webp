@@ -169,6 +169,12 @@ fn select(l: u32, t: u32, tl: u32) -> u32 {
 
 /// §4.1: compute the prediction for `mode` `[0..13]` given the four
 /// already-reconstructed neighbours.
+///
+/// `#[inline(always)]` (round 440) so the const-generic block-run loop
+/// [`predict_run`] folds the mode `match` away at monomorphization —
+/// the mode is constant across a §4.1 block, and the pre-r440 shape
+/// paid an out-of-line call plus a 14-way dispatch per pixel.
+#[inline(always)]
 fn predict(mode: u8, l: u32, t: u32, tr: u32, tl: u32) -> u32 {
     match mode {
         0 => 0xff00_0000,
@@ -219,6 +225,51 @@ fn add_pred(residual: u32, pred: u32) -> u32 {
     let lo = (residual & 0x00ff_00ff).wrapping_add(pred & 0x00ff_00ff) & 0x00ff_00ff;
     let hi = (residual & 0xff00_ff00).wrapping_add(pred & 0xff00_ff00) & 0xff00_ff00;
     lo | hi
+}
+
+/// One §4.1 interior block-run at a compile-time-constant mode
+/// (round 440): reconstruct `pixels[row + x]` for `x in x0..x1`, with
+/// the mode `match` folded away by monomorphization and the
+/// left-neighbour value carried in a register across iterations (it is
+/// exactly the pixel the previous iteration wrote). Bit-identical to
+/// the per-pixel `predict(mode, ..)` form.
+#[inline(always)]
+fn predict_run<const MODE: u8>(pixels: &mut [u32], row: usize, w: usize, x0: usize, x1: usize) {
+    debug_assert!(x0 >= 1 && x1 <= pixels.len().saturating_sub(row) && x0 < x1);
+    let mut l = pixels[row + x0 - 1];
+    for x in x0..x1 {
+        let idx = row + x;
+        let t = pixels[idx - w];
+        let tl = pixels[idx - w - 1];
+        let tr = pixels[idx - w + 1];
+        let pred = predict(MODE, l, t, tr, tl);
+        let v = add_pred(pixels[idx], pred);
+        pixels[idx] = v;
+        l = v;
+    }
+}
+
+/// Dispatch a §4.1 interior block-run to the [`predict_run`]
+/// instantiation for `mode`. An out-of-range mode (not written by any
+/// conformant encoder; `predict` maps it to the solid-black constant)
+/// runs the mode-0 body, whose per-pixel result is identical.
+fn dispatch_predict_run(mode: u8, pixels: &mut [u32], row: usize, w: usize, x0: usize, x1: usize) {
+    match mode {
+        1 => predict_run::<1>(pixels, row, w, x0, x1),
+        2 => predict_run::<2>(pixels, row, w, x0, x1),
+        3 => predict_run::<3>(pixels, row, w, x0, x1),
+        4 => predict_run::<4>(pixels, row, w, x0, x1),
+        5 => predict_run::<5>(pixels, row, w, x0, x1),
+        6 => predict_run::<6>(pixels, row, w, x0, x1),
+        7 => predict_run::<7>(pixels, row, w, x0, x1),
+        8 => predict_run::<8>(pixels, row, w, x0, x1),
+        9 => predict_run::<9>(pixels, row, w, x0, x1),
+        10 => predict_run::<10>(pixels, row, w, x0, x1),
+        11 => predict_run::<11>(pixels, row, w, x0, x1),
+        12 => predict_run::<12>(pixels, row, w, x0, x1),
+        13 => predict_run::<13>(pixels, row, w, x0, x1),
+        _ => predict_run::<0>(pixels, row, w, x0, x1),
+    }
 }
 
 /// Apply the §4.1 inverse predictor transform in place.
@@ -286,16 +337,25 @@ pub fn inverse_predictor(
         let row = y * w;
         let block_row = (y >> size_bits) * tw;
         // Interior: x in 1..w-1, TR is the actual top-right neighbour.
-        for x in 1..w - 1 {
-            let idx = row + x;
-            let block_index = block_row + (x >> size_bits);
-            let mode = green(predictor_image[block_index]);
-            let l = pixels[idx - 1];
-            let t = pixels[idx - w];
-            let tl = pixels[idx - w - 1];
-            let tr = pixels[idx - w + 1];
-            let pred = predict(mode, l, t, tr, tl);
-            pixels[idx] = add_pred(pixels[idx], pred);
+        //
+        // Round 440: the §4.1 mode is constant across each transform
+        // block, so the per-pixel 14-way `predict` dispatch is hoisted
+        // to block-run granularity — one `match`, then a monomorphized
+        // inner loop ([`predict_run`]) over the run `[x, block_end)`.
+        // Per-pixel arithmetic, evaluation order (left-to-right over
+        // the just-written left neighbour), and the out-of-range-mode
+        // fallback are all unchanged, so the reconstruction is
+        // bit-identical to the per-pixel form (pinned by
+        // `inverse_predictor_matches_unsplit_reference_random`).
+        let mut x = 1usize;
+        while x < w - 1 {
+            let block = x >> size_bits;
+            let mode = green(predictor_image[block_row + block]);
+            // Next block boundary, clamped to the interior end; both
+            // bounds are > x here, so the run is never empty.
+            let block_end = ((block + 1) << size_bits).min(w - 1);
+            dispatch_predict_run(mode, pixels, row, w, x, block_end);
+            x = block_end;
         }
         // Right column (x = w - 1): §4.1 rightmost-column rule uses the
         // row's leftmost pixel as TR. `idx - w - (w - 1)` collapses to

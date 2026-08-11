@@ -6,6 +6,23 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(vp8l_transform)* **block-run §4.1 inverse-predictor dispatch**
+  (round 440, output-invariant): the interior reconstruction loop paid
+  an out-of-line `predict` call plus a 14-way mode dispatch per pixel,
+  though the mode is constant across each transform block. The mode
+  `match` is hoisted to block-run granularity with const-generic
+  monomorphized inner loops (`predict_run`), and the left-neighbour
+  value is carried in a register (it is exactly the pixel the previous
+  iteration wrote). Per-pixel arithmetic, left-to-right order, and the
+  out-of-range-mode fallback are unchanged, so reconstruction is
+  bit-identical (existing
+  `inverse_predictor_matches_unsplit_reference_random` oracle; golden
+  corpus digests unchanged). `inverse_predictor_blocks16_mixed_256x256`
+  228 µs → 178 µs (−22%); `lossless_decode_argb_256` 520 µs → 509 µs
+  (−2%). The degenerate `size_bits = 0` bench cells (1-pixel blocks,
+  below the on-wire §4.1 `size_bits ∈ [2, 9]` floor) shift ±6% — they
+  dispatch per pixel in both shapes.
+
 - *(vp8l_encode)* **fused matcher pass for the plan build** (round 440,
   output-invariant — the second round-388 structural follow-up): the
   greedy parse and the DP match-table build each ran a full §5.2.2
