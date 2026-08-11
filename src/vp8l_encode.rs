@@ -6720,18 +6720,70 @@ fn plan_meta_prefix_image_with_codes(
         // Same degenerate gate as the writer.
         return None;
     }
-    // §6.2.2 group selection for the pixel at scan position `pos` —
-    // the [`EncoderMetaIndex::group_for`] rule over the borrowed
-    // `codes` slice (no `to_vec` per sweep value).
     let wpx = width as usize;
-    let group_for = |pos: usize| -> usize {
-        let bx = (pos % wpx) >> prefix_bits;
-        let by = (pos / wpx) >> prefix_bits;
-        codes[by * pw + bx] as usize
-    };
 
     let tokens = best_stream_tokens(pixels, width, cache_code_bits);
     let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
+
+    // Round 440: one shared prepass over the token stream for the two
+    // walks below. Each walk previously re-derived, per token, the
+    // §6.2.2 group of the token's starting pixel (a `div` + `mod` per
+    // token via the scan position) and — for `Copy` tokens — the two
+    // §5.2.2 `value_to_prefix` splits plus the distance-code probe.
+    // The prepass computes each exactly once: the group via
+    // incrementally-maintained block coordinates (identical to the
+    // `group_for(pos)` rule at the token's starting position), the
+    // decompositions via the same pure helpers. Both walks then read
+    // the precomputed rows, so every counted and priced symbol is
+    // unchanged.
+    struct TokenPlanRow {
+        group: u16,
+        /// `Copy` decomposition; unused (zero) for other tokens.
+        len_prefix: u16,
+        len_extra: u16,
+        dist_prefix: u16,
+        dist_extra: u16,
+    }
+    let mut rows: Vec<TokenPlanRow> = Vec::with_capacity(tokens.len());
+    {
+        let (mut x, mut y) = (0usize, 0usize);
+        for &tok in &tokens {
+            let group = codes[(y >> prefix_bits) * pw + (x >> prefix_bits)];
+            let (advance, row) = match tok {
+                Token::Literal(_) | Token::CacheRef { .. } => (
+                    1usize,
+                    TokenPlanRow {
+                        group,
+                        len_prefix: 0,
+                        len_extra: 0,
+                        dist_prefix: 0,
+                        dist_extra: 0,
+                    },
+                ),
+                Token::Copy { length, distance } => {
+                    let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
+                    let raw_code = pixel_distance_to_distance_code(distance, image_width);
+                    let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
+                    (
+                        length,
+                        TokenPlanRow {
+                            group,
+                            len_prefix: len_prefix as u16,
+                            len_extra: len_extra as u16,
+                            dist_prefix: dist_prefix as u16,
+                            dist_extra: dist_extra as u16,
+                        },
+                    )
+                }
+            };
+            rows.push(row);
+            x += advance;
+            if x >= wpx {
+                y += x / wpx;
+                x %= wpx;
+            }
+        }
+    }
 
     // color-cache-info (`%b0` or `%b1 4BIT`) + meta-prefix `%b1` +
     // 3-bit `prefix_bits - 2`.
@@ -6767,13 +6819,19 @@ fn plan_meta_prefix_image_with_codes(
     let mut group_freqs: Vec<Frequencies> = (0..actual_groups)
         .map(|_| Frequencies::new(cache_size))
         .collect();
-    let mut pos = 0usize;
-    for &tok in &tokens {
-        group_freqs[group_for(pos)].count_token(tok, image_width);
-        pos += match tok {
-            Token::Literal(_) | Token::CacheRef { .. } => 1usize,
-            Token::Copy { length, .. } => length,
-        };
+    for (&tok, row) in tokens.iter().zip(&rows) {
+        let freqs = &mut group_freqs[row.group as usize];
+        match tok {
+            Token::Literal(_) | Token::CacheRef { .. } => {
+                freqs.count_token(tok, image_width);
+            }
+            Token::Copy { .. } => {
+                // Same two symbols `count_token` derives, from the
+                // prepass decomposition.
+                freqs.green[256 + row.len_prefix as usize] += 1;
+                freqs.distance[row.dist_prefix as usize] += 1;
+            }
+        }
     }
     let group_tables: Vec<StreamCostTables> = group_freqs
         .iter()
@@ -6786,9 +6844,8 @@ fn plan_meta_prefix_image_with_codes(
             + tables.alpha.code_lengths_bits()
             + tables.distance.code_lengths_bits();
     }
-    let mut pos = 0usize;
-    for &tok in &tokens {
-        let tables = &group_tables[group_for(pos)];
+    for (&tok, row) in tokens.iter().zip(&rows) {
+        let tables = &group_tables[row.group as usize];
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
@@ -6799,20 +6856,16 @@ fn plan_meta_prefix_image_with_codes(
                     + tables.red.sym_bits(r)
                     + tables.blue.sym_bits(b)
                     + tables.alpha.sym_bits(a);
-                pos += 1;
             }
             Token::CacheRef { index } => {
                 let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
                 bits += tables.green.sym_bits(sym);
-                pos += 1;
             }
-            Token::Copy { length, distance } => {
-                let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
-                bits += tables.green.sym_bits(256 + len_prefix as usize) + len_extra as usize;
-                let raw_code = pixel_distance_to_distance_code(distance, image_width);
-                let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
-                bits += tables.distance.sym_bits(dist_prefix as usize) + dist_extra as usize;
-                pos += length;
+            Token::Copy { .. } => {
+                bits += tables.green.sym_bits(256 + row.len_prefix as usize)
+                    + row.len_extra as usize
+                    + tables.distance.sym_bits(row.dist_prefix as usize)
+                    + row.dist_extra as usize;
             }
         }
     }

@@ -6,6 +6,20 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- *(vp8l_encode)* **shared prepass for the §6.2.2 mirror's token
+  walks** (round 440, output-invariant): each
+  `plan_meta_prefix_image_with_codes` call ran two walks over the plan
+  stream (group-table counting, then per-token pricing), and each walk
+  re-derived per token the §6.2.2 group of the starting pixel (a
+  `div` + `mod` on the scan position) and — per `Copy` — both
+  `value_to_prefix` splits plus the distance-code probe. A single
+  prepass now computes each exactly once (groups via incrementally
+  maintained block coordinates, decompositions via the same pure
+  helpers) into a compact per-token row both walks read. Every counted
+  and priced symbol is unchanged; golden corpus digests are
+  byte-identical. Corpus encode wall 4.36 s → 4.25 s (−2.5%),
+  animation-encode timeline 1.17 s → 1.11 s.
+
 - *(vp8l_transform)* **block-run §4.1 inverse-predictor dispatch**
   (round 440, output-invariant): the interior reconstruction loop paid
   an out-of-line `predict` call plus a 14-way mode dispatch per pixel,
