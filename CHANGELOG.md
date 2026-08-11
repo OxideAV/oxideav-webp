@@ -4,6 +4,37 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/OxideAV/oxideav-webp/compare/v0.2.3...v0.3.0) - 2026-08-11
+
+### Other
+
+- round-440 BENCHMARKS section + README perf paragraph refresh
+- *(vp8l_encode)* shared prepass for the SS6.2.2 mirror's token walks
+- *(vp8l_transform)* block-run dispatch for the inverse predictor
+- *(vp8l_encode)* fuse the greedy parse and DP match-table matcher passes
+- *(vp8l_encode)* block-compare the LZ77 match-extension walk
+- *(vp8l_encode)* memoize integer log2 in the Shannon-cost choosers
+- *(vp8l_encode)* closed-form distance-code chooser via compile-time inverse map
+- final round-432 tier re-measure + README/CHANGELOG rollup
+- shared declared-pixel-load gate across the whole-file decode harnesses
+- *(decode_still_paths)* gate the decode tail on declared pixel load
+- weight scheduled slices by measured exec/s + cap roundtrip_lossless at 32
+- mark internal public surface #[doc(hidden)] for cargo-semver-checks
+- BENCHMARKS + README: round-409 encoder wall-time rollup
+- replay the precomputed §5.2.3 hit table in finalize
+- §2.7.1.1 animation-encode harness (build_animated_webp per AnimFrameMode)
+- fuse the §6.2.2 plan mirror's token walks
+- DP inner-loop cost tables + explicit candidate blocks, matcher quick-reject
+- size-first mirror for the §6.2.2 meta-prefix sweeps
+- memoize per-cache-bits token plans across the §6.2.2 meta-prefix sweeps
+- unignore fuzz/corpus/*/seeds/ so committed regression seeds are not tracked-and-ignored
+- fix undecodable degenerate §3.7.2 prefix-code tables + encode_params_roundtrip fuzz oracle
+- extract_routing consistency oracle on the chunk-routing façade
+- lossy VP8 sub-frames + §2.7.1.1 field-carry oracle in compose_animation
+- unskip the §2.5 lossy legs in decode_still_paths
+- add compose_animation structure-aware ANIM/ANMF compositor hostility harness
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Changed
 
 - *(docs)* round-440 rollup: `BENCHMARKS.md` gains the round-440
