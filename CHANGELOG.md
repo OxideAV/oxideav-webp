@@ -6,6 +6,88 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- **Image-crate API contract (round 465).** The crate root now exposes
+  the workspace-wide standalone vocabulary — `probe`, `info`, `decode`,
+  `decode_with`, `decode_rgb8`, `decode_rgba8`, `decode_all`,
+  `decode_all_with`, `decode_from`, `encode`, `encode_rgb8`,
+  `encode_rgba8`, `encode_to`, `encode_animation`,
+  `encode_animation_frames`, `read_metadata`, `animation_params` — over
+  ONE image type `WebpImage { width, height, format, planes, color,
+  metadata, palette }` with `new` / `from_rgb8` / `from_rgba8` /
+  `from_yuv420` / `as_bytes` / `into_raw` / `to_rgb8` / `to_rgba8`, the
+  packed `RgbImage` / `RgbaImage`, `Plane`, `ColorInfo` (+ `ColorRange`),
+  `Metadata`, `Palette`, `ImageInfo`, `Frame`, `DecodeOptions`,
+  `EncodeOptions`, `WebpPixelFormat` (+ `pub type PixelFormat`,
+  variants `Rgb24` / `Rgba` / `Yuv420P` / `Yuva420P` mirroring
+  `oxideav_core::PixelFormat`), and ONE error `WebpError` (+ `pub type
+  Error`). All of it builds and is tested with `default-features =
+  false`; the `ci-standalone` CI job now runs clippy + the test suite in
+  that configuration.
+- **`decode` returns the native layout.** Lossless `VP8L` → `Rgba`;
+  lossy `VP8 ` → planar `Yuv420P` (`Yuva420P` with an `ALPH` chunk), the
+  Y′CbCr planes as the VP8 decoder reconstructs them, `color` =
+  BT.601 limited (H.273 `1 / 13 / 6`). `to_rgb8` / `to_rgba8` /
+  `decode_rgb8` / `decode_rgba8` convert.
+- **Lossy Y′CbCr → RGB is now the limited-range Rec. ITU-R BT.601
+  inverse** (`R = 1.164384 (Y − 16) + 1.596027 (Cr − 128)`, …; Q16,
+  round-half-up, clamped) per RFC 9649 §2.5 "To convert to RGB,
+  Recommendation 601 SHOULD be used" and BT.601-7 §2.5.3's 16..235 /
+  16..240 quantisation. The previous conversion used the un-scaled
+  (full-range) matrix and was ~10 code values off for every lossy
+  pixel; black-box against the reference decoder's non-fancy output the
+  new kernel is within ±1 on every sample (98.5 % bit-exact) where the
+  old one matched 0 %. **Decoded lossy RGBA bytes change**; lossless
+  output is byte-identical (fixture digests unchanged). The three lossy
+  decode digests in `tests/fixture_walks.rs` were re-pinned.
+- **`WebpError` is the single error type**: `InvalidData(String)`,
+  `Unsupported(String)`, `LimitExceeded(String)`, `Io(std::io::Error)`,
+  `Eof`, `NeedMore` (`#[non_exhaustive]`; `invalid` / `unsupported` /
+  `limit` constructors; `is_*` predicates). The rich root `Error` enum
+  with its per-module variants and `UnsupportedKind` are gone — every
+  per-module parser error converts into `WebpError::InvalidData` with
+  the layer named in the message; `oxideav_vp8::DecodeError::Unsupported`
+  → `Unsupported`, `FrameTooLarge` → `LimitExceeded`. `WebpError::
+  InvalidData` / `Unsupported` are no longer unit variants.
+- **`register_codecs` / `register_containers` take the sub-registries**
+  (`&mut CodecRegistry` / `&mut ContainerRegistry`), the fleet-wide
+  signature; `register(&mut RuntimeContext)` is unchanged. The framework
+  decoder emits the native layout (`Yuv420P` / `Yuva420P` for lossy,
+  with the BT.601-limited colour signal attached to the frame; `Rgba`
+  for lossless) and refreshes `CodecParameters::pixel_format` per frame;
+  its capabilities declare all three. The `"webp_vp8"` lossy encoder is
+  now actually registered. `From<WebpImage> for VideoFrame`,
+  `WebpImage::from_video_frame`, `From<WebpPixelFormat> for
+  oxideav_core::PixelFormat` / `TryFrom` back, and `ColorInfo` ⇄
+  `ColorSignal` conversions added. `decode_webp_to_frame` returns the
+  frame together with its `CodecParameters`.
+- **Lossy encode is standalone**: `EncodeOptions::with_quality` drives
+  `oxideav_vp8::encode_keyframe` directly (no `registry` needed); RGB(A)
+  input is converted to limited-range BT.601 4:2:0 (chroma = rounded
+  2×2 mean) and alpha becomes a §2.7.1.2 `ALPH` chunk (new writer:
+  method 1 headerless-VP8L green channel, raw fallback when smaller).
+  `encode` refuses what WebP cannot carry instead of converting:
+  lossless Y′CbCr and full-range Y′CbCr are `Error::Unsupported`.
+- Lossless `encode` of an RGBA image with alpha and no metadata emits
+  the simple `VP8L` layout (alpha lives in the bitstream, as the
+  reference encoder does), not the `VP8X` promotion the registry path
+  used to apply; `encode_vp8l_argb_with_metadata` keeps its documented
+  promotion.
+- `WebpMetadata` gains `From<&Metadata>`; `WebpMetadataOwned` converts
+  to / from `Metadata`.
+- New tests: `tests/contract_api.rs` (the contract over the whole
+  fixture corpus: native layouts, exact `to_rgba8`, limits before
+  allocation, hostile inputs, lossless round trips incl. metadata,
+  lossy + `ALPH`, animation encode); `tests/external_oracle.rs`
+  directions D (lossy decode vs the reference decoder's non-fancy
+  output, ±1) and E (our lossy encode readable by the reference
+  decoder, `ALPH` byte-exact). New fuzz target `contract_encode`
+  (lossless-exact + lossy round trips); `decode` / `extract_metadata`
+  targets now drive `decode` / `decode_rgba8` / `decode_all` and
+  `probe` / `info` / `read_metadata`.
+- README rewritten in the contract's section order (Standalone use,
+  Framework use, Supported layouts, Options, Metadata and colour,
+  Limits, WebP specifics).
+
 - *(docs)* round-440 rollup: `BENCHMARKS.md` gains the round-440
   section (step-by-step corpus movement, per-bench before/after, the
   two measured-and-dropped candidates, and the remaining-wall-time
@@ -215,6 +297,26 @@ All notable changes to `oxideav-webp` are recorded here.
   only on the pixel prefix, not the token partition. The stateful
   `cacheify_tokens` is retained as the test-suite reference, pinned by
   `cacheify_with_hits_matches_stateful_cacheify`.
+
+### Deprecated
+
+- `decode_webp` (→ `decode_all` + `info`), returning the renamed
+  `DecodedWebpFile` (the pre-contract `WebpImage` shape: `frames:
+  Vec<WebpFrame>`, `anim_background_rgba`, `anim_loop_count`);
+  `WebpFrame`; `decode_webp_image` / `DecodedWebp` (→ `decode_rgba8`);
+  `extract_metadata` / `WebpFileMetadata` (→ `read_metadata` /
+  `Metadata`); `encode_webp_lossless` (→ `encode_rgba8`);
+  `build_animated_webp` / `build_animated_webp_with_options` /
+  `AnimEncoderOptions` (→ `encode_animation` / `encode_animation_frames`
+  with `EncodeOptions`). All are thin wrappers over the contract
+  functions and go away in the release after this one.
+
+### Removed
+
+- The hidden rich root `Error` enum and `UnsupportedKind` (merged into
+  `WebpError`); the `RuntimeContext`-typed `register_codecs` /
+  `register_containers` (replaced by the sub-registry signature — no
+  in-workspace caller used the old form).
 
 ### Fixed
 

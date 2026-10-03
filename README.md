@@ -2,204 +2,189 @@
 
 [![CI](https://github.com/OxideAV/oxideav-webp/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-webp/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-webp.svg)](https://crates.io/crates/oxideav-webp) [![docs.rs](https://docs.rs/oxideav-webp/badge.svg)](https://docs.rs/oxideav-webp) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust WebP image codec (RIFF + VP8 + VP8L + VP8X + ALPH + ANIM +
-ANMF). Decoder and encoder are both at production status.
+Pure-Rust WebP image codec (RFC 9649: RIFF + VP8 + VP8L + VP8X + ALPH +
+ANIM + ANMF). Decoder and encoder are both at production status, and the
+crate follows the OxideAV **image-crate API contract**
+(`IMAGE_CRATE_API.md` in the workspace): the same small standalone
+vocabulary every OxideAV image crate exposes, usable without the
+framework.
 
-## Capabilities
-
-* Full **decode** of every container variant: simple-lossy (VP8),
-  simple-lossless (VP8L), extended (`VP8X`) with `ALPH` alpha plane,
-  ICCP / EXIF / XMP metadata, and animated WebP (`ANIM` + `ANMF`) —
-  with per-frame `ANMF` bitstreams of both kinds the §2.7.2 rendering
-  loop permits (`VP8L` lossless and `VP8 ` lossy, each with an optional
-  `ALPH` alpha plane).
-* **Encode** of complete `.webp` files in both lossless (VP8L) and
-  lossy (VP8) modes, plus complete animated `.webp` files.
-* Decoded pixels land in a tightly-packed `Vec<u8>` of
-  `width * height * 4` RGBA bytes — drops directly into
-  [`image`](https://crates.io/crates/image)'s `ImageBuffer::from_raw`
-  with zero copy.
-* The full `0.1.2` public surface is reachable both with the default
-  `registry` build and under `--no-default-features`.
-  [`tests/api_compat_0_1_2.rs`](./tests/api_compat_0_1_2.rs) is the
-  compile-only assertion suite pinning every published symbol in place.
-
-The lossless encoder is a byte-cost super-chooser: it builds the §3
-no-transform / subtract-green baseline plus every §4 single-transform
-and §3.5 stacked-transform candidate (including subtract-green →
-predictor and transform-stacked §6.2.2 multi-group main images) —
-sweeping `size_bits`, the §5.2.3 color cache, §4.4 palette orderings,
-and the §6.2.2 meta-prefix grouping — and emits the byte-shortest
-stream, so adding a candidate can never enlarge the output. The
-compression density is driven by run-length §3.7.2.1.2 code-length
-tables (codes 16/17/18, chosen per table by exact bit cost),
-cost-priced LZ77 token planning (a shortest-path re-parse against
-per-symbol Huffman prices, kept only when an exact writer-cost mirror
-says it is smaller — round 388 widened it with cache-aware literal
-pricing and per-position candidate sets at the cheapest §5.2.2
-distances 1/2/w−1/w/w+1), and agglomerative entropy-merge clustering
-of the §6.2.2 entropy image (per-block symbol histograms over the five
-§6.2.3 alphabets, one merge chain snapshotting every group count).
-Round 388 also restructured the maximum-effort sweep so every
-cache-independent pass — transform forward passes, sub-image builds,
-clustering, the DP match table with its §5.2.2 decompositions, and
-each stream's cost tables — is built once and shared across the
-§5.2.3 cache-bits sweep, and candidates are *sized* through an exact
-mirror with only the winner written: corpus encode wall time −44% at
-byte-identical-or-smaller output. Round 409 extended both ideas to
-the whole chooser at **byte-identical output** (every corpus digest
-unchanged): the winning token plan is memoized per §5.2.3 cache choice
-(the §6.2.2 meta-prefix sweeps re-arbitrated the same plan up to ~30×
-per shape), the meta-prefix sweeps are sized through an exact
-per-group mirror with only the winner written, and the DP inner loop /
-hash-chain matcher / §5.2.3 rewrite were tightened — corpus encode
-wall −70% on top of r388 (9.5 s → 2.8 s; e2e criterion −74% on the
-256×256 gradient, −68% on the 128×128 natural tile; encoder-in-loop
-fuzz throughput ~4×). On a 10-image mixed corpus the
-output is smaller than the reference encoder's best effort on 9 of 10
-images (up to −28%) and within 2% on the photo-like remainder; every
-stream is re-verified bit-exact through a black-box reference decode.
-The cost models only change which spec-legal stream is emitted;
-round-trips stay bit-exact regardless. Round 440 continued at strictly
-byte-identical output (FNV-64 golden digests over every corpus decode,
-max-effort encode, and animation output pinned before/after each
-step): a closed-form §5.2.2 distance-code chooser (compile-time
-inverse of the distance map; the no-match scan regime drops ~17×),
-memoized integer `log2` in the Shannon-cost choosers, a block-compare
-LZ77 extension walk, a fused matcher pass (the greedy parse records
-its probes; the DP match-table build replays them instead of re-running
-a second full hash-chain search), a shared prepass for the §6.2.2
-mirror's two token walks, and block-run const-generic dispatch in the
-decoder's §4.1 inverse predictor. Encoder measurement-corpus wall
-−13% on top of r409 (e2e criterion −16% on the 256×256 gradient,
-−10% on the natural tile, −11% on a 512×512 photo-like tile);
-animation encode −13..−20% per mode; decode −22% on the realistic
-16×16-block inverse-predictor cell (−2% e2e lossless).
-
-## Install
+## Standalone use
 
 ```toml
-# Standalone — flat RGBA in / flat RGBA out, no framework dep:
 [dependencies]
-oxideav-webp = { version = "0.1", default-features = false }
-
-# With the OxideAV runtime:
-[dependencies]
-oxideav-webp = "0.1"
+oxideav-webp = { version = "0.2", default-features = false }
 ```
 
-| Feature | Default | What it does |
-|---|---|---|
-| `registry` | ✅ on | Pulls `oxideav-core` plus the framework-trait factories. Cascades into `oxideav-vp8/registry` so the VP8-lossy encode delegation can reach the sibling crate's factories. With this off, lossless encode/decode + animation + metadata extraction all still work; only the VP8-lossy *encode* requires `registry`. |
-| `simd` | off (nightly only) | Opt-in `std::simd` acceleration of the hottest pixel-repack / inverse-transform loops. Requires nightly rustc (`#![feature(portable_simd)]`). Byte-identical to the scalar path; see [`BENCHMARKS.md`](./BENCHMARKS.md). |
-
-## Standalone use (no `oxideav-core`)
-
-### Decode any `.webp` file
-
 ```rust
-use oxideav_webp::{decode_webp, WebpImage};
+let bytes = std::fs::read("in.webp")?;
+if oxideav_webp::probe(&bytes) {
+    let info = oxideav_webp::info(&bytes)?;         // header only: width, height, format, frames, alpha, icc/exif/xmp
+    let img  = oxideav_webp::decode(&bytes)?;       // WebpImage in its native layout
+    let rgba: Vec<u8> = img.to_rgba8();             // tightly packed RGBA, 4 × width bytes per row
+    let (w, h) = (img.width(), img.height());
 
-let webp_bytes: &[u8] = /* file bytes from disk, HTTP, … */;
-let image: WebpImage = decode_webp(webp_bytes)?;
+    let opts = oxideav_webp::EncodeOptions::default();            // lossless (VP8L)
+    let out: Vec<u8> = oxideav_webp::encode_rgba8(w, h, &rgba, &opts)?;
+    std::fs::write("out.webp", out)?;
 
-println!("{} × {}, {} frame(s)", image.width, image.height, image.frames.len());
-for frame in &image.frames {
-    // frame.rgba is a tight Vec<u8> of width*height*4 RGBA bytes,
-    // row-major, no per-row padding — drops into `image::ImageBuffer`.
-    println!("  frame: {}×{}, {} ms", frame.width, frame.height, frame.duration_ms);
+    let lossy = oxideav_webp::EncodeOptions::default().with_quality(80.0); // lossy (VP8 + ALPH)
+    let small = oxideav_webp::encode_rgba8(w, h, &rgba, &lossy)?;
 }
-// ICC / EXIF / XMP are on image.metadata.{icc, exif, xmp} (each Option<Vec<u8>>).
 ```
 
-### Read metadata only (no pixel decode)
+Root items, all available with `default-features = false`:
 
-```rust
-use oxideav_webp::extract_metadata;
+| Item | Signature |
+|---|---|
+| `probe` | `fn(&[u8]) -> bool` — `RIFF????WEBP` sniff, never panics |
+| `info` | `fn(&[u8]) -> Result<ImageInfo, Error>` — dimensions, native `PixelFormat`, `frames`, `has_alpha`, `color`, `has_icc` / `has_exif` / `has_xmp`, plus `is_animated`, `is_lossy`, `loop_count`, `background_rgba` |
+| `decode` / `decode_with` | `fn(&[u8]) -> Result<WebpImage, Error>` / `fn(&[u8], &DecodeOptions) -> …` — the primary image (an animation's first composited frame), native layout, `color` + `metadata` filled |
+| `decode_rgb8` / `decode_rgba8` | `fn(&[u8]) -> Result<RgbImage, Error>` / `Result<RgbaImage, Error>` — `{ width, height, data }`, 3 / 4 bytes per pixel, tightly packed |
+| `decode_all` / `decode_all_with` | `fn(&[u8]) -> Result<Vec<Frame>, Error>` — every frame of an animation composited onto the canvas per §2.7.1.1, `Frame { image, delay: Option<Duration> }`; a still yields one frame |
+| `decode_from` | `fn<R: Read>(R) -> Result<WebpImage, Error>` |
+| `encode` | `fn(&WebpImage, &EncodeOptions) -> Result<Vec<u8>, Error>` — writes the image as given; `Error::Unsupported` for a layout WebP cannot carry |
+| `encode_rgb8` / `encode_rgba8` | `fn(u32, u32, &[u8], &EncodeOptions) -> Result<Vec<u8>, Error>` |
+| `encode_to` | `fn<W: Write>(&WebpImage, &EncodeOptions, W) -> Result<(), Error>` |
+| `encode_animation` | `fn(&[Frame], &EncodeOptions) -> Result<Vec<u8>, Error>` — lossless `ANIM` + `ANMF` (and `encode_animation_frames` for positioned `AnimFrame`s with blend / dispose flags) |
+| `read_metadata` | `fn(&[u8]) -> Result<Metadata, Error>` — `ICCP` / `EXIF` / `XMP ` payloads without decoding pixels |
+| `WebpImage` | `{ width, height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo, metadata: Metadata, palette: None }` with `new` / `from_rgb8` / `from_rgba8` / `from_yuv420`, `as_bytes` (packed layouts), `into_raw`, `to_rgb8`, `to_rgba8` |
+| `PixelFormat` | `= WebpPixelFormat { Rgb24, Rgba, Yuv420P, Yuva420P }` — names mirror `oxideav_core::PixelFormat` |
+| `Error` | `= WebpError { InvalidData(String), Unsupported(String), LimitExceeded(String), Io(io::Error), Eof, NeedMore }` |
 
-let meta = extract_metadata(webp_bytes)?;
-if let Some(icc) = meta.icc.as_deref()  { /* color-management profile */ }
-if let Some(exif) = meta.exif.as_deref() { /* EXIF blob */ }
-if let Some(xmp) = meta.xmp.as_deref()   { /* XMP UTF-8 XML */ }
+## Framework use
+
+```toml
+[dependencies]
+oxideav-webp = "0.2"      # default `registry` feature: pulls oxideav-core
 ```
-
-### Encode a lossless `.webp` from RGBA bytes
-
-```rust
-use oxideav_webp::encode_webp_lossless;
-
-let rgba: Vec<u8> = /* width*height*4 RGBA bytes */;
-let webp_bytes: Vec<u8> = encode_webp_lossless(&rgba, width, height)?;
-std::fs::write("out.webp", &webp_bytes)?;
-```
-
-### Encode lossless with metadata (ICC / EXIF / XMP)
-
-```rust
-use oxideav_webp::{encode_vp8l_argb_with_metadata, WebpMetadata};
-
-// VP8L works in ARGB, one u32/pixel.
-let argb: Vec<u32> = /* width*height ARGB pixels */;
-let meta = WebpMetadata {
-    icc:  Some(&my_icc_profile),
-    exif: Some(&my_exif_blob),
-    xmp:  Some(&my_xmp_xml),
-};
-let webp_bytes = encode_vp8l_argb_with_metadata(
-    width, height, &argb, /* has_alpha = */ true, &meta,
-)?;
-```
-
-If `has_alpha` is `true` or any metadata field is set, the output
-auto-promotes to the extended `VP8X` layout; otherwise it's the simple
-lossless layout. For consumers that wrap the bitstream themselves,
-`vp8l::encode_vp8l_argb` emits the bare VP8L bitstream with no RIFF
-wrap.
-
-### Build an animated `.webp`
-
-```rust
-use oxideav_webp::{build_animated_webp, build_animated_webp_with_options,
-                   AnimFrame, AnimEncoderOptions};
-
-let frames = vec![
-    AnimFrame::new(/* w */ 64, /* h */ 64, /* rgba */ frame0_rgba, /* duration_ms */ 100),
-    AnimFrame::new(64, 64, frame1_rgba, 100),
-];
-// Defaults: per-frame Auto mode (picks byte-smallest of Lossless / Delta).
-let webp = build_animated_webp(&frames)?;
-
-let opts = AnimEncoderOptions {
-    loop_count: 0,                      // 0 = infinite
-    background_rgba: [0xff, 0xff, 0xff, 0xff],
-    ..Default::default()
-};
-let webp = build_animated_webp_with_options(&frames, &opts)?;
-```
-
-## With the OxideAV runtime (`registry` feature on)
 
 ```rust
 use oxideav_core::RuntimeContext;
-use oxideav_webp::{CODEC_ID_VP8, CODEC_ID_VP8L};   // "webp_vp8" / "webp_vp8l"
 
 let mut ctx = RuntimeContext::new();
 oxideav_webp::register(&mut ctx);
-// ctx now exposes the "webp" container plus "webp_vp8" + "webp_vp8l" codecs.
+// ctx now exposes the "webp" decoder (claiming the `WEBP` FourCC and the
+// `.webp` extension) plus the "webp_vp8l" (lossless) and "webp_vp8"
+// (lossy) encoders.  Piece-wise: register_codecs(&mut ctx.codecs) /
+// register_containers(&mut ctx.containers).
 ```
 
-This is the only way to reach the **VP8-lossy encoder** — it delegates
-to the `oxideav-vp8` sibling crate's framework factory family:
+The framework `Decoder` emits each still in its **native** layout — one
+`Rgba` plane for lossless, three `Yuv420P` planes (four with `ALPH`,
+`Yuva420P`) for lossy, with the Rec. 601 limited-range colour signal
+attached to the frame — exactly what `decode` returns; `From<WebpImage>
+for VideoFrame` and `WebpImage::from_video_frame` convert both ways and
+the pixel-format enums map 1:1 by name (`From<WebpPixelFormat> for
+oxideav_core::PixelFormat` / `TryFrom` back). `make_decoder` /
+`make_encoder` are the direct factories; `encoder_vp8::make_encoder_with_quality`
+/ `make_encoder_with_qindex` reach the lossy encoder's quantiser knobs.
+The registry path is a thin adapter: one implementation, two entry
+styles.
 
-```rust
-use oxideav_webp::encoder_vp8::{make_encoder_with_quality, make_encoder_with_qindex};
+| Feature | Default | What it does |
+|---|---|---|
+| `registry` | ✅ on | Pulls `oxideav-core` plus the framework-trait factories and `register*`. Cascades into `oxideav-vp8/registry` for the `webp_vp8` framework encoder. Everything in the table above works with it off. |
+| `simd` | off (nightly only) | Opt-in `std::simd` acceleration of the hottest pixel-repack / inverse-transform loops. Requires nightly rustc (`#![feature(portable_simd)]`). Byte-identical to the scalar path; see [`BENCHMARKS.md`](./BENCHMARKS.md). |
 
-let enc = make_encoder_with_quality(&params, 75.0)?;
-let enc = make_encoder_with_qindex(&params, 32)?;
-```
+## Supported layouts
 
-(Lossless encode + decode + animation + metadata extraction all work
-without `registry`; only the VP8 *lossy* encode path needs it.)
+Decode — the native layout `decode` / `info` report:
+
+| File | `PixelFormat` | Planes | `color` |
+|---|---|---|---|
+| Lossless `VP8L` (simple or `VP8X`), with or without alpha | `Rgba` | 1, stride `4 × width` | sRGB (`1 / 13 / 0`, full range) |
+| Lossy `VP8 ` (simple or `VP8X`) | `Yuv420P` | Y `width × height`; Cb, Cr `⌈w/2⌉ × ⌈h/2⌉` | BT.601 limited (`1 / 13 / 6`, limited range) |
+| Lossy `VP8 ` + `ALPH` | `Yuva420P` | the three above + alpha `width × height` | BT.601 limited |
+| Animation (`ANIM` + `ANMF`, lossless or lossy frames, optional `ALPH`) | `Rgba` per composited frame | 1 | sRGB |
+
+`to_rgb8` / `to_rgba8` are exact integer kernels: a copy for the packed
+layouts; for Y′CbCr the limited-range Rec. ITU-R BT.601 inverse
+(`R = 1.164384 (Y − 16) + 1.596027 (Cr − 128)`, …, Q16 fixed point,
+round-half-up, clamped) with nearest-neighbour 4:2:0 chroma upsampling —
+RFC 9649 §2.5 "To convert to RGB, Recommendation 601 SHOULD be used".
+Against the reference decoder's non-fancy output every sample is within
+±1 (its own fixed-point rounding; see `tests/external_oracle.rs`).
+
+Encode — what `encode` accepts:
+
+| `WebpImage.format` | `EncodeOptions::default()` (lossless) | `.with_quality(q)` (lossy) |
+|---|---|---|
+| `Rgb24` | `VP8L`, opaque | `VP8 ` (RGB → limited-range BT.601 4:2:0) |
+| `Rgba` | `VP8L`, alpha in the bitstream | `VP8 ` + `ALPH` when any pixel is not opaque |
+| `Yuv420P` | `Error::Unsupported` (WebP has no lossless Y′CbCr) | `VP8 ` straight through (`color.range` must not be `Full`) |
+| `Yuva420P` | `Error::Unsupported` | `VP8 ` + `ALPH` |
+
+Nothing is converted silently: a lossless request for Y′CbCr planes and
+a lossy request for full-range planes are refused. Lossless round trips
+are exact — `decode(encode(img)) == img` for planes and metadata, pinned
+by `tests/contract_api.rs`. The `ALPH` plane of a lossy encode is itself
+lossless (method 1, headerless VP8L, falling back to raw when smaller).
+
+## Options
+
+`DecodeOptions` (`Default` + `with_*`): `max_width` / `max_height`
+(default 16384, the VP8L / VP8 per-side ceiling), `max_pixels` (default
+16384²), `max_bytes` (default unlimited), `strict` (default off — on,
+a `VP8X` canvas disagreeing with its bitstream, `VP8X` reserved bits, an
+`ALPH` chunk next to `VP8L`, or an `ANMF` rectangle disagreeing with its
+frame bitstream are refused). Limits are checked against the headers
+before any pixel buffer is allocated; a hit is `Error::LimitExceeded`.
+
+`EncodeOptions` (`Default` + `with_*`): `quality: Option<f32>` (`None` =
+lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
+strength), `embed_icc` / `embed_exif` / `embed_xmp` (default on — the
+image's metadata is written when present), and for animations
+`loop_count` (`0` = forever), `background_rgba`, `frame_mode`
+(`Auto` / `Delta` / `Lossless` dirty-rectangle strategy) and `delta`.
+One struct for stills and animations; behaviour variants are fields.
+
+## Metadata and colour
+
+`WebpImage.metadata` / `ImageInfo.has_*` carry the §2.7.1.4 `ICCP` and
+§2.7.1.5 `EXIF` / `XMP ` payloads verbatim (`gamma` is always `None`;
+WebP has no such field). `WebpImage.color` is a `ColorInfo { range,
+primaries, transfer, matrix }` with H.273 code points: sRGB
+(`Full, 1, 13, 0`) for every RGB(A) image — RFC 9649 §2.7.1.4 "If this
+chunk is not present, sRGB SHOULD be assumed" — and BT.601 limited
+(`Limited, 1, 13, 6`) for the lossy Y′CbCr planes. An embedded ICC
+profile is carried, not applied.
+
+## Limits
+
+* Dimensions: 1..=16384 per side (VP8L header), 1..=16383 for a lossy
+  `VP8 ` encode (RFC 6386 §9.1 14-bit size words). A `VP8X` canvas
+  larger than 16384 per side is refused before allocation (no frame
+  could fill it).
+* Animation frames are composited onto a full canvas; each `Frame.image`
+  is a canvas-sized `Rgba` snapshot (`width × height × 4` bytes per
+  frame).
+* Lossy animation *encode* is not implemented (`Error::Unsupported`);
+  lossy animation *decode* is.
+* Hostile input never panics: every entry point returns `Error`; the
+  fuzz targets below cover `probe` / `info` / `decode` / `decode_all` and
+  both encode paths.
+
+## WebP specifics
+
+* `read_metadata` reads the metadata chunks without decoding pixels;
+  `encode_animation_frames` takes positioned `AnimFrame`s (even `x` / `y`
+  offsets, `blend` / `dispose`, per-frame `AnimFrameMode`);
+  `encode_vp8l_argb` emits a bare VP8L bitstream with no RIFF wrapper;
+  `animation_params` returns the `ANIM` loop count and background.
+* The pre-contract surface — `decode_webp` (→ `DecodedWebpFile` with
+  `WebpFrame`s), `decode_webp_image` (→ `DecodedWebp`),
+  `extract_metadata`, `encode_webp_lossless`, `build_animated_webp` /
+  `build_animated_webp_with_options` / `AnimEncoderOptions`,
+  `WebpFileMetadata` — is kept for one release as `#[deprecated]` thin
+  wrappers over the contract functions.
+* The lossless encoder is a byte-cost super-chooser over every §3 / §4 /
+  §3.5 transform candidate, cost-priced LZ77 planning and §6.2.2
+  entropy-image clustering; on a 10-image corpus its output is smaller
+  than the reference encoder's best effort on 9 of 10 images (up to
+  −28%). Every stream is re-verified bit-exact through a black-box
+  reference decode. See [`BENCHMARKS.md`](./BENCHMARKS.md) for the
+  optimisation log.
 
 ## Benchmarks
 
@@ -221,12 +206,15 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ## Fuzzing
 
-Over thirty [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Thirty-eight [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets). They
 fall into three groups:
 
-* **Public entry points** — `decode`, `decode_lossless_image`,
-  `decode_alpha_plane`, `extract_metadata`, and the differential
+* **Public entry points** — `decode` (the contract `decode` /
+  `decode_rgba8` / `decode_all`), `extract_metadata` (`probe` / `info` /
+  `read_metadata`), `contract_encode` (lossless-exact + lossy VP8/`ALPH`
+  round trips through `encode_rgb8` / `encode_rgba8`),
+  `decode_lossless_image`, `decode_alpha_plane`, and the differential
   `roundtrip_lossless` / `roundtrip_animated` / `roundtrip_anim_modes`
   / `roundtrip_metadata` oracles that assert the encode→decode contract
   pixel-for-pixel, plus two `ALPH` inverse-filter value oracles:
@@ -325,7 +313,7 @@ The fixture corpus at `docs/image/webp/fixtures/` is consumed as opaque
 byte streams; end-to-end fixture tests validate against the ARGB pixels
 of each fixture's committed `expected.png`, and the §2.7.1 metadata
 aux-chunk extraction paths (`ICCP` / `EXIF` / `XMP `) are each
-value-validated end-to-end — `extract_metadata` over the
+value-validated end-to-end — `read_metadata` over the
 `extended-with-icc-profile` / `extended-with-exif` / `extended-with-xmp`
 fixtures must return the exact embedded payload bytes (length +
 whole-payload digest + chunk-body cross-check). No third-party codec
