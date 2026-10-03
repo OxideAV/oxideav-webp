@@ -130,10 +130,30 @@ impl From<WebpImage> for VideoFrame {
 
 impl WebpImage {
     /// Rebuild a [`WebpImage`] from a framework frame plus the stream
-    /// geometry the frame does not carry. Side-channel planes (palette,
-    /// colour signal, …) are skipped; a colour signal on the frame
-    /// overrides the layout default.
+    /// parameters that carry the geometry the frame does not: `width`,
+    /// `height` and `pixel_format` are read from `params` (all three
+    /// required). Side-channel planes (palette, colour signal, …) are
+    /// skipped; a colour signal on the frame overrides the layout default.
     pub fn from_video_frame(
+        frame: &VideoFrame,
+        params: &CodecParameters,
+    ) -> Result<Self, WebpError> {
+        let width = params
+            .width
+            .ok_or_else(|| WebpError::invalid("codec parameters carry no width"))?;
+        let height = params
+            .height
+            .ok_or_else(|| WebpError::invalid("codec parameters carry no height"))?;
+        let format = params
+            .pixel_format
+            .ok_or_else(|| WebpError::invalid("codec parameters carry no pixel format"))?;
+        Self::from_video_frame_parts(frame, width, height, format)
+    }
+
+    /// [`from_video_frame`](Self::from_video_frame) with the geometry
+    /// given directly — the form the registry encoder uses.
+    #[doc(hidden)]
+    pub fn from_video_frame_parts(
         frame: &VideoFrame,
         width: u32,
         height: u32,
@@ -153,6 +173,14 @@ impl WebpImage {
         }
         img.check_geometry()?;
         Ok(img)
+    }
+}
+
+impl TryFrom<(&VideoFrame, &CodecParameters)> for WebpImage {
+    type Error = WebpError;
+
+    fn try_from((frame, params): (&VideoFrame, &CodecParameters)) -> Result<Self, WebpError> {
+        Self::from_video_frame(frame, params)
     }
 }
 
@@ -337,7 +365,7 @@ impl Encoder for WebpVp8lEncoder {
         let Frame::Video(v) = frame else {
             return Err(CoreError::invalid("webp_vp8l encoder: video frames only"));
         };
-        let img = WebpImage::from_video_frame(v, self.width, self.height, self.pix)?
+        let img = WebpImage::from_video_frame_parts(v, self.width, self.height, self.pix)?
             .with_metadata(self.metadata.clone());
         let bytes = crate::encode(&img, &EncodeOptions::default())?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 1000), bytes);
@@ -375,12 +403,13 @@ pub fn encode_vp8l_frame(
     pix: PixelFormat,
     metadata: &crate::WebpMetadata<'_>,
 ) -> oxideav_core::Result<Vec<u8>> {
-    let img = WebpImage::from_video_frame(frame, width, height, pix)?.with_metadata(Metadata {
-        icc: metadata.icc.map(<[u8]>::to_vec),
-        exif: metadata.exif.map(<[u8]>::to_vec),
-        xmp: metadata.xmp.map(<[u8]>::to_vec),
-        gamma: None,
-    });
+    let img =
+        WebpImage::from_video_frame_parts(frame, width, height, pix)?.with_metadata(Metadata {
+            icc: metadata.icc.map(<[u8]>::to_vec),
+            exif: metadata.exif.map(<[u8]>::to_vec),
+            xmp: metadata.xmp.map(<[u8]>::to_vec),
+            gamma: None,
+        });
     Ok(crate::encode(&img, &EncodeOptions::default())?)
 }
 
@@ -617,10 +646,21 @@ mod tests {
         assert_eq!(fmt, PixelFormat::Yuva420P);
         let vf: VideoFrame = img.clone().into();
         assert_eq!(vf.image_planes().len(), 4);
-        let back = WebpImage::from_video_frame(&vf, img.width, img.height, fmt).unwrap();
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(img.width);
+        params.height = Some(img.height);
+        params.pixel_format = Some(fmt);
+        let back = WebpImage::from_video_frame(&vf, &params).unwrap();
         assert_eq!(back.planes, img.planes);
         assert_eq!(back.color, img.color);
-        assert!(WebpImage::from_video_frame(&vf, 1, 1, PixelFormat::Gray8).is_err());
+        let via_try: WebpImage = (&vf, &params).try_into().unwrap();
+        assert_eq!(via_try, back);
+        assert!(WebpImage::from_video_frame_parts(&vf, 1, 1, PixelFormat::Gray8).is_err());
+        let mut bad = params.clone();
+        bad.pixel_format = None;
+        assert!(WebpImage::from_video_frame(&vf, &bad).is_err());
+        bad.pixel_format = Some(PixelFormat::Gray8);
+        assert!(WebpImage::from_video_frame(&vf, &bad).is_err());
     }
 
     // ───────────────────── VP8L encoder ─────────────────────

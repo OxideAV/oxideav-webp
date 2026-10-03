@@ -74,7 +74,8 @@ The framework `Decoder` emits each still in its **native** layout — one
 `Rgba` plane for lossless, three `Yuv420P` planes (four with `ALPH`,
 `Yuva420P`) for lossy, with the Rec. 601 limited-range colour signal
 attached to the frame — exactly what `decode` returns; `From<WebpImage>
-for VideoFrame` and `WebpImage::from_video_frame` convert both ways and
+for VideoFrame`, `WebpImage::from_video_frame(&frame, &params)` and
+`TryFrom<(&VideoFrame, &CodecParameters)>` convert both ways and
 the pixel-format enums map 1:1 by name (`From<WebpPixelFormat> for
 oxideav_core::PixelFormat` / `TryFrom` back). `make_decoder` /
 `make_encoder` are the direct factories; `encoder_vp8::make_encoder_with_quality`

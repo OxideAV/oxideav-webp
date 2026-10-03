@@ -57,7 +57,8 @@ All notable changes to `oxideav-webp` are recorded here.
   for lossless) and refreshes `CodecParameters::pixel_format` per frame;
   its capabilities declare all three. The `"webp_vp8"` lossy encoder is
   now actually registered. `From<WebpImage> for VideoFrame`,
-  `WebpImage::from_video_frame`, `From<WebpPixelFormat> for
+  `WebpImage::from_video_frame(&VideoFrame, &CodecParameters)` +
+  `TryFrom<(&VideoFrame, &CodecParameters)>`, `From<WebpPixelFormat> for
   oxideav_core::PixelFormat` / `TryFrom` back, and `ColorInfo` ⇄
   `ColorSignal` conversions added. `decode_webp_to_frame` returns the
   frame together with its `CodecParameters`.
