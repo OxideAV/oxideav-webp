@@ -31,8 +31,8 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::anim_encode::{build_animated_webp, AnimFrame, AnimFrameMode};
-use oxideav_webp::decode_webp;
+use oxideav_webp::decode_all;
+use oxideav_webp::{encode_animation_frames, AnimFrame, AnimFrameMode, EncodeOptions, Metadata};
 
 const W: u32 = 128;
 const H: u32 = 128;
@@ -65,7 +65,8 @@ fn build_timeline(mode: AnimFrameMode) -> Vec<u8> {
             f
         })
         .collect();
-    build_animated_webp(&frames).expect("assemble animation")
+    encode_animation_frames(&frames, &Metadata::default(), &EncodeOptions::default())
+        .expect("assemble animation")
 }
 
 fn bench_anim_decode(c: &mut Criterion) {
@@ -73,14 +74,14 @@ fn bench_anim_decode(c: &mut Criterion) {
     let delta = build_timeline(AnimFrameMode::Delta);
 
     // Setup sanity: both layouts decode to the same 12-frame timeline.
-    let img_k = decode_webp(&keyframes).expect("decode keyframes");
-    let img_d = decode_webp(&delta).expect("decode delta");
-    assert_eq!(img_k.frames.len(), FRAMES as usize);
-    assert_eq!(img_d.frames.len(), FRAMES as usize);
-    assert_eq!((img_k.width, img_k.height), (W, H));
+    let img_k = decode_all(&keyframes).expect("decode keyframes");
+    let img_d = decode_all(&delta).expect("decode delta");
+    assert_eq!(img_k.len(), FRAMES as usize);
+    assert_eq!(img_d.len(), FRAMES as usize);
+    assert_eq!((img_k[0].image.width, img_k[0].image.height), (W, H));
     assert_eq!(
-        img_k.frames.last().unwrap().rgba,
-        img_d.frames.last().unwrap().rgba,
+        img_k.last().unwrap().image.as_bytes().unwrap(),
+        img_d.last().unwrap().image.as_bytes().unwrap(),
         "delta layout must composite to the keyframe timeline"
     );
     assert!(
@@ -93,13 +94,13 @@ fn bench_anim_decode(c: &mut Criterion) {
 
     c.bench_function("anim_decode_keyframes_12x128", |b| {
         b.iter(|| {
-            let img = decode_webp(black_box(&keyframes)).expect("decode");
+            let img = decode_all(black_box(&keyframes)).expect("decode");
             black_box(img)
         })
     });
     c.bench_function("anim_decode_delta_12x128", |b| {
         b.iter(|| {
-            let img = decode_webp(black_box(&delta)).expect("decode");
+            let img = decode_all(black_box(&delta)).expect("decode");
             black_box(img)
         })
     });

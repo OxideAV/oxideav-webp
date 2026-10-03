@@ -25,7 +25,7 @@
 //! [`oxideav_vp8::encoder::make_encoder_with_qindex`] /
 //! [`oxideav_vp8::encoder::make_encoder_with_quality`] and wraps the
 //! emitted raw VP8 keyframe bitstream in the §2.5 `RIFF/WEBP` container
-//! framing so the output decodes back through [`crate::decode_webp`].
+//! framing so the output decodes back through [`crate::decode_all`].
 //! The `_freq_deltas` variants pass through to the matching no-deltas
 //! factory in this round — the `Vp8FreqDeltas` argument is forwarded as
 //! a hint (the surface stays unchanged) and the per-band quantiser-delta
@@ -94,7 +94,7 @@ use std::collections::VecDeque;
 /// [`oxideav_vp8::encoder::make_encoder`] (default `y_ac_qi = 32`) and
 /// wraps every emitted raw VP8 keyframe in a §2.5 simple-lossy
 /// `RIFF/WEBP` container so the output decodes through
-/// [`crate::decode_webp`].
+/// [`crate::decode_all`].
 #[cfg(feature = "registry")]
 pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     make_encoder_with_qindex(params, 32)
@@ -267,7 +267,7 @@ impl Encoder for WebpVp8LossyEncoder {
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub fn unsupported_for_standalone() -> WebpError {
-    WebpError::Unsupported
+    WebpError::unsupported("webp_vp8 framework encoder needs the `registry` feature")
 }
 
 #[cfg(test)]

@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Encode a fuzz-controlled RGBA image through `encode_webp_lossless`
 //! and assert it survives a `decode_webp` round trip pixel-for-pixel.

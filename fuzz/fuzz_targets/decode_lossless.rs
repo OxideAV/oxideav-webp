@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Decode arbitrary fuzz-supplied bits through the §4 + §5 + §6 full VP8L
 //! lossless-bitstream decode path standalone entry points

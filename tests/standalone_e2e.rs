@@ -25,6 +25,10 @@
 //! Each test asserts **byte-exact** round-trip (lossless = bit-exact per
 //! RFC 9649 §3) — no PSNR / SSIM tolerance budget anywhere in this file.
 
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
+
 use oxideav_webp::build::{build_chunk, ImageKind};
 use oxideav_webp::{
     build_animated_webp, build_webp_file, decode_lossless_image, decode_webp, encode_vp8l_argb,
@@ -287,13 +291,14 @@ fn standalone_extract_metadata_reads_without_full_decode() {
 fn standalone_decode_garbage_rejected_as_invalid_data() {
     // Non-WebP input must surface the stable coarse error, not panic.
     let err = decode_webp(b"definitely not a webp file").expect_err("garbage rejected");
-    assert_eq!(err, WebpError::InvalidData);
+    assert!(err.is_invalid_data(), "{err}");
+    let _ = WebpError::Eof;
 }
 
 #[test]
 fn standalone_extract_metadata_garbage_rejected_as_invalid_data() {
     let err = extract_metadata(b"\x00\x01\x02\x03 not webp").expect_err("garbage rejected");
-    assert_eq!(err, WebpError::InvalidData);
+    assert!(err.is_invalid_data(), "{err}");
 }
 
 #[test]

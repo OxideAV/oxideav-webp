@@ -99,11 +99,11 @@ fn extract_vp8_bitstream(file: &[u8]) -> Vec<u8> {
 
 fn bench_decode_webp_lossy_e2e(c: &mut Criterion) {
     // Sanity: the fixture decodes before we time it.
-    let probe = oxideav_webp::decode_webp(LOSSY_128).expect("lossy fixture decodes");
+    let probe = oxideav_webp::decode_rgba8(LOSSY_128).expect("lossy fixture decodes");
     assert_eq!((probe.width, probe.height), (128, 128));
     c.bench_function("decode_webp_lossy_e2e", |b| {
         b.iter(|| {
-            let img = oxideav_webp::decode_webp(black_box(LOSSY_128)).expect("decode");
+            let img = oxideav_webp::decode_rgba8(black_box(LOSSY_128)).expect("decode");
             black_box(img)
         })
     });

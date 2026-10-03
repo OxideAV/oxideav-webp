@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Parse arbitrary fuzz-supplied bits through the §5.2.3 color-cache
 //! info, §6.2.2 meta-prefix, and §6.2 prefix-code-group reader standalone

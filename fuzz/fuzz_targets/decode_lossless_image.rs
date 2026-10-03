@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Decode arbitrary fuzz-supplied bytes through the public top-level
 //! lossless façade `oxideav_webp::decode_lossless_image`.

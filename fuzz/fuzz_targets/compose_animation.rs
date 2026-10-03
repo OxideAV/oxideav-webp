@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Structure-aware hostility harness for the §2.7.1.1 / §2.7.2 animation
 //! **compositor** — `decode_webp` → `decode_animation` — fed *raw*

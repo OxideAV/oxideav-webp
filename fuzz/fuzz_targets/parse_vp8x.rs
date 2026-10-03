@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Parse arbitrary fuzz-supplied bytes through the §2.7.1 VP8X chunk
 //! parser entry point `oxideav_webp::vp8x::Vp8xHeader::parse`.

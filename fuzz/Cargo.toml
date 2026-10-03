@@ -864,3 +864,11 @@ path = "fuzz_targets/encode_params_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+# Round 465: the contract encode round trips (lossless exact + lossy
+# VP8 / ALPH) through `encode_rgb8` / `encode_rgba8` → `decode`.
+[[bin]]
+name = "contract_encode"
+path = "fuzz_targets/contract_encode.rs"
+test = false
+doc = false

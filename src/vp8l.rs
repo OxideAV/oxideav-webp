@@ -21,7 +21,7 @@ pub const VP8L_SIGNATURE: u8 = 0x2F;
 ///
 /// `buf` is the **chunk payload** — the bytes starting at the 5-byte
 /// VP8L image header, **not** a complete `RIFF/WEBP` file. For a full
-/// `.webp`, use [`crate::decode_webp`] (which routes the VP8L chunk
+/// `.webp`, use [`crate::decode`] (which routes the VP8L chunk
 /// here internally).
 pub fn decode(buf: &[u8]) -> Result<Vp8lImage, crate::WebpError> {
     // The bare-bitstream entry point matches the published 0.1.2 shape:
@@ -30,17 +30,17 @@ pub fn decode(buf: &[u8]) -> Result<Vp8lImage, crate::WebpError> {
     // carries width / height / alpha_is_used; we then run the full §4
     // inverse-transform chain over the §5/§6 entropy-coded body.
     if buf.is_empty() || buf[0] != VP8L_SIGNATURE {
-        return Err(crate::WebpError::InvalidData);
+        return Err(crate::WebpError::invalid(
+            "bare VP8L bitstream without the 0x2F signature",
+        ));
     }
     // Reuse the in-crate VP8L chunk header reader for width / height /
     // alpha-is-used extraction.
-    let chunk = crate::vp8l_chunk::WebpLosslessChunk::from_payload(buf)
-        .map_err(|_| crate::WebpError::InvalidData)?;
+    let chunk = crate::vp8l_chunk::WebpLosslessChunk::from_payload(buf)?;
     let width = chunk.width();
     let height = chunk.height();
     let has_alpha = chunk.alpha_is_used();
-    let image = crate::vp8l_transform::decode_lossless(chunk.bitstream(), width, height)
-        .map_err(|_| crate::WebpError::InvalidData)?;
+    let image = crate::vp8l_transform::decode_lossless(chunk.bitstream(), width, height)?;
     Ok(Vp8lImage {
         width,
         height,
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn bare_decode_rejects_bad_signature() {
         let err = decode(&[0x00, 0x00, 0x00, 0x00, 0x00]).expect_err("bad sig");
-        assert_eq!(err, crate::WebpError::InvalidData);
+        assert!(err.is_invalid_data(), "{err}");
     }
 
     #[test]

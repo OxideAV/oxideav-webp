@@ -12,9 +12,13 @@
 //! * `WebpMetadata` (borrowed) — the encode-side metadata input.
 //! * `extract_metadata` — reading the embedded ICC / Exif / XMP back.
 
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
+
 use oxideav_webp::{
     decode_webp, encode_vp8l_argb, encode_vp8l_argb_with, encode_vp8l_argb_with_metadata,
-    extract_metadata, WebpError, WebpMetadata,
+    extract_metadata, WebpMetadata,
 };
 
 /// Build a deterministic `width * height` ARGB ramp (packed
@@ -136,5 +140,5 @@ fn encode_vp8l_argb_rejects_dimension_mismatch() {
     // One pixel claimed as 2x2 → published coarse error.
     let argb = vec![0xff00_0000u32];
     let err = encode_vp8l_argb(&argb, 2, 2).expect_err("mismatch rejected");
-    assert_eq!(err, WebpError::InvalidData);
+    assert!(err.is_invalid_data(), "{err}");
 }

@@ -24,7 +24,8 @@ name: Fuzz
 #     roundtrip_anim_modes (6..7), compose_animation (14..19),
 #     encode_params_roundtrip (9..15), roundtrip_metadata (14..18),
 #     roundtrip_animated (16..29).
-#   * 2 slices — roundtrip_alpha_filter_lossless (131..147).
+#   * 2 slices — roundtrip_alpha_filter_lossless (131..147) and the
+#     round-465 contract_encode (VP8 keyframe encoder in the loop).
 #   * 1 slice — the remaining 30 targets. decode_still_paths (~1.8 k
 #     exec/s) and decode_lossless_image (~17 k exec/s) were in the slow
 #     tier before round 432 added declared-pixel-load gates to their
@@ -32,7 +33,7 @@ name: Fuzz
 #     decompression-bomb corpus entries); with the gates they fuzz at
 #     fast-tier rates.
 #
-# 56 slices over a 5400 s budget is ~96 s per slice: ~385 s/day for each
+# 58 slices over a 5400 s budget is ~93 s per slice: ~385 s/day for each
 # slow target (vs ~48 s before) and still ~96 s/day for each fast one.
 #
 # MAINTENANCE: the explicit `targets` list bypasses the reusable
@@ -51,5 +52,5 @@ jobs:
     uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
     with:
       time_budget_seconds: 5400
-      targets: "backward_reference,color_cache,decode,decode_alph,decode_alpha_plane,decode_argb,decode_entropy_coded_image,decode_entropy_image,decode_lossless,decode_lossless_image,decode_lossless_lut,decode_still_paths,distance_code,extract_metadata,extract_routing,inverse_predictor_color,inverse_subtract_green_indexing,meta_prefix_index,parse_alph,parse_anim,parse_anmf,parse_container,parse_meta_prefix,parse_transform_list,parse_vp8_chunk,parse_vp8x,prefix_code,prefix_code_group,read_symbol_lut_diff,roundtrip_alpha_filter,roundtrip_alpha_filter_lossless,roundtrip_alpha_filter_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_anim_modes,roundtrip_anim_modes,roundtrip_anim_modes,roundtrip_anim_modes,compose_animation,compose_animation,compose_animation,compose_animation,encode_params_roundtrip,encode_params_roundtrip,encode_params_roundtrip,encode_params_roundtrip,roundtrip_metadata,roundtrip_metadata,roundtrip_metadata,roundtrip_metadata,roundtrip_animated,roundtrip_animated,roundtrip_animated,roundtrip_animated"
+      targets: "backward_reference,color_cache,contract_encode,contract_encode,decode,decode_alph,decode_alpha_plane,decode_argb,decode_entropy_coded_image,decode_entropy_image,decode_lossless,decode_lossless_image,decode_lossless_lut,decode_still_paths,distance_code,extract_metadata,extract_routing,inverse_predictor_color,inverse_subtract_green_indexing,meta_prefix_index,parse_alph,parse_anim,parse_anmf,parse_container,parse_meta_prefix,parse_transform_list,parse_vp8_chunk,parse_vp8x,prefix_code,prefix_code_group,read_symbol_lut_diff,roundtrip_alpha_filter,roundtrip_alpha_filter_lossless,roundtrip_alpha_filter_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_lossless,roundtrip_anim_modes,roundtrip_anim_modes,roundtrip_anim_modes,roundtrip_anim_modes,compose_animation,compose_animation,compose_animation,compose_animation,encode_params_roundtrip,encode_params_roundtrip,encode_params_roundtrip,encode_params_roundtrip,roundtrip_metadata,roundtrip_metadata,roundtrip_metadata,roundtrip_metadata,roundtrip_animated,roundtrip_animated,roundtrip_animated,roundtrip_animated"
     secrets: inherit

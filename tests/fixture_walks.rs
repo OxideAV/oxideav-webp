@@ -14,6 +14,10 @@
 //! lossless (and near-lossless) container, which the decoder
 //! reconstructs bit-for-bit.
 
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
+
 use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::build::{build_chunk, ImageKind, Vp8xFlags};
@@ -293,6 +297,13 @@ fn round284_fixture_corpus_decode_digests_are_pinned() {
     // the docs fixture set before the table landed). Any future
     // entropy-path rewrite must keep every digest below unchanged.
     //
+    // Round 465: the three lossy (`VP8 `) digests were re-pinned once the
+    // Y'CbCr -> RGB conversion moved from the full-range to the
+    // limited-range Rec. 601 matrix RFC 9649 §2.5 prescribes (black-box
+    // checked against the reference decoder's non-fancy output: every
+    // sample within ±1, see `tests/external_oracle.rs` direction D). The
+    // five lossless / animation digests are unchanged.
+    //
     // Digest layout: FNV-1a-64 over `width_le ‖ height_le ‖
     // (frame_count as u32)_le ‖ frames[..].rgba` — dimensions and frame
     // count are folded in so a decoder that returns the right bytes at
@@ -306,7 +317,7 @@ fn round284_fixture_corpus_decode_digests_are_pinned() {
         (
             "extended-with-exif",
             EXTENDED_WITH_EXIF,
-            0x10bb_4321_d897_9d82,
+            0x15b4_3126_d70c_cc94,
         ),
         (
             "lossless-128x128-natural",
@@ -324,11 +335,11 @@ fn round284_fixture_corpus_decode_digests_are_pinned() {
             LOSSLESS_COLOR_INDEXING,
             0xbfc8_1c3b_8ce3_ca04,
         ),
-        ("lossy-1x1", LOSSY_1X1, 0x9abb_50fd_9e15_d10d),
+        ("lossy-1x1", LOSSY_1X1, 0x9ca4_412a_b8e8_48f4),
         (
             "lossy-with-alpha-128x128",
             LOSSY_WITH_ALPHA,
-            0x00a4_e8ba_d528_34bf,
+            0x20b2_f7f0_b496_4f0a,
         ),
     ];
     for (name, bytes, want) in cases {
@@ -1074,7 +1085,8 @@ fn round107_decode_error_surfaces_through_crate_error() {
         alphabet_size: 280,
     };
     let wrapped: oxideav_webp::Error = e.into();
-    assert!(matches!(wrapped, oxideav_webp::Error::Vp8lDecode(_)));
+    assert!(wrapped.is_invalid_data(), "{wrapped}");
+    assert!(wrapped.to_string().contains("vp8l decode"));
 }
 
 /// LSB-first bit writer for the round-108 synthetic-stream tests.

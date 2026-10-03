@@ -499,7 +499,7 @@ impl FileMetadata<'_> {
 /// Every byte stream produced by this function parses successfully
 /// through [`crate::container::parse`], and its §2.7.1.4 `ICCP` /
 /// §2.7.1.5 `EXIF` / §2.7.1.5 `XMP ` payloads round-trip byte-for-byte
-/// through [`crate::extract_metadata`]. The §2.7.1 `VP8X` flag octet
+/// through [`crate::read_metadata`]. The §2.7.1 `VP8X` flag octet
 /// also round-trips through [`crate::vp8x::Vp8xHeader::parse`] —
 /// `has_iccp` / `has_exif` / `has_xmp` reflect exactly which
 /// [`FileMetadata`] fields were `Some(..)`, and `has_alpha` reflects
@@ -956,7 +956,7 @@ mod tests {
         assert!(!vp8x.has_exif);
         assert!(!vp8x.has_xmp);
         // Extracted ICCP payload matches.
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
         assert_eq!(m.exif, None);
         assert_eq!(m.xmp, None);
@@ -989,7 +989,7 @@ mod tests {
         assert!(!vp8x.has_iccp);
         assert!(vp8x.has_exif);
         assert!(!vp8x.has_xmp);
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert_eq!(m.icc, None);
         assert_eq!(m.exif.as_deref(), Some(&exif[..]));
         assert_eq!(m.xmp, None);
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(c.chunks[2].fourcc, fourcc::XMP);
         let vp8x = Vp8xHeader::parse(c.chunks[0].payload(&bytes)).unwrap();
         assert!(vp8x.has_xmp);
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
     }
 
@@ -1053,7 +1053,7 @@ mod tests {
         assert!(vp8x.has_iccp);
         assert!(vp8x.has_exif);
         assert!(!vp8x.has_xmp);
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
         assert_eq!(m.exif.as_deref(), Some(&exif[..]));
     }
@@ -1087,7 +1087,7 @@ mod tests {
         assert!(vp8x.has_iccp);
         assert!(!vp8x.has_exif);
         assert!(vp8x.has_xmp);
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
         assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
     }
@@ -1118,7 +1118,7 @@ mod tests {
         assert_eq!(c.chunks[1].fourcc, fourcc::VP8L);
         assert_eq!(c.chunks[2].fourcc, fourcc::EXIF);
         assert_eq!(c.chunks[3].fourcc, fourcc::XMP);
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert_eq!(m.exif.as_deref(), Some(&exif[..]));
         assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
     }
@@ -1160,7 +1160,7 @@ mod tests {
         // §2.7.1 canvas dims survive.
         assert_eq!(vp8x.canvas_width, 16);
         assert_eq!(vp8x.canvas_height, 16);
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert_eq!(m.icc.as_deref(), Some(&iccp[..]));
         assert_eq!(m.exif.as_deref(), Some(&exif[..]));
         assert_eq!(m.xmp.as_deref(), Some(&xmp[..]));
@@ -1317,7 +1317,7 @@ mod tests {
         assert_eq!(c.chunks.len(), 2);
         assert_eq!(c.chunks[0].fourcc, fourcc::VP8X);
         assert_eq!(c.chunks[1].fourcc, fourcc::VP8L);
-        let m = crate::extract_metadata(&bytes).unwrap();
+        let m = crate::read_metadata(&bytes).unwrap();
         assert!(m.icc.is_none());
         assert!(m.exif.is_none());
         assert!(m.xmp.is_none());

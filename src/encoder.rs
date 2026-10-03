@@ -1,17 +1,13 @@
-//! Published-API `oxideav_webp::encoder` module — RIFF-wrapped output
-//! factories.
+//! Pre-contract `oxideav_webp::encoder` module path — the framework
+//! encoder factory under its historical qualified name.
 //!
-//! Per the published 0.1.2 surface, this module exposes a single
-//! [`make_encoder`] factory that returns a `Box<dyn Encoder>` registered
-//! under the umbrella `"webp"` codec id. The factory is the framework
-//! entry point; the registry side wires it under [`crate::registry::register_codecs`].
-//!
-//! The factory is gated behind the default-on `registry` Cargo feature
-//! because it depends on the `oxideav_core::Encoder` trait.
+//! New code uses the crate root ([`crate::encode`], [`crate::encode_rgba8`],
+//! [`crate::EncodeOptions`]).
+
+pub use crate::{encode, encode_rgb8, encode_rgba8, encode_to, EncodeOptions};
 
 #[cfg(feature = "registry")]
 pub use crate::registry::make_encoder;
-// internal — exposed for tests/fuzz; not part of the stable API
 #[cfg(feature = "registry")]
 #[doc(hidden)]
 pub use crate::registry::{make_encoder_with_metadata, WebpVp8lEncoder};

@@ -1,189 +1,223 @@
-//! `oxideav-core` integration — `Decoder` trait impl, `Frame` / `Error`
-//! conversions, and the [`register`] entry point.
+//! `oxideav-core` integration — the framework [`Decoder`] / [`Encoder`]
+//! adapters, the [`WebpImage`] ⇄ [`VideoFrame`] conversions, and the
+//! [`register`] entry points.
 //!
-//! Gated behind the default-on `registry` Cargo feature so consumers
-//! that just want the standalone walker / builder / decoder surface can
-//! depend on `oxideav-webp` with `default-features = false` and skip
-//! the `oxideav-core` dependency entirely.
+//! Gated behind the default-on `registry` Cargo feature. Everything here
+//! is a thin adapter over the standalone contract functions
+//! ([`crate::decode_with`], [`crate::encode`]): one implementation, two
+//! entry styles.
 //!
-//! The module exposes:
-//!
-//! * [`register`] / [`register_codecs`] / [`register_containers`] — the
-//!   `CodecRegistry` / `ContainerRegistry` entry points the umbrella
-//!   `oxideav` crate calls during framework initialisation.
-//! * [`WebpDecoder`] — the `Decoder` trait impl that wraps the
-//!   framework-free [`crate::decode_webp_image`] entry point.
-//! * [`decode_webp_to_frame`] — a `VideoFrame`-flavoured wrapper around
-//!   [`crate::decode_webp_image`] preserved for callers that prefer the
-//!   direct conversion to the framework's frame type.
-//! * The `From<Error> for oxideav_core::Error` conversion that lets the
-//!   trait impl use `?` on errors returned by the framework-free decode
-//!   path.
-//!
-//! Per round 112, the registered decoder covers:
-//!
-//! * **§2.6 / §3.4 `VP8L` lossless** (simple or `VP8X`-extended) —
-//!   decoded all the way to interleaved 8-bit RGBA, surfaced as a single
-//!   planar [`VideoFrame`] with stride `width * 4` and
-//!   [`PixelFormat::Rgba`].
-//! * **§2.7.1.2 `ALPH`-over-`VP8L` alpha override** — the alpha plane
-//!   from an accompanying `ALPH` chunk overrides the per-pixel alpha
-//!   from the `VP8L` bitstream itself.
-//! * **§2.5 `VP8 ` lossy** — a clean `Error::Unsupported`. WebP's lossy
-//!   path is a VP8 bitstream; `oxideav-webp` deliberately does **not**
-//!   take a runtime dependency on `oxideav-vp8`. Callers that need lossy
-//!   should route the chunk via [`crate::extract_lossy_chunk`] to a
-//!   downstream VP8 decoder.
-//! * **Animations / header-only files** (no `VP8L`/`VP8 ` image-data
-//!   chunk) — a clean `Error::Unsupported`.
+//! * The `"webp"` decoder emits each still in its **native** layout —
+//!   [`PixelFormat::Rgba`] for lossless, [`PixelFormat::Yuv420P`] /
+//!   [`PixelFormat::Yuva420P`] (limited-range BT.601, carried as the
+//!   frame's colour signal) for lossy — exactly what [`crate::decode`]
+//!   returns. An animated file decodes to its first composited frame.
+//! * The `"webp_vp8l"` encoder accepts `Rgba` / `Rgb24` frames and writes
+//!   a lossless `.webp`; the `"webp_vp8"` encoder (see
+//!   [`crate::encoder_vp8`]) writes the lossy path.
 
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag,
+    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, ColorSignal,
     ContainerRegistry, Decoder, Encoder, Error as CoreError, Frame, MediaType, Packet, PixelFormat,
     RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::{
-    decode_webp_image, encode_vp8l_argb_with_metadata, DecodedWebp, Error, UnsupportedKind,
-    WebpError, WebpMetadata, WebpMetadataOwned, CODEC_ID_VP8L,
+    ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Metadata, Plane, WebpError, WebpImage,
+    WebpMetadataOwned, WebpPixelFormat, CODEC_ID_VP8L,
 };
 
 /// Stable on-wire identifier this crate registers under in the codec
-/// registry. The single canonical value the framework uses to look up
-/// a WebP decoder is `"webp"`.
-// internal — exposed for tests/fuzz; not part of the stable API
+/// registry: `"webp"`.
 #[doc(hidden)]
 pub const CODEC_ID_STR: &str = "webp";
 
-/// Bridge crate-local errors to the framework-wide `oxideav_core::Error`
-/// so trait impls can use `?` on the framework-free decode path.
-///
-/// `Error::Unsupported(LossyVp8)` and `Error::Unsupported(NoImageData)`
-/// both map to `oxideav_core::Error::Unsupported(...)`. Every other
-/// variant carries diagnostic text already built by the originating
-/// sub-module's `Display` impl — it's surfaced verbatim via
-/// `Error::InvalidData(...)`.
-impl From<Error> for CoreError {
-    fn from(e: Error) -> Self {
+/// Bridge the crate error to the framework-wide `oxideav_core::Error`.
+impl From<WebpError> for CoreError {
+    fn from(e: WebpError) -> Self {
         match e {
-            Error::Unsupported(kind) => CoreError::Unsupported(match kind {
-                UnsupportedKind::LossyVp8 => {
-                    "oxideav-webp: VP8 lossy bitstream (route to a VP8 decoder)".to_string()
-                }
-                UnsupportedKind::NoImageData => {
-                    "oxideav-webp: no VP8L/VP8 image-data chunk (animation or header-only)"
-                        .to_string()
-                }
-            }),
-            Error::NotImplemented => {
-                CoreError::Unsupported("oxideav-webp: code path not implemented yet".to_string())
-            }
-            // A VP8 inter-frame is a recognised-but-unsupported feature,
-            // not a corrupt bitstream; every other VP8 decode failure is
-            // a bitstream problem.
-            Error::Vp8(ref v) => match WebpError::from(v.clone()) {
-                WebpError::Unsupported => CoreError::Unsupported(e.to_string()),
-                _ => CoreError::InvalidData(e.to_string()),
-            },
+            WebpError::Unsupported(m) => CoreError::Unsupported(format!("oxideav-webp: {m}")),
+            WebpError::Eof => CoreError::Eof,
+            WebpError::NeedMore => CoreError::NeedMore,
+            WebpError::Io(io) => CoreError::Io(io),
             other => CoreError::InvalidData(other.to_string()),
         }
     }
 }
 
-// ───────────────────────── Frame conversion ─────────────────────────
+// ───────────────────────── pixel-format mapping ──────────────────────────
 
-/// Convert a fully-decoded [`DecodedWebp`] into a single-planar
-/// [`VideoFrame`] carrying interleaved 8-bit RGBA.
-///
-/// Stride is exactly `width * 4` bytes (no row padding). Stream-level
-/// width / height / pixel format live on [`CodecParameters`], not the
-/// frame — consumers read them from [`WebpDecoder::params`] (which is
-/// updated to the decoded dimensions after the first frame).
-fn decoded_webp_to_video_frame(img: DecodedWebp, pts: Option<i64>) -> VideoFrame {
-    let stride = (img.width as usize).saturating_mul(4);
-    VideoFrame {
-        pts,
-        planes: vec![VideoPlane {
-            stride,
-            data: img.rgba,
-        }],
+impl From<WebpPixelFormat> for PixelFormat {
+    fn from(f: WebpPixelFormat) -> Self {
+        match f {
+            WebpPixelFormat::Rgb24 => PixelFormat::Rgb24,
+            WebpPixelFormat::Rgba => PixelFormat::Rgba,
+            WebpPixelFormat::Yuv420P => PixelFormat::Yuv420P,
+            WebpPixelFormat::Yuva420P => PixelFormat::Yuva420P,
+        }
     }
 }
 
-/// `VideoFrame`-flavoured wrapper around [`decode_webp_image`].
-///
-/// Preserved for callers that already build [`VideoFrame`]s directly
-/// without going through the [`Decoder`] trait (e.g. container demuxers
-/// that want to drop a still WebP picture into a video stream).
-// internal — exposed for tests/fuzz; not part of the stable API
-#[doc(hidden)]
-pub fn decode_webp_to_frame(bytes: &[u8], pts: Option<i64>) -> oxideav_core::Result<VideoFrame> {
-    let img = decode_webp_image(bytes)?;
-    Ok(decoded_webp_to_video_frame(img, pts))
+impl TryFrom<PixelFormat> for WebpPixelFormat {
+    type Error = WebpError;
+
+    fn try_from(f: PixelFormat) -> Result<Self, WebpError> {
+        match f {
+            PixelFormat::Rgb24 => Ok(WebpPixelFormat::Rgb24),
+            PixelFormat::Rgba => Ok(WebpPixelFormat::Rgba),
+            PixelFormat::Yuv420P => Ok(WebpPixelFormat::Yuv420P),
+            PixelFormat::Yuva420P => Ok(WebpPixelFormat::Yuva420P),
+            other => Err(WebpError::unsupported(format!(
+                "pixel format {other:?} has no WebP layout (want Rgba, Rgb24, Yuv420P or Yuva420P)"
+            ))),
+        }
+    }
 }
 
-// ───────────────────────── Decoder + factory ─────────────────────────
+impl From<ColorInfo> for ColorSignal {
+    fn from(c: ColorInfo) -> Self {
+        let sig = ColorSignal::from_code_points(c.primaries, c.transfer, c.matrix, false);
+        let range = match c.range {
+            ColorRange::Limited => oxideav_core::ColorRange::Limited,
+            ColorRange::Full => oxideav_core::ColorRange::Full,
+            _ => oxideav_core::ColorRange::Unspecified,
+        };
+        sig.with_range(range)
+    }
+}
 
-/// Factory for the `Decoder` trait impl — installed in the codec
-/// registry and called by the framework when a `webp` packet stream
-/// needs decoding.
+impl From<ColorSignal> for ColorInfo {
+    fn from(s: ColorSignal) -> Self {
+        let range = match s.range {
+            oxideav_core::ColorRange::Limited => ColorRange::Limited,
+            oxideav_core::ColorRange::Full => ColorRange::Full,
+            _ => ColorRange::Unspecified,
+        };
+        ColorInfo::new(
+            range,
+            s.primaries.code_point(),
+            s.transfer.code_point(),
+            s.matrix.code_point(),
+        )
+    }
+}
+
+// ───────────────────────── frame conversion ──────────────────────────────
+
+/// A [`WebpImage`] becomes a [`VideoFrame`] with one [`VideoPlane`] per
+/// image plane (strides as reported) and the colour description attached
+/// as the frame's colour signal. Width / height / pixel format travel on
+/// [`CodecParameters`], not the frame.
+impl From<WebpImage> for VideoFrame {
+    fn from(img: WebpImage) -> Self {
+        let color: ColorSignal = img.color.into();
+        let frame = VideoFrame {
+            pts: None,
+            planes: img
+                .planes
+                .into_iter()
+                .map(|p| VideoPlane {
+                    stride: p.stride,
+                    data: p.data,
+                })
+                .collect(),
+        };
+        frame.with_color_signal(color)
+    }
+}
+
+impl WebpImage {
+    /// Rebuild a [`WebpImage`] from a framework frame plus the stream
+    /// geometry the frame does not carry. Side-channel planes (palette,
+    /// colour signal, …) are skipped; a colour signal on the frame
+    /// overrides the layout default.
+    pub fn from_video_frame(
+        frame: &VideoFrame,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<Self, WebpError> {
+        let format = WebpPixelFormat::try_from(format)?;
+        let planes: Vec<Plane> = frame
+            .image_planes()
+            .iter()
+            .map(|p| Plane::new(p.stride, p.data.clone()))
+            .collect();
+        let mut img = WebpImage::new(width, height, format, planes);
+        if let Some(sig) = frame.color_signal() {
+            if !sig.is_unspecified() {
+                img.color = sig.into();
+            }
+        }
+        img.check_geometry()?;
+        Ok(img)
+    }
+}
+
+/// Decode a still `.webp` straight to a [`VideoFrame`] in its native
+/// layout; the returned [`CodecParameters`] carry the geometry.
+#[doc(hidden)]
+pub fn decode_webp_to_frame(
+    bytes: &[u8],
+    pts: Option<i64>,
+) -> oxideav_core::Result<(VideoFrame, CodecParameters)> {
+    let img = crate::decode_with(bytes, &DecodeOptions::default())?;
+    let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    params.width = Some(img.width);
+    params.height = Some(img.height);
+    params.pixel_format = Some(img.format.into());
+    let mut frame: VideoFrame = img.into();
+    frame.pts = pts;
+    Ok((frame, params))
+}
+
+// ───────────────────────── Decoder + factory ─────────────────────────────
+
+/// Factory for the `Decoder` trait impl — installed in the codec registry.
 pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     Ok(Box::new(WebpDecoder::new(params.clone())))
 }
 
-/// WebP [`Decoder`] trait impl.
+/// WebP [`Decoder`] trait impl: one complete `RIFF/WEBP` file per packet,
+/// one native-layout [`Frame::Video`] per `receive_frame`.
 ///
-/// Each `send_packet` carries one complete `RIFF/WEBP` file (still
-/// image — animations not yet implemented). The matching `receive_frame`
-/// returns a [`Frame::Video`] holding interleaved 8-bit RGBA pixels.
-///
-/// The decoder caches the most recently observed image dimensions on
-/// its [`CodecParameters`] — see [`Self::params`] — so consumers can
-/// pull width / height / pixel format after the first
-/// `receive_frame`. Before a packet has been decoded the values come
-/// from whatever `CodecParameters` the factory was constructed with
-/// (typically empty width / height for a still-image codec).
+/// The decoder refreshes `width` / `height` / `pixel_format` on its
+/// [`CodecParameters`] after every decode — see [`Self::params`].
 #[derive(Debug)]
 pub struct WebpDecoder {
-    /// Output stream parameters. `pixel_format` is fixed to
-    /// [`PixelFormat::Rgba`] at construction (every supported WebP
-    /// image kind decodes to RGBA today); `width` / `height` are
-    /// refreshed after each successful decode.
     params: CodecParameters,
-    /// Most-recently received packet, consumed by the next
-    /// `receive_frame` call. The contract matches the framework's
-    /// one-packet-in / one-frame-out pattern for image codecs (see e.g.
-    /// the PNG / ICER impls).
+    opts: DecodeOptions,
     pending: Option<Packet>,
-    /// `true` after `flush()` — the next `receive_frame` with an empty
-    /// pending slot returns `Eof` instead of `NeedMore`.
     eof: bool,
 }
 
 impl WebpDecoder {
     /// Build a decoder whose output [`CodecParameters`] start from
-    /// `params`. The factory always passes the caller-supplied
-    /// `CodecParameters` here; the dimensions and pixel format are
-    /// re-derived from each successfully decoded frame so the field is
-    /// authoritative after the first `receive_frame`.
+    /// `params`; `pixel_format` is refined after the first frame.
     pub fn new(params: CodecParameters) -> Self {
+        Self::with_options(params, DecodeOptions::default())
+    }
+
+    /// [`Self::new`] with explicit decode limits.
+    pub fn with_options(params: CodecParameters, opts: DecodeOptions) -> Self {
         let mut p = params;
         p.media_type = MediaType::Video;
         p.codec_id = CodecId::new(CODEC_ID_STR);
-        p.pixel_format = Some(PixelFormat::Rgba);
+        if p.pixel_format.is_none() {
+            p.pixel_format = Some(PixelFormat::Rgba);
+        }
         Self {
             params: p,
+            opts,
             pending: None,
             eof: false,
         }
     }
 
-    /// Reference to the decoder's [`CodecParameters`]. After the first
-    /// successful `receive_frame` the `width`, `height`, and
-    /// `pixel_format` fields reflect the decoded image; before that
-    /// they hold the factory-supplied values.
+    /// The decoder's [`CodecParameters`]; authoritative after the first
+    /// successful `receive_frame`.
     pub fn params(&self) -> &CodecParameters {
         &self.params
     }
@@ -212,15 +246,12 @@ impl Decoder for WebpDecoder {
                 Err(CoreError::NeedMore)
             };
         };
-        let img = decode_webp_image(&pkt.data)?;
-        // Surface the decoded geometry on the decoder's params so
-        // downstream consumers (filter graphs, sinks, the
-        // `oxideav probe` command) can read width / height after the
-        // first frame.
+        let img = crate::decode_with(&pkt.data, &self.opts)?;
         self.params.width = Some(img.width);
         self.params.height = Some(img.height);
-        self.params.pixel_format = Some(PixelFormat::Rgba);
-        let vf = decoded_webp_to_video_frame(img, pkt.pts);
+        self.params.pixel_format = Some(img.format.into());
+        let mut vf: VideoFrame = img.into();
+        vf.pts = pkt.pts;
         Ok(Frame::Video(vf))
     }
 
@@ -230,85 +261,18 @@ impl Decoder for WebpDecoder {
     }
 }
 
-// ───────────────────────── Encoder + factory ─────────────────────────
-
-/// Repack one interleaved-pixel [`VideoFrame`] plane into scan-line ARGB
-/// (`(a << 24) | (r << 16) | (g << 8) | b`), the layout the VP8L encoder
-/// consumes.
-///
-/// Accepts the two input pixel formats the published `webp_vp8l` codec
-/// declares: [`PixelFormat::Rgba`] (4 B/px) and [`PixelFormat::Rgb24`]
-/// (3 B/px, treated as fully opaque, streamed without a 3→4 expansion
-/// alloc). Both read the plane's `stride` so a padded source row is handled.
-fn video_frame_to_argb(
-    frame: &VideoFrame,
-    width: u32,
-    height: u32,
-    pix: PixelFormat,
-) -> oxideav_core::Result<(Vec<u32>, bool)> {
-    let plane = frame
-        .planes
-        .first()
-        .ok_or_else(|| CoreError::invalid("webp_vp8l encoder: frame has no planes"))?;
-    let w = width as usize;
-    let h = height as usize;
-    let stride = plane.stride;
-    let mut pixels = Vec::with_capacity(w * h);
-    let mut alpha_is_used = false;
-    match pix {
-        PixelFormat::Rgba => {
-            for y in 0..h {
-                let row = &plane.data[y * stride..];
-                for x in 0..w {
-                    let p = &row[x * 4..x * 4 + 4];
-                    let (r, g, b, a) = (p[0] as u32, p[1] as u32, p[2] as u32, p[3] as u32);
-                    if a != 0xff {
-                        alpha_is_used = true;
-                    }
-                    pixels.push((a << 24) | (r << 16) | (g << 8) | b);
-                }
-            }
-        }
-        PixelFormat::Rgb24 => {
-            for y in 0..h {
-                let row = &plane.data[y * stride..];
-                for x in 0..w {
-                    let p = &row[x * 3..x * 3 + 3];
-                    let (r, g, b) = (p[0] as u32, p[1] as u32, p[2] as u32);
-                    pixels.push((0xff << 24) | (r << 16) | (g << 8) | b);
-                }
-            }
-        }
-        other => {
-            return Err(CoreError::invalid(format!(
-                "webp_vp8l encoder: unsupported input pixel format {other:?} (want Rgba or Rgb24)"
-            )));
-        }
-    }
-    Ok((pixels, alpha_is_used))
-}
+// ───────────────────────── Encoder + factory ─────────────────────────────
 
 /// Factory for the VP8L `Encoder` trait impl — installed in the codec
-/// registry under [`CODEC_ID_VP8L`] and called by the framework when a
-/// `webp_vp8l` encode is requested.
-///
-/// Reads `width` / `height` / `pixel_format` from `params`; the encoder
-/// accepts [`PixelFormat::Rgba`] or [`PixelFormat::Rgb24`] input and always
-/// emits a §2.6 `VP8L` lossless `.webp`. ICC / Exif / XMP metadata is
-/// carried as a [`WebpMetadataOwned`] derived from `params.extradata` is
-/// **not** assumed here — the framework path embeds no metadata; the direct
-/// factory [`make_encoder_with_metadata`] takes it explicitly.
+/// registry under [`CODEC_ID_VP8L`]. Accepts `Rgba` / `Rgb24` input and
+/// always emits a lossless `.webp`; the framework path embeds no
+/// metadata (see [`make_encoder_with_metadata`]).
 pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     make_encoder_with_metadata(params, WebpMetadataOwned::default())
 }
 
-/// Direct factory: build a VP8L encoder embedding the supplied file-level
-/// metadata (ICC / Exif / XMP) into every encoded `.webp`.
-///
-/// The dual-API counterpart of [`make_encoder`] — the registry path uses the
-/// no-metadata form, while a direct caller that wants to embed an ICC
-/// profile / Exif / XMP block constructs the encoder through this factory.
-// internal — exposed for tests/fuzz; not part of the stable API
+/// Direct factory: a VP8L encoder embedding `metadata` (ICC / Exif / XMP)
+/// into every encoded `.webp`.
 #[doc(hidden)]
 pub fn make_encoder_with_metadata(
     params: &CodecParameters,
@@ -339,28 +303,23 @@ pub fn make_encoder_with_metadata(
         width,
         height,
         pix,
-        metadata,
+        metadata: metadata.into(),
         pending_out: VecDeque::new(),
         eof: false,
     }))
 }
 
-/// WebP VP8L (lossless) [`Encoder`] trait impl.
-///
-/// One frame in → one `.webp` packet out. Each `send_frame` carries an
-/// interleaved RGBA / RGB24 picture; the matching `receive_packet` (after
-/// the frame, or on flush) emits a complete §2.6 / §2.7 `.webp` file. The
-/// output auto-promotes to the extended `VP8X` layout when the frame carries
-/// alpha or the encoder was constructed with non-empty metadata.
+/// WebP VP8L (lossless) [`Encoder`] trait impl: one frame in → one
+/// `.webp` packet out, auto-promoting to the `VP8X` layout when the frame
+/// carries alpha or the encoder holds metadata.
 #[derive(Debug)]
-// internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub struct WebpVp8lEncoder {
     output_params: CodecParameters,
     width: u32,
     height: u32,
     pix: PixelFormat,
-    metadata: WebpMetadataOwned,
+    metadata: Metadata,
     pending_out: VecDeque<Packet>,
     eof: bool,
 }
@@ -378,12 +337,9 @@ impl Encoder for WebpVp8lEncoder {
         let Frame::Video(v) = frame else {
             return Err(CoreError::invalid("webp_vp8l encoder: video frames only"));
         };
-        let (argb, frame_alpha) = video_frame_to_argb(v, self.width, self.height, self.pix)?;
-        let has_alpha = frame_alpha;
-        let meta = self.metadata.as_borrowed();
-        let bytes =
-            encode_vp8l_argb_with_metadata(self.width, self.height, &argb, has_alpha, &meta)
-                .map_err(|e| CoreError::InvalidData(e.to_string()))?;
+        let img = WebpImage::from_video_frame(v, self.width, self.height, self.pix)?
+            .with_metadata(self.metadata.clone());
+        let bytes = crate::encode(&img, &EncodeOptions::default())?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 1000), bytes);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
@@ -409,44 +365,40 @@ impl Encoder for WebpVp8lEncoder {
     }
 }
 
-/// `Vec<u8>`-flavoured wrapper around [`encode_vp8l_argb_with_metadata`] —
-/// repacks a [`VideoFrame`] (Rgba / Rgb24) into ARGB and encodes a `.webp`.
-///
-/// Preserved alongside the [`Encoder`] trait impl for callers that already
-/// build [`VideoFrame`]s directly and want a one-shot `.webp` without the
-/// trait plumbing (the dual-API direct path).
-// internal — exposed for tests/fuzz; not part of the stable API
+/// One-shot lossless encode of a [`VideoFrame`] (`Rgba` / `Rgb24`) to a
+/// `.webp` with `metadata` embedded.
 #[doc(hidden)]
 pub fn encode_vp8l_frame(
     frame: &VideoFrame,
     width: u32,
     height: u32,
     pix: PixelFormat,
-    metadata: &WebpMetadata<'_>,
+    metadata: &crate::WebpMetadata<'_>,
 ) -> oxideav_core::Result<Vec<u8>> {
-    let (argb, alpha_is_used) = video_frame_to_argb(frame, width, height, pix)?;
-    encode_vp8l_argb_with_metadata(width, height, &argb, alpha_is_used, metadata)
-        .map_err(|e| CoreError::InvalidData(e.to_string()))
+    let img = WebpImage::from_video_frame(frame, width, height, pix)?.with_metadata(Metadata {
+        icc: metadata.icc.map(<[u8]>::to_vec),
+        exif: metadata.exif.map(<[u8]>::to_vec),
+        xmp: metadata.xmp.map(<[u8]>::to_vec),
+        gamma: None,
+    });
+    Ok(crate::encode(&img, &EncodeOptions::default())?)
 }
 
-// ───────────────────────── Registration ─────────────────────────
+// ───────────────────────── Registration ──────────────────────────────────
 
-/// Register the WebP decoder factory into a [`CodecRegistry`].
-///
-/// One [`CodecInfo`] is emitted under `CodecId("webp")` with the
-/// [`PixelFormat::Rgba`] output declared on its capabilities. The codec
-/// claims the `WEBP` FourCC on the off-chance a generic container
-/// wraps a WebP still-image payload under that tag; everyday WebP
-/// files live inside `RIFF/WEBP` and are routed via the file-extension
-/// hook installed by [`register_containers`].
-// internal — exposed for tests/fuzz; not part of the stable API
-#[doc(hidden)]
+/// Register the WebP codecs into a [`CodecRegistry`]: the `"webp"`
+/// decoder (claiming the `WEBP` FourCC), the `"webp_vp8l"` lossless
+/// encoder + decoder, and the `"webp_vp8"` lossy encoder + decoder.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("webp_sw")
         .with_intra_only(true)
         .with_lossless(true)
-        .with_max_size(16384, 16384)
-        .with_pixel_formats(vec![PixelFormat::Rgba]);
+        .with_max_size(crate::MAX_DIMENSION, crate::MAX_DIMENSION)
+        .with_pixel_formats(vec![
+            PixelFormat::Rgba,
+            PixelFormat::Yuv420P,
+            PixelFormat::Yuva420P,
+        ]);
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
@@ -454,13 +406,10 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .tag(CodecTag::fourcc(b"WEBP")),
     );
 
-    // VP8L lossless encoder codec. Accepts Rgba / Rgb24 input and emits a
-    // §2.6 / §2.7 VP8L `.webp`; also exposes the decoder under the same id
-    // so a `webp_vp8l` stream round-trips through one codec entry.
     let vp8l_caps = CodecCapabilities::video("webp_vp8l_sw")
         .with_intra_only(true)
         .with_lossless(true)
-        .with_max_size(16384, 16384)
+        .with_max_size(crate::MAX_DIMENSION, crate::MAX_DIMENSION)
         .with_pixel_formats(vec![PixelFormat::Rgba, PixelFormat::Rgb24]);
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_VP8L))
@@ -468,26 +417,26 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder),
     );
+
+    let vp8_caps = CodecCapabilities::video("webp_vp8_sw")
+        .with_intra_only(true)
+        .with_max_size(crate::MAX_DIMENSION - 1, crate::MAX_DIMENSION - 1)
+        .with_pixel_formats(vec![PixelFormat::Yuv420P]);
+    reg.register(
+        CodecInfo::new(CodecId::new(crate::CODEC_ID_VP8))
+            .capabilities(vp8_caps)
+            .decoder(make_decoder)
+            .encoder(crate::encoder_vp8::make_encoder),
+    );
 }
 
 /// Register the `.webp` file extension so a `RuntimeContext` can map a
 /// filename hint back to the WebP codec id.
-///
-/// WebP is its own container (`RIFF/WEBP`); this crate handles the
-/// container walking via [`crate::parse_container`] directly rather
-/// than via a separate `Demuxer` registration, so only the extension
-/// hook is installed here.
-// internal — exposed for tests/fuzz; not part of the stable API
-#[doc(hidden)]
 pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_extension("webp", CODEC_ID_STR);
 }
 
-/// Unified registration entry point: install both the WebP decoder
-/// factory and the `.webp` extension hint into the supplied
-/// [`RuntimeContext`].
-// internal — exposed for tests/fuzz; not part of the stable API
-#[doc(hidden)]
+/// Unified registration: codecs + container hooks.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
     register_containers(&mut ctx.containers);
@@ -500,28 +449,23 @@ mod tests {
 
     const LOSSLESS_1X1: &[u8] = include_bytes!("../tests/data/lossless-1x1.webp");
     const LOSSY_1X1: &[u8] = include_bytes!("../tests/data/lossy-1x1.webp");
+    const LOSSY_ALPHA: &[u8] = include_bytes!("../tests/data/lossy-with-alpha-128x128.webp");
 
     #[test]
     fn register_via_runtime_context_installs_decoder_factory() {
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         let id = CodecId::new(CODEC_ID_STR);
-        assert!(
-            ctx.codecs.has_decoder(&id),
-            "webp decoder factory not installed via RuntimeContext"
-        );
-        // Encoder side stays unwired in round 112.
+        assert!(ctx.codecs.has_decoder(&id));
         assert!(!ctx.codecs.has_encoder(&id));
-        // .webp file-extension hint is wired via the same call.
+        assert!(ctx.codecs.has_encoder(&CodecId::new(CODEC_ID_VP8L)));
+        assert!(ctx.codecs.has_encoder(&CodecId::new(crate::CODEC_ID_VP8)));
         assert_eq!(ctx.containers.container_for_extension("webp"), Some("webp"));
         assert_eq!(ctx.containers.container_for_extension("WEBP"), Some("webp"));
     }
 
     #[test]
     fn register_via_runtime_context_resolves_webp_fourcc_tag() {
-        // FourCC tag claim — confirms the codec can be looked up
-        // through `CodecRegistry::resolve_tag_ref` by an upstream
-        // demuxer that surfaces a `WEBP` tag.
         use oxideav_core::ProbeContext;
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
@@ -534,21 +478,16 @@ mod tests {
     }
 
     #[test]
-    fn first_decoder_returns_a_webp_decoder() {
+    fn fleet_signature_register_codecs_takes_a_codec_registry() {
         let mut ctx = RuntimeContext::new();
-        register(&mut ctx);
-        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let dec = ctx
-            .codecs
-            .first_decoder(&params)
-            .expect("webp decoder factory");
-        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+        crate::register_codecs(&mut ctx.codecs);
+        assert!(ctx.codecs.has_decoder(&CodecId::new(CODEC_ID_STR)));
+        crate::register_containers(&mut ctx.containers);
+        assert_eq!(ctx.containers.container_for_extension("webp"), Some("webp"));
     }
 
     #[test]
     fn end_to_end_lossless_decode_via_runtime_context() {
-        // The user-facing dispatch path: build the context, look up the
-        // factory by codec id, push one packet, read one frame.
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
@@ -560,131 +499,132 @@ mod tests {
         let pkt = Packet::new(0, TimeBase::new(1, 1000), LOSSLESS_1X1.to_vec());
         dec.send_packet(&pkt).expect("send_packet accepts file");
         let frame = dec.receive_frame().expect("receive_frame yields a frame");
-        let v = match frame {
-            Frame::Video(v) => v,
-            other => panic!("expected Frame::Video, got {other:?}"),
+        let Frame::Video(v) = frame else {
+            panic!("expected Frame::Video")
         };
-        assert_eq!(v.planes.len(), 1, "RGBA is a single interleaved plane");
-        assert_eq!(v.planes[0].stride, 4, "1px-wide × 4 bytes/pixel");
-        assert_eq!(v.planes[0].data.len(), 4, "1×1 image × 4 bytes/pixel");
-        // lossless-1x1 fixture: ARGB 0xFFB43C5A → RGBA bytes 0xB4 0x3C
-        // 0x5A 0xFF (R=180, G=60, B=90, A=255).
+        assert_eq!(
+            v.image_planes().len(),
+            1,
+            "RGBA is a single interleaved plane"
+        );
+        assert_eq!(v.planes[0].stride, 4);
         assert_eq!(v.planes[0].data, [0xB4, 0x3C, 0x5A, 0xFF]);
-
-        // After a successful decode we should be back to NeedMore.
-        let again = dec.receive_frame();
-        assert!(matches!(again, Err(CoreError::NeedMore)));
+        assert_eq!(v.color_signal(), Some(ColorSignal::srgb()));
+        assert!(matches!(dec.receive_frame(), Err(CoreError::NeedMore)));
     }
 
     #[test]
-    fn vp8_lossy_packet_decodes_via_registered_decoder() {
-        // Round 124: the §2.5 `VP8 ` lossy path is decoded through the
-        // `oxideav-vp8` sibling crate, so the registered decoder now
-        // yields a frame (previously a clean Unsupported). The 1x1
-        // reference-encoder-produced 1x1 fixture decodes to a single 1px RGBA frame.
-        let mut ctx = RuntimeContext::new();
-        register(&mut ctx);
-        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let mut dec = ctx
-            .codecs
-            .first_decoder(&params)
-            .expect("webp decoder factory");
+    fn vp8_lossy_packet_decodes_to_native_yuv420p() {
+        let mut dec = WebpDecoder::new(CodecParameters::video(CodecId::new(CODEC_ID_STR)));
         let pkt = Packet::new(0, TimeBase::new(1, 1000), LOSSY_1X1.to_vec());
-        dec.send_packet(&pkt).expect("send_packet accepts file");
-        let frame = dec
-            .receive_frame()
-            .expect("VP8 lossy now decodes via oxideav-vp8");
-        let v = match frame {
-            Frame::Video(v) => v,
-            other => panic!("expected Frame::Video, got {other:?}"),
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().expect("VP8 lossy decodes") else {
+            panic!("expected Frame::Video")
         };
-        assert_eq!(v.planes.len(), 1, "RGBA is a single interleaved plane");
-        assert_eq!(v.planes[0].data.len(), 4, "1×1 image × 4 bytes/pixel");
-        // No ALPH chunk on the simple-lossy fixture → opaque alpha.
-        assert_eq!(v.planes[0].data[3], 0xff);
-        // Back to NeedMore after the single frame.
-        let again = dec.receive_frame();
-        assert!(matches!(again, Err(CoreError::NeedMore)));
+        assert_eq!(dec.params().pixel_format, Some(PixelFormat::Yuv420P));
+        assert_eq!(v.image_planes().len(), 3);
+        assert_eq!(v.planes[0].data, [101]);
+        let sig = v.color_signal().expect("colour signal attached");
+        assert_eq!(sig.range, oxideav_core::ColorRange::Limited);
+        assert_eq!(sig.matrix.code_point(), 6);
+
+        let mut dec = WebpDecoder::new(CodecParameters::video(CodecId::new(CODEC_ID_STR)));
+        dec.send_packet(&Packet::new(
+            0,
+            TimeBase::new(1, 1000),
+            LOSSY_ALPHA.to_vec(),
+        ))
+        .unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(dec.params().pixel_format, Some(PixelFormat::Yuva420P));
+        assert_eq!(v.image_planes().len(), 4);
     }
 
     #[test]
     fn decoder_params_carry_dims_and_pixel_format_after_first_frame() {
-        // Pre-decode: pixel format is set at construction; width and
-        // height are empty (the still-image codec doesn't know them
-        // before the first packet has been parsed).
         let mut dec = WebpDecoder::new(CodecParameters::video(CodecId::new(CODEC_ID_STR)));
         assert_eq!(dec.params().pixel_format, Some(PixelFormat::Rgba));
         assert_eq!(dec.params().width, None);
-        assert_eq!(dec.params().height, None);
-
-        // Push the 1×1 fixture and pump the loop. Params should now
-        // reflect the decoded dimensions.
         let pkt = Packet::new(0, TimeBase::new(1, 1000), LOSSLESS_1X1.to_vec());
         dec.send_packet(&pkt).unwrap();
         let _ = dec.receive_frame().expect("decodes");
         assert_eq!(dec.params().width, Some(1));
         assert_eq!(dec.params().height, Some(1));
         assert_eq!(dec.params().pixel_format, Some(PixelFormat::Rgba));
-        // Codec id is forced to "webp" by the constructor regardless of
-        // what the factory params said.
         assert_eq!(dec.params().codec_id.as_str(), CODEC_ID_STR);
         assert_eq!(dec.params().media_type, MediaType::Video);
     }
 
     #[test]
     fn double_send_packet_without_receive_is_rejected() {
-        // Image-codec contract: one packet → one frame. Two consecutive
-        // send_packet calls without a receive_frame between them is a
-        // caller bug and surfaces as Error::Other.
         let mut dec = WebpDecoder::new(CodecParameters::video(CodecId::new(CODEC_ID_STR)));
         let pkt = Packet::new(0, TimeBase::new(1, 1000), LOSSLESS_1X1.to_vec());
         dec.send_packet(&pkt).unwrap();
-        let err = dec
-            .send_packet(&pkt)
-            .expect_err("second send_packet without receive_frame must fail");
-        // The framework's `Error::other(...)` constructor lands in the
-        // catch-all `Other` variant — we don't assert the variant
-        // directly because it isn't part of the public ABI.
-        let s = err.to_string();
-        assert!(
-            s.contains("receive_frame"),
-            "error message should mention receive_frame: {s}"
-        );
+        let err = dec.send_packet(&pkt).expect_err("second send must fail");
+        assert!(err.to_string().contains("receive_frame"));
     }
 
     #[test]
     fn flush_then_receive_with_no_pending_returns_eof() {
         let mut dec = WebpDecoder::new(CodecParameters::video(CodecId::new(CODEC_ID_STR)));
         dec.flush().unwrap();
-        let err = dec
-            .receive_frame()
-            .expect_err("post-flush, no pending packet → Eof");
-        assert!(matches!(err, CoreError::Eof));
+        assert!(matches!(dec.receive_frame(), Err(CoreError::Eof)));
     }
 
     #[test]
-    fn decode_webp_to_frame_returns_rgba_video_frame() {
-        // The framework-free helper, exercised directly (without the
-        // Decoder/CodecRegistry plumbing).
-        let frame = decode_webp_to_frame(LOSSLESS_1X1, Some(123)).expect("decodes");
+    fn decode_limits_surface_as_invalid_data() {
+        let opts = DecodeOptions::default().with_max_width(16);
+        let mut dec =
+            WebpDecoder::with_options(CodecParameters::video(CodecId::new(CODEC_ID_STR)), opts);
+        dec.send_packet(&Packet::new(
+            0,
+            TimeBase::new(1, 1000),
+            LOSSY_ALPHA.to_vec(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            dec.receive_frame(),
+            Err(CoreError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn decode_webp_to_frame_returns_native_video_frame() {
+        let (frame, params) = decode_webp_to_frame(LOSSLESS_1X1, Some(123)).expect("decodes");
         assert_eq!(frame.pts, Some(123));
-        assert_eq!(frame.planes.len(), 1);
-        assert_eq!(frame.planes[0].stride, 4);
         assert_eq!(frame.planes[0].data, [0xB4, 0x3C, 0x5A, 0xFF]);
+        assert_eq!(params.pixel_format, Some(PixelFormat::Rgba));
+        assert_eq!((params.width, params.height), (Some(1), Some(1)));
     }
 
     #[test]
-    fn unsupported_error_conversion_maps_to_core_unsupported() {
-        // Lossy and NoImageData both flow through Error::Unsupported.
-        let lossy: CoreError = Error::Unsupported(UnsupportedKind::LossyVp8).into();
-        assert!(matches!(lossy, CoreError::Unsupported(_)));
-        let none: CoreError = Error::Unsupported(UnsupportedKind::NoImageData).into();
-        assert!(matches!(none, CoreError::Unsupported(_)));
+    fn error_conversion_maps_variants() {
+        let u: CoreError = WebpError::unsupported("x").into();
+        assert!(matches!(u, CoreError::Unsupported(_)));
+        let i: CoreError = WebpError::invalid("x").into();
+        assert!(matches!(i, CoreError::InvalidData(_)));
+        let l: CoreError = WebpError::limit("x").into();
+        assert!(matches!(l, CoreError::InvalidData(_)));
+        assert!(matches!(CoreError::from(WebpError::Eof), CoreError::Eof));
+    }
+
+    #[test]
+    fn image_video_frame_round_trip_keeps_planes_and_colour() {
+        let img = crate::decode(LOSSY_ALPHA).unwrap();
+        let fmt: PixelFormat = img.format.into();
+        assert_eq!(fmt, PixelFormat::Yuva420P);
+        let vf: VideoFrame = img.clone().into();
+        assert_eq!(vf.image_planes().len(), 4);
+        let back = WebpImage::from_video_frame(&vf, img.width, img.height, fmt).unwrap();
+        assert_eq!(back.planes, img.planes);
+        assert_eq!(back.color, img.color);
+        assert!(WebpImage::from_video_frame(&vf, 1, 1, PixelFormat::Gray8).is_err());
     }
 
     // ───────────────────── VP8L encoder ─────────────────────
 
-    /// Build a small Rgba [`Frame`] (no stride padding).
     fn rgba_frame(width: u32, height: u32, fill: impl Fn(u32, u32) -> [u8; 4]) -> Frame {
         let mut data = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
@@ -710,29 +650,11 @@ mod tests {
     }
 
     #[test]
-    fn register_installs_vp8l_encoder_factory() {
-        let mut ctx = RuntimeContext::new();
-        register(&mut ctx);
-        let id = CodecId::new(CODEC_ID_VP8L);
-        assert!(
-            ctx.codecs.has_encoder(&id),
-            "webp_vp8l encoder factory not installed"
-        );
-        assert!(
-            ctx.codecs.has_decoder(&id),
-            "webp_vp8l decoder factory not installed"
-        );
-    }
-
-    #[test]
     fn vp8l_encoder_round_trips_rgba_through_registry() {
-        // Encode an RGBA frame through the registered encoder, decode the
-        // resulting `.webp`, and assert the pixels survive exactly.
         let (w, h) = (4u32, 3u32);
         let frame = rgba_frame(w, h, |x, y| {
             [(x * 40) as u8, (y * 60) as u8, ((x + y) * 25) as u8, 0xff]
         });
-
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         let mut enc = ctx
@@ -742,21 +664,16 @@ mod tests {
         enc.send_frame(&frame).expect("send_frame");
         let pkt = enc.receive_packet().expect("one packet out");
 
-        let img = crate::decode_webp(&pkt.data).expect("decode our own webp");
-        assert_eq!(img.frames.len(), 1);
-        assert_eq!(img.frames[0].width, w);
-        assert_eq!(img.frames[0].height, h);
-        // Re-derive expected RGBA.
+        let img = crate::decode_rgba8(&pkt.data).expect("decode our own webp");
+        assert_eq!((img.width, img.height), (w, h));
         let Frame::Video(v) = &frame else {
             unreachable!()
         };
-        assert_eq!(img.frames[0].rgba, v.planes[0].data);
+        assert_eq!(img.data, v.planes[0].data);
     }
 
     #[test]
     fn vp8l_encoder_streams_rgb24_as_opaque() {
-        // An Rgb24 frame is treated as fully opaque (alpha 0xff) and emits
-        // the simple (non-VP8X) layout.
         let (w, h) = (3u32, 2u32);
         let mut data = Vec::new();
         for y in 0..h {
@@ -768,32 +685,24 @@ mod tests {
             pts: Some(0),
             planes: vec![VideoPlane {
                 stride: (w * 3) as usize,
-                data,
+                data: data.clone(),
             }],
         });
-
         let mut enc =
             make_encoder(&vp8l_params(w, h, PixelFormat::Rgb24)).expect("make_encoder rgb24");
         enc.send_frame(&frame).unwrap();
         let pkt = enc.receive_packet().unwrap();
-
-        // Simple lossless layout: no VP8X chunk.
         let c = crate::parse_container(&pkt.data).unwrap();
         assert!(c
             .first_chunk_with_fourcc(crate::container::fourcc::VP8X)
             .is_none());
-        let img = crate::decode_webp(&pkt.data).unwrap();
-        // Every pixel opaque, RGB preserved.
-        for px in img.frames[0].rgba.chunks_exact(4) {
-            assert_eq!(px[3], 0xff);
-        }
+        assert_eq!(crate::decode_rgb8(&pkt.data).unwrap().data, data);
     }
 
     #[test]
     fn vp8l_encoder_with_metadata_promotes_to_vp8x() {
         let (w, h) = (2u32, 2u32);
         let frame = rgba_frame(w, h, |x, _| [(x * 100) as u8, 0x10, 0x20, 0x80]);
-
         let meta = WebpMetadataOwned {
             icc: Some(b"icc-profile".to_vec()),
             exif: Some(b"Exif\x00\x00II".to_vec()),
@@ -804,22 +713,14 @@ mod tests {
         enc.send_frame(&frame).unwrap();
         let pkt = enc.receive_packet().unwrap();
 
-        // Extended layout: VP8X present, metadata round-trips.
-        let c = crate::parse_container(&pkt.data).unwrap();
-        assert!(c
-            .first_chunk_with_fourcc(crate::container::fourcc::VP8X)
-            .is_some());
-        let read = crate::extract_metadata(&pkt.data).unwrap();
-        assert_eq!(read.icc.as_deref(), Some(&b"icc-profile"[..]));
-        assert_eq!(read.exif.as_deref(), Some(&b"Exif\x00\x00II"[..]));
-        assert_eq!(read.xmp, None);
-
-        // Pixels still round-trip through the alpha-bearing image.
-        let img = crate::decode_webp(&pkt.data).unwrap();
+        let img = crate::decode(&pkt.data).unwrap();
+        assert_eq!(img.metadata.icc.as_deref(), Some(&b"icc-profile"[..]));
+        assert_eq!(img.metadata.exif.as_deref(), Some(&b"Exif\x00\x00II"[..]));
+        assert_eq!(img.metadata.xmp, None);
         let Frame::Video(v) = &frame else {
             unreachable!()
         };
-        assert_eq!(img.frames[0].rgba, v.planes[0].data);
+        assert_eq!(img.as_bytes().unwrap(), &v.planes[0].data[..]);
     }
 
     #[test]

@@ -1,15 +1,16 @@
-//! Published-API `oxideav_webp::encoder_anim` module — animation
-//! encoder surface grouped under its qualified path.
+//! Pre-contract `oxideav_webp::encoder_anim` module path — the animation
+//! encoder surface under its historical qualified name.
 //!
-//! Per the published 0.1.2 surface, consumers may reach
-//! [`build_animated_webp`] / [`build_animated_webp_with_options`] /
-//! [`AnimFrame`] / [`AnimFrameMode`] / [`AnimEncoderOptions`] either at
-//! the crate root or via this module. Both paths share the same
-//! implementation in [`crate::anim_encode`].
+//! New code uses [`crate::encode_animation`] with [`crate::EncodeOptions`].
 
+pub use crate::{
+    encode_animation, encode_animation_frames, AnimFrame, AnimFrameMode, DeltaConfig,
+    DownsampleKernel, EncodeOptions, Frame,
+};
+
+#[allow(deprecated)]
 pub use crate::anim_encode::{
-    build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions, AnimFrame,
-    AnimFrameMode, DeltaConfig, DownsampleKernel,
+    build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions,
 };
 
 /// Result alias for this module's entry points — `Result<T, WebpError>`.

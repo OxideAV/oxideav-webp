@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Walk arbitrary fuzz-supplied bytes through the §2.3 / §2.4 RIFF/WEBP
 //! chunk-walker standalone entry point `oxideav_webp::container::parse`.

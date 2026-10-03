@@ -13,6 +13,10 @@
 //! * `DeltaConfig` / `DownsampleKernel` — the (blocked) delta-path knobs'
 //!   builder shape.
 
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
+
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::{
     build_animated_webp, build_animated_webp_with_options, decode_webp, AnimEncoderOptions,
@@ -297,12 +301,12 @@ fn auto_mode_picks_dirty_rect_on_small_localised_change() {
         file_lossless.len(),
     );
     // Avoid an unused import warning if WebpError stops being referenced.
-    let _ = WebpError::InvalidData;
+    let _ = WebpError::Eof;
 }
 
 #[test]
 fn empty_frame_list_is_invalid_data() {
-    assert_eq!(build_animated_webp(&[]), Err(WebpError::InvalidData));
+    assert!(build_animated_webp(&[]).unwrap_err().is_invalid_data());
 }
 
 #[test]
@@ -477,9 +481,8 @@ fn oversized_anim_canvas_is_rejected_without_eager_allocation() {
 
     // The decode must refuse the over-ceiling canvas with InvalidData and
     // return promptly (no multi-gigabyte allocation).
-    assert_eq!(
-        decode_webp(&file),
-        Err(WebpError::InvalidData),
+    assert!(
+        decode_webp(&file).unwrap_err().is_invalid_data(),
         "an over-ceiling §2.7.1 animation canvas must be rejected, not eagerly allocated",
     );
 
@@ -498,9 +501,8 @@ fn oversized_anim_canvas_is_rejected_without_eager_allocation() {
     file_ok.extend_from_slice(&body_ok);
     // No ANMF → the frame loop produces zero frames → InvalidData (but the
     // canvas guard did NOT trip; the allocation of 16384 * 4 = 64 KiB is fine).
-    assert_eq!(
-        decode_webp(&file_ok),
-        Err(WebpError::InvalidData),
+    assert!(
+        decode_webp(&file_ok).unwrap_err().is_invalid_data(),
         "a canvas at the §3.4 ceiling passes the alloc guard (then errors on the empty frame list)",
     );
 }

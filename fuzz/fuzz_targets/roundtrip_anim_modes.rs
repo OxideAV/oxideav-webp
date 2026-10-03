@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Differential oracle on the §2.7.1.1 animation **assembly** path —
 //! `build_animated_webp_with_options` → `decode_webp` — with every

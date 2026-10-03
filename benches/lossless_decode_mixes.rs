@@ -32,7 +32,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use oxideav_webp::vp8l_stream::TransformType;
-use oxideav_webp::{decode_webp, encode_webp_lossless, read_vp8l_transform_list};
+use oxideav_webp::{decode_rgba8, encode_rgba8, read_vp8l_transform_list, EncodeOptions};
 
 const W: u32 = 256;
 const H: u32 = 256;
@@ -131,7 +131,7 @@ fn fixture_none() -> Vec<u8> {
 /// is exactly what it reports for every body-bearing mix; the
 /// subtract-green and empty lists are read to the terminating bit.
 fn encode_expecting(rgba: &[u8], expect: Option<TransformType>) -> Vec<u8> {
-    let webp = encode_webp_lossless(rgba, W, H).expect("encode");
+    let webp = encode_rgba8(W, H, rgba, &EncodeOptions::default()).expect("encode");
     let list = read_vp8l_transform_list(&webp)
         .expect("transform list")
         .expect("VP8L chunk");
@@ -174,7 +174,7 @@ fn bench_lossless_decode_mixes(c: &mut Criterion) {
             format!("lossless_decode_mix_{name}_256x256").as_str(),
             |b| {
                 b.iter(|| {
-                    let img = decode_webp(black_box(&webp)).expect("decode");
+                    let img = decode_rgba8(black_box(&webp)).expect("decode");
                     black_box(img)
                 })
             },

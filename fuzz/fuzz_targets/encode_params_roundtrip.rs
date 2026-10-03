@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Lossless round-trip oracle over the encoder's **parameterised**
 //! entry points — the path combinations the public one-shot façades

@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Decode adversarial VP8L bitstreams through the §4 + §5 + §6 full
 //! lossless decode path `oxideav_webp::vp8l_transform::{decode_lossless,

@@ -13,7 +13,7 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::{decode_webp, encode_webp_lossless};
+use oxideav_webp::{decode_rgba8, encode_rgba8, EncodeOptions};
 
 fn gradient_rgba_256() -> Vec<u8> {
     let (w, h) = (256u32, 256u32);
@@ -31,10 +31,10 @@ fn gradient_rgba_256() -> Vec<u8> {
 
 fn bench_lossless_decode(c: &mut Criterion) {
     let rgba = gradient_rgba_256();
-    let webp = encode_webp_lossless(&rgba, 256, 256).expect("encode");
+    let webp = encode_rgba8(256, 256, &rgba, &EncodeOptions::default()).expect("encode");
     c.bench_function("lossless_decode_argb_256", |b| {
         b.iter(|| {
-            let img = decode_webp(black_box(&webp)).expect("decode");
+            let img = decode_rgba8(black_box(&webp)).expect("decode");
             black_box(img)
         })
     });

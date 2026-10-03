@@ -16,7 +16,7 @@
 //! its "Frame Data" — a padded §2.3 sub-RIFF holding a single §2.6 `VP8L`
 //! chunk for the [`AnimFrameMode::Lossless`] path. The bitstream itself is
 //! produced by [`crate::vp8l_encode::encode_vp8l_argb_with`], so the encoded
-//! file decodes back through [`crate::decode_webp`] (animation path) to the
+//! file decodes back through [`crate::decode_all`] (animation path) to the
 //! exact input pixels.
 //!
 //! ## Auto / Delta encoding (round 127)
@@ -42,7 +42,7 @@
 //!   (subject to the same two full-keyframe fallbacks).
 //!
 //! Both modes are **lossless** — every encoded byte round-trips through
-//! [`crate::decode_webp`] to the exact caller-provided pixels, the same as
+//! [`crate::decode_all`] to the exact caller-provided pixels, the same as
 //! `Lossless`. The [`DeltaConfig`] / [`DownsampleKernel`] knobs are
 //! preserved for API-shape compatibility but the dirty-rect algorithm
 //! does not consult them yet (they were originally intended for a
@@ -52,7 +52,7 @@ use crate::anmf::{BlendingMethod, DisposalMethod};
 use crate::build::{self, Vp8xFlags};
 use crate::container::fourcc;
 use crate::vp8l_encode;
-use crate::{Error, WebpError, WebpMetadata};
+use crate::{WebpError, WebpMetadata};
 
 /// §2.7.1.1 Figure 9 fixed `ANMF` header length (5 × uint24 + 1 info byte).
 const ANMF_HEADER_LEN: usize = 16;
@@ -87,7 +87,7 @@ pub enum AnimFrameMode {
 /// A single animation frame to encode.
 ///
 /// `pixels` is `width * height * 4` interleaved 8-bit `[R, G, B, A]` bytes in
-/// scan-line order — the same flat layout [`crate::WebpFrame::rgba`] decodes
+/// scan-line order — the same flat layout [`crate::WebpImage::to_rgba8`] decodes
 /// to. `x` / `y` place the frame's upper-left corner on the canvas (must be
 /// even per §2.7.1.1, since the on-disk field is the coordinate / 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +121,7 @@ impl AnimFrame {
     ///
     /// `BlendingMethod::Overwrite` (§2.7.1.1 `B = 1`) is the default so a
     /// full-canvas frame round-trips byte-for-byte through
-    /// [`crate::decode_webp`]'s canvas-compositing path. Callers that want
+    /// [`crate::decode_all`]'s canvas-compositing path. Callers that want
     /// §2.7.1.1 alpha-blending of a translucent sub-frame onto the existing
     /// canvas must build the struct literally and set `blend:
     /// BlendingMethod::AlphaBlend`.
@@ -205,8 +205,16 @@ impl DeltaConfig {
 /// `loop_count` is the §2.7.1.1 `ANIM` loop count (`0` = loop forever).
 /// `background_rgba` is the `ANIM` background colour as `[R, G, B, A]`. The
 /// borrowed [`WebpMetadata`] carries optional ICC / Exif / XMP payloads to
-/// embed in the §2.7 chunk order. `delta` tunes the (blocked) delta path.
+/// embed in the §2.7 chunk order. `delta` tunes the delta path.
+///
+/// Superseded by the unified [`crate::EncodeOptions`] (`loop_count`,
+/// `background_rgba`, `frame_mode`, `delta`) driving
+/// [`crate::encode_animation`].
 #[derive(Debug, Clone, Copy, Default)]
+#[deprecated(
+    since = "0.3.0",
+    note = "use `oxideav_webp::EncodeOptions` with `encode_animation`"
+)]
 pub struct AnimEncoderOptions<'a> {
     /// §2.7.1.1 `ANIM` loop count. `0` means "loop infinitely".
     pub loop_count: u16,
@@ -223,8 +231,15 @@ pub struct AnimEncoderOptions<'a> {
 ///
 /// Convenience wrapper over [`build_animated_webp_with_options`]; see that
 /// function for the full semantics.
+#[deprecated(since = "0.3.0", note = "use `oxideav_webp::encode_animation`")]
 pub fn build_animated_webp(frames: &[AnimFrame]) -> Result<Vec<u8>, WebpError> {
-    build_animated_webp_with_options(frames, &AnimEncoderOptions::default())
+    build_animation(
+        frames,
+        0,
+        [0, 0, 0, 0],
+        &WebpMetadata::default(),
+        &DeltaConfig::default(),
+    )
 }
 
 /// Assemble a complete animated `RIFF/WEBP` file from `frames` per
@@ -254,18 +269,39 @@ pub fn build_animated_webp(frames: &[AnimFrame]) -> Result<Vec<u8>, WebpError> {
 /// its whole declared rect, fall back to a full keyframe with the caller's
 /// flags honoured verbatim. [`AnimFrameMode::Auto`] evaluates both
 /// candidates and picks the smaller bitstream. Both modes round-trip
-/// byte-for-byte through [`crate::decode_webp`]'s canvas compositor for
+/// byte-for-byte through [`crate::decode_all`]'s canvas compositor for
 /// every blend/dispose combination.
 ///
 /// An empty `frames` slice, a frame whose `pixels` length disagrees with
 /// `width * height * 4`, or an odd `x` / `y` offset is
 /// [`WebpError::InvalidData`].
+#[deprecated(since = "0.3.0", note = "use `oxideav_webp::encode_animation`")]
+#[allow(deprecated)]
 pub fn build_animated_webp_with_options(
     frames: &[AnimFrame],
     opts: &AnimEncoderOptions<'_>,
 ) -> Result<Vec<u8>, WebpError> {
+    build_animation(
+        frames,
+        opts.loop_count,
+        opts.background_rgba,
+        &opts.metadata,
+        &opts.delta,
+    )
+}
+
+/// Assemble a complete animated `RIFF/WEBP` file from positioned
+/// [`AnimFrame`]s — the implementation behind [`crate::encode_animation`]
+/// and the deprecated `build_animated_webp*` wrappers.
+pub(crate) fn build_animation(
+    frames: &[AnimFrame],
+    loop_count: u16,
+    background_rgba: [u8; 4],
+    meta: &WebpMetadata<'_>,
+    _delta: &DeltaConfig,
+) -> Result<Vec<u8>, WebpError> {
     if frames.is_empty() {
-        return Err(WebpError::InvalidData);
+        return Err(WebpError::invalid("animation needs at least one frame"));
     }
 
     // §2.7.1.1: canvas must cover every frame rectangle.
@@ -275,29 +311,40 @@ pub fn build_animated_webp_with_options(
 
     for f in frames {
         if f.width == 0 || f.height == 0 {
-            return Err(WebpError::InvalidData);
+            return Err(WebpError::invalid("animation frame with a zero dimension"));
         }
         // §2.7.1.1 stores Frame X / Frame Y as coord/2, so only even
         // offsets are representable.
         if f.x & 1 != 0 || f.y & 1 != 0 {
-            return Err(WebpError::InvalidData);
+            return Err(WebpError::invalid(format!(
+                "animation frame offset ({}, {}) must be even",
+                f.x, f.y
+            )));
         }
         let expected = (f.width as usize)
             .checked_mul(f.height as usize)
             .and_then(|n| n.checked_mul(4));
         if expected != Some(f.pixels.len()) {
-            return Err(WebpError::InvalidData);
+            return Err(WebpError::invalid(format!(
+                "animation frame has {} pixel bytes, {}x{} RGBA needs {}",
+                f.pixels.len(),
+                f.width,
+                f.height,
+                expected.unwrap_or(0)
+            )));
         }
-        let right = f.x.checked_add(f.width).ok_or(WebpError::InvalidData)?;
-        let bottom = f.y.checked_add(f.height).ok_or(WebpError::InvalidData)?;
+        let right =
+            f.x.checked_add(f.width)
+                .ok_or_else(|| WebpError::invalid("animation frame x + width overflows"))?;
+        let bottom =
+            f.y.checked_add(f.height)
+                .ok_or_else(|| WebpError::invalid("animation frame y + height overflows"))?;
         canvas_width = canvas_width.max(right);
         canvas_height = canvas_height.max(bottom);
         if f.pixels.chunks_exact(4).any(|px| px[3] != 0xff) {
             any_alpha = true;
         }
     }
-
-    let meta = &opts.metadata;
 
     // §2.7.1 VP8X flag octet — animation always; alpha/metadata as present.
     let flags = Vp8xFlags {
@@ -321,13 +368,16 @@ pub fn build_animated_webp_with_options(
     if let Some(icc) = meta.icc {
         push(fourcc::ICCP, icc)?;
     }
-    push(fourcc::ANIM, &build_anim_payload(opts))?;
+    push(
+        fourcc::ANIM,
+        &build_anim_payload(loop_count, background_rgba),
+    )?;
 
     // Track the canvas state the decoder will see right *before* this
     // iteration's frame is drawn. Initialised to the ANIM bg colour to
     // mirror the decoder's §2.7.1.1 "canvas is cleared at the start" rule.
-    let mut prev_canvas = build_initial_canvas(canvas_width, canvas_height, opts.background_rgba);
-    let bg_rgba = opts.background_rgba;
+    let mut prev_canvas = build_initial_canvas(canvas_width, canvas_height, background_rgba);
+    let bg_rgba = background_rgba;
     // Per the decoder: before drawing each frame after the first, the
     // *previous* frame's dispose method is applied to *its* rect.
     let mut prev_disposal: Option<(u32, u32, u32, u32, DisposalMethod)> = None;
@@ -354,16 +404,7 @@ pub fn build_animated_webp_with_options(
     }
 
     // §2.4 file framing: "RIFF" | File Size (= body + 4 for "WEBP") | "WEBP".
-    let file_size = (body.len() as u64) + 4;
-    if file_size > u64::from(u32::MAX) {
-        return Err(WebpError::InvalidData);
-    }
-    let mut out = Vec::with_capacity(12 + body.len());
-    out.extend_from_slice(&fourcc::RIFF);
-    out.extend_from_slice(&(file_size as u32).to_le_bytes());
-    out.extend_from_slice(&fourcc::WEBP);
-    out.extend_from_slice(&body);
-    Ok(out)
+    crate::api::frame_riff(body)
 }
 
 /// Build a fresh canvas filled with `bg` per §2.7.1.1 — what the decoder
@@ -562,15 +603,15 @@ struct DirtyRect {
 /// Build the 6-byte §2.7.1.1 Figure 8 `ANIM` payload: BGRA background colour
 /// (the `[R,G,B,A]` option re-ordered to on-disk `[B,G,R,A]`) + LE u16 loop
 /// count.
-fn build_anim_payload(opts: &AnimEncoderOptions<'_>) -> Vec<u8> {
-    let [r, g, b, a] = opts.background_rgba;
+fn build_anim_payload(loop_count: u16, background_rgba: [u8; 4]) -> Vec<u8> {
+    let [r, g, b, a] = background_rgba;
     let mut p = Vec::with_capacity(ANIM_PAYLOAD_LEN);
     // §2.7.1.1: on-disk byte order is [Blue, Green, Red, Alpha].
     p.push(b);
     p.push(g);
     p.push(r);
     p.push(a);
-    p.extend_from_slice(&opts.loop_count.to_le_bytes());
+    p.extend_from_slice(&loop_count.to_le_bytes());
     p
 }
 
@@ -702,9 +743,8 @@ fn emit_full_anmf(
 ) -> Result<Vec<u8>, WebpError> {
     let argb = rgba_to_argb(pixels);
     let has_alpha = pixels.chunks_exact(4).any(|px| px[3] != 0xff);
-    let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, w, h, has_alpha)
-        .map_err(Error::from)
-        .map_err(WebpError::from)?;
+    let bitstream =
+        vp8l_encode::encode_vp8l_argb_with(&argb, w, h, has_alpha).map_err(WebpError::from)?;
     let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
     Ok(build_anmf_header_then_data(
         x,
@@ -730,7 +770,6 @@ fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Ve
     let argb = rgba_to_argb(sub_rgba);
     let has_alpha = sub_rgba.chunks_exact(4).any(|px| px[3] != 0xff);
     let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, rect.w, rect.h, has_alpha)
-        .map_err(Error::from)
         .map_err(WebpError::from)?;
     let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
     Ok(build_anmf_header_then_data(
@@ -795,13 +834,13 @@ fn rgba_to_argb(rgba: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// Collapse a [`crate::build::BuildError`] into the published coarse
-/// [`WebpError::InvalidData`].
-fn to_w(_e: build::BuildError) -> WebpError {
-    WebpError::InvalidData
+/// Lift a [`crate::build::BuildError`] into the crate error.
+fn to_w(e: build::BuildError) -> WebpError {
+    WebpError::from(e)
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -815,7 +854,7 @@ mod tests {
 
     #[test]
     fn empty_frames_is_invalid_data() {
-        assert_eq!(build_animated_webp(&[]), Err(WebpError::InvalidData));
+        assert!(build_animated_webp(&[]).unwrap_err().is_invalid_data());
     }
 
     #[test]
@@ -937,14 +976,14 @@ mod tests {
     fn pixel_length_mismatch_is_invalid_data() {
         let mut f = AnimFrame::new(2, 2, solid_rgba(2, 2, [0, 0, 0, 255]), 0);
         f.pixels.truncate(4);
-        assert_eq!(build_animated_webp(&[f]), Err(WebpError::InvalidData));
+        assert!(build_animated_webp(&[f]).unwrap_err().is_invalid_data());
     }
 
     #[test]
     fn odd_offset_is_invalid_data() {
         let mut f = AnimFrame::new(2, 2, solid_rgba(2, 2, [0, 0, 0, 255]), 0);
         f.x = 1;
-        assert_eq!(build_animated_webp(&[f]), Err(WebpError::InvalidData));
+        assert!(build_animated_webp(&[f]).unwrap_err().is_invalid_data());
     }
 
     #[test]

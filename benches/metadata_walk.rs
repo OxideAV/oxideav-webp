@@ -30,9 +30,9 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::anim_encode::{build_animated_webp_with_options, AnimEncoderOptions, AnimFrame};
 use oxideav_webp::{
-    encode_vp8l_argb_with_metadata, encode_webp_lossless, extract_metadata, WebpMetadata,
+    encode_animation_frames, encode_rgba8, encode_vp8l_argb_with_metadata, read_metadata,
+    AnimFrame, EncodeOptions, Metadata, WebpMetadata,
 };
 
 /// Deterministic LCG payload bytes (same constants as the other
@@ -85,7 +85,8 @@ fn bench_metadata_walk(c: &mut Criterion) {
     };
 
     // Cell 1: simple layout, no metadata.
-    let simple = encode_webp_lossless(&gradient_rgba_64(), 64, 64).expect("encode simple");
+    let simple = encode_rgba8(64, 64, &gradient_rgba_64(), &EncodeOptions::default())
+        .expect("encode simple");
 
     // Cell 2: VP8X still image with all three metadata chunks.
     let vp8x_full = encode_vp8l_argb_with_metadata(64, 64, &gradient_argb_64(), false, &meta)
@@ -101,17 +102,18 @@ fn bench_metadata_walk(c: &mut Criterion) {
             AnimFrame::new(16, 16, px, 30)
         })
         .collect();
-    let opts = AnimEncoderOptions {
-        metadata: meta,
-        ..AnimEncoderOptions::default()
-    };
-    let anim64_full = build_animated_webp_with_options(&frames, &opts).expect("encode anim");
+    let anim_meta = Metadata::new()
+        .with_icc(Some(icc.clone()))
+        .with_exif(Some(exif.clone()))
+        .with_xmp(Some(xmp.clone()));
+    let anim64_full = encode_animation_frames(&frames, &anim_meta, &EncodeOptions::default())
+        .expect("encode anim");
 
     // Setup sanity: each cell yields exactly the payloads it embeds.
-    let got = extract_metadata(&simple).expect("simple meta");
+    let got = read_metadata(&simple).expect("simple meta");
     assert!(got.icc.is_none() && got.exif.is_none() && got.xmp.is_none());
     for bytes in [&vp8x_full, &anim64_full] {
-        let got = extract_metadata(bytes).expect("meta");
+        let got = read_metadata(bytes).expect("meta");
         assert_eq!(got.icc.as_deref(), Some(icc.as_slice()));
         assert_eq!(got.exif.as_deref(), Some(exif.as_slice()));
         assert_eq!(got.xmp.as_deref(), Some(xmp.as_slice()));
@@ -124,7 +126,7 @@ fn bench_metadata_walk(c: &mut Criterion) {
     ] {
         c.bench_function(name, |b| {
             b.iter(|| {
-                let meta = extract_metadata(black_box(bytes)).expect("extract");
+                let meta = read_metadata(black_box(bytes)).expect("extract");
                 black_box(meta)
             })
         });

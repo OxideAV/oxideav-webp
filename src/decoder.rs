@@ -1,18 +1,13 @@
-//! Published-API `oxideav_webp::decoder` module — the published decode
-//! surface grouped under its qualified path.
+//! Pre-contract `oxideav_webp::decoder` module path — re-exports of the
+//! decode surface under its historical qualified name.
 //!
-//! Per the published 0.1.2 surface, consumers may reach the decode entry
-//! points either at the crate root (`oxideav_webp::decode_webp`) or via
-//! this module (`oxideav_webp::decoder::decode_webp`). Both paths return
-//! the same [`WebpImage`] / [`WebpFrame`] values via the same
-//! [`WebpError`].
-//!
-//! The streaming framework-side [`WebpDecoder`] handle lives in
-//! [`crate::registry`] and is only available with the default
-//! `registry` Cargo feature on; it is re-exported here under the same
-//! cfg gate.
+//! New code uses the crate root ([`crate::decode`], [`crate::decode_all`],
+//! [`crate::WebpImage`]); this module only keeps the old paths resolving.
 
-pub use crate::{decode_webp, WebpFrame, WebpImage};
+pub use crate::{decode, decode_all, decode_rgb8, decode_rgba8, decode_with, Frame, WebpImage};
+
+#[allow(deprecated)]
+pub use crate::{decode_webp, DecodedWebpFile, WebpFrame};
 
 /// Result alias for this module's entry points — `Result<T, WebpError>`.
 pub use crate::error::Result;
@@ -20,14 +15,9 @@ pub use crate::error::Result;
 #[cfg(feature = "registry")]
 pub use crate::registry::{make_decoder, WebpDecoder};
 
-/// Direct factory for a streaming VP8L lossless [`WebpDecoder`] —
-/// mirrors the dual-API convention `<crate>::decoder::make_*_decoder`.
-///
-/// The framework-side [`crate::registry::make_decoder`] is the
-/// `CodecParameters`-typed factory installed in the codec registry; this
-/// is the bare-parameters convenience form that constructs the decoder
-/// straight from canvas dimensions, for callers that already know the
-/// WebP `.webp` is a single-frame VP8L image.
+/// Direct factory for a framework [`WebpDecoder`] whose output parameters
+/// start from the given canvas dimensions — the dual-API convenience
+/// counterpart of the `CodecParameters`-typed [`make_decoder`].
 #[cfg(feature = "registry")]
 pub fn make_vp8l_decoder(width: u32, height: u32) -> WebpDecoder {
     use oxideav_core::{CodecId, CodecParameters, MediaType, PixelFormat};

@@ -40,7 +40,7 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::encode_webp_lossless;
+use oxideav_webp::{encode_rgba8, EncodeOptions};
 
 /// 128×128 RGBA tile drawn from a fixed 8-colour palette in
 /// spatially-coherent horizontal bands. The small distinct-colour count makes
@@ -121,7 +121,8 @@ fn bench_stacked_transform_encode(c: &mut Criterion) {
     let (palette, pw, ph) = palette_indexed_rgba();
     c.bench_function("stacked_encode_palette_indexed", |b| {
         b.iter(|| {
-            let out = encode_webp_lossless(black_box(&palette), pw, ph).expect("encode");
+            let out = encode_rgba8(pw, ph, black_box(&palette), &EncodeOptions::default())
+                .expect("encode");
             black_box(out)
         })
     });
@@ -129,7 +130,8 @@ fn bench_stacked_transform_encode(c: &mut Criterion) {
     let (photo, fw, fh) = photo_decorrelated_rgba();
     c.bench_function("stacked_encode_photo_decorrelated", |b| {
         b.iter(|| {
-            let out = encode_webp_lossless(black_box(&photo), fw, fh).expect("encode");
+            let out =
+                encode_rgba8(fw, fh, black_box(&photo), &EncodeOptions::default()).expect("encode");
             black_box(out)
         })
     });
@@ -137,7 +139,8 @@ fn bench_stacked_transform_encode(c: &mut Criterion) {
     let (gradient, gw, gh) = smooth_gradient_rgba();
     c.bench_function("stacked_encode_smooth_gradient", |b| {
         b.iter(|| {
-            let out = encode_webp_lossless(black_box(&gradient), gw, gh).expect("encode");
+            let out = encode_rgba8(gw, gh, black_box(&gradient), &EncodeOptions::default())
+                .expect("encode");
             black_box(out)
         })
     });

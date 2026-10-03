@@ -23,6 +23,9 @@
 //!   `encoder::make_encoder`, `encoder_vp8::make_encoder*`) must also
 //!   resolve.
 
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
 // The whole point of this file is to spell out the exact fn-pointer
 // shapes the published rustdoc carried. Replacing them with `type`
 // aliases obscures the contract — keep the literal signatures.
@@ -34,8 +37,10 @@
 
 #[test]
 fn crate_root_decode_webp_signature() {
-    // `pub fn decode_webp(buf: &[u8]) -> Result<WebpImage, WebpError>`
-    let _: fn(&[u8]) -> Result<oxideav_webp::WebpImage, oxideav_webp::WebpError> =
+    // `pub fn decode_webp(buf: &[u8]) -> Result<DecodedWebpFile, WebpError>`
+    // (the pre-contract whole-file shape, renamed; `WebpImage` is now the
+    // contract's single-image type).
+    let _: fn(&[u8]) -> Result<oxideav_webp::DecodedWebpFile, oxideav_webp::WebpError> =
         oxideav_webp::decode_webp;
 }
 
@@ -77,7 +82,7 @@ fn crate_root_webp_error_constructors() {
 fn crate_root_webp_image_fields() {
     // Field-shape assertions: every documented field must exist with the
     // documented type. Construction-by-value also enforces this.
-    let img = oxideav_webp::WebpImage {
+    let img = oxideav_webp::DecodedWebpFile {
         width: 0,
         height: 0,
         frames: Vec::new(),
@@ -137,7 +142,7 @@ fn crate_root_animation_re_exports() {
 fn error_module_result_alias() {
     // `pub type Result<T> = core::result::Result<T, WebpError>`.
     let _: oxideav_webp::error::Result<u32> = Ok(42);
-    let _: oxideav_webp::error::Result<()> = Err(oxideav_webp::WebpError::InvalidData);
+    let _: oxideav_webp::error::Result<()> = Err(oxideav_webp::WebpError::invalid("x"));
     // The error type re-exported.
     let _: oxideav_webp::error::WebpError = oxideav_webp::WebpError::Eof;
 }
@@ -148,10 +153,10 @@ fn error_module_result_alias() {
 
 #[test]
 fn decoder_module_re_exports() {
-    let _: fn(&[u8]) -> Result<oxideav_webp::decoder::WebpImage, oxideav_webp::WebpError> =
+    let _: fn(&[u8]) -> Result<oxideav_webp::decoder::DecodedWebpFile, oxideav_webp::WebpError> =
         oxideav_webp::decoder::decode_webp;
-    // `WebpFrame` / `WebpImage` re-exported from the module.
-    let _: oxideav_webp::decoder::WebpImage = oxideav_webp::WebpImage {
+    // `WebpFrame` / `DecodedWebpFile` re-exported from the module.
+    let _: oxideav_webp::decoder::DecodedWebpFile = oxideav_webp::DecodedWebpFile {
         width: 0,
         height: 0,
         frames: Vec::new(),
@@ -305,9 +310,11 @@ fn riff_module_build_signature() {
 #[test]
 fn registry_register_signatures() {
     use oxideav_core::RuntimeContext;
+    use oxideav_core::{CodecRegistry, ContainerRegistry};
     let _: fn(&mut RuntimeContext) = oxideav_webp::register;
-    let _: fn(&mut RuntimeContext) = oxideav_webp::register_codecs;
-    let _: fn(&mut RuntimeContext) = oxideav_webp::register_containers;
+    // Fleet signature: the piece-wise registrars take the sub-registries.
+    let _: fn(&mut CodecRegistry) = oxideav_webp::register_codecs;
+    let _: fn(&mut ContainerRegistry) = oxideav_webp::register_containers;
 }
 
 #[cfg(feature = "registry")]
@@ -390,14 +397,8 @@ fn crate_root_webp_error_from_vp8_error_signature() {
 fn crate_root_webp_error_from_vp8_error_variant_mapping() {
     use oxideav_vp8::Vp8Error;
     use oxideav_webp::WebpError;
-    assert_eq!(
-        WebpError::from(Vp8Error::InvalidData("truncated".into())),
-        WebpError::InvalidData
-    );
-    assert_eq!(
-        WebpError::from(Vp8Error::Unsupported("interframe".into())),
-        WebpError::Unsupported
-    );
+    assert!(WebpError::from(Vp8Error::InvalidData("truncated".into())).is_invalid_data());
+    assert!(WebpError::from(Vp8Error::Unsupported("interframe".into())).is_unsupported());
     assert_eq!(WebpError::from(Vp8Error::Eof), WebpError::Eof);
     assert_eq!(WebpError::from(Vp8Error::NeedMore), WebpError::NeedMore);
 }

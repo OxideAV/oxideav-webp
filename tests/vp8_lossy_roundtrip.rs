@@ -9,6 +9,9 @@
 //! returns `Box<dyn oxideav_core::Encoder>` — the standalone
 //! (`--no-default-features`) build skips this test entirely.
 
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
 #![cfg(feature = "registry")]
 
 use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, VideoFrame, VideoPlane};

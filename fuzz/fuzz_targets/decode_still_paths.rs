@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Differential oracle on the two public *still-image decode* entry
 //! points `oxideav_webp::decode_webp` (the published, `image`-crate-

@@ -25,6 +25,17 @@
 //!   byte-for-byte copy of a reference-tool encode) → `decode_webp` →
 //!   spawn `ffmpeg -f rawvideo -pix_fmt rgba` decode of the same file →
 //!   assert the two RGBA buffers are byte-identical.
+//! * **D — lossy fixtures → our `decode_rgba8` → reference decoder with
+//!   plain (non-fancy) chroma upsampling → compare.** The `VP8 ` fixtures
+//!   go through the contract path (`Yuv420P` planes + the limited-range
+//!   Rec. 601 `to_rgba8`); the reference decoder's `-nofancy` output uses
+//!   the same nearest-neighbour geometry, so every sample must agree
+//!   within ±1 (its own fixed-point rounding) and the alpha plane
+//!   byte-for-byte. A full-range matrix would be ~10 code values off.
+//! * **E — our lossy encode → reference decoder.** `encode_rgba8` with a
+//!   quality (VP8 + `ALPH`) must be readable by the reference decoder,
+//!   with the alpha plane byte-exact and the colour within a loose
+//!   quantisation budget.
 //!
 //! ## Skip semantics
 //!
@@ -32,6 +43,10 @@
 //! `PATH`: `eprintln!("skip: …")` then `return` — never `#[ignore]`.
 //! On a host with all four binaries installed (the WebP reference tools
 //! plus ffmpeg), all three directions run.
+
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -477,6 +492,126 @@ fn direction_c_reference_fixture_matches_ffmpeg_decode_byte_for_byte() {
             "our decoder and the reference decoder agree on every byte",
         );
     }
+}
+
+const FIXTURE_LOSSY_1X1: &[u8] = include_bytes!("data/lossy-1x1.webp");
+const FIXTURE_LOSSY_ALPHA: &[u8] = include_bytes!("data/lossy-with-alpha-128x128.webp");
+const FIXTURE_EXT_EXIF: &[u8] = include_bytes!("data/extended-with-exif.webp");
+
+/// Run the reference decoder with plain chroma upsampling and return its
+/// RGBA bytes.
+fn reference_rgba_nofancy(decoder_bin: &Path, dir: &Path, name: &str, file: &[u8]) -> Vec<u8> {
+    let in_path = dir.join(format!("{name}.webp"));
+    let pam_path = dir.join(format!("{name}.pam"));
+    std::fs::write(&in_path, file).expect("write fixture");
+    let mut cmd = Command::new(decoder_bin);
+    cmd.arg(&in_path)
+        .arg("-nofancy")
+        .arg("-pam")
+        .arg("-o")
+        .arg(&pam_path)
+        .arg("-quiet");
+    let _ = run_or_fail(&mut cmd);
+    let pam = std::fs::read(&pam_path).expect("read pam");
+    let (rgba, _, _, depth) = parse_pam(&pam);
+    assert_eq!(depth, 4);
+    rgba
+}
+
+#[test]
+fn direction_d_lossy_decode_matches_reference_nofancy_within_one() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH — install the WebP reference tools to exercise");
+        return;
+    };
+    let dir = tmp_dir("direction-d");
+    for (name, file) in [
+        ("lossy-1x1", FIXTURE_LOSSY_1X1),
+        ("lossy-with-alpha-128x128", FIXTURE_LOSSY_ALPHA),
+        ("extended-with-exif", FIXTURE_EXT_EXIF),
+    ] {
+        let ours = oxideav_webp::decode_rgba8(file).expect("our decode");
+        let theirs = reference_rgba_nofancy(&decoder_bin, &dir, name, file);
+        assert_eq!(theirs.len(), ours.data.len(), "{name}: buffer length");
+        let mut exact = 0usize;
+        for (i, (a, b)) in ours
+            .data
+            .chunks_exact(4)
+            .zip(theirs.chunks_exact(4))
+            .enumerate()
+        {
+            for k in 0..3 {
+                let d = (a[k] as i32 - b[k] as i32).abs();
+                assert!(
+                    d <= 1,
+                    "{name}: pixel {i} channel {k}: ours {} ref {}",
+                    a[k],
+                    b[k]
+                );
+            }
+            assert_eq!(a[3], b[3], "{name}: pixel {i} alpha");
+            if a[..3] == b[..3] {
+                exact += 1;
+            }
+        }
+        let n = ours.data.len() / 4;
+        assert!(
+            exact * 100 >= n * 95,
+            "{name}: only {exact}/{n} pixels bit-exact against the reference decoder"
+        );
+    }
+}
+
+#[test]
+fn direction_e_our_lossy_encode_is_readable_by_reference_decoder() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH — install the WebP reference tools to exercise");
+        return;
+    };
+    let dir = tmp_dir("direction-e");
+    // A smooth colour ramp with an alpha gradient: 4:2:0 chroma
+    // subsampling keeps a smooth image close, while the alpha plane
+    // (`ALPH`, lossless) must come back exactly.
+    let (w, h) = (24u32, 20u32);
+    let mut src = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            src.extend_from_slice(&[
+                (x * 10) as u8,
+                (y * 12) as u8,
+                (200 - (x + y) * 4) as u8,
+                (x * 11 + y * 3) as u8,
+            ]);
+        }
+    }
+    let opts = oxideav_webp::EncodeOptions::default().with_quality(95.0);
+    let file = oxideav_webp::encode_rgba8(w, h, &src, &opts).expect("lossy encode");
+    let theirs = reference_rgba_nofancy(&decoder_bin, &dir, "lossy-alpha", &file);
+    assert_eq!(theirs.len(), src.len());
+    let ours = oxideav_webp::decode_rgba8(&file).expect("our decode");
+    let mut colour_err = 0u64;
+    for (i, ((s, t), o)) in src
+        .chunks_exact(4)
+        .zip(theirs.chunks_exact(4))
+        .zip(ours.data.chunks_exact(4))
+        .enumerate()
+    {
+        assert_eq!(t[3], s[3], "pixel {i}: ALPH alpha must survive byte-exact");
+        for k in 0..3 {
+            colour_err += (s[k] as i32 - t[k] as i32).unsigned_abs() as u64;
+            assert!(
+                (o[k] as i32 - t[k] as i32).abs() <= 1,
+                "pixel {i} channel {k}: our decode {} vs reference {}",
+                o[k],
+                t[k]
+            );
+        }
+    }
+    let mae = colour_err as f64 / (src.len() / 4 * 3) as f64;
+    assert!(
+        mae < 16.0,
+        "q=95 round trip through the reference decoder: MAE {mae}"
+    );
 }
 
 // Used only when an oracle is missing — the `Path` import would otherwise

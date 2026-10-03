@@ -1,4 +1,7 @@
 #![no_main]
+// Drives the pre-contract entry points, kept as deprecated wrappers over
+// the contract API for one release; the harness stays as a regression gate.
+#![allow(deprecated)]
 
 //! Parse arbitrary fuzz-supplied bits through the §4 VP8L transform-list
 //! reader entry point `oxideav_webp::vp8l_stream::TransformList::read`.

@@ -13,7 +13,11 @@
 //! Every test here uses only standalone APIs (no `registry` feature), so
 //! the file builds and runs under `--no-default-features`.
 
-use oxideav_webp::{decode_webp, encode_webp_lossless, WebpError, WebpFrame};
+// The pre-contract surface these tests pin is kept as deprecated wrappers
+// over the contract API for one release; they stay the regression gate.
+#![allow(deprecated)]
+
+use oxideav_webp::{decode_webp, encode_webp_lossless, WebpFrame};
 
 /// Build a deterministic `width * height` RGBA8 ramp (no external input).
 fn make_rgba(width: u32, height: u32) -> Vec<u8> {
@@ -93,5 +97,5 @@ fn decode_webp_roundtrip_larger_buffer_shape() {
 fn decode_webp_rejects_garbage_as_invalid_data() {
     // A non-WebP buffer must surface the published coarse error, not panic.
     let err = decode_webp(b"not a webp file at all").expect_err("garbage is rejected");
-    assert_eq!(err, WebpError::InvalidData);
+    assert!(err.is_invalid_data(), "{err}");
 }

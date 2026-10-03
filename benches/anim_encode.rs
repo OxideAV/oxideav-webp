@@ -25,7 +25,7 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::anim_encode::{build_animated_webp, AnimFrame, AnimFrameMode};
+use oxideav_webp::{encode_animation_frames, AnimFrame, AnimFrameMode, EncodeOptions, Metadata};
 
 /// Canvas side (48 px keeps one full `Auto` sweep in the tens of
 /// milliseconds while still exercising multi-block predictor / LZ77
@@ -76,7 +76,12 @@ fn bench_anim_encode(c: &mut Criterion) {
         let frames = moving_square_frames(mode);
         c.bench_function(name, |b| {
             b.iter(|| {
-                let out = build_animated_webp(black_box(&frames)).expect("encode animation");
+                let out = encode_animation_frames(
+                    black_box(&frames),
+                    &Metadata::default(),
+                    &EncodeOptions::default(),
+                )
+                .expect("encode animation");
                 black_box(out)
             })
         });

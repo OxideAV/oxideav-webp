@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Read embedded metadata out of arbitrary fuzz-supplied bytes through
-//! `extract_metadata`. The metadata-only entry point walks the §2 RIFF
+//! `read_metadata` (plus the header-only `probe` / `info`). The metadata-only entry point walks the §2 RIFF
 //! container looking for the optional `ICCP`, `EXIF`, and `XMP ` chunks
 //! without doing any pixel decode; it must always return a `Result`
 //! rather than panic / abort / OOM regardless of how malformed the
@@ -15,8 +15,10 @@
 //! discarded.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::extract_metadata;
+use oxideav_webp::{info, probe, read_metadata};
 
 fuzz_target!(|data: &[u8]| {
-    let _ = extract_metadata(data);
+    let _ = probe(data);
+    let _ = info(data);
+    let _ = read_metadata(data);
 });

@@ -1,12 +1,13 @@
 #![no_main]
 
-//! Decode arbitrary fuzz-supplied bytes through `decode_webp`. The
+//! Decode arbitrary fuzz-supplied bytes through the contract `decode`,
+//! `decode_rgba8` and `decode_all` entry points. The
 //! decoder must always return a `Result` and never panic / abort / OOM,
 //! regardless of how malformed the input is.
 //!
 //! The contract under test is purely that the call *returns*. A
 //! malformed input must yield `Err(WebpError::…)`, a well-formed one
-//! yields `Ok(WebpImage)`, and neither path may panic,
+//! yields `Ok(WebpImage)` / `Ok(Vec<Frame>)`, and neither path may panic,
 //! integer-overflow in a debug build, index out of bounds, or try to
 //! allocate an attacker-controlled pixel buffer the size of the
 //! declared width × height before validating the §2.7.1 / §3 width and
@@ -24,12 +25,18 @@
 //! to decode at full size.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::decode_webp;
+use oxideav_webp::{decode, decode_all, decode_rgba8};
 use oxideav_webp_fuzz::over_declared_pixel_budget;
 
 fuzz_target!(|data: &[u8]| {
     if over_declared_pixel_budget(data) {
         return;
     }
-    let _ = decode_webp(data);
+    if let Ok(img) = decode(data) {
+        // The conversion kernels must never index out of the planes.
+        let _ = img.to_rgb8();
+        let _ = img.to_rgba8();
+    }
+    let _ = decode_rgba8(data);
+    let _ = decode_all(data);
 });

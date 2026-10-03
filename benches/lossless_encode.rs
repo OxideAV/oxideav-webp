@@ -18,7 +18,7 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::{decode_webp, encode_webp_lossless};
+use oxideav_webp::{decode_rgba8, encode_rgba8, EncodeOptions};
 
 /// Build a 256×256 RGBA gradient. `(x, y)` → `(x, y, (x ^ y), 0xff)`.
 fn gradient_rgba_256() -> Vec<u8> {
@@ -41,7 +41,7 @@ fn gradient_rgba_256() -> Vec<u8> {
 /// (defensive — the fixture is part of the crate's CI corpus).
 fn natural_rgba_128() -> Vec<u8> {
     const FIXTURE: &[u8] = include_bytes!("../tests/data/lossless-32x32-rgba.webp");
-    let img = match decode_webp(FIXTURE) {
+    let img = match decode_rgba8(FIXTURE) {
         Ok(img) => img,
         Err(_) => {
             let g = gradient_rgba_256();
@@ -53,10 +53,9 @@ fn natural_rgba_128() -> Vec<u8> {
             return out;
         }
     };
-    let frame = &img.frames[0];
-    let src = &frame.rgba;
-    let sw = frame.width as usize;
-    let sh = frame.height as usize;
+    let src = &img.data;
+    let sw = img.width as usize;
+    let sh = img.height as usize;
     // Tile to 128×128 (4× repeat each axis for a 32×32 source).
     let tw = 128usize;
     let th = 128usize;
@@ -76,7 +75,8 @@ fn bench_lossless_encode(c: &mut Criterion) {
     let gradient = gradient_rgba_256();
     c.bench_function("lossless_encode_rgba_256", |b| {
         b.iter(|| {
-            let out = encode_webp_lossless(black_box(&gradient), 256, 256).expect("encode");
+            let out = encode_rgba8(256, 256, black_box(&gradient), &EncodeOptions::default())
+                .expect("encode");
             black_box(out)
         })
     });
@@ -84,7 +84,8 @@ fn bench_lossless_encode(c: &mut Criterion) {
     let natural = natural_rgba_128();
     c.bench_function("lossless_encode_natural_128", |b| {
         b.iter(|| {
-            let out = encode_webp_lossless(black_box(&natural), 128, 128).expect("encode");
+            let out = encode_rgba8(128, 128, black_box(&natural), &EncodeOptions::default())
+                .expect("encode");
             black_box(out)
         })
     });

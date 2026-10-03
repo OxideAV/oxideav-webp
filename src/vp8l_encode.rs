@@ -50,7 +50,7 @@
 //!
 //! The result, wrapped by [`encode_webp_lossless`] in the §2.4 RIFF/WEBP
 //! framing (via [`crate::build`]), decodes back to the exact input pixels
-//! through [`crate::decode_webp`] — a pixel-exact round trip.
+//! through [`crate::decode`] — a pixel-exact round trip.
 //!
 //! ## §3.7.2 prefix-code construction
 //!
@@ -7486,8 +7486,8 @@ fn build_image_header(width: u32, height: u32, alpha_is_used: bool) -> [u8; 5] {
 ///
 /// `rgba` is `width * height * 4` bytes in scan-line order, each pixel
 /// `[R, G, B, A]` — the `oxideav_core::PixelFormat::Rgba` layout
-/// [`crate::DecodedWebp::rgba`] uses. The returned file decodes back to the
-/// same RGBA bytes through [`crate::decode_webp`], a pixel-exact round trip.
+/// [`crate::RgbaImage::data`] uses. The returned file decodes back to the
+/// same RGBA bytes through [`crate::decode`], a pixel-exact round trip.
 ///
 /// The encoder takes the simplest spec-conformant path: no §3.8.2
 /// transform, no §3.8.3 color cache, a single meta-prefix code, and a
@@ -9576,8 +9576,8 @@ mod tests {
         eprintln!("round-149 1x1 lossless byte count: {}", file.len());
 
         // Round-trip confirms the chosen stream still decodes.
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
 
         // Round-148 baseline for this fixture was 174 bytes (5 prefix
         // codes × ≥ 58 bits each, plus container envelope). Round 149
@@ -9633,10 +9633,10 @@ mod tests {
         );
 
         // Every chosen stream still decodes byte-exact.
-        let decoded_solid = crate::decode_webp(&file_solid).unwrap();
-        assert_eq!(decoded_solid.frames[0].rgba, solid);
-        let decoded_alpha = crate::decode_webp(&file_alpha).unwrap();
-        assert_eq!(decoded_alpha.frames[0].rgba, alpha);
+        let decoded_solid = crate::decode_rgba8(&file_solid).unwrap();
+        assert_eq!(decoded_solid.data, solid);
+        let decoded_alpha = crate::decode_rgba8(&file_alpha).unwrap();
+        assert_eq!(decoded_alpha.data, alpha);
     }
 
     /// Two-symbol simple-form path: when the alphabet has exactly two
@@ -9700,18 +9700,18 @@ mod tests {
     fn round_trip_1x1_opaque() {
         let rgba = [0x12, 0x34, 0x56, 0xff];
         let file = encode_webp_lossless(&rgba, 1, 1).unwrap();
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
     }
 
     #[test]
     fn round_trip_1x1_with_alpha() {
         let rgba = [0xaa, 0xbb, 0xcc, 0x40];
         let file = encode_webp_lossless(&rgba, 1, 1).unwrap();
-        let img = crate::decode_webp_image(&file).unwrap();
+        let img = crate::decode_rgba8(&file).unwrap();
         assert_eq!(img.width, 1);
         assert_eq!(img.height, 1);
-        assert_eq!(img.rgba, rgba);
+        assert_eq!(img.data, rgba);
     }
 
     #[test]
@@ -9729,8 +9729,8 @@ mod tests {
             }
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
     }
 
     #[test]
@@ -9744,8 +9744,8 @@ mod tests {
             rgba.extend_from_slice(&[0x20, 0x40, 0x60, 0xff]);
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
     }
 
     #[test]
@@ -9766,8 +9766,8 @@ mod tests {
             }
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
     }
 
     /// Round 388 — the DP planner's fixed-distance candidate tables
@@ -9824,8 +9824,8 @@ mod tests {
             })
             .collect();
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
     }
 
     #[test]
@@ -11471,8 +11471,8 @@ mod tests {
             }
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
     }
 
     /// On a smooth gradient the §4.1 predictor candidate should
@@ -11765,8 +11765,8 @@ mod tests {
             }
         }
         let file = encode_webp_lossless(&rgba, w, h).unwrap();
-        let decoded = crate::decode_webp(&file).unwrap();
-        assert_eq!(decoded.frames[0].rgba, rgba);
+        let decoded = crate::decode_rgba8(&file).unwrap();
+        assert_eq!(decoded.data, rgba);
     }
 
     /// On a chroma-correlated synthetic image the §4.2 color-transform
@@ -13749,9 +13749,8 @@ mod tests {
             })
             .collect();
         let webp_bytes = encode_webp_lossless(&rgba, w, h).expect("encode round-150 webp");
-        let decoded = crate::decode_webp(&webp_bytes).expect("decode round-150 webp");
-        assert_eq!(decoded.frames.len(), 1);
-        assert_eq!(decoded.frames[0].rgba.as_slice(), rgba.as_slice());
+        let decoded = crate::decode_rgba8(&webp_bytes).expect("decode round-150 webp");
+        assert_eq!(decoded.data.as_slice(), rgba.as_slice());
     }
 
     /// On photo-like noise (>256 unique colors), the §4.4 candidate
@@ -14204,9 +14203,8 @@ mod tests {
             })
             .collect();
         let webp_bytes = encode_webp_lossless(&rgba, w, h).expect("encode round-151 webp");
-        let decoded = crate::decode_webp(&webp_bytes).expect("decode round-151 webp");
-        assert_eq!(decoded.frames.len(), 1);
-        assert_eq!(decoded.frames[0].rgba.as_slice(), rgba.as_slice());
+        let decoded = crate::decode_rgba8(&webp_bytes).expect("decode round-151 webp");
+        assert_eq!(decoded.data.as_slice(), rgba.as_slice());
     }
 
     /// Diagnostic-only sweep: prints baseline vs multi-meta-prefix
