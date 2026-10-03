@@ -17,7 +17,8 @@ All notable changes to `oxideav-webp` are recorded here.
   `from_yuv420` / `as_bytes` / `into_raw` / `to_rgb8` / `to_rgba8`, the
   packed `RgbImage` / `RgbaImage`, `Plane`, `ColorInfo` (+ `ColorRange`),
   `Metadata`, `Palette`, `ImageInfo`, `Frame`, `DecodeOptions`,
-  `EncodeOptions`, `WebpPixelFormat` (+ `pub type PixelFormat`,
+  `EncodeOptions` (`DecodeOptions` limits are `Option`s, `None` =
+  unlimited, per the 2026-10-03 rulings), `WebpPixelFormat` (+ `pub type PixelFormat`,
   variants `Rgb24` / `Rgba` / `Yuv420P` / `Yuva420P` mirroring
   `oxideav_core::PixelFormat`), and ONE error `WebpError` (+ `pub type
   Error`). All of it builds and is tested with `default-features =

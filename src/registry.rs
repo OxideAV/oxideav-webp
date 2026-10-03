@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn decode_limits_surface_as_invalid_data() {
-        let opts = DecodeOptions::default().with_max_width(16);
+        let opts = DecodeOptions::default().with_max_width(Some(16));
         let mut dec =
             WebpDecoder::with_options(CodecParameters::video(CodecId::new(CODEC_ID_STR)), opts);
         dec.send_packet(&Packet::new(

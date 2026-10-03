@@ -78,10 +78,10 @@ fn contract_root_signatures_compile() {
     let _: PixelFormat = oxideav_webp::WebpPixelFormat::Rgba;
     // Options are `Default` + `with_*`.
     let _ = DecodeOptions::default()
-        .with_max_width(1)
-        .with_max_height(1)
-        .with_max_pixels(1)
-        .with_max_bytes(1)
+        .with_max_width(Some(1))
+        .with_max_height(None)
+        .with_max_pixels(Some(1))
+        .with_max_bytes(None)
         .with_strict(true);
     let _ = EncodeOptions::default().with_quality(80.0).with_lossless();
 }
@@ -283,24 +283,35 @@ fn limits_are_enforced_before_decoding() {
     let big = DecodeOptions::default();
     assert!(decode_with(LOSSY_ALPHA, &big).is_ok());
     for opts in [
-        DecodeOptions::default().with_max_width(127),
-        DecodeOptions::default().with_max_height(127),
-        DecodeOptions::default().with_max_pixels(128 * 128 - 1),
-        DecodeOptions::default().with_max_bytes(LOSSY_ALPHA.len() - 1),
+        DecodeOptions::default().with_max_width(Some(127)),
+        DecodeOptions::default().with_max_height(Some(127)),
+        DecodeOptions::default().with_max_pixels(Some(128 * 128 - 1)),
+        DecodeOptions::default().with_max_bytes(Some(LOSSY_ALPHA.len() as u64 - 1)),
     ] {
         let e = decode_with(LOSSY_ALPHA, &opts).unwrap_err();
         assert!(e.is_limit_exceeded(), "{opts:?}: {e}");
     }
     // Animation canvas limits.
-    let e = decode_all_with(ANIM_RGB, &DecodeOptions::default().with_max_width(63)).unwrap_err();
+    let e =
+        decode_all_with(ANIM_RGB, &DecodeOptions::default().with_max_width(Some(63))).unwrap_err();
     assert!(e.is_limit_exceeded());
     // Lossless too.
     let e = decode_with(
         LOSSLESS_NATURAL,
-        &DecodeOptions::default().with_max_pixels(1),
+        &DecodeOptions::default().with_max_pixels(Some(1)),
     )
     .unwrap_err();
     assert!(e.is_limit_exceeded());
+    // `None` lifts a limit entirely.
+    let unlimited = DecodeOptions::default()
+        .with_max_width(None)
+        .with_max_height(None)
+        .with_max_pixels(None)
+        .with_max_bytes(None);
+    assert!(decode_with(LOSSY_ALPHA, &unlimited).is_ok());
+    let d = DecodeOptions::default();
+    assert_eq!(d.max_width, Some(oxideav_webp::MAX_DIMENSION));
+    assert_eq!(d.max_bytes, None);
 }
 
 #[test]

@@ -32,17 +32,21 @@ pub const MAX_DIMENSION: u32 = 1 << 14;
 // ───────────────────────────────── options ───────────────────────────────
 
 /// Decode limits and strictness. `decode` uses `DecodeOptions::default()`.
+///
+/// Every limit is an `Option`; `None` means unlimited. The defaults are
+/// the format's own ceilings — 16384 per side (the VP8L / VP8 header
+/// range), 16384² pixels (1 GiB of RGBA) — and no byte limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DecodeOptions {
     /// Reject an image (or animation canvas) wider than this.
-    pub max_width: u32,
+    pub max_width: Option<u32>,
     /// Reject an image (or animation canvas) taller than this.
-    pub max_height: u32,
+    pub max_height: Option<u32>,
     /// Reject an image whose `width × height` exceeds this.
-    pub max_pixels: u64,
+    pub max_pixels: Option<u64>,
     /// Reject an input longer than this many bytes.
-    pub max_bytes: usize,
+    pub max_bytes: Option<u64>,
     /// Refuse spec-discouraged or inconsistent files instead of decoding
     /// them leniently: a `VP8X` canvas that disagrees with the bitstream
     /// dimensions, `VP8X` reserved bits set, an `ALPH` chunk next to a
@@ -54,10 +58,10 @@ pub struct DecodeOptions {
 impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
-            max_width: MAX_DIMENSION,
-            max_height: MAX_DIMENSION,
-            max_pixels: (MAX_DIMENSION as u64) * (MAX_DIMENSION as u64),
-            max_bytes: usize::MAX,
+            max_width: Some(MAX_DIMENSION),
+            max_height: Some(MAX_DIMENSION),
+            max_pixels: Some((MAX_DIMENSION as u64) * (MAX_DIMENSION as u64)),
+            max_bytes: None,
             strict: false,
         }
     }
@@ -69,26 +73,26 @@ impl DecodeOptions {
         Self::default()
     }
 
-    /// Builder: maximum width.
-    pub fn with_max_width(mut self, v: u32) -> Self {
+    /// Builder: maximum width (`None` = unlimited).
+    pub fn with_max_width(mut self, v: Option<u32>) -> Self {
         self.max_width = v;
         self
     }
 
-    /// Builder: maximum height.
-    pub fn with_max_height(mut self, v: u32) -> Self {
+    /// Builder: maximum height (`None` = unlimited).
+    pub fn with_max_height(mut self, v: Option<u32>) -> Self {
         self.max_height = v;
         self
     }
 
-    /// Builder: maximum pixel count.
-    pub fn with_max_pixels(mut self, v: u64) -> Self {
+    /// Builder: maximum pixel count (`None` = unlimited).
+    pub fn with_max_pixels(mut self, v: Option<u64>) -> Self {
         self.max_pixels = v;
         self
     }
 
-    /// Builder: maximum input length in bytes.
-    pub fn with_max_bytes(mut self, v: usize) -> Self {
+    /// Builder: maximum input length in bytes (`None` = unlimited).
+    pub fn with_max_bytes(mut self, v: Option<u64>) -> Self {
         self.max_bytes = v;
         self
     }
@@ -99,6 +103,11 @@ impl DecodeOptions {
         self
     }
 
+    /// The pixel cap handed to the VP8 decoder (`u64::MAX` when unlimited).
+    pub(crate) fn pixel_cap(&self) -> u64 {
+        self.max_pixels.unwrap_or(u64::MAX)
+    }
+
     /// Check `width × height` against the limits.
     pub(crate) fn check_dimensions(&self, width: u32, height: u32) -> Result<(), WebpError> {
         if width == 0 || height == 0 {
@@ -106,16 +115,17 @@ impl DecodeOptions {
                 "zero image dimension {width}x{height}"
             )));
         }
-        if width > self.max_width || height > self.max_height {
+        if self.max_width.is_some_and(|m| width > m) || self.max_height.is_some_and(|m| height > m)
+        {
             return Err(WebpError::limit(format!(
-                "{width}x{height} exceeds max {}x{}",
+                "{width}x{height} exceeds max {:?}x{:?}",
                 self.max_width, self.max_height
             )));
         }
         let pixels = (width as u64) * (height as u64);
-        if pixels > self.max_pixels {
+        if self.max_pixels.is_some_and(|m| pixels > m) {
             return Err(WebpError::limit(format!(
-                "{width}x{height} = {pixels} pixels exceeds max {}",
+                "{width}x{height} = {pixels} pixels exceeds max {:?}",
                 self.max_pixels
             )));
         }
@@ -123,9 +133,9 @@ impl DecodeOptions {
     }
 
     fn check_bytes(&self, len: usize) -> Result<(), WebpError> {
-        if len > self.max_bytes {
+        if self.max_bytes.is_some_and(|m| len as u64 > m) {
             return Err(WebpError::limit(format!(
-                "{len} input bytes exceeds max {}",
+                "{len} input bytes exceeds max {:?}",
                 self.max_bytes
             )));
         }
@@ -542,7 +552,7 @@ fn decode_bitstream(
         }
         Kind::Lossy(chunk) => {
             let frame =
-                oxideav_vp8::decode_vp8_with_max_pixels(chunk.bitstream(), opts.max_pixels)?;
+                oxideav_vp8::decode_vp8_with_max_pixels(chunk.bitstream(), opts.pixel_cap())?;
             let (fw, fh) = (frame.width, frame.height);
             if (fw, fh) != (w, h) {
                 return Err(WebpError::invalid(format!(
@@ -1310,12 +1320,17 @@ mod tests {
 
     #[test]
     fn limits_fire_before_decode() {
-        let opts = DecodeOptions::default().with_max_width(64);
+        let opts = DecodeOptions::default().with_max_width(Some(64));
         let e = decode_with(LOSSY_ALPHA, &opts).unwrap_err();
         assert!(e.is_limit_exceeded(), "{e}");
-        let e = decode_with(LOSSY_1X1, &DecodeOptions::default().with_max_bytes(10)).unwrap_err();
+        let e = decode_with(
+            LOSSY_1X1,
+            &DecodeOptions::default().with_max_bytes(Some(10)),
+        )
+        .unwrap_err();
         assert!(e.is_limit_exceeded());
-        let e = decode_all_with(ANIM, &DecodeOptions::default().with_max_pixels(10)).unwrap_err();
+        let e =
+            decode_all_with(ANIM, &DecodeOptions::default().with_max_pixels(Some(10))).unwrap_err();
         assert!(e.is_limit_exceeded());
     }
 

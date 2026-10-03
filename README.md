@@ -123,9 +123,10 @@ lossless (method 1, headerless VP8L, falling back to raw when smaller).
 
 ## Options
 
-`DecodeOptions` (`Default` + `with_*`): `max_width` / `max_height`
-(default 16384, the VP8L / VP8 per-side ceiling), `max_pixels` (default
-16384²), `max_bytes` (default unlimited), `strict` (default off — on,
+`DecodeOptions` (`Default` + `with_*`; every limit an `Option`, `None` =
+unlimited): `max_width` / `max_height` (default `Some(16384)`, the VP8L
+/ VP8 per-side ceiling), `max_pixels` (default `Some(16384²)`),
+`max_bytes` (default `None`), `strict` (default off — on,
 a `VP8X` canvas disagreeing with its bitstream, `VP8X` reserved bits, an
 `ALPH` chunk next to `VP8L`, or an `ANMF` rectangle disagreeing with its
 frame bitstream are refused). Limits are checked against the headers
