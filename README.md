@@ -31,6 +31,7 @@ if oxideav_webp::probe(&bytes) {
     let lossy = oxideav_webp::EncodeOptions::default().with_quality(80.0); // lossy (VP8 + ALPH)
     let small = oxideav_webp::encode_rgba8(w, h, &rgba, &lossy)?;
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Root items, all available with `default-features = false`:
