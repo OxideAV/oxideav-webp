@@ -165,13 +165,12 @@ impl WebpImage {
             .iter()
             .map(|p| Plane::new(p.stride, p.data.clone()))
             .collect();
-        let mut img = WebpImage::new(width, height, format, planes);
+        let mut img = WebpImage::new(width, height, format, planes)?;
         if let Some(sig) = frame.color_signal() {
             if !sig.is_unspecified() {
                 img.color = sig.into();
             }
         }
-        img.check_geometry()?;
         Ok(img)
     }
 }

@@ -377,12 +377,14 @@ fn synthetic_rgba(w: u32, h: u32, seed: u32) -> Vec<u8> {
 fn lossless_round_trip_is_exact_for_planes_and_metadata() {
     let (w, h) = (23u32, 17u32);
     let rgba = synthetic_rgba(w, h, 9);
-    let img = WebpImage::from_rgba8(w, h, rgba.clone()).with_metadata(
-        Metadata::new()
-            .with_icc(Some(b"icc".to_vec()))
-            .with_exif(Some(b"Exif\0\0II*\0".to_vec()))
-            .with_xmp(Some(b"<x:xmpmeta/>".to_vec())),
-    );
+    let img = WebpImage::from_rgba8(w, h, rgba.clone())
+        .unwrap()
+        .with_metadata(
+            Metadata::new()
+                .with_icc(Some(b"icc".to_vec()))
+                .with_exif(Some(b"Exif\0\0II*\0".to_vec()))
+                .with_xmp(Some(b"<x:xmpmeta/>".to_vec())),
+        );
     let bytes = encode(&img, &EncodeOptions::default()).unwrap();
     assert!(probe(&bytes));
     let back = decode(&bytes).unwrap();
@@ -429,7 +431,7 @@ fn every_lossless_fixture_re_encodes_exactly() {
 #[test]
 fn encoder_refuses_layouts_webp_cannot_carry() {
     // Lossless Y'CbCr: no such WebP layout.
-    let yuv = WebpImage::from_yuv420(2, 2, vec![128; 4], vec![128], vec![128]);
+    let yuv = WebpImage::from_yuv420(2, 2, vec![128; 4], vec![128], vec![128]).unwrap();
     let e = encode(&yuv, &EncodeOptions::default()).unwrap_err();
     assert!(e.is_unsupported(), "{e}");
     // Lossy full-range Y'CbCr: VP8 cannot signal the range.
@@ -438,11 +440,9 @@ fn encoder_refuses_layouts_webp_cannot_carry() {
         .with_color(ColorInfo::bt601_limited().with_range(ColorRange::Full));
     let e = encode(&full, &EncodeOptions::default().with_quality(75.0)).unwrap_err();
     assert!(e.is_unsupported(), "{e}");
-    // Geometry mismatch is InvalidData, not a panic.
+    // Geometry mismatch is InvalidData at construction, not a panic.
     let short = WebpImage::new(4, 4, PixelFormat::Rgba, vec![Plane::packed(16, vec![0; 8])]);
-    assert!(encode(&short, &EncodeOptions::default())
-        .unwrap_err()
-        .is_invalid_data());
+    assert!(short.unwrap_err().is_invalid_data());
     assert!(encode_rgba8(3, 3, &[0; 4], &EncodeOptions::default()).is_err());
     assert!(encode_rgba8(0, 3, &[], &EncodeOptions::default()).is_err());
 }
@@ -504,12 +504,14 @@ fn lossy_rgba_with_transparency_emits_alph() {
 
 #[test]
 fn metadata_embed_flags_select_chunks() {
-    let img = WebpImage::from_rgba8(2, 2, vec![1; 16]).with_metadata(
-        Metadata::new()
-            .with_icc(Some(vec![1]))
-            .with_exif(Some(vec![2]))
-            .with_xmp(Some(vec![3])),
-    );
+    let img = WebpImage::from_rgba8(2, 2, vec![1; 16])
+        .unwrap()
+        .with_metadata(
+            Metadata::new()
+                .with_icc(Some(vec![1]))
+                .with_exif(Some(vec![2]))
+                .with_xmp(Some(vec![3])),
+        );
     for (icc, exif, xmp) in [
         (true, true, true),
         (false, false, false),
@@ -540,7 +542,7 @@ fn metadata_embed_flags_select_chunks() {
 
 #[test]
 fn encode_animation_round_trips_through_decode_all() {
-    let mk = |seed: u32| WebpImage::from_rgba8(8, 6, synthetic_rgba(8, 6, seed));
+    let mk = |seed: u32| WebpImage::from_rgba8(8, 6, synthetic_rgba(8, 6, seed)).unwrap();
     let frames = vec![
         Frame::new(mk(1), Some(Duration::from_millis(50))),
         Frame::new(mk(2), Some(Duration::from_millis(70))),

@@ -107,7 +107,8 @@ mod tests {
                 frame.y.clone(),
                 frame.u.clone(),
                 frame.v.clone(),
-            );
+            )
+            .unwrap();
             assert_eq!(yuv420_to_rgba(&frame), img.to_rgba8(), "{w}x{h}");
         }
     }

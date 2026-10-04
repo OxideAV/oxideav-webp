@@ -297,7 +297,37 @@ impl WebpImage {
     /// Build an image from its geometry and planes. The colour defaults to
     /// the layout's WebP default ([`ColorInfo::srgb`] for RGB(A),
     /// [`ColorInfo::bt601_limited`] for Y′CbCr); metadata is empty.
-    pub fn new(width: u32, height: u32, format: WebpPixelFormat, planes: Vec<Plane>) -> Self {
+    ///
+    /// Rejects with [`WebpError::InvalidData`](crate::WebpError) a zero
+    /// dimension or a plane set that does not fit the layout (plane
+    /// count, a stride shorter than the row, a buffer shorter than the
+    /// rows it must hold — [`Self::check_geometry`]), so an image that
+    /// exists is always consistent and [`Self::to_rgb8`] /
+    /// [`Self::to_rgba8`] never need to fail.
+    pub fn new(
+        width: u32,
+        height: u32,
+        format: WebpPixelFormat,
+        planes: Vec<Plane>,
+    ) -> Result<Self, crate::WebpError> {
+        if width == 0 || height == 0 {
+            return Err(crate::WebpError::invalid(format!(
+                "image has a zero dimension ({width}x{height})"
+            )));
+        }
+        let img = Self::new_unchecked(width, height, format, planes);
+        img.check_geometry()?;
+        Ok(img)
+    }
+
+    /// [`Self::new`] without the geometry check, for images the crate
+    /// assembles itself from already-validated buffers.
+    pub(crate) fn new_unchecked(
+        width: u32,
+        height: u32,
+        format: WebpPixelFormat,
+        planes: Vec<Plane>,
+    ) -> Self {
         let color = if format.is_yuv() {
             ColorInfo::bt601_limited()
         } else {
@@ -314,8 +344,9 @@ impl WebpImage {
         }
     }
 
-    /// A packed [`Rgb24`](WebpPixelFormat::Rgb24) image, stride `3 × width`.
-    pub fn from_rgb8(width: u32, height: u32, data: Vec<u8>) -> Self {
+    /// A packed [`Rgb24`](WebpPixelFormat::Rgb24) image, stride `3 × width`;
+    /// `InvalidData` when `data` is shorter than `3 × width × height`.
+    pub fn from_rgb8(width: u32, height: u32, data: Vec<u8>) -> Result<Self, crate::WebpError> {
         let stride = (width as usize) * 3;
         Self::new(
             width,
@@ -325,8 +356,9 @@ impl WebpImage {
         )
     }
 
-    /// A packed [`Rgba`](WebpPixelFormat::Rgba) image, stride `4 × width`.
-    pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Self {
+    /// A packed [`Rgba`](WebpPixelFormat::Rgba) image, stride `4 × width`;
+    /// `InvalidData` when `data` is shorter than `4 × width × height`.
+    pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Result<Self, crate::WebpError> {
         let stride = (width as usize) * 4;
         Self::new(
             width,
@@ -338,8 +370,14 @@ impl WebpImage {
 
     /// A planar [`Yuv420P`](WebpPixelFormat::Yuv420P) image from tightly
     /// packed Y (`width × height`), Cb and Cr (`⌈width/2⌉ × ⌈height/2⌉`)
-    /// planes, limited-range BT.601.
-    pub fn from_yuv420(width: u32, height: u32, y: Vec<u8>, cb: Vec<u8>, cr: Vec<u8>) -> Self {
+    /// planes, limited-range BT.601; `InvalidData` when a plane is short.
+    pub fn from_yuv420(
+        width: u32,
+        height: u32,
+        y: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+    ) -> Result<Self, crate::WebpError> {
         let w = width as usize;
         let cw = w.div_ceil(2);
         Self::new(
@@ -685,10 +723,10 @@ mod tests {
 
     #[test]
     fn rgba_to_rgb8_drops_alpha_and_rgb_to_rgba8_sets_opaque() {
-        let img = WebpImage::from_rgba8(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let img = WebpImage::from_rgba8(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         assert_eq!(img.to_rgb8(), vec![1, 2, 3, 5, 6, 7]);
         assert_eq!(img.as_bytes(), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..]));
-        let rgb = WebpImage::from_rgb8(2, 1, vec![1, 2, 3, 5, 6, 7]);
+        let rgb = WebpImage::from_rgb8(2, 1, vec![1, 2, 3, 5, 6, 7]).unwrap();
         assert_eq!(rgb.to_rgba8(), vec![1, 2, 3, 255, 5, 6, 7, 255]);
         assert_eq!(rgb.to_rgb8(), vec![1, 2, 3, 5, 6, 7]);
     }
@@ -696,7 +734,8 @@ mod tests {
     #[test]
     fn yuv_neutral_grey_round_trips_limited_range() {
         // Y′ = 16 → black, Y′ = 235 → white, Cb = Cr = 128 neutral.
-        let img = WebpImage::from_yuv420(2, 2, vec![16, 235, 126, 16], vec![128], vec![128]);
+        let img =
+            WebpImage::from_yuv420(2, 2, vec![16, 235, 126, 16], vec![128], vec![128]).unwrap();
         assert!(img.as_bytes().is_none());
         let rgba = img.to_rgba8();
         assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
@@ -709,7 +748,7 @@ mod tests {
 
     #[test]
     fn yuva_carries_the_alpha_plane() {
-        let mut img = WebpImage::from_yuv420(1, 1, vec![128], vec![128], vec![128]);
+        let mut img = WebpImage::from_yuv420(1, 1, vec![128], vec![128], vec![128]).unwrap();
         img.format = WebpPixelFormat::Yuva420P;
         img.planes.push(Plane::packed(1, vec![7]));
         assert_eq!(img.to_rgba8(), vec![130, 130, 130, 7]);
@@ -718,13 +757,53 @@ mod tests {
 
     #[test]
     fn into_raw_concatenates_planes() {
-        let img = WebpImage::from_yuv420(2, 2, vec![1, 2, 3, 4], vec![5], vec![6]);
+        let img = WebpImage::from_yuv420(2, 2, vec![1, 2, 3, 4], vec![5], vec![6]).unwrap();
         assert_eq!(img.into_raw(), vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
+    fn constructors_reject_bad_geometry() {
+        let bad = |r: Result<WebpImage, crate::WebpError>| {
+            assert!(matches!(r, Err(crate::WebpError::InvalidData(_))), "{r:?}")
+        };
+        bad(WebpImage::from_rgb8(2, 1, vec![0; 5]));
+        bad(WebpImage::from_rgba8(1, 2, vec![0; 7]));
+        bad(WebpImage::from_rgba8(0, 2, vec![]));
+        bad(WebpImage::from_yuv420(2, 2, vec![0; 4], vec![0], vec![]));
+        bad(WebpImage::new(
+            4,
+            4,
+            WebpPixelFormat::Rgba,
+            vec![Plane::packed(16, vec![9; 20])],
+        ));
+        bad(WebpImage::new(
+            4,
+            4,
+            WebpPixelFormat::Yuv420P,
+            vec![Plane::packed(4, vec![0; 16])],
+        ));
+        bad(WebpImage::new(
+            2,
+            1,
+            WebpPixelFormat::Rgb24,
+            vec![Plane::new(5, vec![0; 6])],
+        ));
+        // The last row may be unpadded.
+        assert!(WebpImage::new(
+            1,
+            2,
+            WebpPixelFormat::Rgba,
+            vec![Plane::new(8, vec![0; 12])]
+        )
+        .is_ok());
+        assert!(WebpImage::from_rgba8(2, 2, vec![0; 16]).is_ok());
+    }
+
+    #[test]
     fn short_planes_never_panic() {
-        let img = WebpImage::new(
+        // `new` refuses this; the kernels stay defensive for images the
+        // crate assembles itself.
+        let img = WebpImage::new_unchecked(
             4,
             4,
             WebpPixelFormat::Rgba,

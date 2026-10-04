@@ -68,9 +68,9 @@ mod yuv;
 
 pub use api::{
     animation_params, decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8,
-    decode_with, encode, encode_animation, encode_animation_frames, encode_rgb8, encode_rgba8,
-    encode_to, info, probe, read_metadata, AnimFrame, AnimFrameMode, DecodeOptions, DeltaConfig,
-    DownsampleKernel, EncodeOptions, MAX_DIMENSION,
+    decode_with, encode, encode_all, encode_animation, encode_animation_frames, encode_rgb8,
+    encode_rgba8, encode_to, info, probe, read_metadata, AnimFrame, AnimFrameMode, DecodeOptions,
+    DeltaConfig, DownsampleKernel, EncodeOptions, MAX_DIMENSION,
 };
 pub use image::{
     ColorInfo, ColorRange, Frame, ImageInfo, Metadata, Palette, PixelFormat, Plane, RgbImage,

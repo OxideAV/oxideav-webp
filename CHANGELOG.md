@@ -4,6 +4,25 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Fallible constructors (`IMAGE_CRATE_API` fleet sweep, breaking).**
+  `WebpImage::new` / `from_rgb8` / `from_rgba8` / `from_yuv420` return
+  `Result<WebpImage, WebpError>` and reject a zero dimension or planes
+  that do not fit the layout (plane count, short stride, short buffer —
+  the former `check_geometry` rule) with `InvalidData`, so an image that
+  exists is always consistent. Callers append `?` (or `.unwrap()` for
+  literal test data); the infallible signatures are not kept.
+
+### Added
+
+- `encode_all(&[Frame], &EncodeOptions)`, the mirror of `decode_all`: a
+  still for one delay-less frame, otherwise the lossless animation
+  `encode_animation` writes (which stays as the depth name).
+  `decode_all(encode_all(frames)) == frames` is pinned for `Rgba`
+  frames with whole-millisecond delays.
+- `Cargo.toml` `exclude = ["/tests", "/fuzz"]` (crates.io 10 MiB cap).
+
 ## [0.3.0](https://github.com/OxideAV/oxideav-webp/compare/v0.2.3...v0.3.0) - 2026-10-03
 
 ### Added

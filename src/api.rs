@@ -548,7 +548,7 @@ fn decode_bitstream(
                     }
                 }
             }
-            Ok(WebpImage::from_rgba8(w, h, argb_to_rgba(image.pixels())))
+            WebpImage::from_rgba8(w, h, argb_to_rgba(image.pixels()))
         }
         Kind::Lossy(chunk) => {
             let frame =
@@ -560,7 +560,7 @@ fn decode_bitstream(
                 )));
             }
             let cw = (fw as usize).div_ceil(2);
-            let mut img = WebpImage::new(
+            let mut img = WebpImage::new_unchecked(
                 fw,
                 fh,
                 WebpPixelFormat::Yuv420P,
@@ -712,7 +712,7 @@ fn decode_animation(
             ),
         }
 
-        let image = WebpImage::from_rgba8(canvas_w, canvas_h, canvas.clone())
+        let image = WebpImage::from_rgba8(canvas_w, canvas_h, canvas.clone())?
             .with_metadata(metadata.clone());
         frames.push(Frame::new(
             image,
@@ -928,7 +928,7 @@ pub fn encode_rgb8(
     rgb: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    encode(&WebpImage::from_rgb8(width, height, rgb.to_vec()), opts)
+    encode(&WebpImage::from_rgb8(width, height, rgb.to_vec())?, opts)
 }
 
 /// Encode packed 8-bit RGBA (4 bytes per pixel, `width × height × 4`).
@@ -938,7 +938,7 @@ pub fn encode_rgba8(
     rgba: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    encode(&WebpImage::from_rgba8(width, height, rgba.to_vec()), opts)
+    encode(&WebpImage::from_rgba8(width, height, rgba.to_vec())?, opts)
 }
 
 /// [`encode`] and write the bytes to `w`.
@@ -1157,7 +1157,24 @@ pub(crate) fn build_alph_payload(alpha: &[u8], width: u32, height: u32) -> Vec<u
 
 // ─────────────────────────────── animation ───────────────────────────────
 
-/// Encode `frames` as an animated `.webp` (RFC 9649 §2.7.1.1).
+/// Encode `frames` as one file — the mirror of [`decode_all`]. A single
+/// frame with no delay is written as a still ([`encode`]); anything else
+/// as an animation via [`encode_animation`] (lossless `VP8L` sub-frames,
+/// so a `quality` option is [`WebpError::Unsupported`]). Every frame is
+/// composited full-canvas as `Rgba` — the layout [`decode_all`] returns
+/// — so `decode_all(encode_all(frames)) == frames` holds for `Rgba`
+/// frames whose metadata matches the first frame's (the file carries one
+/// metadata set) and whose delays are whole milliseconds.
+pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>, WebpError> {
+    match frames {
+        [] => Err(WebpError::invalid("encode_all needs at least one frame")),
+        [single] if single.delay.is_none() => encode(&single.image, opts),
+        _ => encode_animation(frames, opts),
+    }
+}
+
+/// Encode `frames` as an animated `.webp` (RFC 9649 §2.7.1.1) — the
+/// WebP-specific depth name under [`encode_all`].
 ///
 /// Each frame's image is composited as a full-canvas RGBA picture (any
 /// layout is accepted — [`WebpImage::to_rgba8`] runs first) placed at the
@@ -1368,12 +1385,14 @@ mod tests {
 
     #[test]
     fn lossless_round_trip_keeps_metadata() {
-        let img = WebpImage::from_rgba8(2, 2, vec![9; 16]).with_metadata(
-            Metadata::new()
-                .with_icc(Some(vec![1, 2, 3]))
-                .with_exif(Some(vec![4, 5]))
-                .with_xmp(Some(vec![6])),
-        );
+        let img = WebpImage::from_rgba8(2, 2, vec![9; 16])
+            .unwrap()
+            .with_metadata(
+                Metadata::new()
+                    .with_icc(Some(vec![1, 2, 3]))
+                    .with_exif(Some(vec![4, 5]))
+                    .with_xmp(Some(vec![6])),
+            );
         let bytes = encode(&img, &EncodeOptions::default()).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back, img);
@@ -1390,7 +1409,7 @@ mod tests {
 
     #[test]
     fn lossless_refuses_yuv_without_conversion() {
-        let img = WebpImage::from_yuv420(2, 2, vec![128; 4], vec![128], vec![128]);
+        let img = WebpImage::from_yuv420(2, 2, vec![128; 4], vec![128], vec![128]).unwrap();
         let e = encode(&img, &EncodeOptions::default()).unwrap_err();
         assert!(e.is_unsupported(), "{e}");
     }
@@ -1443,6 +1462,7 @@ mod tests {
     #[test]
     fn lossy_refuses_full_range_yuv() {
         let img = WebpImage::from_yuv420(2, 2, vec![128; 4], vec![128], vec![128])
+            .unwrap()
             .with_color(ColorInfo::bt601_limited().with_range(crate::ColorRange::Full));
         let e = encode(&img, &EncodeOptions::default().with_quality(50.0)).unwrap_err();
         assert!(e.is_unsupported());
@@ -1460,7 +1480,7 @@ mod tests {
 
     #[test]
     fn encode_animation_round_trips_frames() {
-        let mk = |v: u8| WebpImage::from_rgba8(4, 4, vec![v; 64]);
+        let mk = |v: u8| WebpImage::from_rgba8(4, 4, vec![v; 64]).unwrap();
         let frames = vec![
             Frame::new(mk(10), Some(Duration::from_millis(40))),
             Frame::new(mk(20), Some(Duration::from_millis(80))),
@@ -1477,6 +1497,50 @@ mod tests {
         assert_eq!(back[1].image.as_bytes().unwrap(), &[20u8; 64][..]);
         assert_eq!(back[1].delay, Some(Duration::from_millis(80)));
         assert_eq!(animation_params(&bytes).unwrap(), Some((3, [0, 0, 0, 0])));
+    }
+
+    #[test]
+    fn encode_all_mirrors_decode_all() {
+        // One delay-less frame: a still, byte-identical to `encode`.
+        let still = WebpImage::from_rgba8(2, 2, vec![7; 16]).unwrap();
+        let bytes = encode_all(
+            &[Frame::new(still.clone(), None)],
+            &EncodeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(bytes, encode(&still, &EncodeOptions::default()).unwrap());
+        assert_eq!(decode_all(&bytes).unwrap(), vec![Frame::new(still, None)]);
+
+        // Several frames: lossless animation; frames + delays read back equal.
+        let meta = Metadata::new().with_xmp(Some(b"<x/>".to_vec()));
+        let mk = |v: u8| {
+            WebpImage::from_rgba8(4, 4, (0..64).map(|i| (i as u8).wrapping_mul(v)).collect())
+                .unwrap()
+                .with_metadata(meta.clone())
+        };
+        let frames = vec![
+            Frame::new(mk(3), Some(Duration::from_millis(40))),
+            Frame::new(mk(5), Some(Duration::from_millis(1500))),
+            Frame::new(mk(7), Some(Duration::from_millis(0))),
+        ];
+        let opts = EncodeOptions::default().with_loop_count(2);
+        let bytes = encode_all(&frames, &opts).unwrap();
+        assert_eq!(info(&bytes).unwrap().frames, 3);
+        assert_eq!(decode_all(&bytes).unwrap(), frames);
+        assert_eq!(bytes, encode_animation(&frames, &opts).unwrap());
+
+        // A lone frame WITH a delay is a one-frame animation.
+        let one = encode_all(&frames[..1], &opts).unwrap();
+        assert_eq!(decode_all(&one).unwrap(), frames[..1]);
+
+        assert!(matches!(
+            encode_all(&[], &EncodeOptions::default()),
+            Err(WebpError::InvalidData(_))
+        ));
+        assert!(matches!(
+            encode_all(&frames, &EncodeOptions::default().with_quality(50.0)),
+            Err(WebpError::Unsupported(_))
+        ));
     }
 
     #[test]

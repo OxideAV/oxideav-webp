@@ -47,9 +47,10 @@ Root items, all available with `default-features = false`:
 | `encode` | `fn(&WebpImage, &EncodeOptions) -> Result<Vec<u8>, Error>` — writes the image as given; `Error::Unsupported` for a layout WebP cannot carry |
 | `encode_rgb8` / `encode_rgba8` | `fn(u32, u32, &[u8], &EncodeOptions) -> Result<Vec<u8>, Error>` |
 | `encode_to` | `fn<W: Write>(&WebpImage, &EncodeOptions, W) -> Result<(), Error>` |
-| `encode_animation` | `fn(&[Frame], &EncodeOptions) -> Result<Vec<u8>, Error>` — lossless `ANIM` + `ANMF` (and `encode_animation_frames` for positioned `AnimFrame`s with blend / dispose flags) |
+| `encode_all` | `fn(&[Frame], &EncodeOptions) -> Result<Vec<u8>, Error>` — the mirror of `decode_all`: a still for one delay-less frame, otherwise a lossless `ANIM` + `ANMF` animation of full-canvas `Rgba` frames (`decode_all(encode_all(f)) == f` for `Rgba` frames with whole-millisecond delays) |
+| `encode_animation` | the WebP-specific depth name under `encode_all` — always an animation (and `encode_animation_frames` for positioned `AnimFrame`s with blend / dispose flags) |
 | `read_metadata` | `fn(&[u8]) -> Result<Metadata, Error>` — `ICCP` / `EXIF` / `XMP ` payloads without decoding pixels |
-| `WebpImage` | `{ width, height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo, metadata: Metadata, palette: None }` with `new` / `from_rgb8` / `from_rgba8` / `from_yuv420`, `as_bytes` (packed layouts), `into_raw`, `to_rgb8`, `to_rgba8` |
+| `WebpImage` | `{ width, height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo, metadata: Metadata, palette: None }` with `new` / `from_rgb8` / `from_rgba8` / `from_yuv420` (each `Result`, refusing a zero dimension or planes that do not fit the layout with `InvalidData`), `as_bytes` (packed layouts), `into_raw`, `to_rgb8`, `to_rgba8` |
 | `PixelFormat` | `= WebpPixelFormat { Rgb24, Rgba, Yuv420P, Yuva420P }` — names mirror `oxideav_core::PixelFormat` |
 | `Error` | `= WebpError { InvalidData(String), Unsupported(String), LimitExceeded(String), Io(io::Error), Eof, NeedMore }` |
 

@@ -12,6 +12,8 @@ readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-webp"
 keywords = ["multimedia", "image", "webp", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::images"]
+# crates.io caps packages at 10 MiB; the fixture corpus and fuzz tree stay in git only.
+exclude = ["/tests", "/fuzz"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
