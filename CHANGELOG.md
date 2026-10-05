@@ -4,6 +4,36 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **The `webp` container** (`oxideav_webp::container_registry`, installed
+  by `register` / `register_containers` next to the codecs): a demuxer
+  that declares what `info` reports for a still (`Rgba` sRGB, or
+  `Yuv420P` / `Yuva420P` with the limited-range BT.601 colour signal;
+  `codec_id` `webp_vp8l` / `webp_vp8` by bitstream) as one packet, and
+  cuts an animation into one complete one-frame animated file per `ANMF`
+  chunk (time base 1/1000 s, `pts` cumulative, `duration` = `Frame
+  Duration`, `extradata` marks the animation layout; `metadata()`
+  carries `loop_count` and `background_color`); a muxer that writes one
+  packet verbatim and merges several into one animated file at the chunk
+  level (durations → `Frame Duration`, `ANIM` from the first packet or
+  the `loop_count` / `background_color` options, metadata chunks from
+  the first packet, lossy and mixed frames included); the content probe.
+  The framework (and `oxideav-image`) can now open and write WebP files
+  through the registry. Pinned: registry frames byte-identical to
+  `decode` on five still fixtures (lossless, paletted, `VP8X` + ICC,
+  lossy, lossy + `ALPH`) and to `decode_all` on both animated fixtures;
+  `demux(mux(frames)) == frames`; demux → mux → demux round trips;
+  a lossy + lossless merge; hostile inputs.
+- `WebpDecoder::from_params`: honours the container's `extradata`
+  record (compositing one canvas across per-frame packets through the
+  same §2.7.1.1 state machine `decode_all` uses) and tightens the decode
+  limits from `CodecParameters::limits`; `reset` clears the canvas and
+  the end-of-stream latch.
+- `container_registry::is_animation_stream` / `is_webp_codec` /
+  `TIME_BASE` and the `EXTRADATA_*` constants describing the record.
+- Fuzz target `demux` (file → demuxer → decoder → muxer).
+
 ### Changed
 
 - **Fallible constructors (`IMAGE_CRATE_API` fleet sweep, breaking).**

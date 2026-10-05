@@ -98,6 +98,8 @@ pub mod anmf;
 pub mod build;
 #[doc(hidden)]
 pub mod container;
+#[cfg(feature = "registry")]
+pub mod container_registry;
 #[doc(hidden)]
 pub mod decoder;
 #[doc(hidden)]

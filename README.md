@@ -66,11 +66,43 @@ use oxideav_core::RuntimeContext;
 
 let mut ctx = RuntimeContext::new();
 oxideav_webp::register(&mut ctx);
-// ctx now exposes the "webp" decoder (claiming the `WEBP` FourCC and the
-// `.webp` extension) plus the "webp_vp8l" (lossless) and "webp_vp8"
-// (lossy) encoders.  Piece-wise: register_codecs(&mut ctx.codecs) /
+// ctx now exposes the "webp" decoder (claiming the `WEBP` FourCC), the
+// "webp_vp8l" (lossless) and "webp_vp8" (lossy) encoders, and the "webp"
+// container — demuxer, muxer, probe and the `.webp` extension — so the
+// framework (and `oxideav-image`) opens and writes WebP files through the
+// registry.  Piece-wise: register_codecs(&mut ctx.codecs) /
 // register_containers(&mut ctx.containers).
 ```
+
+The container (`oxideav_webp::container_registry`) declares one video
+stream, time base **1/1000 s** (the RFC 9649 §2.7.1.1 `Frame Duration`
+unit), `codec_id` `webp_vp8l` for a `VP8L` bitstream and `webp_vp8` for
+`VP8 ` (an animation: its first frame's; all three registered decoders
+accept either):
+
+| File | Stream | Packets |
+|---|---|---|
+| Still | `width` / `height` / `pixel_format` / `color_signal` = what `info` reports (`Rgba` sRGB; `Yuv420P` / `Yuva420P` with the §2.5 limited-range BT.601 signal) | one packet holding the whole file, `pts 0` |
+| Animation (`VP8X` `A` / `ANIM`) | `Rgba` sRGB, the `VP8X` canvas; `extradata` marks the stream as an animation (`container_registry::is_animation_stream`) | one packet per `ANMF` chunk, each a complete one-frame animated file (`VP8X` + `ANIM` + the original `ANMF`; packet 0 also carries `ICCP` / `EXIF` / `XMP `); `pts` cumulative, `duration` = the frame's `Frame Duration` in ms; only the first is a keyframe |
+
+`Demuxer::metadata()` carries `("loop_count", n)` and
+`("background_color", "#RRGGBBAA")` from `ANIM`. The decoder reads the
+`extradata` record: on an animation stream it composites every packet's
+`ANMF` onto one persistent canvas, so the registry yields the same
+frames as `decode_all`; without the record (any other producer of
+`webp` packets) every packet is a whole file and an animated one yields
+its first composited frame, as before. The muxer writes one packet
+verbatim and merges several into one animated file at the chunk level
+(no pixel is re-encoded): a demuxed packet contributes its `ANMF` as
+is, a still from either encoder becomes a full-canvas `ANMF` with
+blending off, packet durations become `Frame Duration`s, `ANIM` comes
+from the first packet or from the stream's `loop_count` /
+`background_color` options (`0` / `#00000000` by default), and `ICCP` /
+`EXIF` / `XMP ` from the first packet. Lossy (`webp_vp8`) and mixed
+frames therefore mux fine even though `encode_animation` refuses a
+`quality`. `demux(mux(frames)) == frames` for full-canvas `Rgba`
+frames; demux → mux → demux of any file reproduces its composited
+frames, delays, loop count and background.
 
 The framework `Decoder` emits each still in its **native** layout — one
 `Rgba` plane for lossless, three `Yuv420P` planes (four with `ALPH`,
@@ -210,10 +242,14 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ## Fuzzing
 
-Thirty-eight [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Thirty-nine [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets). They
 fall into three groups:
 
+* **Framework path** — `demux`: the bytes as a file into the container
+  demuxer, every packet through the registered decoder (whole-file or
+  per-frame animation mode, under a 1 Mpx `DecoderLimits` budget), then
+  the packets back through the muxer.
 * **Public entry points** — `decode` (the contract `decode` /
   `decode_rgba8` / `decode_all`), `extract_metadata` (`probe` / `info` /
   `read_metadata`), `contract_encode` (lossless-exact + lossy VP8/`ALPH`

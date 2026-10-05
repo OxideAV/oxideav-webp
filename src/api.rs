@@ -459,7 +459,7 @@ pub fn decode_from<R: Read>(mut r: R) -> Result<WebpImage, WebpError> {
     decode(&buf)
 }
 
-fn is_animated(bytes: &[u8], c: &WebpContainer) -> bool {
+pub(crate) fn is_animated(bytes: &[u8], c: &WebpContainer) -> bool {
     if c.first_chunk_with_fourcc(fourcc::ANIM).is_some() {
         return true;
     }
@@ -599,13 +599,39 @@ fn decode_animation(
     opts: &DecodeOptions,
     first_only: bool,
 ) -> Result<Vec<Frame>, WebpError> {
+    let (hdr, anim) = animation_headers(bytes, c, opts)?;
+    let mut compositor = AnimCompositor::new(&hdr, &anim, opts)?;
+    let metadata = metadata_from_container(bytes, c);
+
+    let mut frames = Vec::new();
+    for anmf_chunk in c.chunks_with_fourcc(fourcc::ANMF) {
+        let (canvas, duration_ms) = compositor.step(anmf_chunk.payload(bytes), opts)?;
+        let image = WebpImage::from_rgba8(hdr.canvas_width, hdr.canvas_height, canvas)?
+            .with_metadata(metadata.clone());
+        frames.push(Frame::new(
+            image,
+            Some(Duration::from_millis(u64::from(duration_ms))),
+        ));
+        if first_only {
+            break;
+        }
+    }
+    if frames.is_empty() {
+        return Err(WebpError::invalid("animation has no ANMF frames"));
+    }
+    Ok(frames)
+}
+
+/// The `VP8X` and `ANIM` headers an animated container must carry.
+pub(crate) fn animation_headers(
+    bytes: &[u8],
+    c: &WebpContainer,
+    opts: &DecodeOptions,
+) -> Result<(vp8x::Vp8xHeader, anim::AnimHeader), WebpError> {
     let anim_chunk = c
         .first_chunk_with_fourcc(fourcc::ANIM)
         .ok_or_else(|| WebpError::invalid("animated VP8X without ANIM chunk"))?;
     let anim = anim::AnimHeader::parse(anim_chunk.payload(bytes))?;
-    let bg = anim.background_color;
-    let bg_rgba = [bg.red, bg.green, bg.blue, bg.alpha];
-
     let vp8x_chunk = c
         .first_chunk_with_fourcc(fourcc::VP8X)
         .ok_or_else(|| WebpError::invalid("animation without VP8X header"))?;
@@ -613,28 +639,81 @@ fn decode_animation(
     if opts.strict && hdr.has_unknown {
         return Err(WebpError::invalid("VP8X reserved bits set"));
     }
-    let canvas_w = hdr.canvas_width;
-    let canvas_h = hdr.canvas_height;
-    // A canvas wider than any spec-valid frame could cover is rejected
-    // before the full-canvas buffer is allocated (see MAX_DIMENSION).
-    if canvas_w > MAX_DIMENSION || canvas_h > MAX_DIMENSION {
-        return Err(WebpError::invalid(format!(
-            "animation canvas {canvas_w}x{canvas_h} exceeds the {MAX_DIMENSION} frame ceiling"
-        )));
-    }
-    opts.check_dimensions(canvas_w, canvas_h)?;
+    Ok((hdr, anim))
+}
 
-    let canvas_bytes = (canvas_w as usize) * (canvas_h as usize) * 4;
-    let mut canvas: Vec<u8> = Vec::with_capacity(canvas_bytes);
-    for _ in 0..(canvas_bytes / 4) {
-        canvas.extend_from_slice(&bg_rgba);
-    }
-    let metadata = metadata_from_container(bytes, c);
+/// The §2.7.1.1 animation canvas as a persistent object: one `ANMF`
+/// chunk at a time through [`AnimCompositor::step`].
+///
+/// [`decode_all`] drives it over a whole file; the framework decoder
+/// drives it across packets when the demuxer hands it one `ANMF` frame
+/// per packet, so both paths produce byte-identical canvases.
+pub(crate) struct AnimCompositor {
+    canvas_w: u32,
+    canvas_h: u32,
+    bg_rgba: [u8; 4],
+    canvas: Vec<u8>,
+    prev_rect: Option<(u32, u32, u32, u32, anmf::DisposalMethod)>,
+}
 
-    let mut prev_rect: Option<(u32, u32, u32, u32, anmf::DisposalMethod)> = None;
-    let mut frames = Vec::new();
-    for anmf_chunk in c.chunks_with_fourcc(fourcc::ANMF) {
-        let payload = anmf_chunk.payload(bytes);
+impl AnimCompositor {
+    /// A canvas of the `VP8X` size cleared to the `ANIM` background
+    /// colour. The dimensions are checked against `opts` and the format
+    /// ceiling before the buffer is allocated.
+    pub(crate) fn new(
+        hdr: &vp8x::Vp8xHeader,
+        anim: &anim::AnimHeader,
+        opts: &DecodeOptions,
+    ) -> Result<Self, WebpError> {
+        let bg = anim.background_color;
+        let bg_rgba = [bg.red, bg.green, bg.blue, bg.alpha];
+        let canvas_w = hdr.canvas_width;
+        let canvas_h = hdr.canvas_height;
+        // A canvas wider than any spec-valid frame could cover is rejected
+        // before the full-canvas buffer is allocated (see MAX_DIMENSION).
+        if canvas_w > MAX_DIMENSION || canvas_h > MAX_DIMENSION {
+            return Err(WebpError::invalid(format!(
+                "animation canvas {canvas_w}x{canvas_h} exceeds the {MAX_DIMENSION} frame ceiling"
+            )));
+        }
+        opts.check_dimensions(canvas_w, canvas_h)?;
+
+        let canvas_bytes = (canvas_w as usize) * (canvas_h as usize) * 4;
+        let mut canvas: Vec<u8> = Vec::with_capacity(canvas_bytes);
+        for _ in 0..(canvas_bytes / 4) {
+            canvas.extend_from_slice(&bg_rgba);
+        }
+        Ok(Self {
+            canvas_w,
+            canvas_h,
+            bg_rgba,
+            canvas,
+            prev_rect: None,
+        })
+    }
+
+    /// Canvas width in pixels.
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub(crate) fn canvas_width(&self) -> u32 {
+        self.canvas_w
+    }
+
+    /// Canvas height in pixels.
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub(crate) fn canvas_height(&self) -> u32 {
+        self.canvas_h
+    }
+
+    /// Dispose of the previous frame's rectangle, decode and draw one
+    /// `ANMF` chunk payload (header + frame data) with its blending
+    /// method, and return the composited canvas (packed `Rgba`) plus
+    /// the frame's duration in milliseconds.
+    pub(crate) fn step(
+        &mut self,
+        payload: &[u8],
+        opts: &DecodeOptions,
+    ) -> Result<(Vec<u8>, u32), WebpError> {
+        let (canvas_w, canvas_h, bg_rgba) = (self.canvas_w, self.canvas_h, self.bg_rgba);
         let header = anmf::AnmfHeader::parse(payload)?;
         let frame_data = payload
             .get(header.frame_data_offset()..)
@@ -688,45 +767,21 @@ fn decode_animation(
         };
         let sub_rgba = sub.to_rgba8();
 
-        if let Some((px, py, pw, ph, anmf::DisposalMethod::Background)) = prev_rect {
-            fill_canvas_rect(&mut canvas, canvas_w, px, py, pw, ph, bg_rgba);
+        let canvas = &mut self.canvas;
+        if let Some((px, py, pw, ph, anmf::DisposalMethod::Background)) = self.prev_rect {
+            fill_canvas_rect(canvas, canvas_w, px, py, pw, ph, bg_rgba);
         }
         match header.blend {
             anmf::BlendingMethod::Overwrite => blit_rect_overwrite(
-                &mut canvas,
-                canvas_w,
-                header.x,
-                header.y,
-                sub_w,
-                sub_h,
-                &sub_rgba,
+                canvas, canvas_w, header.x, header.y, sub_w, sub_h, &sub_rgba,
             ),
             anmf::BlendingMethod::AlphaBlend => blit_rect_alpha_blend(
-                &mut canvas,
-                canvas_w,
-                header.x,
-                header.y,
-                sub_w,
-                sub_h,
-                &sub_rgba,
+                canvas, canvas_w, header.x, header.y, sub_w, sub_h, &sub_rgba,
             ),
         }
-
-        let image = WebpImage::from_rgba8(canvas_w, canvas_h, canvas.clone())?
-            .with_metadata(metadata.clone());
-        frames.push(Frame::new(
-            image,
-            Some(Duration::from_millis(u64::from(header.duration_ms))),
-        ));
-        prev_rect = Some((header.x, header.y, sub_w, sub_h, header.dispose));
-        if first_only {
-            break;
-        }
+        self.prev_rect = Some((header.x, header.y, sub_w, sub_h, header.dispose));
+        Ok((canvas.clone(), header.duration_ms))
     }
-    if frames.is_empty() {
-        return Err(WebpError::invalid("animation has no ANMF frames"));
-    }
-    Ok(frames)
 }
 
 /// Fill an axis-aligned rectangle of `canvas` with `rgba`. Bounds are

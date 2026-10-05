@@ -202,27 +202,55 @@ pub fn decode_webp_to_frame(
 
 // ───────────────────────── Decoder + factory ─────────────────────────────
 
-/// Factory for the `Decoder` trait impl — installed in the codec registry.
+/// Factory for the `Decoder` trait impl — installed in the codec registry
+/// under all three ids. `params.extradata` selects the packetisation
+/// (see [`WebpDecoder::from_params`]) and `params.limits` tighten the
+/// decode limits.
 pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
-    Ok(Box::new(WebpDecoder::new(params.clone())))
+    Ok(Box::new(WebpDecoder::from_params(params)))
 }
 
-/// WebP [`Decoder`] trait impl: one complete `RIFF/WEBP` file per packet,
-/// one native-layout [`Frame::Video`] per `receive_frame`.
+/// WebP [`Decoder`] trait impl: one complete `RIFF/WEBP` file per packet.
+///
+/// * Whole-file packets (the default): one native-layout
+///   [`Frame::Video`] per `receive_frame`, exactly what [`crate::decode`]
+///   returns — an animated file decodes to its first composited frame.
+/// * Per-frame animation packets (the [`crate::container_registry`]
+///   demuxer's layout, announced in `extradata`): every packet is a
+///   one-frame animated file whose `ANMF` is composited onto a canvas
+///   that persists across packets, so the sequence of frames equals
+///   [`crate::decode_all`] of the original file (`Rgba`, sRGB).
 ///
 /// The decoder refreshes `width` / `height` / `pixel_format` on its
 /// [`CodecParameters`] after every decode — see [`Self::params`].
+/// Drained, `receive_frame` returns `NeedMore` until [`Decoder::flush`],
+/// then `Eof`.
 #[derive(Debug)]
 pub struct WebpDecoder {
     params: CodecParameters,
     opts: DecodeOptions,
     pending: Option<Packet>,
+    queued: VecDeque<Frame>,
+    anim: Option<AnimState>,
     eof: bool,
 }
 
+/// Per-frame animation state (see [`WebpDecoder`]).
+struct AnimState {
+    compositor: Option<crate::api::AnimCompositor>,
+}
+
+impl std::fmt::Debug for AnimState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnimState")
+            .field("canvas", &self.compositor.is_some())
+            .finish()
+    }
+}
+
 impl WebpDecoder {
-    /// Build a decoder whose output [`CodecParameters`] start from
-    /// `params`; `pixel_format` is refined after the first frame.
+    /// Build a whole-file decoder whose output [`CodecParameters`] start
+    /// from `params`; `pixel_format` is refined after the first frame.
     pub fn new(params: CodecParameters) -> Self {
         Self::with_options(params, DecodeOptions::default())
     }
@@ -231,7 +259,9 @@ impl WebpDecoder {
     pub fn with_options(params: CodecParameters, opts: DecodeOptions) -> Self {
         let mut p = params;
         p.media_type = MediaType::Video;
-        p.codec_id = CodecId::new(CODEC_ID_STR);
+        if !crate::container_registry::is_webp_codec(&p.codec_id) {
+            p.codec_id = CodecId::new(CODEC_ID_STR);
+        }
         if p.pixel_format.is_none() {
             p.pixel_format = Some(PixelFormat::Rgba);
         }
@@ -239,14 +269,84 @@ impl WebpDecoder {
             params: p,
             opts,
             pending: None,
+            queued: VecDeque::new(),
+            anim: None,
             eof: false,
         }
+    }
+
+    /// A decoder for the stream `params` describe: the
+    /// [`crate::container_registry`] `extradata` record selects
+    /// whole-file or per-frame animation packets, and `params.limits`
+    /// (`max_pixels_per_frame`, `max_alloc_bytes_per_frame`) tighten the
+    /// [`DecodeOptions`] limits (never loosen them).
+    pub fn from_params(params: &CodecParameters) -> Self {
+        let limits = &params.limits;
+        let mut opts = DecodeOptions::default();
+        opts.max_pixels = Some(opts.max_pixels.map_or(limits.max_pixels_per_frame, |m| {
+            m.min(limits.max_pixels_per_frame)
+        }));
+        opts.max_bytes = Some(
+            opts.max_bytes
+                .map_or(limits.max_alloc_bytes_per_frame, |m| {
+                    m.min(limits.max_alloc_bytes_per_frame)
+                }),
+        );
+        let mut dec = Self::with_options(params.clone(), opts);
+        if crate::container_registry::is_animation_stream(params) {
+            dec.anim = Some(AnimState { compositor: None });
+        }
+        dec
     }
 
     /// The decoder's [`CodecParameters`]; authoritative after the first
     /// successful `receive_frame`.
     pub fn params(&self) -> &CodecParameters {
         &self.params
+    }
+
+    /// Animation-packets path: composite this packet's `ANMF` frame(s)
+    /// onto the persistent canvas and queue the results.
+    fn decode_animation_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
+        let bytes = &packet.data;
+        let c = crate::container::parse(bytes).map_err(WebpError::from)?;
+        let (hdr, anim) = crate::api::animation_headers(bytes, &c, &self.opts)?;
+        let Some(state) = self.anim.as_mut() else {
+            unreachable!("decode_animation_packet is only called in animation mode");
+        };
+        if state.compositor.is_none() {
+            state.compositor = Some(crate::api::AnimCompositor::new(&hdr, &anim, &self.opts)?);
+        }
+        let comp = state
+            .compositor
+            .as_mut()
+            .expect("compositor was just created");
+        if (comp.canvas_width(), comp.canvas_height()) != (hdr.canvas_width, hdr.canvas_height) {
+            return Err(CoreError::invalid(format!(
+                "oxideav-webp decoder: packet canvas {}x{} differs from the stream's {}x{}",
+                hdr.canvas_width,
+                hdr.canvas_height,
+                comp.canvas_width(),
+                comp.canvas_height()
+            )));
+        }
+        let color: ColorSignal = ColorInfo::srgb().into();
+        for anmf in c.chunks_with_fourcc(crate::container::fourcc::ANMF) {
+            let (canvas, _ms) = comp.step(anmf.payload(bytes), &self.opts)?;
+            self.params.width = Some(hdr.canvas_width);
+            self.params.height = Some(hdr.canvas_height);
+            self.params.pixel_format = Some(PixelFormat::Rgba);
+            let vf = VideoFrame {
+                pts: packet.pts,
+                planes: vec![VideoPlane {
+                    stride: hdr.canvas_width as usize * 4,
+                    data: canvas,
+                }],
+            }
+            .with_color_signal(color);
+            self.queued.push_back(Frame::Video(vf));
+        }
+        Ok(())
     }
 }
 
@@ -256,6 +356,9 @@ impl Decoder for WebpDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
+        if self.anim.is_some() {
+            return self.decode_animation_packet(packet);
+        }
         if self.pending.is_some() {
             return Err(CoreError::other(
                 "oxideav-webp decoder: receive_frame must be called before sending another packet",
@@ -266,6 +369,9 @@ impl Decoder for WebpDecoder {
     }
 
     fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
+        if let Some(f) = self.queued.pop_front() {
+            return Ok(f);
+        }
         let Some(pkt) = self.pending.take() else {
             return if self.eof {
                 Err(CoreError::Eof)
@@ -284,6 +390,16 @@ impl Decoder for WebpDecoder {
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
         self.eof = true;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> oxideav_core::Result<()> {
+        self.pending = None;
+        self.queued.clear();
+        self.eof = false;
+        if let Some(state) = self.anim.as_mut() {
+            state.compositor = None;
+        }
         Ok(())
     }
 }
@@ -458,10 +574,11 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
 }
 
-/// Register the `.webp` file extension so a `RuntimeContext` can map a
-/// filename hint back to the WebP codec id.
+/// Register the WebP container — demuxer, muxer, content probe and the
+/// `.webp` extension — so the framework can open and write WebP files
+/// through the registry (see [`crate::container_registry`]).
 pub fn register_containers(reg: &mut ContainerRegistry) {
-    reg.register_extension("webp", CODEC_ID_STR);
+    crate::container_registry::register(reg);
 }
 
 /// Unified registration: codecs + container hooks.

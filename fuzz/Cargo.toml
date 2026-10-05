@@ -468,14 +468,16 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-# Pulled in with `default-features = false` so the fuzz build exercises
-# the framework-free standalone surface (`decode_webp`,
-# `extract_metadata`, `encode_webp_lossless`) and never links
-# `oxideav-core` — the same shape every other fuzz harness in this
-# workspace uses.
+# The `registry` feature (default) is on: the `demux` target drives the
+# container demuxer / muxer and the framework decoder through
+# `oxideav-core`; every other target still exercises the framework-free
+# standalone surface (`decode`, `info`, `read_metadata`, `encode`), which
+# is the same code either way (the registry path is a thin adapter).
 [dependencies.oxideav-webp]
 path = ".."
-default-features = false
+
+[dependencies.oxideav-core]
+version = "0.1"
 
 [profile.release]
 debug = 1
@@ -870,5 +872,11 @@ bench = false
 [[bin]]
 name = "contract_encode"
 path = "fuzz_targets/contract_encode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
 test = false
 doc = false

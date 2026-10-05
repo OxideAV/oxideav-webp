@@ -603,7 +603,7 @@ struct DirtyRect {
 /// Build the 6-byte §2.7.1.1 Figure 8 `ANIM` payload: BGRA background colour
 /// (the `[R,G,B,A]` option re-ordered to on-disk `[B,G,R,A]`) + LE u16 loop
 /// count.
-fn build_anim_payload(loop_count: u16, background_rgba: [u8; 4]) -> Vec<u8> {
+pub(crate) fn build_anim_payload(loop_count: u16, background_rgba: [u8; 4]) -> Vec<u8> {
     let [r, g, b, a] = background_rgba;
     let mut p = Vec::with_capacity(ANIM_PAYLOAD_LEN);
     // §2.7.1.1: on-disk byte order is [Blue, Green, Red, Alpha].
@@ -787,7 +787,7 @@ fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Ve
 /// Splice the 16-byte §2.7.1.1 Figure 9 header in front of the per-frame
 /// Frame Data sub-RIFF and return the complete ANMF chunk payload.
 #[allow(clippy::too_many_arguments)]
-fn build_anmf_header_then_data(
+pub(crate) fn build_anmf_header_then_data(
     x: u32,
     y: u32,
     w: u32,
