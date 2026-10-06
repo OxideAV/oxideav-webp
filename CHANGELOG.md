@@ -4,6 +4,14 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
+
+### Other
+
+- container demuxer + muxer behind register_containers; per-frame animation decode
+- fallible WebpImage constructors, encode_all, exclude tests/fuzz (image-crate API fleet sweep)
+- README examples use the current registry API
+
 ### Added
 
 - **The `webp` container** (`oxideav_webp::container_registry`, installed
