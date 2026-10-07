@@ -15,6 +15,11 @@
 //! [`oxideav_webp::decode_webp`] entry point — RIFF walk + §6 entropy
 //! decode + §4 inverse-transform chain + ARGB→RGBA repack.
 //!
+//! The fixtures are encoded at `EncodeOptions::method` 6, the exhaustive
+//! search: it is the encoder that elects the §3.5.2 colour transform for the
+//! `crosscolor` cell (the single-pass default does not try it), and it
+//! keeps the decoded bytes the same as earlier rounds measured.
+//!
 //! | Cell | Content | Elected transform list (asserted) |
 //! |---|---|---|
 //! | `predictor` | smooth gradient | §4.1 `Predictor` |
@@ -131,7 +136,8 @@ fn fixture_none() -> Vec<u8> {
 /// is exactly what it reports for every body-bearing mix; the
 /// subtract-green and empty lists are read to the terminating bit.
 fn encode_expecting(rgba: &[u8], expect: Option<TransformType>) -> Vec<u8> {
-    let webp = encode_rgba8(W, H, rgba, &EncodeOptions::default()).expect("encode");
+    let opts = EncodeOptions::default().with_method(6);
+    let webp = encode_rgba8(W, H, rgba, &opts).expect("encode");
     let list = read_vp8l_transform_list(&webp)
         .expect("transform list")
         .expect("VP8L chunk");

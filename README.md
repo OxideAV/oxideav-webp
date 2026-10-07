@@ -173,7 +173,14 @@ strength), `embed_icc` / `embed_exif` / `embed_xmp` (default on — the
 image's metadata is written when present), and for animations
 `loop_count` (`0` = forever), `background_rgba`, `frame_mode`
 (`Auto` / `Delta` / `Lossless` dirty-rectangle strategy) and `delta`.
-One struct for stills and animations; behaviour variants are fields.
+`method` (`0..=6`, default `4`, the scale of `cwebp -m`) sets the
+lossless encoder's effort, for the alpha plane of a lossy encode too:
+`0..=5` pick the transforms and the colour cache from histogram cost
+estimates and encode once; `6` runs the exhaustive search. On the
+crate's test images the default writes at most 8.7% more than `6` (most
+come out the same size), and `6` is about 100 times slower on
+photo-like images. One struct for stills and animations; behaviour
+variants are fields.
 
 ## Metadata and colour
 
@@ -214,13 +221,16 @@ profile is carried, not applied.
   `build_animated_webp_with_options` / `AnimEncoderOptions`,
   `WebpFileMetadata` — is kept for one release as `#[deprecated]` thin
   wrappers over the contract functions.
-* The lossless encoder is a byte-cost super-chooser over every §3 / §4 /
-  §3.5 transform candidate, cost-priced LZ77 planning and §6.2.2
-  entropy-image clustering; on a 10-image corpus its output is smaller
-  than the reference encoder's best effort on 9 of 10 images (up to
-  −28%). Every stream is re-verified bit-exact through a black-box
-  reference decode. See [`BENCHMARKS.md`](./BENCHMARKS.md) for the
-  optimisation log.
+* The default lossless encoder (`method` `0..=5`) estimates each
+  transform stack and colour-cache size from the histograms of one
+  greedy LZ77 parse, then encodes the cheapest once with cost-priced
+  LZ77 planning: a 1024 x 1024 photo takes about 0.5 s. `method` `6` is a
+  byte-cost super-chooser over every RFC 9649 §3.5 transform candidate,
+  cost-priced LZ77 planning and §3.7.2.2 entropy-image clustering; on a
+  10-image corpus its output is smaller than the reference encoder's best
+  effort on 9 of 10 images (up to -28%). Every stream is re-verified
+  bit-exact through a black-box reference decode. See
+  [`BENCHMARKS.md`](./BENCHMARKS.md) for the optimisation log.
 
 ## Benchmarks
 

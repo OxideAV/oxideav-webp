@@ -9,7 +9,15 @@
 //!   `tests/data/lossless-32x32-rgba.webp` fixture (decoded once, tiled
 //!   4×4 to 128×128), exercising a more realistic colour distribution.
 //!
-//! Both benches build their input once outside `b.iter`, so the
+//! * `photo_256`: a 256×256 photo-like RGBA image (smooth gradients, a
+//!   soft blob and small per-channel noise), the input the standalone
+//!   speed comparison against the reference encoder uses.
+//!
+//! The `*_method6` cells encode the same inputs at `EncodeOptions::method`
+//! 6, the exhaustive search that was the only lossless path before the
+//! single-pass default; the other cells measure the default.
+//!
+//! Every bench builds its input once outside `b.iter`, so the
 //! measured time is encode-only. Run with:
 //!
 //! ```text
@@ -71,6 +79,32 @@ fn natural_rgba_128() -> Vec<u8> {
     out
 }
 
+/// Build a deterministic photo-like `w × h` RGBA image: gradients, a soft
+/// bright blob and xorshift noise of ±8 per channel.
+fn photo_rgba(w: u32, h: u32) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let fx = x as f32 / w as f32;
+            let fy = y as f32 / h as f32;
+            let d = ((fx - 0.5).powi(2) + (fy - 0.4).powi(2)).sqrt();
+            let blob = (1.0 - (d * 3.0).min(1.0)) * 60.0;
+            let nr = (state & 0xF) as f32 - 8.0;
+            let ng = ((state >> 4) & 0xF) as f32 - 8.0;
+            let nb = ((state >> 8) & 0xF) as f32 - 8.0;
+            let r = (40.0 + 180.0 * fx + blob + nr).clamp(0.0, 255.0) as u8;
+            let g = (60.0 + 150.0 * fy + blob + ng).clamp(0.0, 255.0) as u8;
+            let b = (200.0 - 120.0 * fx * fy + nb).clamp(0.0, 255.0) as u8;
+            px.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    px
+}
+
 fn bench_lossless_encode(c: &mut Criterion) {
     let gradient = gradient_rgba_256();
     c.bench_function("lossless_encode_rgba_256", |b| {
@@ -86,6 +120,29 @@ fn bench_lossless_encode(c: &mut Criterion) {
         b.iter(|| {
             let out = encode_rgba8(128, 128, black_box(&natural), &EncodeOptions::default())
                 .expect("encode");
+            black_box(out)
+        })
+    });
+
+    let photo = photo_rgba(256, 256);
+    c.bench_function("lossless_encode_photo_256", |b| {
+        b.iter(|| {
+            let out = encode_rgba8(256, 256, black_box(&photo), &EncodeOptions::default())
+                .expect("encode");
+            black_box(out)
+        })
+    });
+
+    let exhaustive = EncodeOptions::default().with_method(6);
+    c.bench_function("lossless_encode_rgba_256_method6", |b| {
+        b.iter(|| {
+            let out = encode_rgba8(256, 256, black_box(&gradient), &exhaustive).expect("encode");
+            black_box(out)
+        })
+    });
+    c.bench_function("lossless_encode_natural_128_method6", |b| {
+        b.iter(|| {
+            let out = encode_rgba8(128, 128, black_box(&natural), &exhaustive).expect("encode");
             black_box(out)
         })
     });

@@ -52,6 +52,17 @@
 //! framing (via [`crate::build`]), decodes back to the exact input pixels
 //! through [`crate::decode`] — a pixel-exact round trip.
 //!
+//! ## Effort levels
+//!
+//! The candidate search the sections below describe
+//! ([`encode_argb_with_predictor_chooser`]) runs at lossless effort `6`
+//! ([`crate::EncodeOptions::method`]): it encodes every candidate in full
+//! and keeps the smallest stream. The default effort runs the single-pass
+//! encoder in [`entropy_estimate`] instead, which picks the transform
+//! stack and the colour cache from histogram cost estimates and encodes
+//! the image once, reusing this module's transforms, LZ77 matcher, token
+//! planner and writer.
+//!
 //! ## §3.7.2 prefix-code construction
 //!
 //! For each of the five symbol alphabets the encoder:
@@ -238,6 +249,8 @@
 
 use crate::build::{self, ImageKind};
 
+mod entropy_estimate;
+
 /// The largest code length a VP8L canonical prefix code may use (§3.7.2.1.2
 /// stores literal code lengths in `[0..15]`). Mirrors
 /// [`crate::vp8l_prefix::MAX_CODE_LENGTH`].
@@ -309,6 +322,18 @@ impl std::error::Error for EncodeError {}
 /// §3.4 14-bit `width - 1` / `height - 1` field maximum (1-based 16384).
 const MAX_DIMENSION: u32 = 1 << 14;
 
+/// Default lossless effort ([`crate::EncodeOptions::method`]): the
+/// single-pass encoder of [`entropy_estimate`], which picks the
+/// transforms and the colour cache from histogram cost estimates and
+/// encodes once.
+pub(crate) const DEFAULT_METHOD: u8 = 4;
+
+/// Lowest lossless effort that runs the exhaustive search
+/// ([`encode_argb_with_predictor_chooser`]): every candidate stream is
+/// encoded in full and the smallest kept. Higher values behave the same;
+/// lower ones run the single-pass encoder of [`entropy_estimate`].
+pub(crate) const EXHAUSTIVE_METHOD: u8 = 6;
+
 /// Least-significant-bit-first bit writer over a growing byte buffer.
 ///
 /// The exact inverse of [`crate::vp8l_stream::BitReader`]: bits are packed
@@ -362,6 +387,21 @@ impl BitWriter {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+
+    /// A writer that continues after `bytes`: the next bit lands in a new
+    /// byte appended to them. Lets the encoder write a bitstream straight
+    /// behind container and image headers instead of copying it there.
+    pub(crate) fn after_bytes(bytes: Vec<u8>) -> Self {
+        let bit_pos = bytes.len() * 8;
+        Self { bytes, bit_pos }
+    }
+
+    /// Reserve room for `bits` more bits, so a write of known size never
+    /// reallocates.
+    pub(crate) fn reserve_bits(&mut self, bits: usize) {
+        let needed = (self.bit_pos + bits).div_ceil(8);
+        self.bytes.reserve(needed.saturating_sub(self.bytes.len()));
+    }
 }
 
 /// Build a length-limited (≤ [`MAX_CODE_LENGTH`]) canonical Huffman
@@ -397,17 +437,54 @@ impl BitWriter {
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
+    let mut scratch = PrefixCodeScratch::default();
+    build_code_lengths_into(freqs, &mut scratch);
+    scratch.lengths
+}
+
+/// Reusable work buffers for [`build_code_lengths_into`]. The
+/// single-pass encoder ([`entropy_estimate`]) prices a few hundred
+/// candidate histograms per image; the buffers grow to the largest
+/// alphabet priced and are reused after that (see [`PricingScratch`]).
+#[derive(Debug, Default)]
+struct PrefixCodeScratch {
+    /// The code lengths of the last build, one per symbol.
+    lengths: Vec<u8>,
+    /// The used symbols of the last build, ascending.
+    used: Vec<usize>,
+    leaves: Vec<u64>,
+    inode_freq: Vec<u64>,
+    parent: Vec<u32>,
+    internal_depth: Vec<u32>,
+    /// Per-length buckets of the length-limiting pass.
+    buckets: Vec<Vec<usize>>,
+}
+
+/// [`build_code_lengths`] into `scratch.lengths`, reusing the scratch
+/// buffers (the same algorithm, so the same lengths).
+fn build_code_lengths_into(freqs: &[u32], scratch: &mut PrefixCodeScratch) {
+    let PrefixCodeScratch {
+        lengths,
+        used,
+        leaves,
+        inode_freq,
+        parent,
+        internal_depth,
+        buckets,
+    } = scratch;
     let n = freqs.len();
-    let mut lengths = vec![0u8; n];
+    lengths.clear();
+    lengths.resize(n, 0);
 
     // Collect used symbols.
-    let used: Vec<usize> = (0..n).filter(|&s| freqs[s] > 0).collect();
+    used.clear();
+    used.extend((0..n).filter(|&s| freqs[s] > 0));
     match used.len() {
-        0 => return lengths, // empty code; caller encodes single-symbol-0.
+        0 => return, // empty code; caller encodes single-symbol-0.
         1 => {
             // §3.7.2.1.2 single-leaf: one symbol marked length 1.
             lengths[used[0]] = 1;
-            return lengths;
+            return;
         }
         _ => {}
     }
@@ -422,17 +499,17 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     // exactly the `(freq, ascending symbol)` tie-break the merge needs
     // (`freq` is `u32`, so the shift is exact, and a symbol index always
     // fits the low half).
-    let mut leaves: Vec<u64> = used
-        .iter()
-        .map(|&s| ((freqs[s] as u64) << 32) | s as u64)
-        .collect();
+    leaves.clear();
+    leaves.extend(used.iter().map(|&s| ((freqs[s] as u64) << 32) | s as u64));
     leaves.sort_unstable();
 
     // Internal-node FIFO: frequencies only; internal node `i` has node
     // index `n + i`. `u32::MAX` marks "no parent yet" (only the root
     // keeps it, and the root's slot is never read back).
-    let mut inode_freq: Vec<u64> = Vec::with_capacity(m - 1);
-    let mut parent: Vec<u32> = vec![u32::MAX; n + m - 1];
+    inode_freq.clear();
+    inode_freq.reserve(m - 1);
+    parent.clear();
+    parent.resize(n + m - 1, u32::MAX);
 
     /// Take the smallest remaining node by `(freq, tie-break order)`:
     /// the front leaf wins ties because leaves rank before internal
@@ -464,8 +541,8 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     let mut li = 0usize; // leaf cursor
     let mut ii = 0usize; // internal-node cursor
     for _ in 0..m - 1 {
-        let (a_node, a_freq) = take_min(&leaves, &mut li, &inode_freq, &mut ii, n);
-        let (b_node, b_freq) = take_min(&leaves, &mut li, &inode_freq, &mut ii, n);
+        let (a_node, a_freq) = take_min(leaves, &mut li, inode_freq, &mut ii, n);
+        let (b_node, b_freq) = take_min(leaves, &mut li, inode_freq, &mut ii, n);
         let new_node = n + inode_freq.len();
         parent[a_node] = new_node as u32;
         parent[b_node] = new_node as u32;
@@ -476,7 +553,8 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     // always created later (larger index), so a single reverse pass over
     // the internal nodes settles every internal depth, and each leaf is
     // then one deeper than its (always internal) parent.
-    let mut internal_depth = vec![0u32; m - 1];
+    internal_depth.clear();
+    internal_depth.resize(m - 1, 0);
     for i in (0..m - 1).rev() {
         let p = parent[n + i];
         if p != u32::MAX {
@@ -484,7 +562,7 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
         }
     }
     let mut max_len = 0usize;
-    for &s in &used {
+    for &s in used.iter() {
         let depth = internal_depth[parent[s] as usize - n] as usize + 1;
         // A single internal-node tree (two leaves) gives depth 1; never 0
         // here because used.len() >= 2.
@@ -493,10 +571,8 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     }
 
     if max_len > MAX_CODE_LENGTH {
-        limit_code_lengths(&mut lengths, &used);
+        limit_code_lengths(lengths, used, buckets);
     }
-
-    lengths
 }
 
 /// Cap every code length at [`MAX_CODE_LENGTH`] while keeping the Kraft sum
@@ -508,9 +584,10 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
 /// than the format allows. It produces a *valid* (complete) code that is at
 /// most marginally sub-optimal; exactness of the round trip is unaffected
 /// because the decoder reconstructs pixels from whatever complete code the
-/// lengths describe.
-fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
-    limit_code_lengths_to(lengths, used, MAX_CODE_LENGTH);
+/// lengths describe. `buckets` is reusable scratch (see
+/// [`limit_code_lengths_with`]).
+fn limit_code_lengths(lengths: &mut [u8], used: &[usize], buckets: &mut Vec<Vec<usize>>) {
+    limit_code_lengths_with(lengths, used, MAX_CODE_LENGTH, buckets);
 }
 
 /// As [`limit_code_lengths`], but caps every code length at the
@@ -530,6 +607,18 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
 /// `max_len <= MAX_CODE_LENGTH` is required (the Kraft arithmetic uses
 /// `2^max_len` as the common denominator).
 fn limit_code_lengths_to(lengths: &mut [u8], used: &[usize], max_len: usize) {
+    limit_code_lengths_with(lengths, used, max_len, &mut Vec::new());
+}
+
+/// [`limit_code_lengths_to`] with its per-length buckets kept in
+/// `buckets` between calls (emptied, not freed), so repeated builds
+/// through a [`PrefixCodeScratch`] do not allocate them again.
+fn limit_code_lengths_with(
+    lengths: &mut [u8],
+    used: &[usize],
+    max_len: usize,
+    buckets: &mut Vec<Vec<usize>>,
+) {
     debug_assert!((1..=MAX_CODE_LENGTH).contains(&max_len));
     // Clamp.
     for &s in used {
@@ -571,7 +660,12 @@ fn limit_code_lengths_to(lengths: &mut [u8], used: &[usize], max_len: usize) {
     //    ever gains a member while the pass is still running.
     let mut k = kraft(lengths);
     if k > full {
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); max_len];
+        for bucket in buckets.iter_mut() {
+            bucket.clear();
+        }
+        if buckets.len() < max_len {
+            buckets.resize_with(max_len, Vec::new);
+        }
         for &s in used {
             let l = lengths[s] as usize;
             if l < max_len {
@@ -987,8 +1081,20 @@ fn clc_extra_bits(sym: u8) -> usize {
 /// is only ever emitted immediately after its value has been emitted,
 /// so the "before any nonzero emits 8" corner is never produced.
 fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToken> {
-    let n = lengths.len();
     let mut out = Vec::new();
+    for_each_rle_code_length_token(lengths, use_repeat_16, |t| out.push(t));
+    out
+}
+
+/// The tokens of [`rle_tokenize_code_lengths`], handed to `out` one at a
+/// time instead of collected (the allocation-free table pricing in
+/// [`normal_form_bits_with`] walks them twice).
+fn for_each_rle_code_length_token(
+    lengths: &[u8],
+    use_repeat_16: bool,
+    mut out: impl FnMut(ClcToken),
+) {
+    let n = lengths.len();
     let mut i = 0usize;
     while i < n {
         let v = lengths[i];
@@ -1002,11 +1108,11 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             while z > 0 {
                 if z < 3 {
                     for _ in 0..z {
-                        out.push(ClcToken { sym: 0, extra: 0 });
+                        out(ClcToken { sym: 0, extra: 0 });
                     }
                     z = 0;
                 } else if z <= 10 {
-                    out.push(ClcToken {
+                    out(ClcToken {
                         sym: 17,
                         extra: (z - 3) as u8,
                     });
@@ -1019,7 +1125,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
                         c = z - 3;
                     }
                     debug_assert!(c >= 11);
-                    out.push(ClcToken {
+                    out(ClcToken {
                         sym: 18,
                         extra: (c - 11) as u8,
                     });
@@ -1028,7 +1134,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             }
         } else {
             // Emit the literal, then fold immediate repeats into 16s.
-            out.push(ClcToken { sym: v, extra: 0 });
+            out(ClcToken { sym: v, extra: 0 });
             i += 1;
             let mut r = 0usize;
             while i + r < n && lengths[i + r] == v {
@@ -1038,7 +1144,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             while r > 0 {
                 if !use_repeat_16 || r < 3 {
                     for _ in 0..r {
-                        out.push(ClcToken { sym: v, extra: 0 });
+                        out(ClcToken { sym: v, extra: 0 });
                     }
                     r = 0;
                 } else {
@@ -1048,7 +1154,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
                         c = r - 3;
                     }
                     debug_assert!(c >= 3);
-                    out.push(ClcToken {
+                    out(ClcToken {
                         sym: 16,
                         extra: (c - 3) as u8,
                     });
@@ -1057,7 +1163,6 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             }
         }
     }
-    out
 }
 
 /// The token variants [`write_normal_code_lengths`] /
@@ -1088,7 +1193,15 @@ fn clc_layout(tokens: &[ClcToken]) -> ([u8; NUM_CODE_LENGTH_CODES], usize, Optio
     let clc_lengths_vec = build_clc_code_lengths(&clc_freq);
     let mut clc_lengths = [0u8; NUM_CODE_LENGTH_CODES];
     clc_lengths.copy_from_slice(&clc_lengths_vec);
+    clc_layout_from_lengths(&clc_freq, clc_lengths)
+}
 
+/// The `(num_code_lengths, single_leaf)` half of [`clc_layout`], given the
+/// CLC symbol frequencies and the CLC lengths already built from them.
+fn clc_layout_from_lengths(
+    clc_freq: &[u32; NUM_CODE_LENGTH_CODES],
+    clc_lengths: [u8; NUM_CODE_LENGTH_CODES],
+) -> ([u8; NUM_CODE_LENGTH_CODES], usize, Option<usize>) {
     let mut max_order_used = 0usize;
     for (order_idx, &pos) in CODE_LENGTH_CODE_ORDER.iter().enumerate() {
         if clc_lengths[pos] != 0 {
@@ -1097,10 +1210,11 @@ fn clc_layout(tokens: &[ClcToken]) -> ([u8; NUM_CODE_LENGTH_CODES], usize, Optio
     }
     let num_code_lengths = (max_order_used + 1).max(4);
 
-    let used: Vec<usize> = (0..NUM_CODE_LENGTH_CODES)
-        .filter(|&s| clc_freq[s] > 0)
-        .collect();
-    let single_leaf = if used.len() == 1 { Some(used[0]) } else { None };
+    let mut used = (0..NUM_CODE_LENGTH_CODES).filter(|&s| clc_freq[s] > 0);
+    let single_leaf = match (used.next(), used.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    };
     (clc_lengths, num_code_lengths, single_leaf)
 }
 
@@ -1169,6 +1283,125 @@ fn normal_form_bits(lengths: &[u8]) -> usize {
         .map(|t| code_length_tokens_bits(t))
         .min()
         .expect("three variants")
+}
+
+/// [`normal_form_bits`] without collecting tokens: each of the three token
+/// variants is walked twice (CLC frequencies, then bits), and the CLC code
+/// is built in `scratch`, so once `scratch` has grown to the 19-symbol CLC
+/// alphabet a call allocates nothing. Same result.
+fn normal_form_bits_with(lengths: &[u8], scratch: &mut PrefixCodeScratch) -> usize {
+    // Variant 0 is the verbatim form; 1 and 2 are the RLE forms without
+    // and with code 16, in `normal_form_token_variants` order.
+    let walk = |variant: usize, f: &mut dyn FnMut(ClcToken)| match variant {
+        0 => lengths
+            .iter()
+            .for_each(|&l| f(ClcToken { sym: l, extra: 0 })),
+        v => for_each_rle_code_length_token(lengths, v == 2, f),
+    };
+    let mut best = usize::MAX;
+    for variant in 0..3 {
+        let mut clc_freq = [0u32; NUM_CODE_LENGTH_CODES];
+        walk(variant, &mut |t| clc_freq[t.sym as usize] += 1);
+        build_code_lengths_into(&clc_freq, scratch);
+        if scratch
+            .lengths
+            .iter()
+            .any(|&l| l as usize > MAX_CLC_CODE_LENGTH)
+        {
+            // Rare: the same re-balance `build_clc_code_lengths` applies.
+            limit_code_lengths_with(
+                &mut scratch.lengths,
+                &scratch.used,
+                MAX_CLC_CODE_LENGTH,
+                &mut scratch.buckets,
+            );
+        }
+        let mut clc_lengths = [0u8; NUM_CODE_LENGTH_CODES];
+        clc_lengths.copy_from_slice(&scratch.lengths);
+        let (clc_lengths, num_code_lengths, single_leaf) =
+            clc_layout_from_lengths(&clc_freq, clc_lengths);
+        // Same tally as `code_length_tokens_bits`.
+        let mut bits = 1 + 4 + 3 * num_code_lengths + 1;
+        walk(variant, &mut |t| {
+            if single_leaf.is_none() {
+                bits += clc_lengths[t.sym as usize] as usize;
+            }
+            bits += clc_extra_bits(t.sym);
+        });
+        best = best.min(bits);
+    }
+    best
+}
+
+/// [`simple_form_bits`] of `lengths` when the §3.7.2.1.1 simple form can
+/// carry it (the [`lengths_simple_form`] test), without allocating.
+fn simple_form_bits_of(lengths: &[u8]) -> Option<usize> {
+    let mut symbols = [0usize; 2];
+    let mut count = 0usize;
+    for (s, &l) in lengths.iter().enumerate() {
+        if l == 0 {
+            continue;
+        }
+        if l != 1 || s > 255 || count == 2 {
+            return None;
+        }
+        symbols[count] = s;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(simple_form_bits(&symbols[..count]))
+}
+
+/// The two scratch sets [`prefix_code_bits`] works in: one for the
+/// histogram's own prefix code, one for the CLC code that transmits its
+/// code lengths. Kept apart so pricing never has to move the first
+/// code's lengths out of the way to build the second.
+#[derive(Debug, Default)]
+struct PricingScratch {
+    code: PrefixCodeScratch,
+    clc: PrefixCodeScratch,
+}
+
+/// Exact bit cost of coding a symbol stream whose histogram is `freqs`
+/// through this encoder's prefix-code writer: the code-length table
+/// ([`WriteCode::write_code_lengths`]) plus the sum of frequency times
+/// code length. It equals the [`CostLengths::from_freqs`] price
+/// (`code_lengths_bits()` plus `sym_bits` per symbol), including the two
+/// degenerate shapes [`WriteCode::from_freqs`] promotes. Both codes are
+/// built in `pricing`, so once its buffers have grown to the largest
+/// alphabet priced, a call allocates nothing.
+fn prefix_code_bits(freqs: &[u32], pricing: &mut PricingScratch) -> u64 {
+    let PricingScratch { code: scratch, clc } = pricing;
+    let mut body = 0u64;
+    if !freqs.is_empty() && freqs.iter().all(|&f| f == 0) {
+        // Priced as the §3.7.2.1.1 single-symbol-0 form; no symbols.
+        scratch.lengths.clear();
+        scratch.lengths.resize(freqs.len(), 0);
+        scratch.lengths[0] = 1;
+    } else if let Some(symbol) = single_used_symbol_above_simple_ceiling(freqs) {
+        // The promoted two-leaf table: 1 bit per symbol.
+        scratch.lengths.clear();
+        scratch.lengths.resize(freqs.len(), 0);
+        scratch.lengths[0] = 1;
+        scratch.lengths[symbol] = 1;
+        body = u64::from(freqs[symbol]);
+    } else {
+        build_code_lengths_into(freqs, scratch);
+        // A single used symbol is the 0-bit single-leaf form.
+        if scratch.used.len() > 1 {
+            for &s in &scratch.used {
+                body += u64::from(freqs[s]) * u64::from(scratch.lengths[s]);
+            }
+        }
+    }
+    let normal = normal_form_bits_with(&scratch.lengths, clc);
+    let table = match simple_form_bits_of(&scratch.lengths) {
+        Some(simple) if simple <= normal => simple,
+        _ => normal,
+    };
+    body + table as u64
 }
 
 /// Write a per-symbol length table with the §3.7.2.1.1 *simple code
@@ -1285,28 +1518,82 @@ struct Lz77Matcher<'a> {
     pixels: &'a [u32],
     head: Vec<i32>,
     prev: Vec<i32>,
+    /// `32 - hash_bits`: the right shift that folds the 32-bit window
+    /// hash into a bucket index.
+    hash_shift: u32,
+    /// Farthest backward-reference distance [`Self::find`] returns.
+    max_distance: usize,
+}
+
+/// Farthest backward reference RFC 9649 §3.6.2.2 can code: the 40-symbol
+/// distance alphabet reaches distance code `1 << 20`, and a scan-line
+/// distance `D` is coded as `D + 120`. libwebp's `WINDOW_SIZE` is the same
+/// value.
+const MAX_BACKWARD_DISTANCE: usize = (1 << 20) - crate::vp8l_decode::NUM_DISTANCE_MAP_CODES;
+
+/// The two hash-chain arrays of an [`Lz77Matcher`], kept between matcher
+/// lifetimes so the single-pass encoder parses every candidate stream
+/// without allocating them again.
+#[derive(Debug, Default)]
+struct Lz77Buffers {
+    head: Vec<i32>,
+    prev: Vec<i32>,
 }
 
 impl<'a> Lz77Matcher<'a> {
     /// Build a matcher over `pixels` with empty hash chains.
+    ///
+    /// No distance cap: this is the exhaustive path's matcher, kept as it
+    /// was so that path's output does not change. On images over about a
+    /// megapixel it can find references farther than
+    /// [`MAX_BACKWARD_DISTANCE`].
     fn new(pixels: &'a [u32]) -> Self {
+        Self::with_buffers(pixels, HASH_BITS as u32, usize::MAX, Lz77Buffers::default())
+    }
+
+    /// Build a matcher over `pixels` with `1 << hash_bits` buckets that
+    /// returns matches at most `max_distance` back, reusing (and
+    /// resetting) `buffers`. With [`HASH_BITS`], no cap and fresh buffers
+    /// this is exactly [`Self::new`].
+    fn with_buffers(
+        pixels: &'a [u32],
+        hash_bits: u32,
+        max_distance: usize,
+        buffers: Lz77Buffers,
+    ) -> Self {
+        debug_assert!((1..=24).contains(&hash_bits));
+        let Lz77Buffers { mut head, mut prev } = buffers;
+        head.clear();
+        head.resize(1 << hash_bits, -1);
+        prev.clear();
+        prev.resize(pixels.len(), -1);
         Self {
             pixels,
-            head: vec![-1; 1 << HASH_BITS],
-            prev: vec![-1; pixels.len()],
+            head,
+            prev,
+            hash_shift: 32 - hash_bits,
+            max_distance,
+        }
+    }
+
+    /// Give the hash-chain arrays back for the next matcher.
+    fn into_buffers(self) -> Lz77Buffers {
+        Lz77Buffers {
+            head: self.head,
+            prev: self.prev,
         }
     }
 
     /// Hash the 4-pixel window starting at `pos` (callers guarantee
     /// `pos + 4 <= pixels.len()`). A simple multiplicative mix over the
-    /// four ARGB words, folded into `HASH_BITS` bits.
+    /// four ARGB words, folded into the matcher's bucket bits.
     fn hash(&self, pos: usize) -> usize {
         let p = self.pixels;
         let mut h = 0u32;
         for k in 0..4 {
             h = h.wrapping_mul(0x9e37_79b1).wrapping_add(p[pos + k]);
         }
-        (h >> (32 - HASH_BITS)) as usize
+        (h >> self.hash_shift) as usize
     }
 
     /// Insert `pos` at the head of its hash bucket's chain.
@@ -1338,7 +1625,12 @@ impl<'a> Lz77Matcher<'a> {
         let mut best_len = 0usize;
         let mut best_dist = 0usize;
         let mut steps = 0usize;
-        while cand >= 0 && steps < MAX_CHAIN {
+        // Chains run from the newest position to the oldest, so the first
+        // candidate past the distance cap ends the walk. Without a cap the
+        // bound is 0, the end-of-chain test alone. (Positions fit `i32`:
+        // an image holds at most 2^28 pixels.)
+        let oldest = pos.saturating_sub(self.max_distance) as i32;
+        while cand >= oldest && steps < MAX_CHAIN {
             let c = cand as usize;
             // Candidates were all inserted at positions < pos.
             //
@@ -1561,17 +1853,46 @@ fn tokenize_lz77_impl(
     lazy_depth: u32,
     mut probes: Option<&mut [FindProbe]>,
 ) -> Vec<Token> {
-    let n = pixels.len();
     let mut matcher = Lz77Matcher::new(pixels);
     let mut tokens = Vec::new();
+    lz77_parse(
+        &mut matcher,
+        lazy_depth,
+        |pos, found| {
+            if let Some(rec) = probes.as_deref_mut() {
+                rec[pos] = FindProbe::record(found);
+            }
+        },
+        |tok| tokens.push(tok),
+    );
+    tokens
+}
+
+/// The lazy-matching §3.6.2.2 parse behind [`tokenize_lz77_impl`], over a
+/// caller-built `matcher` and reporting through two callbacks instead of
+/// collecting a `Vec`:
+///
+/// * `on_probe(pos, found)` observes every `find(pos)` result (the
+///   round-440 probe recording; observation only).
+/// * `emit(token)` receives the token stream in order.
+///
+/// The parse, its matcher bookkeeping, and the emitted tokens are
+/// exactly [`tokenize_lz77_impl`]'s; a caller can stream the tokens into
+/// histograms or a compact parse instead of a `Vec<Token>`.
+fn lz77_parse(
+    matcher: &mut Lz77Matcher<'_>,
+    lazy_depth: u32,
+    mut on_probe: impl FnMut(usize, Option<(usize, usize)>),
+    mut emit: impl FnMut(Token),
+) {
+    let pixels = matcher.pixels;
+    let n = pixels.len();
     let mut pos = 0usize;
     let depth = lazy_depth.min(4);
     // Record a probe result without disturbing the parse.
     macro_rules! record {
         ($p:expr, $r:expr) => {
-            if let Some(rec) = probes.as_deref_mut() {
-                rec[$p] = FindProbe::record($r);
-            }
+            on_probe($p, $r)
         };
     }
     while pos < n {
@@ -1690,9 +2011,9 @@ fn tokenize_lz77_impl(
             // Emit literals for any pixels skipped by the chosen
             // lazy starting position, then the chosen match.
             for &skipped in &pixels[pos..best_start] {
-                tokens.push(Token::Literal(skipped));
+                emit(Token::Literal(skipped));
             }
-            tokens.push(Token::Copy {
+            emit(Token::Copy {
                 length: best_len,
                 distance: best_dist,
             });
@@ -1722,12 +2043,11 @@ fn tokenize_lz77_impl(
             }
             pos = end;
         } else {
-            tokens.push(Token::Literal(pixels[pos]));
+            emit(Token::Literal(pixels[pos]));
             matcher.insert(pos);
             pos += 1;
         }
     }
-    tokens
 }
 
 /// Allowed range for the §5.2.3 `color_cache_code_bits` field: an
@@ -2119,6 +2439,16 @@ fn prefix_codes_and_tokens_bits_from(
     tokens: &[Token],
     image_width: u32,
 ) -> usize {
+    token_stream_bits_from(tables, tokens.iter().copied(), image_width)
+}
+
+/// [`prefix_codes_and_tokens_bits_from`] over any token stream, so a
+/// caller can price a parse it does not store as a `Vec<Token>`.
+fn token_stream_bits_from(
+    tables: &StreamCostTables,
+    tokens: impl IntoIterator<Item = Token>,
+    image_width: u32,
+) -> usize {
     // Round 408: the writer's §3.7.2.1.1 single-symbol-0 substitution
     // for an all-empty table moved inside `from_freqs` (both the
     // `WriteCode` writer and the `CostLengths` mirror), so every
@@ -2131,7 +2461,7 @@ fn prefix_codes_and_tokens_bits_from(
         + tables.alpha.code_lengths_bits()
         + tables.distance.code_lengths_bits();
 
-    for &tok in tokens {
+    for tok in tokens {
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
@@ -2905,8 +3235,18 @@ const fn build_dist_map_inverse(
 /// possibly match at width 1, so all row-style matches fall back to the
 /// scan-line `D + 120` form.
 fn count_frequencies(tokens: &[Token], color_cache_size: usize, image_width: u32) -> Frequencies {
+    count_token_stream_frequencies(tokens.iter().copied(), color_cache_size, image_width)
+}
+
+/// [`count_frequencies`] over any token stream, so a caller can count a
+/// parse it does not store as a `Vec<Token>`.
+fn count_token_stream_frequencies(
+    tokens: impl IntoIterator<Item = Token>,
+    color_cache_size: usize,
+    image_width: u32,
+) -> Frequencies {
     let mut freqs = Frequencies::new(color_cache_size);
-    for &tok in tokens {
+    for tok in tokens {
         freqs.count_token(tok, image_width);
     }
     freqs
@@ -7343,6 +7683,24 @@ fn write_spatially_coded_image(
     color_cache_code_bits: Option<u32>,
     image_width: u32,
 ) {
+    write_spatially_coded_token_stream(
+        w,
+        tokens.iter().copied(),
+        color_cache_code_bits,
+        image_width,
+    );
+}
+
+/// [`write_spatially_coded_image`] over any re-iterable token stream
+/// (the writer walks it twice: frequencies, then symbols).
+fn write_spatially_coded_token_stream<I>(
+    w: &mut BitWriter,
+    tokens: I,
+    color_cache_code_bits: Option<u32>,
+    image_width: u32,
+) where
+    I: Iterator<Item = Token> + Clone,
+{
     // §3.8.3 spatially-coded-image = color-cache-info meta-prefix data.
     // color-cache-info: `%b0` (no cache) or `%b1 4BIT` (enabled).
     let color_cache_size = match color_cache_code_bits {
@@ -7360,7 +7718,7 @@ fn write_spatially_coded_image(
     // meta-prefix: `%b0` (single prefix-code group).
     w.write_bit(false);
 
-    write_prefix_codes_and_tokens(w, tokens, color_cache_size, image_width);
+    write_prefix_codes_and_token_stream(w, tokens, color_cache_size, image_width);
 }
 
 /// Write an §7.3 `entropy-coded-image` (color-cache-info + data) of
@@ -7398,13 +7756,26 @@ fn write_prefix_codes_and_tokens(
     color_cache_size: usize,
     image_width: u32,
 ) {
+    write_prefix_codes_and_token_stream(w, tokens.iter().copied(), color_cache_size, image_width);
+}
+
+/// [`write_prefix_codes_and_tokens`] over any re-iterable token stream:
+/// one pass counts the frequencies, a second emits the symbols.
+fn write_prefix_codes_and_token_stream<I>(
+    w: &mut BitWriter,
+    tokens: I,
+    color_cache_size: usize,
+    image_width: u32,
+) where
+    I: Iterator<Item = Token> + Clone,
+{
     // Build the five prefix codes from token frequencies. The GREEN
     // alphabet covers literals (`< 256`), the §5.2.2 length prefix
     // symbols (`256 + length_prefix`), and (when the cache is enabled)
     // the §5.2.3 cache indices (`256 + 24 + index`). The distance
     // alphabet (40 codes) is exercised only when the matcher emitted at
     // least one copy.
-    let freqs = count_frequencies(tokens, color_cache_size, image_width);
+    let freqs = count_token_stream_frequencies(tokens.clone(), color_cache_size, image_width);
     let green_code = WriteCode::from_freqs(&freqs.green);
     let red_code = WriteCode::from_freqs(&freqs.red);
     let blue_code = WriteCode::from_freqs(&freqs.blue);
@@ -7430,7 +7801,7 @@ fn write_prefix_codes_and_tokens(
     // (channel order green, red, blue, alpha), a §5.2.3 color-cache
     // reference (a single GREEN symbol), or a §5.2.2 length + distance
     // backward reference.
-    for &tok in tokens {
+    for tok in tokens {
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
@@ -7518,10 +7889,38 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
         pixels.push((a << 24) | (r << 16) | (g << 8) | b);
     }
 
-    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used);
+    encode_webp_lossless_file(&pixels, width, height, alpha_is_used, DEFAULT_METHOD)
+}
 
-    // §2.4 / §2.6 RIFF/WEBP framing around the VP8L payload.
-    let file = build::build_webp_file(&payload, ImageKind::Lossless, width, height)?;
+/// Encode an ARGB image to a complete simple-layout (§2.6) lossless
+/// `.webp` at lossless effort `method` (see
+/// [`crate::EncodeOptions::method`]).
+///
+/// Below [`EXHAUSTIVE_METHOD`] the bitstream is written straight behind
+/// the file and chunk headers, so the finished stream is never copied.
+pub(crate) fn encode_webp_lossless_file(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_argb(pixels, width, height)?;
+    if method >= EXHAUSTIVE_METHOD {
+        let payload = encode_vp8l_payload(pixels, width, height, alpha_is_used, method);
+        return Ok(build::build_webp_file(
+            &payload,
+            ImageKind::Lossless,
+            width,
+            height,
+        )?);
+    }
+    let mut file = build::begin_simple_webp_file(ImageKind::Lossless);
+    file.extend_from_slice(&build_image_header(width, height, alpha_is_used));
+    let mut w = BitWriter::after_bytes(file);
+    entropy_estimate::encode_image_stream(pixels, width, height, &mut w);
+    let mut file = w.into_bytes();
+    build::finish_simple_webp_file(&mut file)?;
     Ok(file)
 }
 
@@ -7554,12 +7953,28 @@ fn validate_argb(pixels: &[u32], width: u32, height: u32) -> Result<(), EncodeEr
 /// becomes the §3.4 `alpha_is_used` header bit. This is the inner payload a
 /// `VP8L` chunk wraps — *not* a RIFF/WEBP file. Callers wanting the framed
 /// file use [`encode_webp_lossless`] / [`encode_vp8l_argb_with_metadata`].
-fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: bool) -> Vec<u8> {
+///
+/// `method` is the lossless effort ([`crate::EncodeOptions::method`]):
+/// below [`EXHAUSTIVE_METHOD`] the single-pass encoder of
+/// [`entropy_estimate`] writes the stream; from it up, the exhaustive
+/// search of [`encode_argb_with_predictor_chooser`] does.
+fn encode_vp8l_payload(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Vec<u8> {
+    let header = build_image_header(width, height, alpha_is_used);
+    if method < EXHAUSTIVE_METHOD {
+        let mut w = BitWriter::after_bytes(header.to_vec());
+        entropy_estimate::encode_image_stream(pixels, width, height, &mut w);
+        return w.into_bytes();
+    }
     // Production path: thread the actual image width so the §5.2.2
     // distance-map chooser can swap row-style scan-line codes for
     // small distance-map codes (round 130).
     let stream = encode_argb_with_predictor_chooser(pixels, width, height);
-    let header = build_image_header(width, height, alpha_is_used);
     let mut payload = Vec::with_capacity(header.len() + stream.len());
     payload.extend_from_slice(&header);
     payload.extend_from_slice(&stream);
@@ -8805,8 +9220,26 @@ pub fn encode_vp8l_argb_with(
     height: u32,
     alpha_is_used: bool,
 ) -> Result<Vec<u8>, EncodeError> {
+    encode_vp8l_argb_with_method(pixels, width, height, alpha_is_used, DEFAULT_METHOD)
+}
+
+/// [`encode_vp8l_argb_with`] at lossless effort `method` (see
+/// [`crate::EncodeOptions::method`]).
+pub(crate) fn encode_vp8l_argb_with_method(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Result<Vec<u8>, EncodeError> {
     validate_argb(pixels, width, height)?;
-    Ok(encode_vp8l_payload(pixels, width, height, alpha_is_used))
+    Ok(encode_vp8l_payload(
+        pixels,
+        width,
+        height,
+        alpha_is_used,
+        method,
+    ))
 }
 
 #[cfg(test)]

@@ -13,7 +13,10 @@
 //! exercises the chooser on inputs where each stacked chain is the regime it
 //! was added for. This bench supplies that A/B target.
 //!
-//! The encoder evaluates every candidate and keeps the byte-shortest stream,
+//! The cells encode at `EncodeOptions::method` 6, the exhaustive search
+//! those stacked chains belong to (the single-pass default estimates a
+//! smaller candidate set; `benches/lossless_encode.rs` measures it). That
+//! search evaluates every candidate and keeps the byte-shortest stream,
 //! so the encode *time* scales with how many candidates a given input
 //! activates. The three inputs here are shaped so that a different stacked
 //! chain is the one expected to win each one, giving future cost-model rounds
@@ -118,11 +121,11 @@ fn smooth_gradient_rgba() -> (Vec<u8>, u32, u32) {
 }
 
 fn bench_stacked_transform_encode(c: &mut Criterion) {
+    let exhaustive = EncodeOptions::default().with_method(6);
     let (palette, pw, ph) = palette_indexed_rgba();
     c.bench_function("stacked_encode_palette_indexed", |b| {
         b.iter(|| {
-            let out = encode_rgba8(pw, ph, black_box(&palette), &EncodeOptions::default())
-                .expect("encode");
+            let out = encode_rgba8(pw, ph, black_box(&palette), &exhaustive).expect("encode");
             black_box(out)
         })
     });
@@ -130,8 +133,7 @@ fn bench_stacked_transform_encode(c: &mut Criterion) {
     let (photo, fw, fh) = photo_decorrelated_rgba();
     c.bench_function("stacked_encode_photo_decorrelated", |b| {
         b.iter(|| {
-            let out =
-                encode_rgba8(fw, fh, black_box(&photo), &EncodeOptions::default()).expect("encode");
+            let out = encode_rgba8(fw, fh, black_box(&photo), &exhaustive).expect("encode");
             black_box(out)
         })
     });
@@ -139,8 +141,7 @@ fn bench_stacked_transform_encode(c: &mut Criterion) {
     let (gradient, gw, gh) = smooth_gradient_rgba();
     c.bench_function("stacked_encode_smooth_gradient", |b| {
         b.iter(|| {
-            let out = encode_rgba8(gw, gh, black_box(&gradient), &EncodeOptions::default())
-                .expect("encode");
+            let out = encode_rgba8(gw, gh, black_box(&gradient), &exhaustive).expect("encode");
             black_box(out)
         })
     });

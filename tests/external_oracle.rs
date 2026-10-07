@@ -51,7 +51,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxideav_webp::{build_animated_webp, decode_webp, encode_webp_lossless, AnimFrame};
+mod common;
+
+use oxideav_webp::{
+    build_animated_webp, decode_webp, encode_rgba8, encode_webp_lossless, AnimFrame, EncodeOptions,
+};
 
 // ──────────────────────────── shared utilities ──────────────────────────
 
@@ -216,6 +220,10 @@ fn direction_a_our_lossless_encode_is_readable_by_reference_decoder() {
 /// content (the cost-priced DP token planner). Each encode must decode
 /// bit-exactly through the reference decoder, proving the new wire
 /// shapes are universally readable.
+///
+/// That machinery is the exhaustive search, `EncodeOptions::method` 6, so
+/// every regime is encoded at method 6 explicitly, and at the default
+/// (the single-pass encoder) as well.
 #[test]
 fn direction_a_round_383_encoder_paths_are_readable_by_reference_decoder() {
     let Some(decoder_bin) = which("dwebp") else {
@@ -310,8 +318,64 @@ fn direction_a_round_383_encoder_paths_are_readable_by_reference_decoder() {
     regimes.push(("runs-noise", runs_noise));
 
     let dir = tmp_dir("direction-a-r383");
+    let paths = [
+        ("method6", EncodeOptions::default().with_method(6)),
+        ("default", EncodeOptions::default()),
+    ];
     for (tag, src) in regimes {
-        let file = encode_webp_lossless(&src, w, h).expect("encode_webp_lossless");
+        for (path, opts) in &paths {
+            let file = encode_rgba8(w, h, &src, opts).expect("encode");
+            let in_path = dir.join(format!("{tag}-{path}.webp"));
+            let out_path = dir.join(format!("{tag}-{path}.pam"));
+            std::fs::write(&in_path, &file).expect("write our.webp");
+            let mut cmd = Command::new(&decoder_bin);
+            cmd.arg(&in_path)
+                .arg("-pam")
+                .arg("-o")
+                .arg(&out_path)
+                .arg("-quiet");
+            let _ = run_or_fail(&mut cmd);
+            let pam_bytes = std::fs::read(&out_path).expect("read decoded PAM");
+            let (rgba, ref_w, ref_h, depth) = parse_pam(&pam_bytes);
+            assert_eq!((ref_w, ref_h, depth), (w, h, 4), "{tag}, {path}: geometry");
+            assert_eq!(
+                rgba, src,
+                "{tag}, {path}: our encode must round-trip bit-exact through the reference decoder"
+            );
+        }
+    }
+}
+
+/// Direction A over the default lossless path (`EncodeOptions::default()`,
+/// the single-pass encoder that picks its transforms and colour cache from
+/// histogram cost estimates). Covers
+/// the bench-like photo the speed numbers use, the committed natural
+/// fixture, and an odd-sized photo with partial predictor blocks and
+/// non-opaque alpha. Every encode must decode bit-exactly through the
+/// reference decoder.
+#[test]
+fn direction_a_default_lossless_path_is_readable_by_reference_decoder() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH - install the WebP reference tools to exercise");
+        return;
+    };
+
+    let (nw, nh, natural) = common::natural_fixture_rgba();
+    let mut odd = common::photo_rgba(77, 45);
+    for (i, px) in odd.chunks_exact_mut(4).enumerate() {
+        if i % 5 == 0 {
+            px[3] = (i % 253) as u8;
+        }
+    }
+    let cases: [(&str, u32, u32, Vec<u8>); 3] = [
+        ("photo-256", 256, 256, common::photo_rgba(256, 256)),
+        ("natural-fixture", nw, nh, natural),
+        ("photo-77x45-alpha", 77, 45, odd),
+    ];
+
+    let dir = tmp_dir("direction-a-default");
+    for (tag, w, h, src) in cases {
+        let file = encode_rgba8(w, h, &src, &EncodeOptions::default()).expect("default encode");
         let in_path = dir.join(format!("{tag}.webp"));
         let out_path = dir.join(format!("{tag}.pam"));
         std::fs::write(&in_path, &file).expect("write our.webp");
@@ -327,7 +391,7 @@ fn direction_a_round_383_encoder_paths_are_readable_by_reference_decoder() {
         assert_eq!((ref_w, ref_h, depth), (w, h, 4), "{tag}: geometry");
         assert_eq!(
             rgba, src,
-            "{tag}: our encode must round-trip bit-exact through the reference decoder"
+            "{tag}: the default lossless encode must round-trip bit-exact through the reference decoder"
         );
     }
 }

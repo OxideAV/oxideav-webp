@@ -4,6 +4,93 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The default lossless encode is single-pass (behaviour change).**
+  `EncodeOptions::default().method` is `4`, so `encode`, `encode_rgba8`,
+  `encode_rgb8`, `encode_all`, `encode_animation` frames, the
+  `webp_vp8l` registry encoder, the bare `encode_vp8l_argb*` and
+  `encode_webp_lossless` helpers and the `ALPH` alpha plane of a lossy
+  encode take the single-pass encoder instead of the exhaustive search.
+  On a photo-like 1024 x 1024 RGBA image the encode takes 0.48 s instead
+  of 47.8 s (release build, same 1,729,228-byte output); the
+  `lossless_encode` and `anim_encode` criterion cells drop by about 99%.
+  The output bytes change. Over every still image the output pins use
+  plus a 128 x 128 photo (23 inputs) the default writes at most 8.7%
+  more than before (50 bytes against 46 on `lossless-32x32-rgb`;
+  the 128 x 128 natural fixture takes 658 bytes against 644), most
+  inputs come out the same size, and every output tested decodes
+  bit-exactly through `dwebp`. The alpha plane of a lossy encode grows
+  by up to 8.2% (`lossy-with-alpha-128x128.webp`: 1,649 to 1,743 bytes,
+  its quality-80 file 2,926 to 3,020; a 1024 x 1024 cutout mask: 5,531
+  to 5,984), because coding a plane exhaustively takes 27 to 111 times as
+  long as the whole lossy encode (1.24 s against 0.026 s at 128 x 128,
+  52.9 s against 0.47 s at 1024 x 1024). `EncodeOptions::with_method(6)`
+  restores the previous output byte for byte, alpha planes included.
+- The single-pass encoder allocates once per encode: the twelve
+  colour-cache histograms are priced in reusable scratch buffers (one
+  for each histogram's prefix code, one for its code-length code), the
+  simple-layout lossless file is written straight behind its RIFF, chunk
+  and image headers instead of being copied into place, and
+  `encode_rgba8` / `encode_rgb8` read the caller's buffer in place on
+  the lossless path instead of copying it into a `WebpImage` first (any
+  method). A 256 x 256 default encode allocates 3.2 MB in 1,352 calls,
+  about 12x the RGBA input.
+- Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
+  callback, and the frequency count, exact cost and writer of a
+  spatially-coded image take any token stream, so a parse no longer has
+  to be stored as a `Vec<Token>`.
+
+### Added
+
+- `EncodeOptions::method` and `EncodeOptions::with_method`: lossless
+  effort on the `0..=6` scale of `cwebp -m`, default `4`. It reaches
+  stills, animation frames and the alpha plane of a lossy encode.
+  - Levels `0..=5` run the single-pass encoder. It estimates each
+    transform stack (none, subtract-green, predictor, subtract-green +
+    predictor, and for images of at most 256 colours colour indexing
+    with and without a predictor) from the histograms of one greedy
+    LZ77 parse, prices all twelve §3.6.2.3 colour-cache choices from the
+    same parse (as libwebp's `CalculateBestCacheSize` does), and encodes
+    the cheapest stack and cache once with the exhaustive path's
+    cost-priced token planner, kept in compact per-pixel arrays. Its
+    LZ77 hash table grows with the image (about four pixels per bucket,
+    2^14 to 2^20 buckets). These levels share one path; the scale
+    leaves room for faster ones.
+  - Level `6` (and anything above) runs the exhaustive search the
+    encoder has always run: every transform stack and colour-cache size
+    is encoded in full and the smallest stream kept.
+- Tests:
+  - `tests/lossless_output_pins.rs` pins the v0.3.1 output at method 6:
+    every fixture frame, three synthetic images, five animations and the
+    lossy encodes of the four fixture frames with alpha.
+  - `tests/lossless_method.rs` covers the knob, its reach into the alpha
+    plane and round trips at every level. Over every still image the
+    pins use plus a 128 x 128 photo (23 inputs), it fails on growth of
+    more than 1% over an input's recorded default size, or of more than
+    9% over method 6.
+  - `tests/encode_alloc.rs` bounds a 256 x 256 default encode to 16x the
+    input under a counting allocator, and checks that a 512 x 512 encode
+    makes fewer than 128 more allocation calls than a 256 x 256 one.
+  - `tests/external_oracle.rs` decodes default output bit-exactly
+    through `dwebp`, and the round-383 regimes at both method 6 and the
+    default.
+  - A unit test pins the single-pass planner token for token to the
+    exhaustive path's planner on three images without a cache and with
+    3- and 10-bit caches.
+
+### Notes
+
+- The single-pass encoder never uses §3.5.1 predictor modes 3, 5, 9 or 10
+  (the modes that read the top-right pixel) in the last column of
+  predictor blocks. This crate's predictor takes the rightmost column's
+  top-right pixel from the row above, while RFC 9649 §3.5.1 and libwebp
+  take it from the current row; avoiding those modes there keeps
+  single-pass output decoding identically in both. Method 6 and the
+  decoder are unchanged.
+- The single-pass encoder caps backward references at 1,048,456 pixels,
+  the farthest distance the 40-symbol §3.6.2.2 distance alphabet codes.
+
 ## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
 
 ### Other
