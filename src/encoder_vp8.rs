@@ -78,6 +78,137 @@ pub fn quality_to_qindex(quality: f32) -> u8 {
     qi.clamp(0.0, 127.0) as u8
 }
 
+/// Largest VP8 frame side: the RFC 6386 §9.1 key-frame header stores
+/// 14-bit sizes.
+const MAX_VP8_DIMENSION: u32 = 0x3FFF;
+
+/// Lossy (`VP8 `) still encoder with a direct constructor: the keyframe
+/// encoder the [`make_encoder_with_qindex`] family wraps, built without
+/// the `registry` feature or a framework `Encoder`.
+///
+/// [`encode_yuv420`](Self::encode_yuv420) reads a 4:2:0 picture's planes
+/// in place at the caller's strides (the framework encoder copies each
+/// plane into a tightly packed buffer first) and writes a simple-lossy
+/// `.webp`. For the same picture and quantiser the bytes are those of the
+/// `webp_vp8` framework encoder's packet.
+///
+/// ```
+/// use oxideav_webp::encoder_vp8::Vp8LossyEncoder;
+///
+/// let (w, h) = (32u32, 16u32);
+/// let y = vec![128u8; 32 * 16];
+/// let (u, v) = (vec![128u8; 16 * 8], vec![128u8; 16 * 8]);
+/// let webp = Vp8LossyEncoder::with_quality(80.0)
+///     .encode_yuv420(w, h, &y, 32, &u, &v, 16)
+///     .expect("encode");
+/// assert_eq!(&webp[..4], b"RIFF");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vp8LossyEncoder {
+    qindex: u8,
+}
+
+impl Vp8LossyEncoder {
+    /// An encoder at WebP `quality` (`0.0..=100.0`), projected onto the VP8
+    /// quantiser index with [`quality_to_qindex`], as
+    /// [`make_encoder_with_quality`] does.
+    pub fn with_quality(quality: f32) -> Self {
+        Self::with_qindex(quality_to_qindex(quality))
+    }
+
+    /// An encoder at VP8 quantiser index `qindex` (`0..=127`, lower is
+    /// better quality); larger values are treated as `127`.
+    pub fn with_qindex(qindex: u8) -> Self {
+        Self {
+            qindex: qindex.min(127),
+        }
+    }
+
+    /// The VP8 quantiser index this encoder uses.
+    pub fn qindex(&self) -> u8 {
+        self.qindex
+    }
+
+    /// Encode one `width x height` 4:2:0 picture to a simple-lossy
+    /// `.webp`. `y` holds `height` rows `y_stride` bytes apart; `u` and
+    /// `v` hold `ceil(height / 2)` rows of `ceil(width / 2)` samples,
+    /// `uv_stride` bytes apart. Samples are limited-range BT.601, as
+    /// VP8 expects.
+    ///
+    /// A zero or over-16383 dimension, a stride narrower than its row, or
+    /// a plane shorter than its rows need is
+    /// [`WebpError::InvalidData`](crate::WebpError).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_yuv420(
+        &self,
+        width: u32,
+        height: u32,
+        y: &[u8],
+        y_stride: usize,
+        u: &[u8],
+        v: &[u8],
+        uv_stride: usize,
+    ) -> Result<Vec<u8>, WebpError> {
+        if width == 0 || height == 0 || width > MAX_VP8_DIMENSION || height > MAX_VP8_DIMENSION {
+            return Err(WebpError::invalid(format!(
+                "VP8 picture {width}x{height} is outside 1..={MAX_VP8_DIMENSION} per side"
+            )));
+        }
+        let (w, h) = (width as usize, height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        check_plane("Y", y, y_stride, w, h)?;
+        check_plane("U", u, uv_stride, cw, ch)?;
+        check_plane("V", v, uv_stride, cw, ch)?;
+        let frame = oxideav_vp8::I420Frame {
+            width,
+            height,
+            y,
+            u,
+            v,
+            y_stride,
+            uv_stride,
+        };
+        let params = oxideav_vp8::KeyframeParams {
+            y_ac_qi: self.qindex,
+            ..oxideav_vp8::KeyframeParams::default()
+        };
+        let vp8 = oxideav_vp8::encode_keyframe(&frame, &params)?;
+        Ok(crate::build::build_webp_file(
+            &vp8,
+            crate::build::ImageKind::Lossy,
+            width,
+            height,
+        )?)
+    }
+}
+
+/// Check that `plane` holds `rows` rows of `row_width` bytes, `stride`
+/// bytes apart.
+fn check_plane(
+    name: &str,
+    plane: &[u8],
+    stride: usize,
+    row_width: usize,
+    rows: usize,
+) -> Result<(), WebpError> {
+    if stride < row_width {
+        return Err(WebpError::invalid(format!(
+            "VP8 {name} plane stride {stride} is narrower than its {row_width}-byte rows"
+        )));
+    }
+    let need = stride
+        .checked_mul(rows - 1)
+        .and_then(|n| n.checked_add(row_width))
+        .ok_or_else(|| WebpError::invalid(format!("VP8 {name} plane geometry overflows")))?;
+    if plane.len() < need {
+        return Err(WebpError::invalid(format!(
+            "VP8 {name} plane holds {} bytes, its rows need {need}",
+            plane.len()
+        )));
+    }
+    Ok(())
+}
+
 // ───────────────────────── framework-side factories ─────────────────────────
 
 #[cfg(feature = "registry")]

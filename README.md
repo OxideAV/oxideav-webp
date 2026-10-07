@@ -207,6 +207,8 @@ profile is carried, not applied.
   `encode_animation_frames` takes positioned `AnimFrame`s (even `x` / `y`
   offsets, `blend` / `dispose`, per-frame `AnimFrameMode`);
   `encode_vp8l_argb` emits a bare VP8L bitstream with no RIFF wrapper;
+  `encoder_vp8::Vp8LossyEncoder` encodes 4:2:0 planes in place (any
+  stride) to a lossy `.webp` without the `registry` feature;
   `animation_params` returns the `ANIM` loop count and background.
 * The pre-contract surface — `decode_webp` (→ `DecodedWebpFile` with
   `WebpFrame`s), `decode_webp_image` (→ `DecodedWebp`),
