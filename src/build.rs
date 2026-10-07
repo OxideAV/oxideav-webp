@@ -217,17 +217,40 @@ pub fn build_chunk(fourcc: FourCc, payload: &[u8]) -> Result<Vec<u8>, BuildError
     if payload.len() as u64 > MAX_CHUNK_PAYLOAD as u64 {
         return Err(BuildError::PayloadTooLargeForChunk { got: payload.len() });
     }
-    let size = payload.len() as u32;
-    let needs_pad = (size & 1) == 1;
-    let total = 8 + payload.len() + if needs_pad { 1 } else { 0 };
-    let mut out = Vec::with_capacity(total);
+    let mut out = Vec::with_capacity(chunk_len(payload.len()));
+    append_chunk(&mut out, fourcc, payload);
+    Ok(out)
+}
+
+/// On-disk length of a §2.3 chunk with a `payload_len`-byte payload: the
+/// 8-byte header, the payload and its pad byte when the length is odd.
+fn chunk_len(payload_len: usize) -> usize {
+    8 + payload_len + (payload_len & 1)
+}
+
+/// Append the §2.3 chunk [`build_chunk`] builds to `out`, with the same
+/// payload-size check.
+pub(crate) fn append_checked_chunk(
+    out: &mut Vec<u8>,
+    fourcc: FourCc,
+    payload: &[u8],
+) -> Result<(), BuildError> {
+    if payload.len() as u64 > MAX_CHUNK_PAYLOAD as u64 {
+        return Err(BuildError::PayloadTooLargeForChunk { got: payload.len() });
+    }
+    append_chunk(out, fourcc, payload);
+    Ok(())
+}
+
+/// Append the §2.3 chunk [`build_chunk`] builds to `out`. The caller has
+/// checked the payload against [`MAX_CHUNK_PAYLOAD`].
+fn append_chunk(out: &mut Vec<u8>, fourcc: FourCc, payload: &[u8]) {
     out.extend_from_slice(&fourcc);
-    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(payload);
-    if needs_pad {
+    if payload.len() & 1 == 1 {
         out.push(0);
     }
-    Ok(out)
 }
 
 /// Emit the 10-byte §2.7.1 Figure 7 `VP8X` chunk **payload**
@@ -391,21 +414,20 @@ pub fn build_webp_file(
         return Err(BuildError::PayloadTooLargeForChunk { got: payload.len() });
     }
 
-    let bitstream_chunk = build_chunk(image_kind.bitstream_fourcc(), payload)?;
-
-    let body = if image_kind.is_extended() {
-        let vp8x_payload = build_vp8x_chunk(canvas_width, canvas_height, Vp8xFlags::default())?;
-        let vp8x_chunk = build_chunk(fourcc::VP8X, &vp8x_payload)?;
-        let mut b = Vec::with_capacity(vp8x_chunk.len() + bitstream_chunk.len());
-        b.extend_from_slice(&vp8x_chunk);
-        b.extend_from_slice(&bitstream_chunk);
-        b
+    let vp8x_payload = if image_kind.is_extended() {
+        Some(build_vp8x_chunk(
+            canvas_width,
+            canvas_height,
+            Vp8xFlags::default(),
+        )?)
     } else {
-        bitstream_chunk
+        None
     };
+    let body_len =
+        vp8x_payload.as_ref().map_or(0, |p| chunk_len(p.len())) + chunk_len(payload.len());
 
     // §2.4: File Size = 4 ('WEBP' FourCC) + body length.
-    let file_size = (body.len() as u64) + 4;
+    let file_size = (body_len as u64) + 4;
     // The §2.4 File Size field is uint32 with a documented maximum of
     // 2^32 - 10, so a body up to ~4 GiB - 14 fits. We bound by u32::MAX
     // here for the cast; in practice MAX_CHUNK_PAYLOAD already caps
@@ -415,11 +437,16 @@ pub fn build_webp_file(
     }
     let file_size = file_size as u32;
 
-    let mut out = Vec::with_capacity(12 + body.len());
+    // One allocation, one copy of the payload: the chunks are written
+    // straight into the file instead of being built and then copied.
+    let mut out = Vec::with_capacity(12 + body_len);
     out.extend_from_slice(&fourcc::RIFF);
     out.extend_from_slice(&file_size.to_le_bytes());
     out.extend_from_slice(&fourcc::WEBP);
-    out.extend_from_slice(&body);
+    if let Some(vp8x) = &vp8x_payload {
+        append_chunk(&mut out, fourcc::VP8X, vp8x);
+    }
+    append_chunk(&mut out, image_kind.bitstream_fourcc(), payload);
     Ok(out)
 }
 
@@ -586,6 +613,38 @@ mod tests {
 
     /// §2.3 sanity: a chunk with even-length payload is exactly
     /// `8 + payload.len()` bytes — no pad byte.
+    /// `build_webp_file` writes the chunks straight into the file; the
+    /// bytes must equal the chunk-by-chunk assembly it replaced.
+    #[test]
+    fn build_webp_file_matches_chunk_by_chunk_assembly() {
+        for len in [0usize, 1, 2, 9, 10, 1001] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            for kind in [
+                ImageKind::Lossy,
+                ImageKind::Lossless,
+                ImageKind::ExtendedLossy,
+                ImageKind::ExtendedLossless,
+            ] {
+                let mut body = Vec::new();
+                if kind.is_extended() {
+                    let vp8x = build_vp8x_chunk(33, 17, Vp8xFlags::default()).unwrap();
+                    body.extend_from_slice(&build_chunk(fourcc::VP8X, &vp8x).unwrap());
+                }
+                body.extend_from_slice(&build_chunk(kind.bitstream_fourcc(), &payload).unwrap());
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&fourcc::RIFF);
+                expected.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+                expected.extend_from_slice(&fourcc::WEBP);
+                expected.extend_from_slice(&body);
+                assert_eq!(
+                    build_webp_file(&payload, kind, 33, 17).unwrap(),
+                    expected,
+                    "{kind:?}, {len}-byte payload"
+                );
+            }
+        }
+    }
+
     #[test]
     fn build_chunk_even_payload_has_no_pad_byte() {
         let bytes = build_chunk(fourcc::VP8, &[0u8; 8]).unwrap();
