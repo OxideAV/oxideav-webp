@@ -5,6 +5,10 @@
 //! [`oxideav_webp::decode_webp`] entry point — i.e. RIFF walk +
 //! VP8L bitstream decode + per-pixel ARGB→RGBA repack.
 //!
+//! The input is encoded at `EncodeOptions::method` 6 (the exhaustive
+//! search), so the decoded bytes are the same ones earlier rounds measured
+//! and the numbers stay comparable across encoder changes.
+//!
 //! Run with:
 //!
 //! ```text
@@ -31,7 +35,8 @@ fn gradient_rgba_256() -> Vec<u8> {
 
 fn bench_lossless_decode(c: &mut Criterion) {
     let rgba = gradient_rgba_256();
-    let webp = encode_rgba8(256, 256, &rgba, &EncodeOptions::default()).expect("encode");
+    let opts = EncodeOptions::default().with_method(6);
+    let webp = encode_rgba8(256, 256, &rgba, &opts).expect("encode");
     c.bench_function("lossless_decode_argb_256", |b| {
         b.iter(|| {
             let img = decode_rgba8(black_box(&webp)).expect("decode");

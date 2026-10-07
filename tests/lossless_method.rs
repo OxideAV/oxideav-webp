@@ -1,21 +1,21 @@
 //! The lossless (`VP8L`) encoder's `method` knob.
 //!
-//! * Methods `0..=5` take the single-pass path: the transform stack is
-//!   chosen from histogram cost estimates and the image is encoded once.
-//! * Method `6` (the default) runs the exhaustive search; anything above
-//!   behaves as `6`.
-//! * The single-pass path must stay within a measured bound of the
-//!   exhaustive output's size on every still image the output pins use,
-//!   plus a 128 x 128 photo.
+//! * Methods `0..=5` (default `4`) take the single-pass path: the
+//!   transforms and the colour cache are chosen from histogram cost
+//!   estimates and the image is encoded once.
+//! * Method `6` runs the exhaustive search; anything above behaves as `6`.
+//! * The default must stay within a measured bound of the exhaustive
+//!   output's size on every still image the output pins use, plus a
+//!   128 x 128 photo.
 
 mod common;
 
 use oxideav_webp::{decode_all, decode_rgba8, encode_rgba8, EncodeOptions};
 
 #[test]
-fn method_defaults_to_6_and_with_method_sets_it() {
-    assert_eq!(EncodeOptions::default().method, 6);
-    assert_eq!(EncodeOptions::new().with_method(4).method, 4);
+fn method_defaults_to_4_and_with_method_sets_it() {
+    assert_eq!(EncodeOptions::default().method, 4);
+    assert_eq!(EncodeOptions::new().with_method(6).method, 6);
     assert_eq!(EncodeOptions::new().with_method(0).method, 0);
 }
 
@@ -98,17 +98,17 @@ fn method_reaches_the_alpha_plane_of_a_lossy_encode() {
     }
 }
 
-/// Largest file-size ratio of the single-pass path (method 4) to the
-/// exhaustive search (method 6) over [`SINGLE_PASS_SIZES`], plus a small
+/// Largest file-size ratio of the default single-pass path (method 4) to
+/// the exhaustive search (method 6) over [`SINGLE_PASS_SIZES`], plus a small
 /// margin. Measured worst: 1.087 (+8.7%), `lossless-32x32-rgb.webp` at 50
 /// bytes against 46; most inputs come out the same size.
 const SIZE_BOUND: f64 = 1.09;
 
-/// Method-4 file size of every still image the output pins use, plus the
-/// photo at 128 x 128 (23 inputs): each fixture frame (`name#frame`) and
-/// each synthetic image. Growth of more than 1% over the recorded size
-/// (rounded down, so the small images must not grow at all), or of more
-/// than 9% over method 6, fails. Smaller is always fine.
+/// Default (method-4) file size of every still image the output pins use,
+/// plus the photo at 128 x 128 (23 inputs): each fixture frame
+/// (`name#frame`) and each synthetic image. Growth of more than 1% over
+/// the recorded size (rounded down, so the small images must not grow at
+/// all), or of more than 9% over method 6, fails. Smaller is always fine.
 const SINGLE_PASS_SIZES: &[(&str, usize)] = &[
     ("animated-3-frames-rgb.webp#0", 114),
     ("animated-3-frames-rgb.webp#1", 112),
@@ -190,7 +190,7 @@ fn size_gate_inputs() -> Vec<(String, u32, u32, Vec<u8>)> {
 }
 
 #[test]
-fn single_pass_size_stays_within_its_measured_bound_of_exhaustive() {
+fn default_size_stays_within_its_measured_bound_of_exhaustive() {
     let inputs = size_gate_inputs();
     assert_eq!(
         inputs.len(),
@@ -199,8 +199,7 @@ fn single_pass_size_stays_within_its_measured_bound_of_exhaustive() {
     );
     let mut worst = (0.0f64, String::new());
     for (name, w, h, rgba) in inputs {
-        let fast = encode_rgba8(w, h, &rgba, &EncodeOptions::default().with_method(4))
-            .expect("method 4 encode");
+        let fast = encode_rgba8(w, h, &rgba, &EncodeOptions::default()).expect("default encode");
         let best = encode_rgba8(w, h, &rgba, &EncodeOptions::default().with_method(6))
             .expect("method 6 encode");
         let ratio = fast.len() as f64 / best.len() as f64;
@@ -213,12 +212,12 @@ fn single_pass_size_stays_within_its_measured_bound_of_exhaustive() {
             .unwrap_or_else(|| panic!("{name}: no recorded size"));
         assert!(
             fast.len() <= recorded + recorded / 100,
-            "{name}: method 4 wrote {} bytes, recorded {recorded}",
+            "{name}: the default wrote {} bytes, recorded {recorded}",
             fast.len()
         );
         assert!(
             ratio <= SIZE_BOUND,
-            "{name}: method 4's {} bytes are {:+.2}% against method 6's {}",
+            "{name}: the default's {} bytes are {:+.2}% against method 6's {}",
             fast.len(),
             (ratio - 1.0) * 100.0,
             best.len()

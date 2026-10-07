@@ -2,8 +2,9 @@
 //!
 //! Every pin is the length and FNV-1a 64 fingerprint of a file the v0.3.1
 //! encoder wrote, including lossy files whose alpha plane (`ALPH`) the
-//! lossless encoder codes. A change meant to leave the encoder's output
-//! alone (a refactor, a speed-up) must leave every pin as it is.
+//! lossless encoder codes. That encoder's exhaustive search is now
+//! `EncodeOptions::method` 6, so the pins are taken at method 6, which
+//! must keep reproducing them byte for byte.
 
 mod common;
 
@@ -61,9 +62,9 @@ const FIXTURE_PINS: &[(&str, usize, usize, u64)] = &[
     ),
 ];
 
-/// The options every pin was captured with.
+/// The options that reproduce the v0.3.1 encoder: the exhaustive search.
 fn pinned() -> EncodeOptions {
-    EncodeOptions::default()
+    EncodeOptions::default().with_method(6)
 }
 
 fn fixture(name: &str) -> Vec<u8> {

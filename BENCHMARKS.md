@@ -24,6 +24,8 @@ the medians are still stable to a few percent.
 |---|---|---|
 | `benches/lossless_encode.rs` | `lossless_encode_rgba_256` | Full RIFF/WEBP encode of a 256×256 RGBA gradient |
 | `benches/lossless_encode.rs` | `lossless_encode_natural_128` | Full RIFF/WEBP encode of a 128×128 tile from the in-tree natural-image fixture |
+| `benches/lossless_encode.rs` | `lossless_encode_photo_256` | Full RIFF/WEBP encode of a 256×256 photo-like RGBA image (gradients, a soft blob, small per-channel noise) |
+| `benches/lossless_encode.rs` | `lossless_encode_{rgba_256,natural_128}_method6` | The first two inputs at `EncodeOptions::method` 6, the exhaustive search (the only lossless path before the single-pass default); the other cells measure the default |
 | `benches/lossless_decode.rs` | `lossless_decode_argb_256` | Full RIFF/WEBP decode of the encoded 256×256 gradient |
 | `benches/lz77_match.rs`      | `vp8l_lz77_match` | §5.2.2 hash-chain LZ77 matcher over a 4096-pixel synthetic tile |
 | `benches/argb_to_rgba.rs`    | `argb_to_rgba`, `repack_push_loop`, `repack_chunks_exact` | `Vp8lImage::to_rgba` repack on a 256×256 image, plus two A/B cells isolating the byte-repack *form* (`Vec::push` vs. pre-sized `chunks_exact_mut(4)`) the private `decode_lossless_image` converter uses |
@@ -2814,3 +2816,99 @@ structural levers left are all inside the DP arbitration itself
 bytes, but the exact-mirror ordering is what keeps the sweep
 output-deterministic — any cut there needs the same
 memoized-pure-function argument the r409/r440 steps used).
+
+## Single-pass lossless default (2026-10-07) - encoder chosen from estimates
+
+The lossless encoder used to encode every transform stack and every
+§3.6.2.3 colour-cache size in full and keep the smallest stream. That
+search is now `EncodeOptions::method` 6. The default (methods `0..=5`)
+estimates each candidate stack from the histograms of one greedy LZ77
+parse, prices all twelve colour-cache choices from the same parse, and
+encodes the cheapest once with the same cost-priced token planner. See
+`src/vp8l_encode/entropy_estimate.rs`.
+
+These numbers come from a different host than the sections above: an
+x86_64 Intel i9-13900K under Linux, release builds, on a machine
+shared with other builds (load average about 10 during the runs). Treat
+differences of a few percent as noise.
+
+### End-to-end criterion movement (v0.3.1 -> single-pass default, `--quick`)
+
+| Bench | v0.3.1 | after | Δ |
+|---|---:|---:|---:|
+| `lossless_encode_rgba_256` | 1.438 s | **19.35 ms** | **-98.7%** |
+| `lossless_encode_natural_128` | 291.2 ms | **3.014 ms** | **-99.0%** |
+| `lossless_encode_photo_256` | (new cell) | **23.49 ms** | |
+| `lossless_encode_rgba_256_method6` | 1.438 s (the v0.3.1 default) | 1.448 s | same search |
+| `lossless_encode_natural_128_method6` | 291.2 ms (the v0.3.1 default) | 296.5 ms | same search |
+| `anim_encode_lossless_4f_48` | 502.1 ms | **5.712 ms** | **-98.9%** |
+| `anim_encode_delta_4f_48` | 215.9 ms | **3.271 ms** | **-98.5%** |
+| `anim_encode_auto_4f_48` | 604.0 ms | **7.597 ms** | **-98.7%** |
+
+A min-of-seven A/B of the method-6 gradient encode against v0.3.1 on
+one core gave 1.452 to 1.486 s for both, so the refactors under the
+single-pass path cost the exhaustive search nothing measurable.
+
+The decode benches (`lossless_decode`, `lossless_decode_mixes`,
+`anim_decode`) and `stacked_transform_encode` now build their inputs at
+method 6, so they decode and encode the same bytes as before and their
+numbers do not move.
+
+### Against the reference encoder
+
+The photo-like RGBA image of `lossless_encode_photo_256` at four sizes,
+through the `webp_vp8l` registry encoder (the path an application using
+the framework takes). The reference encoder is `cwebp` 1.6.0 at its
+default lossless effort (`-lossless -m 4`) on one core. Times are the
+best of five runs.
+
+| Size | v0.3.1 | single-pass default | `cwebp -m 4` | Bytes: v0.3.1 / default / `cwebp` |
+|---|---:|---:|---:|---|
+| 256 x 256 | 1.953 s | 0.023 s | 0.03 s | 108,598 / 108,598 / 109,332 |
+| 512 x 512 | 8.286 s | 0.096 s | 0.06 s | 433,022 / 433,022 / 433,368 |
+| 1024 x 1024 | 47.837 s | 0.476 s | 0.19 s | 1,729,228 / 1,729,228 / 1,729,346 |
+| 2048 x 2048 | not run | 2.02 s | 0.80 s | - / 6,911,724 / 6,911,056 |
+
+The 2048 x 2048 time ranged from 2.0 to 4.1 s across the five runs
+under load, and measured 1.90 s in an earlier, lighter-loaded run of the
+same code. Every output above decodes bit-exactly through `dwebp`.
+
+Over every still image the output pins use plus a 128 x 128 photo (23
+inputs: each fixture frame, photo-like images at 64, 96 and 128 pixels
+square, and a gradient), the default writes at most 8.7% more than
+method 6: 50 bytes against 46 on
+`lossless-32x32-rgb.webp`, then 120 against 112 (+7.1%) on a frame of
+`animated-3-frames-rgb.webp`. The 128 x 128 natural fixture takes 658
+bytes against 644 (+2.2%), and most inputs come out the same size.
+`tests/lossless_method.rs` fails on growth of more than 1% over an
+input's recorded size, or of more than 9% over method 6.
+
+The alpha plane (`ALPH`) of a lossy encode follows the `method` option.
+At the default it is up to 8.2% larger than at method 6 on the planes
+measured (1,743 bytes against 1,649 on `lossy-with-alpha-128x128.webp`,
+5,984 against 5,531 on a 1024 x 1024 cutout mask), but coding a plane at
+method 6 takes 27 to 111 times as long as the whole lossy encode at the
+default (1.24 s against 0.026 s at 128 x 128, 52.9 s against 0.47 s at
+1024 x 1024).
+
+### Allocation
+
+Under a counting allocator (`tests/encode_alloc.rs`), one default
+256 x 256 encode allocates 3.2 MB in 1,352 calls, about 12x the RGBA
+input: one ARGB copy, the transformed stream, the LZ77 hash chain, the
+longest-match table, the dynamic programme's costs and two parses, and
+the output written once in place. The v0.3.1 encoder allocated 10.4 GB
+in 1.67 million calls for the same image.
+
+### Where the remaining wall-time is
+
+At 1024 x 1024 the single-pass encoder parses each candidate stack once
+to estimate it (four stacks for a photo; six for an image of at most
+256 colours) and then plans the winner. Each greedy LZ77 parse costs
+about 40 ms with the image-sized hash table, and the 14-mode predictor
+chooser about 40 ms per predictor stack; the final plan adds one more
+parse, the match-table pass and up to two dynamic-programming re-parses.
+`cwebp` estimates its transforms from pixel histograms without parsing
+(`AnalyzeEntropy`), which is cheaper but ranked the stacks wrongly on
+smooth content here (see the module docs), so the estimate keeps the
+parse.

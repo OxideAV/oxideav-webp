@@ -22,6 +22,8 @@
 //! Both fixtures are verified at setup to decode to 12 frames on a
 //! 128×128 canvas with identical final-frame pixels, so the two cells
 //! measure the same visual timeline through the two `ANMF` layouts.
+//! The frames are encoded at `EncodeOptions::method` 6 (the exhaustive
+//! search), so the decoded bytes stay the ones earlier rounds measured.
 //!
 //! Run with:
 //!
@@ -65,8 +67,8 @@ fn build_timeline(mode: AnimFrameMode) -> Vec<u8> {
             f
         })
         .collect();
-    encode_animation_frames(&frames, &Metadata::default(), &EncodeOptions::default())
-        .expect("assemble animation")
+    let opts = EncodeOptions::default().with_method(6);
+    encode_animation_frames(&frames, &Metadata::default(), &opts).expect("assemble animation")
 }
 
 fn bench_anim_decode(c: &mut Criterion) {

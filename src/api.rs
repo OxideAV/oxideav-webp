@@ -180,14 +180,17 @@ pub struct EncodeOptions {
     /// Animation only — delta-path tuning.
     pub delta: DeltaConfig,
     /// Lossless only: how hard the `VP8L` encoder searches for a small
-    /// stream, on the `0..=6` scale of `cwebp -m`. The default is `6`.
+    /// stream, on the `0..=6` scale of `cwebp -m`. The default is `4`.
     ///
+    /// * `0..=5` choose the transforms and the colour cache from
+    ///   histogram cost estimates and encode the image once. These levels
+    ///   currently share one path; the scale leaves room for faster ones.
     /// * `6` (and anything above, which is treated as `6`) runs the
-    ///   exhaustive search: every transform stack and colour-cache size
-    ///   is encoded in full and the smallest stream kept.
-    /// * `0..=5` choose the transform stack from histogram cost estimates
-    ///   and encode the image once. These levels currently share one
-    ///   path; the scale leaves room for faster ones.
+    ///   exhaustive search instead: every transform stack and colour-cache
+    ///   size is encoded in full and the smallest stream kept. On the
+    ///   crate's test images the default writes at most 8.7% more than
+    ///   method 6 (most come out the same size), and method 6 is about 100
+    ///   times slower on photo-like images.
     ///
     /// With a quality set, the lossy `VP8 ` path uses it for the
     /// lossless-coded alpha plane (`ALPH`).

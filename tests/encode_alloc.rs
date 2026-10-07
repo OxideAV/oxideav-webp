@@ -1,5 +1,5 @@
-//! Allocation budget of the single-pass lossless (`VP8L`) encode
-//! (`EncodeOptions::method` 4).
+//! Allocation budget of the default lossless (`VP8L`) encode, the
+//! single-pass path (`EncodeOptions::method` 4).
 //!
 //! A counting `#[global_allocator]` measures the bytes the encoder really
 //! allocates, so the budget below is a measurement and not a guess. The
@@ -83,7 +83,7 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, u64, u64) {
     (out, BYTES.with(Cell::get), CALLS.with(Cell::get))
 }
 
-/// Upper bound on the bytes one single-pass 256 x 256 lossless encode may
+/// Upper bound on the bytes one default 256 x 256 lossless encode may
 /// allocate, as a multiple of the RGBA input size (4 bytes per pixel).
 ///
 /// The single-pass encoder allocates its per-pixel buffers once per encode
@@ -110,7 +110,7 @@ const BUDGET_MULTIPLE: u64 = 16;
 /// encode, and return its bytes, calls and input size.
 fn measure_encode(side: u32) -> (u64, u64, u64) {
     let rgba = common::photo_rgba(side, side);
-    let opts = EncodeOptions::default().with_method(4);
+    let opts = EncodeOptions::default();
 
     // Warm-up: the first encode in a process also fills process-wide
     // lookup tables (for example the integer log2 table). Those are not
@@ -122,14 +122,14 @@ fn measure_encode(side: u32) -> (u64, u64, u64) {
     let decoded = decode_rgba8(&file).expect("decode");
     assert_eq!(decoded.data, rgba, "lossless round trip");
     eprintln!(
-        "{side}x{side} method 4 lossless encode: {bytes} bytes in {calls} calls ({:.2}x the image)",
+        "{side}x{side} default lossless encode: {bytes} bytes in {calls} calls ({:.2}x the image)",
         bytes as f64 / rgba.len() as f64
     );
     (bytes, calls, rgba.len() as u64)
 }
 
 #[test]
-fn single_pass_encode_allocates_a_small_multiple_of_the_image() {
+fn default_lossless_encode_allocates_a_small_multiple_of_the_image() {
     let (bytes, _, image) = measure_encode(256);
     assert!(
         bytes <= BUDGET_MULTIPLE * image,
@@ -143,7 +143,7 @@ fn single_pass_encode_allocates_a_small_multiple_of_the_image() {
 /// drifts a little with content (prefix codes of other shapes), so the
 /// bound is half the added rows.
 #[test]
-fn single_pass_encode_allocation_calls_do_not_grow_with_the_image() {
+fn default_lossless_encode_allocation_calls_do_not_grow_with_the_image() {
     let (_, small, _) = measure_encode(256);
     let (_, large, _) = measure_encode(512);
     assert!(

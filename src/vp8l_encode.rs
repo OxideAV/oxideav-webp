@@ -56,11 +56,11 @@
 //!
 //! The candidate search the sections below describe
 //! ([`encode_argb_with_predictor_chooser`]) runs at lossless effort `6`
-//! ([`crate::EncodeOptions::method`]), the default: it encodes every
-//! candidate in full and keeps the smallest stream. Efforts `0..=5` run
-//! the single-pass encoder in [`entropy_estimate`] instead, which picks
-//! the transform stack from histogram cost estimates and encodes the
-//! image once, reusing this module's transforms, LZ77 matcher, token
+//! ([`crate::EncodeOptions::method`]): it encodes every candidate in full
+//! and keeps the smallest stream. The default effort runs the single-pass
+//! encoder in [`entropy_estimate`] instead, which picks the transform
+//! stack and the colour cache from histogram cost estimates and encodes
+//! the image once, reusing this module's transforms, LZ77 matcher, token
 //! planner and writer.
 //!
 //! ## §3.7.2 prefix-code construction
@@ -322,8 +322,11 @@ impl std::error::Error for EncodeError {}
 /// §3.4 14-bit `width - 1` / `height - 1` field maximum (1-based 16384).
 const MAX_DIMENSION: u32 = 1 << 14;
 
-/// Default lossless effort ([`crate::EncodeOptions::method`]).
-pub(crate) const DEFAULT_METHOD: u8 = EXHAUSTIVE_METHOD;
+/// Default lossless effort ([`crate::EncodeOptions::method`]): the
+/// single-pass encoder of [`entropy_estimate`], which picks the
+/// transforms and the colour cache from histogram cost estimates and
+/// encodes once.
+pub(crate) const DEFAULT_METHOD: u8 = 4;
 
 /// Lowest lossless effort that runs the exhaustive search
 /// ([`encode_argb_with_predictor_chooser`]): every candidate stream is

@@ -1,8 +1,8 @@
-//! Single-pass `VP8L` encoder: lossless efforts `0..=5`
-//! ([`crate::EncodeOptions::method`]).
+//! Single-pass `VP8L` encoder: the default lossless path
+//! ([`crate::EncodeOptions::method`] `0..=5`).
 //!
 //! The exhaustive search ([`super::encode_argb_with_predictor_chooser`],
-//! effort `6`) encodes dozens of complete candidate streams (every
+//! method `6`) encodes dozens of complete candidate streams (every
 //! transform stack, every predictor chooser, every §3.6.2.3 colour-cache
 //! size) and keeps the smallest. This module chooses the transform stack
 //! and the §3.6.2.3 colour cache from histogram cost estimates instead, the
