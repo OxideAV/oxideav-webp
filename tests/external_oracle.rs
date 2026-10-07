@@ -51,7 +51,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxideav_webp::{build_animated_webp, decode_webp, encode_webp_lossless, AnimFrame};
+mod common;
+
+use oxideav_webp::{
+    build_animated_webp, decode_webp, encode_rgba8, encode_webp_lossless, AnimFrame, EncodeOptions,
+};
 
 // ──────────────────────────── shared utilities ──────────────────────────
 
@@ -328,6 +332,56 @@ fn direction_a_round_383_encoder_paths_are_readable_by_reference_decoder() {
         assert_eq!(
             rgba, src,
             "{tag}: our encode must round-trip bit-exact through the reference decoder"
+        );
+    }
+}
+
+/// Direction A over the single-pass lossless path (`EncodeOptions::method`
+/// 4, which picks its transforms from histogram cost estimates). Covers
+/// the bench-like photo the speed numbers use, the committed natural
+/// fixture, and an odd-sized photo with partial predictor blocks and
+/// non-opaque alpha. Every encode must decode bit-exactly through the
+/// reference decoder.
+#[test]
+fn direction_a_single_pass_lossless_path_is_readable_by_reference_decoder() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH - install the WebP reference tools to exercise");
+        return;
+    };
+
+    let (nw, nh, natural) = common::natural_fixture_rgba();
+    let mut odd = common::photo_rgba(77, 45);
+    for (i, px) in odd.chunks_exact_mut(4).enumerate() {
+        if i % 5 == 0 {
+            px[3] = (i % 253) as u8;
+        }
+    }
+    let cases: [(&str, u32, u32, Vec<u8>); 3] = [
+        ("photo-256", 256, 256, common::photo_rgba(256, 256)),
+        ("natural-fixture", nw, nh, natural),
+        ("photo-77x45-alpha", 77, 45, odd),
+    ];
+
+    let opts = EncodeOptions::default().with_method(4);
+    let dir = tmp_dir("direction-a-single-pass");
+    for (tag, w, h, src) in cases {
+        let file = encode_rgba8(w, h, &src, &opts).expect("single-pass encode");
+        let in_path = dir.join(format!("{tag}.webp"));
+        let out_path = dir.join(format!("{tag}.pam"));
+        std::fs::write(&in_path, &file).expect("write our.webp");
+        let mut cmd = Command::new(&decoder_bin);
+        cmd.arg(&in_path)
+            .arg("-pam")
+            .arg("-o")
+            .arg(&out_path)
+            .arg("-quiet");
+        let _ = run_or_fail(&mut cmd);
+        let pam_bytes = std::fs::read(&out_path).expect("read decoded PAM");
+        let (rgba, ref_w, ref_h, depth) = parse_pam(&pam_bytes);
+        assert_eq!((ref_w, ref_h, depth), (w, h, 4), "{tag}: geometry");
+        assert_eq!(
+            rgba, src,
+            "{tag}: the single-pass lossless encode must round-trip bit-exact through the reference decoder"
         );
     }
 }
