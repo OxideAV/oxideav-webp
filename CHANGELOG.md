@@ -6,6 +6,19 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- The single-pass lossless encoder (methods `0..=5`) allocates once per
+  encode: the twelve colour-cache histograms are priced in reusable
+  scratch buffers (one for each histogram's prefix code, one for the
+  code-length code) instead of building fresh codes each time,
+  the simple-layout lossless file is written straight behind its RIFF,
+  chunk and image headers instead of being copied into place, and
+  `encode_rgba8` / `encode_rgb8` read the caller's buffer in place on
+  the lossless path instead of copying it into a `WebpImage` first (any
+  method). A 256 x 256 method-4 encode allocates 3.2 MB in 1,352 calls
+  instead of 7.8 MB in 13,390, about 12x the RGBA input; the output
+  bytes are unchanged. `tests/encode_alloc.rs` bounds it with a counting
+  allocator: at most 16x the input, and fewer than 128 more allocation
+  calls at 512 x 512 than at 256 x 256.
 - Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
   callback, and the frequency count, exact cost and writer of a
   spatially-coded image take any token stream, so a parse no longer has

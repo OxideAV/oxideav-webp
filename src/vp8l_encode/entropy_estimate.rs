@@ -25,7 +25,8 @@
 //! histograms; no token stream is stored. The estimate is the exact size
 //! of that greedy stream: transform header and sub-image bits, the five
 //! prefix-code tables, the symbols and the extra bits, priced with the
-//! encoder's own prefix-code builder.
+//! encoder's own prefix-code builder ([`super::prefix_code_bits`], which
+//! works in reusable scratch buffers).
 //!
 //! libwebp's `AnalyzeEntropy` ranks the stacks from pixel histograms
 //! alone, using "pixel minus left neighbour" as the spatial proxy. That
@@ -366,17 +367,6 @@ fn apply_stack<'a>(
     }
 }
 
-/// Exact bits of coding `freqs` with its own prefix code: the
-/// code-length table plus the symbols, as [`CostLengths`] prices them.
-fn histogram_bits(freqs: &[u32]) -> u64 {
-    let code = CostLengths::from_freqs(freqs);
-    let mut bits = code.code_lengths_bits() as u64;
-    for (sym, &f) in freqs.iter().enumerate() {
-        bits += u64::from(f) * code.sym_bits(sym) as u64;
-    }
-    bits
-}
-
 /// Symbol histograms of one greedy parse under all twelve §3.6.2.3
 /// colour-cache choices at once (the libwebp `CalculateBestCacheSize`
 /// method). Index 0 is "no cache"; index `b` is `cache_code_bits = b`.
@@ -479,15 +469,15 @@ impl CacheSweep {
     /// bits: the colour-cache-info field, the meta-prefix bit, the five
     /// prefix-code tables, the symbols and the extra bits. The first of
     /// equal choices wins, as in the exhaustive sweep (no cache first).
-    fn best(&self) -> (Option<u32>, u64) {
+    fn best(&self, scratch: &mut PricingScratch) -> (Option<u32>, u64) {
         // The distance histogram is the same under every choice.
-        let shared = self.extra_bits + histogram_bits(&self.freqs[0].distance);
+        let shared = self.extra_bits + prefix_code_bits(&self.freqs[0].distance, scratch);
         let mut best = (None, u64::MAX);
         for (bits, f) in self.freqs.iter().enumerate() {
             let info_bits = if bits == 0 { 1 } else { 5 };
             let mut total = info_bits + 1 + shared;
             for table in [&f.green, &f.red, &f.blue, &f.alpha] {
-                total += histogram_bits(table);
+                total += prefix_code_bits(table, scratch);
             }
             if total < best.1 {
                 best = (if bits == 0 { None } else { Some(bits as u32) }, total);
@@ -900,6 +890,7 @@ fn choose(
     lz77: &mut Lz77Buffers,
 ) -> Choice {
     let mut sweep = CacheSweep::new();
+    let mut scratch = PricingScratch::default();
     let mut best: Option<Choice> = None;
     for stack in Stack::ALL {
         let mut prelude = BitWriter::new();
@@ -932,7 +923,7 @@ fn choose(
             },
         );
         *lz77 = matcher.into_buffers();
-        let (cache_bits, body_bits) = sweep.best();
+        let (cache_bits, body_bits) = sweep.best(&mut scratch);
         let bits = prelude.bit_position() as u64 + body_bits;
         if best.map_or(true, |b| bits < b.bits) {
             best = Some(Choice {
@@ -947,7 +938,8 @@ fn choose(
 
 /// Encode `pixels` (`width * height` ARGB values in scan-line order) as a
 /// §3.8.1 image stream appended to `w`: the transform list, then the
-/// spatially-coded image.
+/// spatially-coded image. The stream starts on a byte boundary when `w`
+/// does, which the §3.4 image header in front of it guarantees.
 pub(super) fn encode_image_stream(pixels: &[u32], width: u32, height: u32, w: &mut BitWriter) {
     debug_assert_eq!(pixels.len(), width as usize * height as usize);
     let hash_bits = lz77_hash_bits(pixels.len());
@@ -974,7 +966,11 @@ pub(super) fn encode_image_stream(pixels: &[u32], width: u32, height: u32, w: &m
         w,
     )
     .expect("the chosen stack applies");
-    let (chosen, _) = planner.plan(stream, stream_width, choice.cache_bits, hash_bits);
+    let (chosen, body_bits) = planner.plan(stream, stream_width, choice.cache_bits, hash_bits);
+    // Colour-cache info (1 or 5 bits) + meta-prefix bit + the planned
+    // body, plus one byte for the §2.3 pad byte a container may append.
+    let tail_bits = if choice.cache_bits.is_some() { 5 } else { 1 } + 1 + body_bits;
+    w.reserve_bits(tail_bits + 8);
     let hits = choice.cache_bits.map(|_| &planner.hits[..]);
     let tokens = planner.parse(chosen).tokens(stream, hits);
     write_spatially_coded_token_stream(w, tokens, choice.cache_bits, stream_width);
@@ -1021,6 +1017,67 @@ mod tests {
         assert_eq!(lz77_hash_bits(1024 * 1024), 18);
         assert_eq!(lz77_hash_bits(2048 * 2048), 20);
         assert_eq!(lz77_hash_bits(16384 * 16384), 20);
+    }
+
+    #[test]
+    fn prefix_code_bits_matches_the_cost_mirror() {
+        let mut scratch = PricingScratch::default();
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut tables: Vec<Vec<u32>> = vec![
+            vec![0; 280], // all zero: priced as the single-symbol-0 form
+            {
+                let mut t = vec![0; 2328];
+                t[1000] = 7; // lone symbol above 255: the promoted two-leaf form
+                t
+            },
+            {
+                let mut t = vec![0; 256];
+                t[3] = 9; // single-leaf form, 0 bits per symbol
+                t
+            },
+            {
+                let mut t = vec![0; 40];
+                t[0] = 1;
+                t[1] = 1; // simple form with two symbols
+                t
+            },
+        ];
+        for size in [40usize, 256, 280, 536, 2328] {
+            for density in [2u32, 8, 64] {
+                let t: Vec<u32> = (0..size)
+                    .map(|_| {
+                        let v = next();
+                        if v % density == 0 {
+                            1 + (v >> 8) % 5000
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                tables.push(t);
+            }
+            // Very skewed: forces the length-limiting pass.
+            tables.push((0..size).map(|s| 1u32 << (s % 24)).collect());
+        }
+        for t in &tables {
+            let c = CostLengths::from_freqs(t);
+            let mut expected = c.code_lengths_bits() as u64;
+            for (s, &f) in t.iter().enumerate() {
+                expected += u64::from(f) * c.sym_bits(s) as u64;
+            }
+            assert_eq!(
+                prefix_code_bits(t, &mut scratch),
+                expected,
+                "table of {}",
+                t.len()
+            );
+        }
     }
 
     #[test]
@@ -1072,7 +1129,8 @@ mod tests {
                     }
                 }
             }
-            let (best_bits_choice, best_total) = sweep.best();
+            let mut scratch = PricingScratch::default();
+            let (best_bits_choice, best_total) = sweep.best(&mut scratch);
             let mut expected_best = (None, u64::MAX);
             for choice in std::iter::once(None).chain((1..=COLOR_CACHE_BITS_MAX).map(Some)) {
                 let stream = match choice {

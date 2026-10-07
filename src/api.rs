@@ -984,17 +984,22 @@ pub fn encode(image: &WebpImage, opts: &EncodeOptions) -> Result<Vec<u8>, WebpEr
     if image.width == 0 || image.height == 0 {
         return Err(WebpError::invalid("zero image dimension"));
     }
-    if image.width > MAX_DIMENSION || image.height > MAX_DIMENSION {
-        return Err(WebpError::invalid(format!(
-            "{}x{} exceeds the WebP {MAX_DIMENSION} per-side ceiling",
-            image.width, image.height
-        )));
-    }
+    check_max_dimension(image.width, image.height)?;
     let meta = opts.filtered_metadata(&image.metadata);
     match opts.quality {
         None => encode_lossless(image, &meta, opts.method),
         Some(q) => encode_lossy(image, q, &meta, opts.method),
     }
+}
+
+/// The per-side ceiling check of [`encode`].
+fn check_max_dimension(width: u32, height: u32) -> Result<(), WebpError> {
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(WebpError::invalid(format!(
+            "{width}x{height} exceeds the WebP {MAX_DIMENSION} per-side ceiling"
+        )));
+    }
+    Ok(())
 }
 
 /// Encode packed 8-bit RGB (3 bytes per pixel, `width × height × 3`).
@@ -1004,7 +1009,7 @@ pub fn encode_rgb8(
     rgb: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    encode(&WebpImage::from_rgb8(width, height, rgb.to_vec())?, opts)
+    encode_packed(width, height, rgb, WebpPixelFormat::Rgb24, opts)
 }
 
 /// Encode packed 8-bit RGBA (4 bytes per pixel, `width × height × 4`).
@@ -1014,7 +1019,43 @@ pub fn encode_rgba8(
     rgba: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    encode(&WebpImage::from_rgba8(width, height, rgba.to_vec())?, opts)
+    encode_packed(width, height, rgba, WebpPixelFormat::Rgba, opts)
+}
+
+/// [`encode`] of a packed `Rgb24` / `Rgba` buffer. The lossless path reads
+/// `data` in place; only the lossy path builds a [`WebpImage`], which
+/// copies it. Both run the checks building the image and encoding it
+/// would, in the same order.
+fn encode_packed(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    format: WebpPixelFormat,
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>, WebpError> {
+    let bpp = format.packed_bytes_per_pixel().unwrap_or(4);
+    if opts.quality.is_some() {
+        let image = WebpImage::new(
+            width,
+            height,
+            format,
+            vec![Plane::packed(width as usize * bpp, data.to_vec())],
+        )?;
+        return encode(&image, opts);
+    }
+    WebpImage::check_packed(width, height, format, data.len())?;
+    check_max_dimension(width, height)?;
+    // A bare buffer carries no metadata.
+    let meta = crate::WebpMetadata::default();
+    encode_lossless_packed(
+        width,
+        height,
+        data,
+        width as usize * bpp,
+        bpp,
+        &meta,
+        opts.method,
+    )
 }
 
 /// [`encode`] and write the bytes to `w`.
@@ -1043,40 +1084,39 @@ fn encode_lossless(
         }
     };
     let plane = &image.planes[0];
-    let (argb, has_alpha) = packed_to_argb(
-        image.width as usize,
-        image.height as usize,
+    encode_lossless_packed(
+        image.width,
+        image.height,
         &plane.data,
         plane.stride,
         bpp,
-    );
+        meta,
+        method,
+    )
+}
+
+/// Lossless encode of packed RGB(A) rows (`bpp` 3 or 4, rows `stride`
+/// bytes apart) at effort `method`.
+fn encode_lossless_packed(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    stride: usize,
+    bpp: usize,
+    meta: &crate::WebpMetadata<'_>,
+    method: u8,
+) -> Result<Vec<u8>, WebpError> {
+    let (argb, has_alpha) = packed_to_argb(width as usize, height as usize, data, stride, bpp);
     // RFC 9649 §2.6: the simple lossless layout carries alpha inside the
     // VP8L bitstream itself, so the extended VP8X header is only needed
     // when there is metadata to declare (the reference lossless-RGBA
     // fixtures in docs/ use the simple layout too).
     if meta.is_empty() {
-        let payload = vp8l_encode::encode_vp8l_argb_with_method(
-            &argb,
-            image.width,
-            image.height,
-            has_alpha,
-            method,
-        )?;
-        return Ok(build::build_webp_file(
-            &payload,
-            build::ImageKind::Lossless,
-            image.width,
-            image.height,
+        return Ok(vp8l_encode::encode_webp_lossless_file(
+            &argb, width, height, has_alpha, method,
         )?);
     }
-    crate::encode_vp8l_argb_with_metadata_method(
-        image.width,
-        image.height,
-        &argb,
-        has_alpha,
-        meta,
-        method,
-    )
+    crate::encode_vp8l_argb_with_metadata_method(width, height, &argb, has_alpha, meta, method)
 }
 
 fn encode_lossy(

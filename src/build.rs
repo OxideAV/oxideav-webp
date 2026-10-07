@@ -352,6 +352,52 @@ pub struct Vp8xFlags {
     pub has_animation: bool,
 }
 
+/// Length of everything in front of the bitstream in a simple (`VP8 ` or
+/// `VP8L`, no `VP8X`) file: the 12-byte §2.4 file header and the 8-byte
+/// §2.3 chunk header.
+pub(crate) const SIMPLE_FILE_PREFIX_LEN: usize = 20;
+
+/// Start a simple-layout file whose bitstream the caller appends in
+/// place: the §2.4 file header and the §2.3 chunk header of `kind`'s
+/// bitstream chunk, with both size fields still zero.
+/// [`finish_simple_webp_file`] fills them in. Writing the bitstream
+/// straight behind its headers saves the two copies [`build_webp_file`]
+/// makes of a finished payload.
+pub(crate) fn begin_simple_webp_file(kind: ImageKind) -> Vec<u8> {
+    debug_assert!(!kind.is_extended());
+    let mut file = Vec::with_capacity(SIMPLE_FILE_PREFIX_LEN);
+    file.extend_from_slice(&fourcc::RIFF);
+    file.extend_from_slice(&[0; 4]);
+    file.extend_from_slice(&fourcc::WEBP);
+    file.extend_from_slice(&kind.bitstream_fourcc());
+    file.extend_from_slice(&[0; 4]);
+    file
+}
+
+/// Finish a file started with [`begin_simple_webp_file`] once its
+/// bitstream follows the prefix: fill the chunk `Size` and §2.4
+/// `File Size` fields and append the §2.3 pad byte when the bitstream
+/// length is odd. The result is byte-identical to [`build_webp_file`]
+/// over the same bitstream, with the same errors.
+pub(crate) fn finish_simple_webp_file(file: &mut Vec<u8>) -> Result<(), BuildError> {
+    debug_assert!(file.len() >= SIMPLE_FILE_PREFIX_LEN);
+    let payload_len = file.len() - SIMPLE_FILE_PREFIX_LEN;
+    if payload_len as u64 > MAX_CHUNK_PAYLOAD as u64 {
+        return Err(BuildError::PayloadTooLargeForChunk { got: payload_len });
+    }
+    if payload_len & 1 == 1 {
+        file.push(0);
+    }
+    // §2.4: File Size = 4 ('WEBP' FourCC) + the chunks that follow.
+    let file_size = (file.len() - 8) as u64;
+    if file_size > u64::from(u32::MAX) {
+        return Err(BuildError::PayloadTooLargeForChunk { got: payload_len });
+    }
+    file[4..8].copy_from_slice(&(file_size as u32).to_le_bytes());
+    file[16..20].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    Ok(())
+}
+
 /// Build a `RIFF/WEBP` file around a single bitstream payload per
 /// RFC 9649 §2.4 + §2.5 / §2.6 / §2.7.
 ///

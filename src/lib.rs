@@ -428,12 +428,12 @@ pub(crate) fn encode_vp8l_argb_with_metadata_method(
     meta: &WebpMetadata<'_>,
     method: u8,
 ) -> Result<Vec<u8>, WebpError> {
-    let payload =
-        vp8l_encode::encode_vp8l_argb_with_method(argb, width, height, has_alpha, method)?;
     if !has_alpha && meta.is_empty() {
-        return build::build_webp_file(&payload, build::ImageKind::Lossless, width, height)
+        return vp8l_encode::encode_webp_lossless_file(argb, width, height, false, method)
             .map_err(Into::into);
     }
+    let payload =
+        vp8l_encode::encode_vp8l_argb_with_method(argb, width, height, has_alpha, method)?;
     let flags = build::Vp8xFlags {
         has_iccp: meta.icc.is_some(),
         has_alpha,

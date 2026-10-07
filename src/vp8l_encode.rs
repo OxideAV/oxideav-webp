@@ -384,6 +384,21 @@ impl BitWriter {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+
+    /// A writer that continues after `bytes`: the next bit lands in a new
+    /// byte appended to them. Lets the encoder write a bitstream straight
+    /// behind container and image headers instead of copying it there.
+    pub(crate) fn after_bytes(bytes: Vec<u8>) -> Self {
+        let bit_pos = bytes.len() * 8;
+        Self { bytes, bit_pos }
+    }
+
+    /// Reserve room for `bits` more bits, so a write of known size never
+    /// reallocates.
+    pub(crate) fn reserve_bits(&mut self, bits: usize) {
+        let needed = (self.bit_pos + bits).div_ceil(8);
+        self.bytes.reserve(needed.saturating_sub(self.bytes.len()));
+    }
 }
 
 /// Build a length-limited (≤ [`MAX_CODE_LENGTH`]) canonical Huffman
@@ -419,17 +434,54 @@ impl BitWriter {
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
+    let mut scratch = PrefixCodeScratch::default();
+    build_code_lengths_into(freqs, &mut scratch);
+    scratch.lengths
+}
+
+/// Reusable work buffers for [`build_code_lengths_into`]. The
+/// single-pass encoder ([`entropy_estimate`]) prices a few hundred
+/// candidate histograms per image; the buffers grow to the largest
+/// alphabet priced and are reused after that (see [`PricingScratch`]).
+#[derive(Debug, Default)]
+struct PrefixCodeScratch {
+    /// The code lengths of the last build, one per symbol.
+    lengths: Vec<u8>,
+    /// The used symbols of the last build, ascending.
+    used: Vec<usize>,
+    leaves: Vec<u64>,
+    inode_freq: Vec<u64>,
+    parent: Vec<u32>,
+    internal_depth: Vec<u32>,
+    /// Per-length buckets of the length-limiting pass.
+    buckets: Vec<Vec<usize>>,
+}
+
+/// [`build_code_lengths`] into `scratch.lengths`, reusing the scratch
+/// buffers (the same algorithm, so the same lengths).
+fn build_code_lengths_into(freqs: &[u32], scratch: &mut PrefixCodeScratch) {
+    let PrefixCodeScratch {
+        lengths,
+        used,
+        leaves,
+        inode_freq,
+        parent,
+        internal_depth,
+        buckets,
+    } = scratch;
     let n = freqs.len();
-    let mut lengths = vec![0u8; n];
+    lengths.clear();
+    lengths.resize(n, 0);
 
     // Collect used symbols.
-    let used: Vec<usize> = (0..n).filter(|&s| freqs[s] > 0).collect();
+    used.clear();
+    used.extend((0..n).filter(|&s| freqs[s] > 0));
     match used.len() {
-        0 => return lengths, // empty code; caller encodes single-symbol-0.
+        0 => return, // empty code; caller encodes single-symbol-0.
         1 => {
             // §3.7.2.1.2 single-leaf: one symbol marked length 1.
             lengths[used[0]] = 1;
-            return lengths;
+            return;
         }
         _ => {}
     }
@@ -444,17 +496,17 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     // exactly the `(freq, ascending symbol)` tie-break the merge needs
     // (`freq` is `u32`, so the shift is exact, and a symbol index always
     // fits the low half).
-    let mut leaves: Vec<u64> = used
-        .iter()
-        .map(|&s| ((freqs[s] as u64) << 32) | s as u64)
-        .collect();
+    leaves.clear();
+    leaves.extend(used.iter().map(|&s| ((freqs[s] as u64) << 32) | s as u64));
     leaves.sort_unstable();
 
     // Internal-node FIFO: frequencies only; internal node `i` has node
     // index `n + i`. `u32::MAX` marks "no parent yet" (only the root
     // keeps it, and the root's slot is never read back).
-    let mut inode_freq: Vec<u64> = Vec::with_capacity(m - 1);
-    let mut parent: Vec<u32> = vec![u32::MAX; n + m - 1];
+    inode_freq.clear();
+    inode_freq.reserve(m - 1);
+    parent.clear();
+    parent.resize(n + m - 1, u32::MAX);
 
     /// Take the smallest remaining node by `(freq, tie-break order)`:
     /// the front leaf wins ties because leaves rank before internal
@@ -486,8 +538,8 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     let mut li = 0usize; // leaf cursor
     let mut ii = 0usize; // internal-node cursor
     for _ in 0..m - 1 {
-        let (a_node, a_freq) = take_min(&leaves, &mut li, &inode_freq, &mut ii, n);
-        let (b_node, b_freq) = take_min(&leaves, &mut li, &inode_freq, &mut ii, n);
+        let (a_node, a_freq) = take_min(leaves, &mut li, inode_freq, &mut ii, n);
+        let (b_node, b_freq) = take_min(leaves, &mut li, inode_freq, &mut ii, n);
         let new_node = n + inode_freq.len();
         parent[a_node] = new_node as u32;
         parent[b_node] = new_node as u32;
@@ -498,7 +550,8 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     // always created later (larger index), so a single reverse pass over
     // the internal nodes settles every internal depth, and each leaf is
     // then one deeper than its (always internal) parent.
-    let mut internal_depth = vec![0u32; m - 1];
+    internal_depth.clear();
+    internal_depth.resize(m - 1, 0);
     for i in (0..m - 1).rev() {
         let p = parent[n + i];
         if p != u32::MAX {
@@ -506,7 +559,7 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
         }
     }
     let mut max_len = 0usize;
-    for &s in &used {
+    for &s in used.iter() {
         let depth = internal_depth[parent[s] as usize - n] as usize + 1;
         // A single internal-node tree (two leaves) gives depth 1; never 0
         // here because used.len() >= 2.
@@ -515,10 +568,8 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
     }
 
     if max_len > MAX_CODE_LENGTH {
-        limit_code_lengths(&mut lengths, &used);
+        limit_code_lengths(lengths, used, buckets);
     }
-
-    lengths
 }
 
 /// Cap every code length at [`MAX_CODE_LENGTH`] while keeping the Kraft sum
@@ -530,9 +581,10 @@ pub fn build_code_lengths(freqs: &[u32]) -> Vec<u8> {
 /// than the format allows. It produces a *valid* (complete) code that is at
 /// most marginally sub-optimal; exactness of the round trip is unaffected
 /// because the decoder reconstructs pixels from whatever complete code the
-/// lengths describe.
-fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
-    limit_code_lengths_to(lengths, used, MAX_CODE_LENGTH);
+/// lengths describe. `buckets` is reusable scratch (see
+/// [`limit_code_lengths_with`]).
+fn limit_code_lengths(lengths: &mut [u8], used: &[usize], buckets: &mut Vec<Vec<usize>>) {
+    limit_code_lengths_with(lengths, used, MAX_CODE_LENGTH, buckets);
 }
 
 /// As [`limit_code_lengths`], but caps every code length at the
@@ -552,6 +604,18 @@ fn limit_code_lengths(lengths: &mut [u8], used: &[usize]) {
 /// `max_len <= MAX_CODE_LENGTH` is required (the Kraft arithmetic uses
 /// `2^max_len` as the common denominator).
 fn limit_code_lengths_to(lengths: &mut [u8], used: &[usize], max_len: usize) {
+    limit_code_lengths_with(lengths, used, max_len, &mut Vec::new());
+}
+
+/// [`limit_code_lengths_to`] with its per-length buckets kept in
+/// `buckets` between calls (emptied, not freed), so repeated builds
+/// through a [`PrefixCodeScratch`] do not allocate them again.
+fn limit_code_lengths_with(
+    lengths: &mut [u8],
+    used: &[usize],
+    max_len: usize,
+    buckets: &mut Vec<Vec<usize>>,
+) {
     debug_assert!((1..=MAX_CODE_LENGTH).contains(&max_len));
     // Clamp.
     for &s in used {
@@ -593,7 +657,12 @@ fn limit_code_lengths_to(lengths: &mut [u8], used: &[usize], max_len: usize) {
     //    ever gains a member while the pass is still running.
     let mut k = kraft(lengths);
     if k > full {
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); max_len];
+        for bucket in buckets.iter_mut() {
+            bucket.clear();
+        }
+        if buckets.len() < max_len {
+            buckets.resize_with(max_len, Vec::new);
+        }
         for &s in used {
             let l = lengths[s] as usize;
             if l < max_len {
@@ -1009,8 +1078,20 @@ fn clc_extra_bits(sym: u8) -> usize {
 /// is only ever emitted immediately after its value has been emitted,
 /// so the "before any nonzero emits 8" corner is never produced.
 fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToken> {
-    let n = lengths.len();
     let mut out = Vec::new();
+    for_each_rle_code_length_token(lengths, use_repeat_16, |t| out.push(t));
+    out
+}
+
+/// The tokens of [`rle_tokenize_code_lengths`], handed to `out` one at a
+/// time instead of collected (the allocation-free table pricing in
+/// [`normal_form_bits_with`] walks them twice).
+fn for_each_rle_code_length_token(
+    lengths: &[u8],
+    use_repeat_16: bool,
+    mut out: impl FnMut(ClcToken),
+) {
+    let n = lengths.len();
     let mut i = 0usize;
     while i < n {
         let v = lengths[i];
@@ -1024,11 +1105,11 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             while z > 0 {
                 if z < 3 {
                     for _ in 0..z {
-                        out.push(ClcToken { sym: 0, extra: 0 });
+                        out(ClcToken { sym: 0, extra: 0 });
                     }
                     z = 0;
                 } else if z <= 10 {
-                    out.push(ClcToken {
+                    out(ClcToken {
                         sym: 17,
                         extra: (z - 3) as u8,
                     });
@@ -1041,7 +1122,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
                         c = z - 3;
                     }
                     debug_assert!(c >= 11);
-                    out.push(ClcToken {
+                    out(ClcToken {
                         sym: 18,
                         extra: (c - 11) as u8,
                     });
@@ -1050,7 +1131,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             }
         } else {
             // Emit the literal, then fold immediate repeats into 16s.
-            out.push(ClcToken { sym: v, extra: 0 });
+            out(ClcToken { sym: v, extra: 0 });
             i += 1;
             let mut r = 0usize;
             while i + r < n && lengths[i + r] == v {
@@ -1060,7 +1141,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             while r > 0 {
                 if !use_repeat_16 || r < 3 {
                     for _ in 0..r {
-                        out.push(ClcToken { sym: v, extra: 0 });
+                        out(ClcToken { sym: v, extra: 0 });
                     }
                     r = 0;
                 } else {
@@ -1070,7 +1151,7 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
                         c = r - 3;
                     }
                     debug_assert!(c >= 3);
-                    out.push(ClcToken {
+                    out(ClcToken {
                         sym: 16,
                         extra: (c - 3) as u8,
                     });
@@ -1079,7 +1160,6 @@ fn rle_tokenize_code_lengths(lengths: &[u8], use_repeat_16: bool) -> Vec<ClcToke
             }
         }
     }
-    out
 }
 
 /// The token variants [`write_normal_code_lengths`] /
@@ -1110,7 +1190,15 @@ fn clc_layout(tokens: &[ClcToken]) -> ([u8; NUM_CODE_LENGTH_CODES], usize, Optio
     let clc_lengths_vec = build_clc_code_lengths(&clc_freq);
     let mut clc_lengths = [0u8; NUM_CODE_LENGTH_CODES];
     clc_lengths.copy_from_slice(&clc_lengths_vec);
+    clc_layout_from_lengths(&clc_freq, clc_lengths)
+}
 
+/// The `(num_code_lengths, single_leaf)` half of [`clc_layout`], given the
+/// CLC symbol frequencies and the CLC lengths already built from them.
+fn clc_layout_from_lengths(
+    clc_freq: &[u32; NUM_CODE_LENGTH_CODES],
+    clc_lengths: [u8; NUM_CODE_LENGTH_CODES],
+) -> ([u8; NUM_CODE_LENGTH_CODES], usize, Option<usize>) {
     let mut max_order_used = 0usize;
     for (order_idx, &pos) in CODE_LENGTH_CODE_ORDER.iter().enumerate() {
         if clc_lengths[pos] != 0 {
@@ -1119,10 +1207,11 @@ fn clc_layout(tokens: &[ClcToken]) -> ([u8; NUM_CODE_LENGTH_CODES], usize, Optio
     }
     let num_code_lengths = (max_order_used + 1).max(4);
 
-    let used: Vec<usize> = (0..NUM_CODE_LENGTH_CODES)
-        .filter(|&s| clc_freq[s] > 0)
-        .collect();
-    let single_leaf = if used.len() == 1 { Some(used[0]) } else { None };
+    let mut used = (0..NUM_CODE_LENGTH_CODES).filter(|&s| clc_freq[s] > 0);
+    let single_leaf = match (used.next(), used.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    };
     (clc_lengths, num_code_lengths, single_leaf)
 }
 
@@ -1191,6 +1280,125 @@ fn normal_form_bits(lengths: &[u8]) -> usize {
         .map(|t| code_length_tokens_bits(t))
         .min()
         .expect("three variants")
+}
+
+/// [`normal_form_bits`] without collecting tokens: each of the three token
+/// variants is walked twice (CLC frequencies, then bits), and the CLC code
+/// is built in `scratch`, so once `scratch` has grown to the 19-symbol CLC
+/// alphabet a call allocates nothing. Same result.
+fn normal_form_bits_with(lengths: &[u8], scratch: &mut PrefixCodeScratch) -> usize {
+    // Variant 0 is the verbatim form; 1 and 2 are the RLE forms without
+    // and with code 16, in `normal_form_token_variants` order.
+    let walk = |variant: usize, f: &mut dyn FnMut(ClcToken)| match variant {
+        0 => lengths
+            .iter()
+            .for_each(|&l| f(ClcToken { sym: l, extra: 0 })),
+        v => for_each_rle_code_length_token(lengths, v == 2, f),
+    };
+    let mut best = usize::MAX;
+    for variant in 0..3 {
+        let mut clc_freq = [0u32; NUM_CODE_LENGTH_CODES];
+        walk(variant, &mut |t| clc_freq[t.sym as usize] += 1);
+        build_code_lengths_into(&clc_freq, scratch);
+        if scratch
+            .lengths
+            .iter()
+            .any(|&l| l as usize > MAX_CLC_CODE_LENGTH)
+        {
+            // Rare: the same re-balance `build_clc_code_lengths` applies.
+            limit_code_lengths_with(
+                &mut scratch.lengths,
+                &scratch.used,
+                MAX_CLC_CODE_LENGTH,
+                &mut scratch.buckets,
+            );
+        }
+        let mut clc_lengths = [0u8; NUM_CODE_LENGTH_CODES];
+        clc_lengths.copy_from_slice(&scratch.lengths);
+        let (clc_lengths, num_code_lengths, single_leaf) =
+            clc_layout_from_lengths(&clc_freq, clc_lengths);
+        // Same tally as `code_length_tokens_bits`.
+        let mut bits = 1 + 4 + 3 * num_code_lengths + 1;
+        walk(variant, &mut |t| {
+            if single_leaf.is_none() {
+                bits += clc_lengths[t.sym as usize] as usize;
+            }
+            bits += clc_extra_bits(t.sym);
+        });
+        best = best.min(bits);
+    }
+    best
+}
+
+/// [`simple_form_bits`] of `lengths` when the §3.7.2.1.1 simple form can
+/// carry it (the [`lengths_simple_form`] test), without allocating.
+fn simple_form_bits_of(lengths: &[u8]) -> Option<usize> {
+    let mut symbols = [0usize; 2];
+    let mut count = 0usize;
+    for (s, &l) in lengths.iter().enumerate() {
+        if l == 0 {
+            continue;
+        }
+        if l != 1 || s > 255 || count == 2 {
+            return None;
+        }
+        symbols[count] = s;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(simple_form_bits(&symbols[..count]))
+}
+
+/// The two scratch sets [`prefix_code_bits`] works in: one for the
+/// histogram's own prefix code, one for the CLC code that transmits its
+/// code lengths. Kept apart so pricing never has to move the first
+/// code's lengths out of the way to build the second.
+#[derive(Debug, Default)]
+struct PricingScratch {
+    code: PrefixCodeScratch,
+    clc: PrefixCodeScratch,
+}
+
+/// Exact bit cost of coding a symbol stream whose histogram is `freqs`
+/// through this encoder's prefix-code writer: the code-length table
+/// ([`WriteCode::write_code_lengths`]) plus the sum of frequency times
+/// code length. It equals the [`CostLengths::from_freqs`] price
+/// (`code_lengths_bits()` plus `sym_bits` per symbol), including the two
+/// degenerate shapes [`WriteCode::from_freqs`] promotes. Both codes are
+/// built in `pricing`, so once its buffers have grown to the largest
+/// alphabet priced, a call allocates nothing.
+fn prefix_code_bits(freqs: &[u32], pricing: &mut PricingScratch) -> u64 {
+    let PricingScratch { code: scratch, clc } = pricing;
+    let mut body = 0u64;
+    if !freqs.is_empty() && freqs.iter().all(|&f| f == 0) {
+        // Priced as the §3.7.2.1.1 single-symbol-0 form; no symbols.
+        scratch.lengths.clear();
+        scratch.lengths.resize(freqs.len(), 0);
+        scratch.lengths[0] = 1;
+    } else if let Some(symbol) = single_used_symbol_above_simple_ceiling(freqs) {
+        // The promoted two-leaf table: 1 bit per symbol.
+        scratch.lengths.clear();
+        scratch.lengths.resize(freqs.len(), 0);
+        scratch.lengths[0] = 1;
+        scratch.lengths[symbol] = 1;
+        body = u64::from(freqs[symbol]);
+    } else {
+        build_code_lengths_into(freqs, scratch);
+        // A single used symbol is the 0-bit single-leaf form.
+        if scratch.used.len() > 1 {
+            for &s in &scratch.used {
+                body += u64::from(freqs[s]) * u64::from(scratch.lengths[s]);
+            }
+        }
+    }
+    let normal = normal_form_bits_with(&scratch.lengths, clc);
+    let table = match simple_form_bits_of(&scratch.lengths) {
+        Some(simple) if simple <= normal => simple,
+        _ => normal,
+    };
+    body + table as u64
 }
 
 /// Write a per-symbol length table with the §3.7.2.1.1 *simple code
@@ -7678,10 +7886,38 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
         pixels.push((a << 24) | (r << 16) | (g << 8) | b);
     }
 
-    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used, DEFAULT_METHOD);
+    encode_webp_lossless_file(&pixels, width, height, alpha_is_used, DEFAULT_METHOD)
+}
 
-    // §2.4 / §2.6 RIFF/WEBP framing around the VP8L payload.
-    let file = build::build_webp_file(&payload, ImageKind::Lossless, width, height)?;
+/// Encode an ARGB image to a complete simple-layout (§2.6) lossless
+/// `.webp` at lossless effort `method` (see
+/// [`crate::EncodeOptions::method`]).
+///
+/// Below [`EXHAUSTIVE_METHOD`] the bitstream is written straight behind
+/// the file and chunk headers, so the finished stream is never copied.
+pub(crate) fn encode_webp_lossless_file(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_argb(pixels, width, height)?;
+    if method >= EXHAUSTIVE_METHOD {
+        let payload = encode_vp8l_payload(pixels, width, height, alpha_is_used, method);
+        return Ok(build::build_webp_file(
+            &payload,
+            ImageKind::Lossless,
+            width,
+            height,
+        )?);
+    }
+    let mut file = build::begin_simple_webp_file(ImageKind::Lossless);
+    file.extend_from_slice(&build_image_header(width, height, alpha_is_used));
+    let mut w = BitWriter::after_bytes(file);
+    entropy_estimate::encode_image_stream(pixels, width, height, &mut w);
+    let mut file = w.into_bytes();
+    build::finish_simple_webp_file(&mut file)?;
     Ok(file)
 }
 
@@ -7726,17 +7962,16 @@ fn encode_vp8l_payload(
     alpha_is_used: bool,
     method: u8,
 ) -> Vec<u8> {
-    let stream = if method < EXHAUSTIVE_METHOD {
-        let mut w = BitWriter::new();
-        entropy_estimate::encode_image_stream(pixels, width, height, &mut w);
-        w.into_bytes()
-    } else {
-        // Production path: thread the actual image width so the §5.2.2
-        // distance-map chooser can swap row-style scan-line codes for
-        // small distance-map codes (round 130).
-        encode_argb_with_predictor_chooser(pixels, width, height)
-    };
     let header = build_image_header(width, height, alpha_is_used);
+    if method < EXHAUSTIVE_METHOD {
+        let mut w = BitWriter::after_bytes(header.to_vec());
+        entropy_estimate::encode_image_stream(pixels, width, height, &mut w);
+        return w.into_bytes();
+    }
+    // Production path: thread the actual image width so the §5.2.2
+    // distance-map chooser can swap row-style scan-line codes for
+    // small distance-map codes (round 130).
+    let stream = encode_argb_with_predictor_chooser(pixels, width, height);
     let mut payload = Vec::with_capacity(header.len() + stream.len());
     payload.extend_from_slice(&header);
     payload.extend_from_slice(&stream);
