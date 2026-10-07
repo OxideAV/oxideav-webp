@@ -12,6 +12,15 @@ All notable changes to `oxideav-webp` are recorded here.
   spatially-coded image take any token stream, so a parse no longer has
   to be stored as a `Vec<Token>`. The output is unchanged (the output
   pins hold).
+- The lossy path copies the `VP8 ` bitstream into the RIFF container
+  once. `build_webp_file` writes its chunks straight into the file
+  instead of building each chunk and copying it again (a 100,001-byte
+  bitstream now allocates about 100 KB instead of 200 KB), and the
+  extended lossy layout (`VP8X` with `ALPH` or metadata) appends every
+  chunk into one buffer instead of building a body and framing it (three
+  copies of the bitstream down to one). The output bytes are unchanged:
+  `tests/lossy_output_pins.rs` pins every fixture's quality-80 encode,
+  two photo-like images and the `webp_vp8` framework encoder's packet.
 
 ### Added
 
