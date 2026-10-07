@@ -7,6 +7,11 @@ All notable changes to `oxideav-webp` are recorded here.
 ### Changed
 
 - edition 2024, MSRV 1.95
+- Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
+  callback, and the frequency count, exact cost and writer of a
+  spatially-coded image take any token stream, so a parse no longer has
+  to be stored as a `Vec<Token>`. The output is unchanged (the output
+  pins hold).
 
 ### Added
 
