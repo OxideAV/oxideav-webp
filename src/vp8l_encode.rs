@@ -1307,6 +1307,9 @@ struct Lz77Matcher<'a> {
     pixels: &'a [u32],
     head: Vec<i32>,
     prev: Vec<i32>,
+    /// `32 - hash_bits`: the right shift that folds the 32-bit window
+    /// hash into a bucket index.
+    hash_shift: u32,
     /// Farthest backward-reference distance [`Self::find`] returns.
     max_distance: usize,
 }
@@ -1334,22 +1337,30 @@ impl<'a> Lz77Matcher<'a> {
     /// megapixel it can find references farther than
     /// [`MAX_BACKWARD_DISTANCE`].
     fn new(pixels: &'a [u32]) -> Self {
-        Self::with_buffers(pixels, usize::MAX, Lz77Buffers::default())
+        Self::with_buffers(pixels, HASH_BITS as u32, usize::MAX, Lz77Buffers::default())
     }
 
-    /// Build a matcher over `pixels` that returns matches at most
-    /// `max_distance` back, reusing (and resetting) `buffers`. With no cap
-    /// and fresh buffers this is exactly [`Self::new`].
-    fn with_buffers(pixels: &'a [u32], max_distance: usize, buffers: Lz77Buffers) -> Self {
+    /// Build a matcher over `pixels` with `1 << hash_bits` buckets that
+    /// returns matches at most `max_distance` back, reusing (and
+    /// resetting) `buffers`. With [`HASH_BITS`], no cap and fresh buffers
+    /// this is exactly [`Self::new`].
+    fn with_buffers(
+        pixels: &'a [u32],
+        hash_bits: u32,
+        max_distance: usize,
+        buffers: Lz77Buffers,
+    ) -> Self {
+        debug_assert!((1..=24).contains(&hash_bits));
         let Lz77Buffers { mut head, mut prev } = buffers;
         head.clear();
-        head.resize(1 << HASH_BITS, -1);
+        head.resize(1 << hash_bits, -1);
         prev.clear();
         prev.resize(pixels.len(), -1);
         Self {
             pixels,
             head,
             prev,
+            hash_shift: 32 - hash_bits,
             max_distance,
         }
     }
@@ -1364,14 +1375,14 @@ impl<'a> Lz77Matcher<'a> {
 
     /// Hash the 4-pixel window starting at `pos` (callers guarantee
     /// `pos + 4 <= pixels.len()`). A simple multiplicative mix over the
-    /// four ARGB words, folded into `HASH_BITS` bits.
+    /// four ARGB words, folded into the matcher's bucket bits.
     fn hash(&self, pos: usize) -> usize {
         let p = self.pixels;
         let mut h = 0u32;
         for k in 0..4 {
             h = h.wrapping_mul(0x9e37_79b1).wrapping_add(p[pos + k]);
         }
-        (h >> (32 - HASH_BITS)) as usize
+        (h >> self.hash_shift) as usize
     }
 
     /// Insert `pos` at the head of its hash bucket's chain.

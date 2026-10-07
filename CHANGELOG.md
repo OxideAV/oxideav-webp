@@ -14,6 +14,14 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- The single-pass lossless encoder (methods `0..=5`) sizes its LZ77 hash
+  table with the image: about four pixels per bucket, from 2^14 buckets
+  up to 2^20. The exhaustive path's fixed 2^14 buckets leave about 64
+  unrelated positions in every chain of a megapixel photo, and each
+  lookup walks them. A 1024 x 1024 photo-like image now encodes at
+  method 4 in 0.54 s instead of 2.15 s (release build, best of three),
+  to the same 1,729,228 bytes. Images up to 256 x 256 keep 2^14 buckets
+  and parse exactly as before.
 - The single-pass lossless encoder (methods `0..=5`) chooses the §3.6.2.3
   colour cache too. The greedy parse that estimates each transform stack
   is priced under all twelve cache choices at once (no cache and

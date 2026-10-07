@@ -32,7 +32,9 @@
 //! is cheaper, but it cannot see what LZ77 does with the residuals, and on
 //! smooth or repetitive content it ranks the stacks wrongly: on the
 //! committed 128 x 128 natural fixture it prefers subtract-green plus
-//! predictor, whose stream is 55% larger than the predictor alone.
+//! predictor, whose stream is 55% larger than the predictor alone. One
+//! LZ77 parse per candidate costs little because the matcher's hash table
+//! grows with the image ([`lz77_hash_bits`]).
 //!
 //! ## Choosing the colour cache
 //!
@@ -52,11 +54,11 @@
 //! length and a 32-bit distance per position) that live for the whole
 //! encode, where the exhaustive path's planner stores `Vec<Token>`
 //! streams and per-position match tables. For the same pixels, stream
-//! width and colour cache the two planners choose the same tokens; the
-//! `planner_matches_the_exhaustive_planner` test checks that on three
-//! images without a cache and with 3- and 10-bit caches. Unlike the
-//! exhaustive path's matcher, this one never returns a backward reference
-//! farther than the RFC 9649 §3.6.2.2 distance codes reach
+//! width, colour cache and hash size the two planners choose the same
+//! tokens; the `planner_matches_the_exhaustive_planner` test checks that
+//! on three images without a cache and with 3- and 10-bit caches. Unlike
+//! the exhaustive path's matcher, this one never returns a backward
+//! reference farther than the RFC 9649 §3.6.2.2 distance codes reach
 //! ([`MAX_BACKWARD_DISTANCE`]).
 //!
 //! ## Rightmost-column predictor modes
@@ -83,6 +85,21 @@ const NOT_PROBED: u16 = u16::MAX;
 
 /// `hits` value for a position whose pixel misses the colour cache.
 const NO_HIT: u16 = u16::MAX;
+
+/// LZ77 hash-table size for an image of `pixels` pixels, in bits: about
+/// four pixels per bucket, from the exhaustive path's [`HASH_BITS`] up to
+/// a 2^20-bucket (4 MiB) table.
+///
+/// The exhaustive path keeps 14 bits at every size, so on a megapixel
+/// photo each chain holds about 64 unrelated positions that every lookup
+/// walks: about 0.4 s per parse at 1024 x 1024. At 18 bits the same parse
+/// takes 0.04 s, and on the photo-like bench image the planned stream
+/// came out the same size. Up to 256 x 256 (2^16 pixels) the size equals
+/// [`HASH_BITS`], so both paths parse identically there.
+fn lz77_hash_bits(pixels: usize) -> u32 {
+    let ceil_log2 = usize::BITS - pixels.saturating_sub(1).leading_zeros();
+    ceil_log2.saturating_sub(2).clamp(HASH_BITS as u32, 20)
+}
 
 /// A transform stack the encoder can choose, in the order it estimates
 /// them (on equal estimates the earlier, simpler stack wins).
@@ -575,7 +592,13 @@ impl Planner {
     /// size winning. This is [`best_stream_tokens_with_cost`] for a single
     /// cache choice. Returns the chosen parse and its exact
     /// `prefix-codes + lz77-coded-image` size in bits.
-    fn plan(&mut self, pixels: &[u32], width: u32, cache_bits: Option<u32>) -> (Chosen, usize) {
+    fn plan(
+        &mut self,
+        pixels: &[u32],
+        width: u32,
+        cache_bits: Option<u32>,
+        hash_bits: u32,
+    ) -> (Chosen, usize) {
         let n = pixels.len();
         self.match_len.clear();
         self.match_len.resize(n, NOT_PROBED);
@@ -588,6 +611,7 @@ impl Planner {
         // match table (the round-440 fusion of the two matcher passes).
         let mut matcher = Lz77Matcher::with_buffers(
             pixels,
+            hash_bits,
             MAX_BACKWARD_DISTANCE,
             std::mem::take(&mut self.lz77),
         );
@@ -616,8 +640,12 @@ impl Planner {
                 },
             );
         }
-        let mut matcher =
-            Lz77Matcher::with_buffers(pixels, MAX_BACKWARD_DISTANCE, matcher.into_buffers());
+        let mut matcher = Lz77Matcher::with_buffers(
+            pixels,
+            hash_bits,
+            MAX_BACKWARD_DISTANCE,
+            matcher.into_buffers(),
+        );
         self.complete_match_table(&mut matcher);
         self.lz77 = matcher.into_buffers();
 
@@ -867,6 +895,7 @@ fn choose(
     width: u32,
     height: u32,
     palette: Option<&PaletteInfo>,
+    hash_bits: u32,
     buf: &mut Vec<u32>,
     lz77: &mut Lz77Buffers,
 ) -> Choice {
@@ -880,8 +909,12 @@ fn choose(
             continue;
         };
         sweep.reset();
-        let mut matcher =
-            Lz77Matcher::with_buffers(stream, MAX_BACKWARD_DISTANCE, std::mem::take(lz77));
+        let mut matcher = Lz77Matcher::with_buffers(
+            stream,
+            hash_bits,
+            MAX_BACKWARD_DISTANCE,
+            std::mem::take(lz77),
+        );
         let mut pos = 0usize;
         lz77_parse(
             &mut matcher,
@@ -917,6 +950,7 @@ fn choose(
 /// spatially-coded image.
 pub(super) fn encode_image_stream(pixels: &[u32], width: u32, height: u32, w: &mut BitWriter) {
     debug_assert_eq!(pixels.len(), width as usize * height as usize);
+    let hash_bits = lz77_hash_bits(pixels.len());
     let palette = PaletteInfo::collect(pixels);
     let mut buf: Vec<u32> = Vec::with_capacity(pixels.len());
     let mut planner = Planner::default();
@@ -926,6 +960,7 @@ pub(super) fn encode_image_stream(pixels: &[u32], width: u32, height: u32, w: &m
         width,
         height,
         palette.as_ref(),
+        hash_bits,
         &mut buf,
         &mut planner.lz77,
     );
@@ -939,7 +974,7 @@ pub(super) fn encode_image_stream(pixels: &[u32], width: u32, height: u32, w: &m
         w,
     )
     .expect("the chosen stack applies");
-    let (chosen, _) = planner.plan(stream, stream_width, choice.cache_bits);
+    let (chosen, _) = planner.plan(stream, stream_width, choice.cache_bits, hash_bits);
     let hits = choice.cache_bits.map(|_| &planner.hits[..]);
     let tokens = planner.parse(chosen).tokens(stream, hits);
     write_spatially_coded_token_stream(w, tokens, choice.cache_bits, stream_width);
@@ -976,6 +1011,16 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn hash_bits_track_image_size() {
+        assert_eq!(lz77_hash_bits(1), HASH_BITS as u32);
+        assert_eq!(lz77_hash_bits(256 * 256), HASH_BITS as u32);
+        assert_eq!(lz77_hash_bits(256 * 256 + 1), 15);
+        assert_eq!(lz77_hash_bits(1024 * 1024), 18);
+        assert_eq!(lz77_hash_bits(2048 * 2048), 20);
+        assert_eq!(lz77_hash_bits(16384 * 16384), 20);
     }
 
     #[test]
@@ -1047,8 +1092,10 @@ mod tests {
 
     #[test]
     fn planner_matches_the_exhaustive_planner() {
-        // For each tested cache choice the planner must pick exactly the tokens
-        // `best_stream_tokens_with_cost` picks, at the same exact cost.
+        // Up to 2^16 pixels the planner uses the exhaustive path's hash
+        // size, so for each tested cache choice it must pick exactly the
+        // tokens `best_stream_tokens_with_cost` picks, at the same exact
+        // cost.
         for (pixels, width) in [
             (photo(48, 40, 11), 48u32),
             (banded(96, 64), 96),
@@ -1058,7 +1105,8 @@ mod tests {
             for cache_bits in [None, Some(3), Some(10)] {
                 let (expected_tokens, expected_bits) =
                     best_stream_tokens_with_cost(&pixels, width, cache_bits);
-                let (chosen, bits) = planner.plan(&pixels, width, cache_bits);
+                let (chosen, bits) =
+                    planner.plan(&pixels, width, cache_bits, lz77_hash_bits(pixels.len()));
                 let hits = cache_bits.map(|_| &planner.hits[..]);
                 let tokens: Vec<Token> = planner.parse(chosen).tokens(&pixels, hits).collect();
                 assert_eq!(
@@ -1081,7 +1129,7 @@ mod tests {
         }
         let find_at = |max_distance: usize| {
             let mut matcher =
-                Lz77Matcher::with_buffers(&pixels, max_distance, Lz77Buffers::default());
+                Lz77Matcher::with_buffers(&pixels, 14, max_distance, Lz77Buffers::default());
             for pos in 0..far {
                 matcher.insert(pos);
             }
