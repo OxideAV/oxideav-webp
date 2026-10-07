@@ -4,6 +4,18 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- The lossy path copies the `VP8 ` bitstream into the RIFF container
+  once. `build_webp_file` writes its chunks straight into the file
+  instead of building each chunk and copying it again (a 100,001-byte
+  bitstream now allocates about 100 KB instead of 200 KB), and the
+  extended lossy layout (`VP8X` with `ALPH` or metadata) appends every
+  chunk into one buffer instead of building a body and framing it (three
+  copies of the bitstream down to one). The output bytes are unchanged:
+  `tests/lossy_output_pins.rs` pins every fixture's quality-80 encode,
+  two photo-like images and the `webp_vp8` framework encoder's packet.
+
 ## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
 
 ### Other

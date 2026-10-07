@@ -1139,29 +1139,68 @@ fn encode_lossy(
         has_animation: false,
     };
     let vp8x_payload = build::build_vp8x_chunk(image.width, image.height, flags)?;
-    let mut body = Vec::new();
-    let mut push = |fourcc, payload: &[u8]| -> Result<(), WebpError> {
-        body.extend_from_slice(&build::build_chunk(fourcc, payload)?);
+    let alph_payload = alpha
+        .as_ref()
+        .map(|a| build_alph_payload(a, image.width, image.height));
+    let chunks: [(container::FourCc, Option<&[u8]>); 6] = [
+        (fourcc::VP8X, Some(&vp8x_payload)),
+        (fourcc::ICCP, meta.icc),
+        (fourcc::ALPH, alph_payload.as_deref()),
+        (fourcc::VP8, Some(&vp8)),
+        (fourcc::EXIF, meta.exif),
+        (fourcc::XMP, meta.xmp),
+    ];
+    let mut file = RiffWriter::new(
+        chunks
+            .iter()
+            .map(|(_, p)| p.map_or(0, |p| 9 + p.len()))
+            .sum(),
+    );
+    for (fourcc, payload) in chunks {
+        if let Some(payload) = payload {
+            file.chunk(fourcc, payload)?;
+        }
+    }
+    file.finish()
+}
+
+/// A `RIFF` / `WEBP` file assembled chunk by chunk in one buffer: each
+/// payload is copied once, straight into place. The bytes are those of
+/// [`frame_riff`] over the same chunks built one by one, which copies
+/// every payload twice more.
+pub(crate) struct RiffWriter {
+    out: Vec<u8>,
+}
+
+impl RiffWriter {
+    /// Start a file with room for `body_capacity` bytes of chunks.
+    pub(crate) fn new(body_capacity: usize) -> Self {
+        let mut out = Vec::with_capacity(12 + body_capacity);
+        out.extend_from_slice(&fourcc::RIFF);
+        out.extend_from_slice(&[0; 4]); // File Size, filled by `finish`
+        out.extend_from_slice(&fourcc::WEBP);
+        Self { out }
+    }
+
+    /// Append one §2.3 chunk.
+    pub(crate) fn chunk(
+        &mut self,
+        fourcc: container::FourCc,
+        payload: &[u8],
+    ) -> Result<(), WebpError> {
+        build::append_checked_chunk(&mut self.out, fourcc, payload)?;
         Ok(())
-    };
-    push(fourcc::VP8X, &vp8x_payload)?;
-    if let Some(icc) = meta.icc {
-        push(fourcc::ICCP, icc)?;
     }
-    if let Some(a) = &alpha {
-        push(
-            fourcc::ALPH,
-            &build_alph_payload(a, image.width, image.height),
-        )?;
+
+    /// Fill the §2.4 File Size field and return the file.
+    pub(crate) fn finish(mut self) -> Result<Vec<u8>, WebpError> {
+        let file_size = (self.out.len() - 8) as u64;
+        if file_size > u64::from(u32::MAX) {
+            return Err(WebpError::invalid("RIFF file size exceeds u32"));
+        }
+        self.out[4..8].copy_from_slice(&(file_size as u32).to_le_bytes());
+        Ok(self.out)
     }
-    push(fourcc::VP8, &vp8)?;
-    if let Some(exif) = meta.exif {
-        push(fourcc::EXIF, exif)?;
-    }
-    if let Some(xmp) = meta.xmp {
-        push(fourcc::XMP, xmp)?;
-    }
-    frame_riff(body)
 }
 
 /// Wrap an assembled chunk body in the §2.4 `RIFF` / `WEBP` file header.
@@ -1333,6 +1372,21 @@ mod tests {
     const LOSSLESS_1X1: &[u8] = include_bytes!("../tests/data/lossless-1x1.webp");
     const LOSSY_ALPHA: &[u8] = include_bytes!("../tests/data/lossy-with-alpha-128x128.webp");
     const ANIM: &[u8] = include_bytes!("../tests/data/animated-3-frames-rgb.webp");
+
+    /// `RiffWriter` must write the bytes `frame_riff` writes over the
+    /// same chunks built one by one.
+    #[test]
+    fn riff_writer_matches_framing_a_built_body() {
+        let payloads: [&[u8]; 4] = [&[1, 2, 3], &[], &[9; 10], &[7; 1001]];
+        let fourccs = [fourcc::VP8X, fourcc::ALPH, fourcc::VP8, fourcc::EXIF];
+        let mut body = Vec::new();
+        let mut file = RiffWriter::new(0);
+        for (fourcc, payload) in fourccs.into_iter().zip(payloads) {
+            body.extend_from_slice(&build::build_chunk(fourcc, payload).unwrap());
+            file.chunk(fourcc, payload).unwrap();
+        }
+        assert_eq!(file.finish().unwrap(), frame_riff(body).unwrap());
+    }
 
     #[test]
     fn probe_sniffs_the_riff_webp_header() {
