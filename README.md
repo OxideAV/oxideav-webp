@@ -173,7 +173,10 @@ strength), `embed_icc` / `embed_exif` / `embed_xmp` (default on — the
 image's metadata is written when present), and for animations
 `loop_count` (`0` = forever), `background_rgba`, `frame_mode`
 (`Auto` / `Delta` / `Lossless` dirty-rectangle strategy) and `delta`.
-One struct for stills and animations; behaviour variants are fields.
+`method` (`0..=6`, default `6`, the scale of `cwebp -m`) sets the
+lossless encoder's effort: `6` runs the exhaustive search; `0..=5` pick
+the transforms from histogram cost estimates and encode once. One
+struct for stills and animations; behaviour variants are fields.
 
 ## Metadata and colour
 

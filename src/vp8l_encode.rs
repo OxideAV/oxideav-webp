@@ -52,6 +52,17 @@
 //! framing (via [`crate::build`]), decodes back to the exact input pixels
 //! through [`crate::decode`] — a pixel-exact round trip.
 //!
+//! ## Effort levels
+//!
+//! The candidate search the sections below describe
+//! ([`encode_argb_with_predictor_chooser`]) runs at lossless effort `6`
+//! ([`crate::EncodeOptions::method`]), the default: it encodes every
+//! candidate in full and keeps the smallest stream. Efforts `0..=5` run
+//! the single-pass encoder in [`entropy_estimate`] instead, which picks
+//! the transform stack from histogram cost estimates and encodes the
+//! image once, reusing this module's transforms, LZ77 matcher, token
+//! planner and writer.
+//!
 //! ## §3.7.2 prefix-code construction
 //!
 //! For each of the five symbol alphabets the encoder:
@@ -238,6 +249,8 @@
 
 use crate::build::{self, ImageKind};
 
+mod entropy_estimate;
+
 /// The largest code length a VP8L canonical prefix code may use (§3.7.2.1.2
 /// stores literal code lengths in `[0..15]`). Mirrors
 /// [`crate::vp8l_prefix::MAX_CODE_LENGTH`].
@@ -308,6 +321,15 @@ impl std::error::Error for EncodeError {}
 
 /// §3.4 14-bit `width - 1` / `height - 1` field maximum (1-based 16384).
 const MAX_DIMENSION: u32 = 1 << 14;
+
+/// Default lossless effort ([`crate::EncodeOptions::method`]).
+pub(crate) const DEFAULT_METHOD: u8 = EXHAUSTIVE_METHOD;
+
+/// Lowest lossless effort that runs the exhaustive search
+/// ([`encode_argb_with_predictor_chooser`]): every candidate stream is
+/// encoded in full and the smallest kept. Higher values behave the same;
+/// lower ones run the single-pass encoder of [`entropy_estimate`].
+pub(crate) const EXHAUSTIVE_METHOD: u8 = 6;
 
 /// Least-significant-bit-first bit writer over a growing byte buffer.
 ///
@@ -1285,15 +1307,58 @@ struct Lz77Matcher<'a> {
     pixels: &'a [u32],
     head: Vec<i32>,
     prev: Vec<i32>,
+    /// Farthest backward-reference distance [`Self::find`] returns.
+    max_distance: usize,
+}
+
+/// Farthest backward reference RFC 9649 §3.6.2.2 can code: the 40-symbol
+/// distance alphabet reaches distance code `1 << 20`, and a scan-line
+/// distance `D` is coded as `D + 120`. libwebp's `WINDOW_SIZE` is the same
+/// value.
+const MAX_BACKWARD_DISTANCE: usize = (1 << 20) - crate::vp8l_decode::NUM_DISTANCE_MAP_CODES;
+
+/// The two hash-chain arrays of an [`Lz77Matcher`], kept between matcher
+/// lifetimes so the single-pass encoder parses every candidate stream
+/// without allocating them again.
+#[derive(Debug, Default)]
+struct Lz77Buffers {
+    head: Vec<i32>,
+    prev: Vec<i32>,
 }
 
 impl<'a> Lz77Matcher<'a> {
     /// Build a matcher over `pixels` with empty hash chains.
+    ///
+    /// No distance cap: this is the exhaustive path's matcher, kept as it
+    /// was so that path's output does not change. On images over about a
+    /// megapixel it can find references farther than
+    /// [`MAX_BACKWARD_DISTANCE`].
     fn new(pixels: &'a [u32]) -> Self {
+        Self::with_buffers(pixels, usize::MAX, Lz77Buffers::default())
+    }
+
+    /// Build a matcher over `pixels` that returns matches at most
+    /// `max_distance` back, reusing (and resetting) `buffers`. With no cap
+    /// and fresh buffers this is exactly [`Self::new`].
+    fn with_buffers(pixels: &'a [u32], max_distance: usize, buffers: Lz77Buffers) -> Self {
+        let Lz77Buffers { mut head, mut prev } = buffers;
+        head.clear();
+        head.resize(1 << HASH_BITS, -1);
+        prev.clear();
+        prev.resize(pixels.len(), -1);
         Self {
             pixels,
-            head: vec![-1; 1 << HASH_BITS],
-            prev: vec![-1; pixels.len()],
+            head,
+            prev,
+            max_distance,
+        }
+    }
+
+    /// Give the hash-chain arrays back for the next matcher.
+    fn into_buffers(self) -> Lz77Buffers {
+        Lz77Buffers {
+            head: self.head,
+            prev: self.prev,
         }
     }
 
@@ -1338,7 +1403,12 @@ impl<'a> Lz77Matcher<'a> {
         let mut best_len = 0usize;
         let mut best_dist = 0usize;
         let mut steps = 0usize;
-        while cand >= 0 && steps < MAX_CHAIN {
+        // Chains run from the newest position to the oldest, so the first
+        // candidate past the distance cap ends the walk. Without a cap the
+        // bound is 0, the end-of-chain test alone. (Positions fit `i32`:
+        // an image holds at most 2^28 pixels.)
+        let oldest = pos.saturating_sub(self.max_distance) as i32;
+        while cand >= oldest && steps < MAX_CHAIN {
             let c = cand as usize;
             // Candidates were all inserted at positions < pos.
             //
@@ -7597,7 +7667,7 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
         pixels.push((a << 24) | (r << 16) | (g << 8) | b);
     }
 
-    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used);
+    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used, DEFAULT_METHOD);
 
     // §2.4 / §2.6 RIFF/WEBP framing around the VP8L payload.
     let file = build::build_webp_file(&payload, ImageKind::Lossless, width, height)?;
@@ -7633,11 +7703,28 @@ fn validate_argb(pixels: &[u32], width: u32, height: u32) -> Result<(), EncodeEr
 /// becomes the §3.4 `alpha_is_used` header bit. This is the inner payload a
 /// `VP8L` chunk wraps — *not* a RIFF/WEBP file. Callers wanting the framed
 /// file use [`encode_webp_lossless`] / [`encode_vp8l_argb_with_metadata`].
-fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: bool) -> Vec<u8> {
-    // Production path: thread the actual image width so the §5.2.2
-    // distance-map chooser can swap row-style scan-line codes for
-    // small distance-map codes (round 130).
-    let stream = encode_argb_with_predictor_chooser(pixels, width, height);
+///
+/// `method` is the lossless effort ([`crate::EncodeOptions::method`]):
+/// below [`EXHAUSTIVE_METHOD`] the single-pass encoder of
+/// [`entropy_estimate`] writes the stream; from it up, the exhaustive
+/// search of [`encode_argb_with_predictor_chooser`] does.
+fn encode_vp8l_payload(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Vec<u8> {
+    let stream = if method < EXHAUSTIVE_METHOD {
+        let mut w = BitWriter::new();
+        entropy_estimate::encode_image_stream(pixels, width, height, &mut w);
+        w.into_bytes()
+    } else {
+        // Production path: thread the actual image width so the §5.2.2
+        // distance-map chooser can swap row-style scan-line codes for
+        // small distance-map codes (round 130).
+        encode_argb_with_predictor_chooser(pixels, width, height)
+    };
     let header = build_image_header(width, height, alpha_is_used);
     let mut payload = Vec::with_capacity(header.len() + stream.len());
     payload.extend_from_slice(&header);
@@ -8884,8 +8971,26 @@ pub fn encode_vp8l_argb_with(
     height: u32,
     alpha_is_used: bool,
 ) -> Result<Vec<u8>, EncodeError> {
+    encode_vp8l_argb_with_method(pixels, width, height, alpha_is_used, DEFAULT_METHOD)
+}
+
+/// [`encode_vp8l_argb_with`] at lossless effort `method` (see
+/// [`crate::EncodeOptions::method`]).
+pub(crate) fn encode_vp8l_argb_with_method(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Result<Vec<u8>, EncodeError> {
     validate_argb(pixels, width, height)?;
-    Ok(encode_vp8l_payload(pixels, width, height, alpha_is_used))
+    Ok(encode_vp8l_payload(
+        pixels,
+        width,
+        height,
+        alpha_is_used,
+        method,
+    ))
 }
 
 #[cfg(test)]

@@ -45,3 +45,11 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     }
     hash
 }
+
+/// The committed 128×128 natural-image fixture, decoded to packed RGBA.
+#[allow(dead_code)]
+pub fn natural_fixture_rgba() -> (u32, u32, Vec<u8>) {
+    let bytes = include_bytes!("../data/lossless-128x128-natural.webp");
+    let img = oxideav_webp::decode_rgba8(bytes).expect("natural fixture decodes");
+    (img.width, img.height, img.data)
+}
