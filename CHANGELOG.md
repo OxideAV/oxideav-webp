@@ -4,6 +4,71 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
+  callback, and the frequency count, exact cost and writer of a
+  spatially-coded image take any token stream, so a parse no longer has
+  to be stored as a `Vec<Token>`. The output is unchanged (the output
+  pins hold).
+
+### Added
+
+- The single-pass lossless encoder (methods `0..=5`) sizes its LZ77 hash
+  table with the image: about four pixels per bucket, from 2^14 buckets
+  up to 2^20. The exhaustive path's fixed 2^14 buckets leave about 64
+  unrelated positions in every chain of a megapixel photo, and each
+  lookup walks them. A 1024 x 1024 photo-like image now encodes at
+  method 4 in 0.54 s instead of 2.15 s (release build, best of three),
+  to the same 1,729,228 bytes. Images up to 256 x 256 keep 2^14 buckets
+  and parse exactly as before.
+- The single-pass lossless encoder (methods `0..=5`) chooses the §3.6.2.3
+  colour cache too. The greedy parse that estimates each transform stack
+  is priced under all twelve cache choices at once (no cache and
+  `cache_code_bits` 1 to 11), as libwebp's `CalculateBestCacheSize`
+  does, and the cheapest stack-and-cache pair is encoded. The planner
+  prices cache hits the way the exhaustive path does; a test pins it to
+  that planner token for token on three images without a cache and with
+  3- and 10-bit caches. The 128 x 128 natural fixture takes 658 bytes at
+  method 4 (676 without the cache; method 6: 644). Over every still
+  image the output pins use plus a 128 x 128 photo (23 inputs), method
+  4 writes at most 8.7% more than method 6 (50 bytes against 46 on a
+  32 x 32 fixture), and most come out the same size; a test fails on
+  growth of more than 1% over an input's recorded size, or of more than
+  9% over method 6.
+- `EncodeOptions::method` and `EncodeOptions::with_method`: lossless
+  effort on the `0..=6` scale of `cwebp -m`. The default, `6`, is the
+  exhaustive search the encoder has always run. Levels `0..=5` select a
+  new single-pass encoder: it estimates each transform stack (none,
+  subtract-green, predictor, subtract-green + predictor, and for images
+  of at most 256 colours colour indexing with and without a predictor)
+  from the histograms of one greedy LZ77 parse, and encodes the cheapest
+  once with the exhaustive path's cost-priced token planner, kept in
+  compact per-pixel arrays. On a photo-like 256 x 256 image both levels
+  write the same 108,598 bytes, method 4 in 0.017 s instead of 1.95 s.
+  Animations honour the knob per frame, and a lossy encode codes its
+  alpha plane (`ALPH`) at it. Tests cover the knob, its reach into the
+  alpha plane, round trips at every level and a bit-exact reference
+  decode (`dwebp`) of single-pass output.
+- Tests (`tests/lossless_output_pins.rs`) pinning the lossless encoder's
+  output bytes: every frame of every committed fixture, three synthetic
+  images, five animations, and the lossy encodes of the four fixture
+  frames with alpha, whose `ALPH` plane the lossless encoder codes. A
+  change meant to leave the encoder's output alone must leave every pin
+  as it is.
+
+### Notes
+
+- The single-pass encoder never uses §3.5.1 predictor modes 3, 5, 9 or 10
+  (the modes that read the top-right pixel) in the last column of
+  predictor blocks. This crate's predictor takes the rightmost column's
+  top-right pixel from the row above, while RFC 9649 §3.5.1 and libwebp
+  take it from the current row; avoiding those modes there keeps
+  single-pass output decoding identically in both. Method 6 and the
+  decoder are unchanged.
+- The single-pass encoder caps backward references at 1,048,456 pixels,
+  the farthest distance the 40-symbol §3.6.2.2 distance alphabet codes.
+
 ## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
 
 ### Other
