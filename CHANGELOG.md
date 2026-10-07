@@ -4,6 +4,23 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
+  callback, and the frequency count, exact cost and writer of a
+  spatially-coded image take any token stream, so a parse no longer has
+  to be stored as a `Vec<Token>`. The output is unchanged (the output
+  pins hold).
+
+### Added
+
+- Tests (`tests/lossless_output_pins.rs`) pinning the lossless encoder's
+  output bytes: every frame of every committed fixture, three synthetic
+  images, five animations, and the lossy encodes of the four fixture
+  frames with alpha, whose `ALPH` plane the lossless encoder codes. A
+  change meant to leave the encoder's output alone must leave every pin
+  as it is.
+
 ## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
 
 ### Other

@@ -1561,17 +1561,46 @@ fn tokenize_lz77_impl(
     lazy_depth: u32,
     mut probes: Option<&mut [FindProbe]>,
 ) -> Vec<Token> {
-    let n = pixels.len();
     let mut matcher = Lz77Matcher::new(pixels);
     let mut tokens = Vec::new();
+    lz77_parse(
+        &mut matcher,
+        lazy_depth,
+        |pos, found| {
+            if let Some(rec) = probes.as_deref_mut() {
+                rec[pos] = FindProbe::record(found);
+            }
+        },
+        |tok| tokens.push(tok),
+    );
+    tokens
+}
+
+/// The lazy-matching §3.6.2.2 parse behind [`tokenize_lz77_impl`], over a
+/// caller-built `matcher` and reporting through two callbacks instead of
+/// collecting a `Vec`:
+///
+/// * `on_probe(pos, found)` observes every `find(pos)` result (the
+///   round-440 probe recording; observation only).
+/// * `emit(token)` receives the token stream in order.
+///
+/// The parse, its matcher bookkeeping, and the emitted tokens are
+/// exactly [`tokenize_lz77_impl`]'s; a caller can stream the tokens into
+/// histograms or a compact parse instead of a `Vec<Token>`.
+fn lz77_parse(
+    matcher: &mut Lz77Matcher<'_>,
+    lazy_depth: u32,
+    mut on_probe: impl FnMut(usize, Option<(usize, usize)>),
+    mut emit: impl FnMut(Token),
+) {
+    let pixels = matcher.pixels;
+    let n = pixels.len();
     let mut pos = 0usize;
     let depth = lazy_depth.min(4);
     // Record a probe result without disturbing the parse.
     macro_rules! record {
         ($p:expr, $r:expr) => {
-            if let Some(rec) = probes.as_deref_mut() {
-                rec[$p] = FindProbe::record($r);
-            }
+            on_probe($p, $r)
         };
     }
     while pos < n {
@@ -1690,9 +1719,9 @@ fn tokenize_lz77_impl(
             // Emit literals for any pixels skipped by the chosen
             // lazy starting position, then the chosen match.
             for &skipped in &pixels[pos..best_start] {
-                tokens.push(Token::Literal(skipped));
+                emit(Token::Literal(skipped));
             }
-            tokens.push(Token::Copy {
+            emit(Token::Copy {
                 length: best_len,
                 distance: best_dist,
             });
@@ -1722,12 +1751,11 @@ fn tokenize_lz77_impl(
             }
             pos = end;
         } else {
-            tokens.push(Token::Literal(pixels[pos]));
+            emit(Token::Literal(pixels[pos]));
             matcher.insert(pos);
             pos += 1;
         }
     }
-    tokens
 }
 
 /// Allowed range for the §5.2.3 `color_cache_code_bits` field: an
@@ -2119,6 +2147,16 @@ fn prefix_codes_and_tokens_bits_from(
     tokens: &[Token],
     image_width: u32,
 ) -> usize {
+    token_stream_bits_from(tables, tokens.iter().copied(), image_width)
+}
+
+/// [`prefix_codes_and_tokens_bits_from`] over any token stream, so a
+/// caller can price a parse it does not store as a `Vec<Token>`.
+fn token_stream_bits_from(
+    tables: &StreamCostTables,
+    tokens: impl IntoIterator<Item = Token>,
+    image_width: u32,
+) -> usize {
     // Round 408: the writer's §3.7.2.1.1 single-symbol-0 substitution
     // for an all-empty table moved inside `from_freqs` (both the
     // `WriteCode` writer and the `CostLengths` mirror), so every
@@ -2131,7 +2169,7 @@ fn prefix_codes_and_tokens_bits_from(
         + tables.alpha.code_lengths_bits()
         + tables.distance.code_lengths_bits();
 
-    for &tok in tokens {
+    for tok in tokens {
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
@@ -2905,8 +2943,18 @@ const fn build_dist_map_inverse(
 /// possibly match at width 1, so all row-style matches fall back to the
 /// scan-line `D + 120` form.
 fn count_frequencies(tokens: &[Token], color_cache_size: usize, image_width: u32) -> Frequencies {
+    count_token_stream_frequencies(tokens.iter().copied(), color_cache_size, image_width)
+}
+
+/// [`count_frequencies`] over any token stream, so a caller can count a
+/// parse it does not store as a `Vec<Token>`.
+fn count_token_stream_frequencies(
+    tokens: impl IntoIterator<Item = Token>,
+    color_cache_size: usize,
+    image_width: u32,
+) -> Frequencies {
     let mut freqs = Frequencies::new(color_cache_size);
-    for &tok in tokens {
+    for tok in tokens {
         freqs.count_token(tok, image_width);
     }
     freqs
@@ -7343,6 +7391,24 @@ fn write_spatially_coded_image(
     color_cache_code_bits: Option<u32>,
     image_width: u32,
 ) {
+    write_spatially_coded_token_stream(
+        w,
+        tokens.iter().copied(),
+        color_cache_code_bits,
+        image_width,
+    );
+}
+
+/// [`write_spatially_coded_image`] over any re-iterable token stream
+/// (the writer walks it twice: frequencies, then symbols).
+fn write_spatially_coded_token_stream<I>(
+    w: &mut BitWriter,
+    tokens: I,
+    color_cache_code_bits: Option<u32>,
+    image_width: u32,
+) where
+    I: Iterator<Item = Token> + Clone,
+{
     // §3.8.3 spatially-coded-image = color-cache-info meta-prefix data.
     // color-cache-info: `%b0` (no cache) or `%b1 4BIT` (enabled).
     let color_cache_size = match color_cache_code_bits {
@@ -7360,7 +7426,7 @@ fn write_spatially_coded_image(
     // meta-prefix: `%b0` (single prefix-code group).
     w.write_bit(false);
 
-    write_prefix_codes_and_tokens(w, tokens, color_cache_size, image_width);
+    write_prefix_codes_and_token_stream(w, tokens, color_cache_size, image_width);
 }
 
 /// Write an §7.3 `entropy-coded-image` (color-cache-info + data) of
@@ -7398,13 +7464,26 @@ fn write_prefix_codes_and_tokens(
     color_cache_size: usize,
     image_width: u32,
 ) {
+    write_prefix_codes_and_token_stream(w, tokens.iter().copied(), color_cache_size, image_width);
+}
+
+/// [`write_prefix_codes_and_tokens`] over any re-iterable token stream:
+/// one pass counts the frequencies, a second emits the symbols.
+fn write_prefix_codes_and_token_stream<I>(
+    w: &mut BitWriter,
+    tokens: I,
+    color_cache_size: usize,
+    image_width: u32,
+) where
+    I: Iterator<Item = Token> + Clone,
+{
     // Build the five prefix codes from token frequencies. The GREEN
     // alphabet covers literals (`< 256`), the §5.2.2 length prefix
     // symbols (`256 + length_prefix`), and (when the cache is enabled)
     // the §5.2.3 cache indices (`256 + 24 + index`). The distance
     // alphabet (40 codes) is exercised only when the matcher emitted at
     // least one copy.
-    let freqs = count_frequencies(tokens, color_cache_size, image_width);
+    let freqs = count_token_stream_frequencies(tokens.clone(), color_cache_size, image_width);
     let green_code = WriteCode::from_freqs(&freqs.green);
     let red_code = WriteCode::from_freqs(&freqs.red);
     let blue_code = WriteCode::from_freqs(&freqs.blue);
@@ -7430,7 +7509,7 @@ fn write_prefix_codes_and_tokens(
     // (channel order green, red, blue, alpha), a §5.2.3 color-cache
     // reference (a single GREEN symbol), or a §5.2.2 length + distance
     // backward reference.
-    for &tok in tokens {
+    for tok in tokens {
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
