@@ -310,14 +310,26 @@ impl WebpImage {
         format: WebpPixelFormat,
         planes: Vec<Plane>,
     ) -> Result<Self, crate::WebpError> {
-        if width == 0 || height == 0 {
-            return Err(crate::WebpError::invalid(format!(
-                "image has a zero dimension ({width}x{height})"
-            )));
-        }
+        check_nonzero(width, height)?;
         let img = Self::new_unchecked(width, height, format, planes);
         img.check_geometry()?;
         Ok(img)
+    }
+
+    /// The checks [`Self::new`] runs for a tightly packed one-plane image
+    /// of `format` (`Rgb24` or `Rgba`) held in `len` bytes, without taking
+    /// the bytes. Lets the lossless encoder read a caller's buffer in
+    /// place instead of copying it into an image first.
+    pub(crate) fn check_packed(
+        width: u32,
+        height: u32,
+        format: WebpPixelFormat,
+        len: usize,
+    ) -> Result<(), crate::WebpError> {
+        check_nonzero(width, height)?;
+        let bpp = format.packed_bytes_per_pixel().unwrap_or(4);
+        let stride = (width as usize) * bpp;
+        check_plane_geometry(format, width, height, std::iter::once((stride, len)))
     }
 
     /// [`Self::new`] without the geometry check, for images the crate
@@ -458,39 +470,12 @@ impl WebpImage {
     /// count, every stride at least the row width, every plane at least
     /// `stride × rows` bytes.
     pub fn check_geometry(&self) -> Result<(), crate::WebpError> {
-        let geom = self.format.plane_geometry(self.width, self.height);
-        if self.planes.len() != geom.len() {
-            return Err(crate::WebpError::invalid(format!(
-                "image has {} plane(s), {:?} needs {}",
-                self.planes.len(),
-                self.format,
-                geom.len()
-            )));
-        }
-        for (i, (plane, (row_bytes, rows))) in self.planes.iter().zip(geom).enumerate() {
-            if plane.stride < row_bytes {
-                return Err(crate::WebpError::invalid(format!(
-                    "plane {i}: stride {} < row width {row_bytes}",
-                    plane.stride
-                )));
-            }
-            let need = if rows == 0 {
-                0
-            } else {
-                plane
-                    .stride
-                    .checked_mul(rows - 1)
-                    .and_then(|v| v.checked_add(row_bytes))
-                    .ok_or_else(|| crate::WebpError::invalid("plane geometry overflows"))?
-            };
-            if plane.data.len() < need {
-                return Err(crate::WebpError::invalid(format!(
-                    "plane {i}: {} bytes, geometry needs {need}",
-                    plane.data.len()
-                )));
-            }
-        }
-        Ok(())
+        check_plane_geometry(
+            self.format,
+            self.width,
+            self.height,
+            self.planes.iter().map(|p| (p.stride, p.data.len())),
+        )
     }
 
     /// Packed 8-bit RGB, `3 × width` bytes per row, alpha dropped.
@@ -715,6 +700,55 @@ impl Frame {
     pub fn new(image: WebpImage, delay: Option<Duration>) -> Self {
         Self { image, delay }
     }
+}
+
+/// The zero-dimension check of [`WebpImage::new`].
+fn check_nonzero(width: u32, height: u32) -> Result<(), crate::WebpError> {
+    if width == 0 || height == 0 {
+        return Err(crate::WebpError::invalid(format!(
+            "image has a zero dimension ({width}x{height})"
+        )));
+    }
+    Ok(())
+}
+
+/// [`WebpImage::check_geometry`] over `(stride, byte length)` per plane.
+fn check_plane_geometry(
+    format: WebpPixelFormat,
+    width: u32,
+    height: u32,
+    planes: impl ExactSizeIterator<Item = (usize, usize)>,
+) -> Result<(), crate::WebpError> {
+    let geom = format.plane_geometry(width, height);
+    if planes.len() != geom.len() {
+        return Err(crate::WebpError::invalid(format!(
+            "image has {} plane(s), {:?} needs {}",
+            planes.len(),
+            format,
+            geom.len()
+        )));
+    }
+    for (i, ((stride, len), (row_bytes, rows))) in planes.zip(geom).enumerate() {
+        if stride < row_bytes {
+            return Err(crate::WebpError::invalid(format!(
+                "plane {i}: stride {stride} < row width {row_bytes}"
+            )));
+        }
+        let need = if rows == 0 {
+            0
+        } else {
+            stride
+                .checked_mul(rows - 1)
+                .and_then(|v| v.checked_add(row_bytes))
+                .ok_or_else(|| crate::WebpError::invalid("plane geometry overflows"))?
+        };
+        if len < need {
+            return Err(crate::WebpError::invalid(format!(
+                "plane {i}: {len} bytes, geometry needs {need}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

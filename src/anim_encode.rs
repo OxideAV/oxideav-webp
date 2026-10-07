@@ -239,6 +239,7 @@ pub fn build_animated_webp(frames: &[AnimFrame]) -> Result<Vec<u8>, WebpError> {
         [0, 0, 0, 0],
         &WebpMetadata::default(),
         &DeltaConfig::default(),
+        vp8l_encode::DEFAULT_METHOD,
     )
 }
 
@@ -287,6 +288,7 @@ pub fn build_animated_webp_with_options(
         opts.background_rgba,
         &opts.metadata,
         &opts.delta,
+        vp8l_encode::DEFAULT_METHOD,
     )
 }
 
@@ -299,6 +301,7 @@ pub(crate) fn build_animation(
     background_rgba: [u8; 4],
     meta: &WebpMetadata<'_>,
     _delta: &DeltaConfig,
+    method: u8,
 ) -> Result<Vec<u8>, WebpError> {
     if frames.is_empty() {
         return Err(WebpError::invalid("animation needs at least one frame"));
@@ -387,7 +390,8 @@ pub(crate) fn build_animation(
         if let Some((px, py, pw, ph, DisposalMethod::Background)) = prev_disposal {
             fill_canvas_rect_in_place(&mut prev_canvas, canvas_width, px, py, pw, ph, bg_rgba);
         }
-        let anmf_payload = build_anmf_payload_with_prev(f, canvas_width, &prev_canvas, idx == 0)?;
+        let anmf_payload =
+            build_anmf_payload_with_prev(f, canvas_width, &prev_canvas, idx == 0, method)?;
         push(fourcc::ANMF, &anmf_payload)?;
         // Update the canvas tracker with this frame's drawn pixels
         // (matching the decoder's blend method).
@@ -650,12 +654,15 @@ fn build_anmf_payload_with_prev(
     canvas_w: u32,
     prev: &[u8],
     is_first_frame: bool,
+    method: u8,
 ) -> Result<Vec<u8>, WebpError> {
     match f.mode {
-        AnimFrameMode::Lossless => emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels),
+        AnimFrameMode::Lossless => {
+            emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, method)
+        }
         AnimFrameMode::Delta => {
             if is_first_frame || f.dispose == DisposalMethod::Background {
-                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)
+                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, method)
             } else {
                 let drawn = drawn_canvas(prev, canvas_w, f);
                 let rect =
@@ -671,13 +678,13 @@ fn build_anmf_payload_with_prev(
                         h: 2.min(f.height),
                     });
                 let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, rect);
-                emit_dirty_anmf(f, rect, &sub_rgba)
+                emit_dirty_anmf(f, rect, &sub_rgba, method)
             }
         }
         AnimFrameMode::Auto => {
             // Always evaluate the full-frame candidate (and use it for the
             // first frame / Background-dispose fallbacks regardless).
-            let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels)?;
+            let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, method)?;
             if is_first_frame || f.dispose == DisposalMethod::Background {
                 return Ok(full);
             }
@@ -692,7 +699,7 @@ fn build_anmf_payload_with_prev(
                     h: 2.min(f.height),
                 };
                 let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, degen_rect);
-                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba)?;
+                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba, method)?;
                 return Ok(if delta.len() < full.len() {
                     delta
                 } else {
@@ -711,7 +718,7 @@ fn build_anmf_payload_with_prev(
                 return Ok(full);
             }
             let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, rect);
-            let delta = emit_dirty_anmf(f, rect, &sub_rgba)?;
+            let delta = emit_dirty_anmf(f, rect, &sub_rgba, method)?;
             Ok(if delta.len() < full.len() {
                 delta
             } else {
@@ -740,11 +747,12 @@ fn emit_full_anmf(
     w: u32,
     h: u32,
     pixels: &[u8],
+    method: u8,
 ) -> Result<Vec<u8>, WebpError> {
     let argb = rgba_to_argb(pixels);
     let has_alpha = pixels.chunks_exact(4).any(|px| px[3] != 0xff);
-    let bitstream =
-        vp8l_encode::encode_vp8l_argb_with(&argb, w, h, has_alpha).map_err(WebpError::from)?;
+    let bitstream = vp8l_encode::encode_vp8l_argb_with_method(&argb, w, h, has_alpha, method)
+        .map_err(WebpError::from)?;
     let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
     Ok(build_anmf_header_then_data(
         x,
@@ -766,11 +774,17 @@ fn emit_full_anmf(
 /// Only reached when the caller's `dispose` is `None` (a `Background`
 /// dispose travels on the full-keyframe fallback instead — see
 /// [`build_anmf_payload_with_prev`]), so `D = 0` *is* the caller's flag.
-fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Vec<u8>, WebpError> {
+fn emit_dirty_anmf(
+    f: &AnimFrame,
+    rect: DirtyRect,
+    sub_rgba: &[u8],
+    method: u8,
+) -> Result<Vec<u8>, WebpError> {
     let argb = rgba_to_argb(sub_rgba);
     let has_alpha = sub_rgba.chunks_exact(4).any(|px| px[3] != 0xff);
-    let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, rect.w, rect.h, has_alpha)
-        .map_err(WebpError::from)?;
+    let bitstream =
+        vp8l_encode::encode_vp8l_argb_with_method(&argb, rect.w, rect.h, has_alpha, method)
+            .map_err(WebpError::from)?;
     let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
     Ok(build_anmf_header_then_data(
         rect.x,
