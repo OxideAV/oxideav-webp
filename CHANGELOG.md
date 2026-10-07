@@ -16,6 +16,16 @@ All notable changes to `oxideav-webp` are recorded here.
   `tests/lossy_output_pins.rs` pins every fixture's quality-80 encode,
   two photo-like images and the `webp_vp8` framework encoder's packet.
 
+### Added
+
+- `encoder_vp8::Vp8LossyEncoder`, the lossy (`VP8 `) still encoder with
+  a direct constructor (`with_quality`, `with_qindex`): it needs neither
+  the `registry` feature nor a framework `Encoder`. `encode_yuv420`
+  reads a 4:2:0 picture's planes in place at the caller's strides and
+  writes a simple-lossy `.webp`, byte-identical to the `webp_vp8`
+  framework encoder's packet for the same picture and quality (a test
+  pins it, padded rows included).
+
 ## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
 
 ### Other
