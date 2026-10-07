@@ -4,6 +4,9 @@
 //!   chosen from histogram cost estimates and the image is encoded once.
 //! * Method `6` (the default) runs the exhaustive search; anything above
 //!   behaves as `6`.
+//! * The single-pass path must stay within a measured bound of the
+//!   exhaustive output's size on every still image the output pins use,
+//!   plus a 128 x 128 photo.
 
 mod common;
 
@@ -93,4 +96,138 @@ fn method_reaches_the_alpha_plane_of_a_lossy_encode() {
         }
         assert_eq!(alph, &expected[..], "method {method}");
     }
+}
+
+/// Largest file-size ratio of the single-pass path (method 4) to the
+/// exhaustive search (method 6) over [`SINGLE_PASS_SIZES`], plus a small
+/// margin. Measured worst: 1.087 (+8.7%), `lossless-32x32-rgb.webp` at 50
+/// bytes against 46; most inputs come out the same size.
+const SIZE_BOUND: f64 = 1.09;
+
+/// Method-4 file size of every still image the output pins use, plus the
+/// photo at 128 x 128 (23 inputs): each fixture frame (`name#frame`) and
+/// each synthetic image. Growth of more than 1% over the recorded size
+/// (rounded down, so the small images must not grow at all), or of more
+/// than 9% over method 6, fails. Smaller is always fine.
+const SINGLE_PASS_SIZES: &[(&str, usize)] = &[
+    ("animated-3-frames-rgb.webp#0", 114),
+    ("animated-3-frames-rgb.webp#1", 112),
+    ("animated-3-frames-rgb.webp#2", 120),
+    ("animated-with-alpha.webp#0", 114),
+    ("animated-with-alpha.webp#1", 114),
+    ("animated-with-alpha.webp#2", 114),
+    ("extended-with-exif.webp#0", 12852),
+    ("extended-with-icc-profile.webp#0", 12852),
+    ("extended-with-xmp.webp#0", 12852),
+    ("lossless-128x128-natural.webp#0", 658),
+    ("lossless-1x1.webp#0", 32),
+    ("lossless-32x32-rgb.webp#0", 50),
+    ("lossless-32x32-rgba.webp#0", 58),
+    ("lossless-color-cache-stress.webp#0", 158),
+    ("lossless-color-indexing-paletted.webp#0", 94),
+    ("lossless-cross-color-active.webp#0", 54),
+    ("lossy-1x1.webp#0", 32),
+    ("lossy-near-lossless-q40.webp#0", 8214),
+    ("lossy-with-alpha-128x128.webp#0", 15368),
+    ("photo 64", 6964),
+    ("photo 96", 15492),
+    ("gradient 64", 106),
+    ("photo 128", 27394),
+];
+
+/// Every input of [`SINGLE_PASS_SIZES`] as `(name, width, height, rgba)`.
+fn size_gate_inputs() -> Vec<(String, u32, u32, Vec<u8>)> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("fixture directory")
+        .map(|e| {
+            e.expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8 name")
+        })
+        .collect();
+    names.sort();
+    let mut inputs = Vec::new();
+    for name in names {
+        let bytes = std::fs::read(format!("{dir}/{name}")).expect("fixture");
+        for (i, frame) in decode_all(&bytes)
+            .expect("fixture decodes")
+            .iter()
+            .enumerate()
+        {
+            let image = &frame.image;
+            inputs.push((
+                format!("{name}#{i}"),
+                image.width(),
+                image.height(),
+                image.to_rgba8(),
+            ));
+        }
+    }
+    for side in [64u32, 96] {
+        inputs.push((
+            format!("photo {side}"),
+            side,
+            side,
+            common::photo_rgba(side, side),
+        ));
+    }
+    let mut gradient = Vec::new();
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            gradient.extend_from_slice(&[(x * 4) as u8, (y * 4) as u8, ((x ^ y) * 4) as u8, 255]);
+        }
+    }
+    inputs.push(("gradient 64".to_string(), 64, 64, gradient));
+    inputs.push((
+        "photo 128".to_string(),
+        128,
+        128,
+        common::photo_rgba(128, 128),
+    ));
+    inputs
+}
+
+#[test]
+fn single_pass_size_stays_within_its_measured_bound_of_exhaustive() {
+    let inputs = size_gate_inputs();
+    assert_eq!(
+        inputs.len(),
+        SINGLE_PASS_SIZES.len(),
+        "one recorded size per input"
+    );
+    let mut worst = (0.0f64, String::new());
+    for (name, w, h, rgba) in inputs {
+        let fast = encode_rgba8(w, h, &rgba, &EncodeOptions::default().with_method(4))
+            .expect("method 4 encode");
+        let best = encode_rgba8(w, h, &rgba, &EncodeOptions::default().with_method(6))
+            .expect("method 6 encode");
+        let ratio = fast.len() as f64 / best.len() as f64;
+        if ratio > worst.0 {
+            worst = (ratio, name.clone());
+        }
+        let &(_, recorded) = SINGLE_PASS_SIZES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("{name}: no recorded size"));
+        assert!(
+            fast.len() <= recorded + recorded / 100,
+            "{name}: method 4 wrote {} bytes, recorded {recorded}",
+            fast.len()
+        );
+        assert!(
+            ratio <= SIZE_BOUND,
+            "{name}: method 4's {} bytes are {:+.2}% against method 6's {}",
+            fast.len(),
+            (ratio - 1.0) * 100.0,
+            best.len()
+        );
+        assert_eq!(decode_rgba8(&fast).expect("decode").data, rgba, "{name}");
+    }
+    eprintln!(
+        "worst size ratio: {:+.2}% on {}",
+        (worst.0 - 1.0) * 100.0,
+        worst.1
+    );
 }

@@ -14,6 +14,20 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- The single-pass lossless encoder (methods `0..=5`) chooses the §3.6.2.3
+  colour cache too. The greedy parse that estimates each transform stack
+  is priced under all twelve cache choices at once (no cache and
+  `cache_code_bits` 1 to 11), as libwebp's `CalculateBestCacheSize`
+  does, and the cheapest stack-and-cache pair is encoded. The planner
+  prices cache hits the way the exhaustive path does; a test pins it to
+  that planner token for token on three images without a cache and with
+  3- and 10-bit caches. The 128 x 128 natural fixture takes 658 bytes at
+  method 4 (676 without the cache; method 6: 644). Over every still
+  image the output pins use plus a 128 x 128 photo (23 inputs), method
+  4 writes at most 8.7% more than method 6 (50 bytes against 46 on a
+  32 x 32 fixture), and most come out the same size; a test fails on
+  growth of more than 1% over an input's recorded size, or of more than
+  9% over method 6.
 - `EncodeOptions::method` and `EncodeOptions::with_method`: lossless
   effort on the `0..=6` scale of `cwebp -m`. The default, `6`, is the
   exhaustive search the encoder has always run. Levels `0..=5` select a
@@ -22,13 +36,12 @@ All notable changes to `oxideav-webp` are recorded here.
   of at most 256 colours colour indexing with and without a predictor)
   from the histograms of one greedy LZ77 parse, and encodes the cheapest
   once with the exhaustive path's cost-priced token planner, kept in
-  compact per-pixel arrays. It does not use a colour cache yet. On a
-  photo-like 256 x 256 image both levels write the same 108,598 bytes,
-  method 4 in 0.017 s instead of 1.95 s; the 128 x 128 natural fixture
-  takes 676 bytes against 644. Animations honour the knob per frame,
-  and a lossy encode codes its alpha plane (`ALPH`) at it. Tests cover
-  the knob, its reach into the alpha plane, round trips at every level
-  and a bit-exact reference decode (`dwebp`) of single-pass output.
+  compact per-pixel arrays. On a photo-like 256 x 256 image both levels
+  write the same 108,598 bytes, method 4 in 0.017 s instead of 1.95 s.
+  Animations honour the knob per frame, and a lossy encode codes its
+  alpha plane (`ALPH`) at it. Tests cover the knob, its reach into the
+  alpha plane, round trips at every level and a bit-exact reference
+  decode (`dwebp`) of single-pass output.
 - Tests (`tests/lossless_output_pins.rs`) pinning the lossless encoder's
   output bytes: every frame of every committed fixture, three synthetic
   images, five animations, and the lossy encodes of the four fixture
