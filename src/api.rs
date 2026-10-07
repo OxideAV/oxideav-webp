@@ -179,6 +179,19 @@ pub struct EncodeOptions {
     pub frame_mode: AnimFrameMode,
     /// Animation only — delta-path tuning.
     pub delta: DeltaConfig,
+    /// Lossless only: how hard the `VP8L` encoder searches for a small
+    /// stream, on the `0..=6` scale of `cwebp -m`. The default is `6`.
+    ///
+    /// * `6` (and anything above, which is treated as `6`) runs the
+    ///   exhaustive search: every transform stack and colour-cache size
+    ///   is encoded in full and the smallest stream kept.
+    /// * `0..=5` choose the transform stack from histogram cost estimates
+    ///   and encode the image once. These levels currently share one
+    ///   path; the scale leaves room for faster ones.
+    ///
+    /// With a quality set, the lossy `VP8 ` path uses it for the
+    /// lossless-coded alpha plane (`ALPH`).
+    pub method: u8,
 }
 
 impl Default for EncodeOptions {
@@ -192,6 +205,7 @@ impl Default for EncodeOptions {
             background_rgba: [0, 0, 0, 0],
             frame_mode: AnimFrameMode::Auto,
             delta: DeltaConfig::default(),
+            method: vp8l_encode::DEFAULT_METHOD,
         }
     }
 }
@@ -243,6 +257,13 @@ impl EncodeOptions {
     /// Builder: animation delta tuning.
     pub fn with_delta(mut self, delta: DeltaConfig) -> Self {
         self.delta = delta;
+        self
+    }
+
+    /// Builder: lossless encoder effort, `0..=6` (see
+    /// [`method`](Self::method)). `6` selects the exhaustive search.
+    pub fn with_method(mut self, method: u8) -> Self {
+        self.method = method;
         self
     }
 
@@ -971,8 +992,8 @@ pub fn encode(image: &WebpImage, opts: &EncodeOptions) -> Result<Vec<u8>, WebpEr
     }
     let meta = opts.filtered_metadata(&image.metadata);
     match opts.quality {
-        None => encode_lossless(image, &meta),
-        Some(q) => encode_lossy(image, q, &meta),
+        None => encode_lossless(image, &meta, opts.method),
+        Some(q) => encode_lossy(image, q, &meta, opts.method),
     }
 }
 
@@ -1010,6 +1031,7 @@ pub fn encode_to<W: Write>(
 fn encode_lossless(
     image: &WebpImage,
     meta: &crate::WebpMetadata<'_>,
+    method: u8,
 ) -> Result<Vec<u8>, WebpError> {
     let bpp = match image.format {
         WebpPixelFormat::Rgb24 => 3,
@@ -1033,8 +1055,13 @@ fn encode_lossless(
     // when there is metadata to declare (the reference lossless-RGBA
     // fixtures in docs/ use the simple layout too).
     if meta.is_empty() {
-        let payload =
-            vp8l_encode::encode_vp8l_argb_with(&argb, image.width, image.height, has_alpha)?;
+        let payload = vp8l_encode::encode_vp8l_argb_with_method(
+            &argb,
+            image.width,
+            image.height,
+            has_alpha,
+            method,
+        )?;
         return Ok(build::build_webp_file(
             &payload,
             build::ImageKind::Lossless,
@@ -1042,13 +1069,21 @@ fn encode_lossless(
             image.height,
         )?);
     }
-    crate::encode_vp8l_argb_with_metadata(image.width, image.height, &argb, has_alpha, meta)
+    crate::encode_vp8l_argb_with_metadata_method(
+        image.width,
+        image.height,
+        &argb,
+        has_alpha,
+        meta,
+        method,
+    )
 }
 
 fn encode_lossy(
     image: &WebpImage,
     quality: f32,
     meta: &crate::WebpMetadata<'_>,
+    method: u8,
 ) -> Result<Vec<u8>, WebpError> {
     let w = image.width as usize;
     let h = image.height as usize;
@@ -1151,7 +1186,7 @@ fn encode_lossy(
     if let Some(a) = &alpha {
         push(
             fourcc::ALPH,
-            &build_alph_payload(a, image.width, image.height),
+            &build_alph_payload(a, image.width, image.height, method),
         )?;
     }
     push(fourcc::VP8, &vp8)?;
@@ -1186,14 +1221,15 @@ pub(crate) fn frame_riff(body: Vec<u8>) -> Result<Vec<u8>, WebpError> {
 /// alpha in the GREEN channel (the §3.4 image header is exactly five
 /// bytes, so the image-stream is the `VP8L` payload from byte 5 on) —
 /// and method `0`, the raw plane. Filtering `F = 0`, preprocessing
-/// `P = 0`.
-pub(crate) fn build_alph_payload(alpha: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// `P = 0`. `method` is the lossless effort ([`EncodeOptions::method`])
+/// the VP8L candidate is coded at.
+pub(crate) fn build_alph_payload(alpha: &[u8], width: u32, height: u32, method: u8) -> Vec<u8> {
     let argb: Vec<u32> = alpha
         .iter()
         .map(|&a| 0xff00_0000 | (u32::from(a) << 8))
         .collect();
-    let compressed =
-        vp8l_encode::encode_vp8l_argb_with(&argb, width, height, false).unwrap_or_default();
+    let compressed = vp8l_encode::encode_vp8l_argb_with_method(&argb, width, height, false, method)
+        .unwrap_or_default();
     let stream = compressed
         .get(vp8l_chunk::VP8L_IMAGE_HEADER_LEN..)
         .unwrap_or(&[]);
@@ -1274,6 +1310,7 @@ pub fn encode_animation(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8
         opts.background_rgba,
         &meta,
         &opts.delta,
+        opts.method,
     )
 }
 
@@ -1301,6 +1338,7 @@ pub fn encode_animation_frames(
         opts.background_rgba,
         &meta,
         &opts.delta,
+        opts.method,
     )
 }
 
@@ -1527,7 +1565,7 @@ mod tests {
     fn alph_payload_round_trips_through_decode_alpha() {
         for (w, h) in [(1u32, 1u32), (3, 2), (17, 9), (64, 64)] {
             let alpha: Vec<u8> = (0..w * h).map(|i| (i % 7 * 36) as u8).collect();
-            let payload = build_alph_payload(&alpha, w, h);
+            let payload = build_alph_payload(&alpha, w, h, vp8l_encode::DEFAULT_METHOD);
             let back = alph::decode_alpha(&payload, w, h).unwrap();
             assert_eq!(back, alpha, "{w}x{h}");
         }

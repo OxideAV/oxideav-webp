@@ -52,6 +52,17 @@
 //! framing (via [`crate::build`]), decodes back to the exact input pixels
 //! through [`crate::decode`] — a pixel-exact round trip.
 //!
+//! ## Effort levels
+//!
+//! The candidate search the sections below describe
+//! ([`encode_argb_with_predictor_chooser`]) runs at lossless effort `6`
+//! ([`crate::EncodeOptions::method`]), the default: it encodes every
+//! candidate in full and keeps the smallest stream. Efforts `0..=5` run
+//! the single-pass encoder in [`entropy_estimate`] instead, which picks
+//! the transform stack from histogram cost estimates and encodes the
+//! image once, reusing this module's transforms, LZ77 matcher, token
+//! planner and writer.
+//!
 //! ## §3.7.2 prefix-code construction
 //!
 //! For each of the five symbol alphabets the encoder:
@@ -238,6 +249,8 @@
 
 use crate::build::{self, ImageKind};
 
+mod entropy_estimate;
+
 /// The largest code length a VP8L canonical prefix code may use (§3.7.2.1.2
 /// stores literal code lengths in `[0..15]`). Mirrors
 /// [`crate::vp8l_prefix::MAX_CODE_LENGTH`].
@@ -308,6 +321,15 @@ impl std::error::Error for EncodeError {}
 
 /// §3.4 14-bit `width - 1` / `height - 1` field maximum (1-based 16384).
 const MAX_DIMENSION: u32 = 1 << 14;
+
+/// Default lossless effort ([`crate::EncodeOptions::method`]).
+pub(crate) const DEFAULT_METHOD: u8 = EXHAUSTIVE_METHOD;
+
+/// Lowest lossless effort that runs the exhaustive search
+/// ([`encode_argb_with_predictor_chooser`]): every candidate stream is
+/// encoded in full and the smallest kept. Higher values behave the same;
+/// lower ones run the single-pass encoder of [`entropy_estimate`].
+pub(crate) const EXHAUSTIVE_METHOD: u8 = 6;
 
 /// Least-significant-bit-first bit writer over a growing byte buffer.
 ///
@@ -1285,15 +1307,58 @@ struct Lz77Matcher<'a> {
     pixels: &'a [u32],
     head: Vec<i32>,
     prev: Vec<i32>,
+    /// Farthest backward-reference distance [`Self::find`] returns.
+    max_distance: usize,
+}
+
+/// Farthest backward reference RFC 9649 §3.6.2.2 can code: the 40-symbol
+/// distance alphabet reaches distance code `1 << 20`, and a scan-line
+/// distance `D` is coded as `D + 120`. libwebp's `WINDOW_SIZE` is the same
+/// value.
+const MAX_BACKWARD_DISTANCE: usize = (1 << 20) - crate::vp8l_decode::NUM_DISTANCE_MAP_CODES;
+
+/// The two hash-chain arrays of an [`Lz77Matcher`], kept between matcher
+/// lifetimes so the single-pass encoder parses every candidate stream
+/// without allocating them again.
+#[derive(Debug, Default)]
+struct Lz77Buffers {
+    head: Vec<i32>,
+    prev: Vec<i32>,
 }
 
 impl<'a> Lz77Matcher<'a> {
     /// Build a matcher over `pixels` with empty hash chains.
+    ///
+    /// No distance cap: this is the exhaustive path's matcher, kept as it
+    /// was so that path's output does not change. On images over about a
+    /// megapixel it can find references farther than
+    /// [`MAX_BACKWARD_DISTANCE`].
     fn new(pixels: &'a [u32]) -> Self {
+        Self::with_buffers(pixels, usize::MAX, Lz77Buffers::default())
+    }
+
+    /// Build a matcher over `pixels` that returns matches at most
+    /// `max_distance` back, reusing (and resetting) `buffers`. With no cap
+    /// and fresh buffers this is exactly [`Self::new`].
+    fn with_buffers(pixels: &'a [u32], max_distance: usize, buffers: Lz77Buffers) -> Self {
+        let Lz77Buffers { mut head, mut prev } = buffers;
+        head.clear();
+        head.resize(1 << HASH_BITS, -1);
+        prev.clear();
+        prev.resize(pixels.len(), -1);
         Self {
             pixels,
-            head: vec![-1; 1 << HASH_BITS],
-            prev: vec![-1; pixels.len()],
+            head,
+            prev,
+            max_distance,
+        }
+    }
+
+    /// Give the hash-chain arrays back for the next matcher.
+    fn into_buffers(self) -> Lz77Buffers {
+        Lz77Buffers {
+            head: self.head,
+            prev: self.prev,
         }
     }
 
@@ -1338,7 +1403,12 @@ impl<'a> Lz77Matcher<'a> {
         let mut best_len = 0usize;
         let mut best_dist = 0usize;
         let mut steps = 0usize;
-        while cand >= 0 && steps < MAX_CHAIN {
+        // Chains run from the newest position to the oldest, so the first
+        // candidate past the distance cap ends the walk. Without a cap the
+        // bound is 0, the end-of-chain test alone. (Positions fit `i32`:
+        // an image holds at most 2^28 pixels.)
+        let oldest = pos.saturating_sub(self.max_distance) as i32;
+        while cand >= oldest && steps < MAX_CHAIN {
             let c = cand as usize;
             // Candidates were all inserted at positions < pos.
             //
@@ -1561,17 +1631,46 @@ fn tokenize_lz77_impl(
     lazy_depth: u32,
     mut probes: Option<&mut [FindProbe]>,
 ) -> Vec<Token> {
-    let n = pixels.len();
     let mut matcher = Lz77Matcher::new(pixels);
     let mut tokens = Vec::new();
+    lz77_parse(
+        &mut matcher,
+        lazy_depth,
+        |pos, found| {
+            if let Some(rec) = probes.as_deref_mut() {
+                rec[pos] = FindProbe::record(found);
+            }
+        },
+        |tok| tokens.push(tok),
+    );
+    tokens
+}
+
+/// The lazy-matching §3.6.2.2 parse behind [`tokenize_lz77_impl`], over a
+/// caller-built `matcher` and reporting through two callbacks instead of
+/// collecting a `Vec`:
+///
+/// * `on_probe(pos, found)` observes every `find(pos)` result (the
+///   round-440 probe recording; observation only).
+/// * `emit(token)` receives the token stream in order.
+///
+/// The parse, its matcher bookkeeping, and the emitted tokens are
+/// exactly [`tokenize_lz77_impl`]'s; a caller can stream the tokens into
+/// histograms or a compact parse instead of a `Vec<Token>`.
+fn lz77_parse(
+    matcher: &mut Lz77Matcher<'_>,
+    lazy_depth: u32,
+    mut on_probe: impl FnMut(usize, Option<(usize, usize)>),
+    mut emit: impl FnMut(Token),
+) {
+    let pixels = matcher.pixels;
+    let n = pixels.len();
     let mut pos = 0usize;
     let depth = lazy_depth.min(4);
     // Record a probe result without disturbing the parse.
     macro_rules! record {
         ($p:expr, $r:expr) => {
-            if let Some(rec) = probes.as_deref_mut() {
-                rec[$p] = FindProbe::record($r);
-            }
+            on_probe($p, $r)
         };
     }
     while pos < n {
@@ -1690,9 +1789,9 @@ fn tokenize_lz77_impl(
             // Emit literals for any pixels skipped by the chosen
             // lazy starting position, then the chosen match.
             for &skipped in &pixels[pos..best_start] {
-                tokens.push(Token::Literal(skipped));
+                emit(Token::Literal(skipped));
             }
-            tokens.push(Token::Copy {
+            emit(Token::Copy {
                 length: best_len,
                 distance: best_dist,
             });
@@ -1722,12 +1821,11 @@ fn tokenize_lz77_impl(
             }
             pos = end;
         } else {
-            tokens.push(Token::Literal(pixels[pos]));
+            emit(Token::Literal(pixels[pos]));
             matcher.insert(pos);
             pos += 1;
         }
     }
-    tokens
 }
 
 /// Allowed range for the §5.2.3 `color_cache_code_bits` field: an
@@ -2119,6 +2217,16 @@ fn prefix_codes_and_tokens_bits_from(
     tokens: &[Token],
     image_width: u32,
 ) -> usize {
+    token_stream_bits_from(tables, tokens.iter().copied(), image_width)
+}
+
+/// [`prefix_codes_and_tokens_bits_from`] over any token stream, so a
+/// caller can price a parse it does not store as a `Vec<Token>`.
+fn token_stream_bits_from(
+    tables: &StreamCostTables,
+    tokens: impl IntoIterator<Item = Token>,
+    image_width: u32,
+) -> usize {
     // Round 408: the writer's §3.7.2.1.1 single-symbol-0 substitution
     // for an all-empty table moved inside `from_freqs` (both the
     // `WriteCode` writer and the `CostLengths` mirror), so every
@@ -2131,7 +2239,7 @@ fn prefix_codes_and_tokens_bits_from(
         + tables.alpha.code_lengths_bits()
         + tables.distance.code_lengths_bits();
 
-    for &tok in tokens {
+    for tok in tokens {
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
@@ -2905,8 +3013,18 @@ const fn build_dist_map_inverse(
 /// possibly match at width 1, so all row-style matches fall back to the
 /// scan-line `D + 120` form.
 fn count_frequencies(tokens: &[Token], color_cache_size: usize, image_width: u32) -> Frequencies {
+    count_token_stream_frequencies(tokens.iter().copied(), color_cache_size, image_width)
+}
+
+/// [`count_frequencies`] over any token stream, so a caller can count a
+/// parse it does not store as a `Vec<Token>`.
+fn count_token_stream_frequencies(
+    tokens: impl IntoIterator<Item = Token>,
+    color_cache_size: usize,
+    image_width: u32,
+) -> Frequencies {
     let mut freqs = Frequencies::new(color_cache_size);
-    for &tok in tokens {
+    for tok in tokens {
         freqs.count_token(tok, image_width);
     }
     freqs
@@ -7343,6 +7461,24 @@ fn write_spatially_coded_image(
     color_cache_code_bits: Option<u32>,
     image_width: u32,
 ) {
+    write_spatially_coded_token_stream(
+        w,
+        tokens.iter().copied(),
+        color_cache_code_bits,
+        image_width,
+    );
+}
+
+/// [`write_spatially_coded_image`] over any re-iterable token stream
+/// (the writer walks it twice: frequencies, then symbols).
+fn write_spatially_coded_token_stream<I>(
+    w: &mut BitWriter,
+    tokens: I,
+    color_cache_code_bits: Option<u32>,
+    image_width: u32,
+) where
+    I: Iterator<Item = Token> + Clone,
+{
     // §3.8.3 spatially-coded-image = color-cache-info meta-prefix data.
     // color-cache-info: `%b0` (no cache) or `%b1 4BIT` (enabled).
     let color_cache_size = match color_cache_code_bits {
@@ -7360,7 +7496,7 @@ fn write_spatially_coded_image(
     // meta-prefix: `%b0` (single prefix-code group).
     w.write_bit(false);
 
-    write_prefix_codes_and_tokens(w, tokens, color_cache_size, image_width);
+    write_prefix_codes_and_token_stream(w, tokens, color_cache_size, image_width);
 }
 
 /// Write an §7.3 `entropy-coded-image` (color-cache-info + data) of
@@ -7398,13 +7534,26 @@ fn write_prefix_codes_and_tokens(
     color_cache_size: usize,
     image_width: u32,
 ) {
+    write_prefix_codes_and_token_stream(w, tokens.iter().copied(), color_cache_size, image_width);
+}
+
+/// [`write_prefix_codes_and_tokens`] over any re-iterable token stream:
+/// one pass counts the frequencies, a second emits the symbols.
+fn write_prefix_codes_and_token_stream<I>(
+    w: &mut BitWriter,
+    tokens: I,
+    color_cache_size: usize,
+    image_width: u32,
+) where
+    I: Iterator<Item = Token> + Clone,
+{
     // Build the five prefix codes from token frequencies. The GREEN
     // alphabet covers literals (`< 256`), the §5.2.2 length prefix
     // symbols (`256 + length_prefix`), and (when the cache is enabled)
     // the §5.2.3 cache indices (`256 + 24 + index`). The distance
     // alphabet (40 codes) is exercised only when the matcher emitted at
     // least one copy.
-    let freqs = count_frequencies(tokens, color_cache_size, image_width);
+    let freqs = count_token_stream_frequencies(tokens.clone(), color_cache_size, image_width);
     let green_code = WriteCode::from_freqs(&freqs.green);
     let red_code = WriteCode::from_freqs(&freqs.red);
     let blue_code = WriteCode::from_freqs(&freqs.blue);
@@ -7430,7 +7579,7 @@ fn write_prefix_codes_and_tokens(
     // (channel order green, red, blue, alpha), a §5.2.3 color-cache
     // reference (a single GREEN symbol), or a §5.2.2 length + distance
     // backward reference.
-    for &tok in tokens {
+    for tok in tokens {
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
@@ -7518,7 +7667,7 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
         pixels.push((a << 24) | (r << 16) | (g << 8) | b);
     }
 
-    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used);
+    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used, DEFAULT_METHOD);
 
     // §2.4 / §2.6 RIFF/WEBP framing around the VP8L payload.
     let file = build::build_webp_file(&payload, ImageKind::Lossless, width, height)?;
@@ -7554,11 +7703,28 @@ fn validate_argb(pixels: &[u32], width: u32, height: u32) -> Result<(), EncodeEr
 /// becomes the §3.4 `alpha_is_used` header bit. This is the inner payload a
 /// `VP8L` chunk wraps — *not* a RIFF/WEBP file. Callers wanting the framed
 /// file use [`encode_webp_lossless`] / [`encode_vp8l_argb_with_metadata`].
-fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: bool) -> Vec<u8> {
-    // Production path: thread the actual image width so the §5.2.2
-    // distance-map chooser can swap row-style scan-line codes for
-    // small distance-map codes (round 130).
-    let stream = encode_argb_with_predictor_chooser(pixels, width, height);
+///
+/// `method` is the lossless effort ([`crate::EncodeOptions::method`]):
+/// below [`EXHAUSTIVE_METHOD`] the single-pass encoder of
+/// [`entropy_estimate`] writes the stream; from it up, the exhaustive
+/// search of [`encode_argb_with_predictor_chooser`] does.
+fn encode_vp8l_payload(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Vec<u8> {
+    let stream = if method < EXHAUSTIVE_METHOD {
+        let mut w = BitWriter::new();
+        entropy_estimate::encode_image_stream(pixels, width, height, &mut w);
+        w.into_bytes()
+    } else {
+        // Production path: thread the actual image width so the §5.2.2
+        // distance-map chooser can swap row-style scan-line codes for
+        // small distance-map codes (round 130).
+        encode_argb_with_predictor_chooser(pixels, width, height)
+    };
     let header = build_image_header(width, height, alpha_is_used);
     let mut payload = Vec::with_capacity(header.len() + stream.len());
     payload.extend_from_slice(&header);
@@ -8805,8 +8971,26 @@ pub fn encode_vp8l_argb_with(
     height: u32,
     alpha_is_used: bool,
 ) -> Result<Vec<u8>, EncodeError> {
+    encode_vp8l_argb_with_method(pixels, width, height, alpha_is_used, DEFAULT_METHOD)
+}
+
+/// [`encode_vp8l_argb_with`] at lossless effort `method` (see
+/// [`crate::EncodeOptions::method`]).
+pub(crate) fn encode_vp8l_argb_with_method(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Result<Vec<u8>, EncodeError> {
     validate_argb(pixels, width, height)?;
-    Ok(encode_vp8l_payload(pixels, width, height, alpha_is_used))
+    Ok(encode_vp8l_payload(
+        pixels,
+        width,
+        height,
+        alpha_is_used,
+        method,
+    ))
 }
 
 #[cfg(test)]

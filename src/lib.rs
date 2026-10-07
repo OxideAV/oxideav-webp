@@ -408,7 +408,28 @@ pub fn encode_vp8l_argb_with_metadata(
     has_alpha: bool,
     meta: &WebpMetadata<'_>,
 ) -> Result<Vec<u8>, WebpError> {
-    let payload = encode_vp8l_argb_with(argb, width, height, has_alpha)?;
+    encode_vp8l_argb_with_metadata_method(
+        width,
+        height,
+        argb,
+        has_alpha,
+        meta,
+        vp8l_encode::DEFAULT_METHOD,
+    )
+}
+
+/// [`encode_vp8l_argb_with_metadata`] at lossless effort `method` (see
+/// [`EncodeOptions::method`]).
+pub(crate) fn encode_vp8l_argb_with_metadata_method(
+    width: u32,
+    height: u32,
+    argb: &[u32],
+    has_alpha: bool,
+    meta: &WebpMetadata<'_>,
+    method: u8,
+) -> Result<Vec<u8>, WebpError> {
+    let payload =
+        vp8l_encode::encode_vp8l_argb_with_method(argb, width, height, has_alpha, method)?;
     if !has_alpha && meta.is_empty() {
         return build::build_webp_file(&payload, build::ImageKind::Lossless, width, height)
             .map_err(Into::into);
