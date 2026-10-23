@@ -611,8 +611,6 @@ mod tests {
     use crate::container::{ContainerError, parse};
     use crate::vp8x::Vp8xHeader;
 
-    /// §2.3 sanity: a chunk with even-length payload is exactly
-    /// `8 + payload.len()` bytes — no pad byte.
     /// `build_webp_file` writes the chunks straight into the file; the
     /// bytes must equal the chunk-by-chunk assembly it replaced.
     #[test]
@@ -645,6 +643,8 @@ mod tests {
         }
     }
 
+    /// §2.3 sanity: a chunk with even-length payload is exactly
+    /// `8 + payload.len()` bytes — no pad byte.
     #[test]
     fn build_chunk_even_payload_has_no_pad_byte() {
         let bytes = build_chunk(fourcc::VP8, &[0u8; 8]).unwrap();

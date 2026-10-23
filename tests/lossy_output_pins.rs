@@ -6,45 +6,10 @@
 //! wrapping meant to leave the output alone must leave every pin as it
 //! is.
 
-use oxideav_webp::{decode_all, encode, encode_rgba8, EncodeOptions};
+mod common;
 
-/// 64-bit FNV-1a over `bytes`: a dependency-free fingerprint for pinning
-/// encoder output byte for byte.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// A deterministic photo-like RGBA image: smooth gradients, a soft bright
-/// blob and small per-channel noise. Fully opaque.
-fn photo_rgba(width: u32, height: u32) -> Vec<u8> {
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut px = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            // xorshift64 noise source.
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let fx = x as f32 / width as f32;
-            let fy = y as f32 / height as f32;
-            let d = ((fx - 0.5).powi(2) + (fy - 0.4).powi(2)).sqrt();
-            let blob = (1.0 - (d * 3.0).min(1.0)) * 60.0;
-            let nr = (state & 0xF) as f32 - 8.0;
-            let ng = ((state >> 4) & 0xF) as f32 - 8.0;
-            let nb = ((state >> 8) & 0xF) as f32 - 8.0;
-            let r = (40.0 + 180.0 * fx + blob + nr).clamp(0.0, 255.0) as u8;
-            let g = (60.0 + 150.0 * fy + blob + ng).clamp(0.0, 255.0) as u8;
-            let b = (200.0 - 120.0 * fx * fy + nb).clamp(0.0, 255.0) as u8;
-            px.extend_from_slice(&[r, g, b, 255]);
-        }
-    }
-    px
-}
+use common::{fnv1a64, photo_rgba};
+use oxideav_webp::{EncodeOptions, decode_all, encode, encode_rgba8};
 
 /// `(fixture, length, FNV-1a 64)` of the first frame of every committed
 /// fixture, encoded at quality 80 with its metadata.

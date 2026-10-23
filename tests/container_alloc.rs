@@ -47,21 +47,26 @@ fn record(size: usize) {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record(layout.size());
-        System.alloc(layout)
+        // SAFETY: forwarded unchanged to `System`, whose contract the
+        // caller already upholds for this call.
+        unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         record(layout.size());
-        System.alloc_zeroed(layout)
+        // SAFETY: as for `alloc`.
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record(new_size);
-        System.realloc(ptr, layout, new_size)
+        // SAFETY: as for `alloc`; `ptr` and `layout` are the caller's.
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        // SAFETY: as for `alloc`; `ptr` and `layout` are the caller's.
+        unsafe { System.dealloc(ptr, layout) }
     }
 }
 
