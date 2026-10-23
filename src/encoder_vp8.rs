@@ -104,6 +104,7 @@ const MAX_VP8_DIMENSION: u32 = 0x3FFF;
 /// assert_eq!(&webp[..4], b"RIFF");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Vp8LossyEncoder {
     qindex: u8,
 }

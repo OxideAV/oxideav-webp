@@ -4,7 +4,7 @@
 //! bytes as the `webp_vp8` framework encoder for the same picture.
 
 use oxideav_webp::encoder_vp8::Vp8LossyEncoder;
-use oxideav_webp::{decode, info, PixelFormat};
+use oxideav_webp::{PixelFormat, decode, info};
 
 /// A `w x h` 4:2:0 picture whose rows sit `pad` bytes apart beyond their
 /// width: `(y, y_stride, u, v, uv_stride)`.
@@ -76,16 +76,19 @@ fn bad_geometry_is_an_error() {
     assert!(enc.encode_yuv420(16, 16, &y, 15, &u, &v, cs).is_err());
     assert!(enc.encode_yuv420(16, 16, &y, ys, &u, &v, 7).is_err());
     // Planes shorter than their rows need.
-    assert!(enc
-        .encode_yuv420(16, 16, &y[..y.len() - 1], ys, &u, &v, cs)
-        .is_err());
-    assert!(enc
-        .encode_yuv420(16, 16, &y, ys, &u, &v[..v.len() - 1], cs)
-        .is_err());
+    assert!(
+        enc.encode_yuv420(16, 16, &y[..y.len() - 1], ys, &u, &v, cs)
+            .is_err()
+    );
+    assert!(
+        enc.encode_yuv420(16, 16, &y, ys, &u, &v[..v.len() - 1], cs)
+            .is_err()
+    );
     // A stride whose row offsets overflow.
-    assert!(enc
-        .encode_yuv420(16, 16, &y, usize::MAX, &u, &v, cs)
-        .is_err());
+    assert!(
+        enc.encode_yuv420(16, 16, &y, usize::MAX, &u, &v, cs)
+            .is_err()
+    );
 }
 
 /// For the same picture and quality, the direct encoder writes exactly the
