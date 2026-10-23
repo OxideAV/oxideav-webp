@@ -14,7 +14,7 @@
 //! whose distance has no encoding. The encoder must skip it (emit
 //! literals instead) and still round-trip losslessly.
 
-use oxideav_webp::{decode_rgb8, encode_rgb8, EncodeOptions};
+use oxideav_webp::{EncodeOptions, decode_rgb8, encode_rgb8};
 
 fn lcg(state: &mut u32) -> u8 {
     *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -47,7 +47,10 @@ fn lossless_encode_with_unencodable_match_distance_does_not_panic() {
     rgb[FAR_OFFSET * 3..FAR_OFFSET * 3 + pattern.len()].copy_from_slice(&pattern);
 
     let opts = EncodeOptions::default();
-    assert!(opts.quality.is_none(), "test must exercise the lossless path");
+    assert!(
+        opts.quality.is_none(),
+        "test must exercise the lossless path"
+    );
     let encoded = encode_rgb8(w as u32, h as u32, &rgb, &opts).expect("encode must not panic");
     assert_eq!(&encoded[0..4], b"RIFF");
     assert_eq!(&encoded[8..12], b"WEBP");

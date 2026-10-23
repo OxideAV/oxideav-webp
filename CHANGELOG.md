@@ -4,6 +4,16 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The lossless encoder no longer panics when the §3.6.2.2 LZ77 matcher
+  finds a match farther back than the 40 distance prefix codes can
+  express (1 048 456 pixels, the largest scan-line distance): the
+  matcher stops its chain walk at that bound, so such a match is never
+  selected, and the frequency count guards the distance histogram
+  (#34, #44). Covered by `tests/lossless_far_match.rs`, a 1025 x 1024
+  image whose only long match sits 1 048 500 pixels back.
+
 ### Changed
 
 - edition 2024, MSRV 1.95
