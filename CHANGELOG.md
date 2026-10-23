@@ -6,6 +6,18 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Fixed
 
+- Predictor transform, rightmost column: RFC 9649 §4.1 makes the
+  leftmost pixel of the *same* row stand in for TR there; this crate's
+  encoder and decoder both read the leftmost pixel of the row above, so
+  a file using modes 3, 5, 9 or 10 in its last block column decoded
+  differently in the reference decoder (and reference files decoded
+  differently here) wherever the two pixels differ (#33). Both sides
+  now read `pixels[idx - width + 1]` for every column. Encoder output
+  changes only for images that elect such a mode on the last block
+  column (none of the pinned ones); the committed fixture
+  `lossless-tr-right-column-50x37.webp` and the direction-F oracle
+  tests (our encode through `dwebp`, the reference encoder's file
+  through our decoder) pin the rule.
 - The lossless encoder no longer panics when the §3.6.2.2 LZ77 matcher
   finds a match farther back than the 40 distance prefix codes can
   express (1 048 456 pixels, the largest scan-line distance): the

@@ -51,7 +51,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxideav_webp::{AnimFrame, build_animated_webp, decode_webp, encode_webp_lossless};
+use oxideav_webp::{
+    AnimFrame, EncodeOptions, build_animated_webp, decode, decode_webp, encode_rgba8,
+    encode_webp_lossless,
+};
 
 // ──────────────────────────── shared utilities ──────────────────────────
 
@@ -624,4 +627,159 @@ fn direction_e_our_lossy_encode_is_readable_by_reference_decoder() {
 #[allow(dead_code)]
 fn _touch_path_import(p: &Path) -> &Path {
     p
+}
+
+// ─────── Direction F: §4.1 rightmost-column TR rule (issue #33) ────────
+
+/// An image whose every channel is a hash of `x + y`: along each
+/// anti-diagonal the value is constant, so the §4.1 TR predictor (mode
+/// 3: `pixels[x + 1][y - 1]`, same `x + y`) is exact everywhere except
+/// on the rightmost column, where RFC 9649 §4.1 substitutes the leftmost
+/// pixel of the *same* row; L, T and TL see `x + y - 1` or `x + y - 2`,
+/// whose hashes are unrelated, so the mode election favours TR in every
+/// block column including the last one. Rows differ from each other in
+/// the leftmost pixel (`hash(y)` vs `hash(y - 1)`), which is what tells
+/// the RFC rule apart from reading the row above (the pre-#33
+/// behaviour of this crate's encoder and decoder).
+fn anti_diagonal_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let h = (x + y).wrapping_mul(0x9E37_79B1).rotate_left(13);
+            // Per-pixel noise of -1..=1 per channel: without it every
+            // pixel equals its top-right neighbour exactly and the
+            // encoder codes the image as distance-`w - 1` LZ77 copies
+            // with no predictor transform at all. With it, TR residuals
+            // stay within ±2 while L / T / TL residuals are unrelated.
+            let n = (x.wrapping_mul(0x85EB_CA6B) ^ y.wrapping_mul(0xC2B2_AE35)).rotate_left(7);
+            let ch = |shift: u32, nshift: u32| -> u8 {
+                ((h >> shift) as u8)
+                    .wrapping_add(((n >> nshift) & 3) as u8)
+                    .wrapping_sub(1)
+            };
+            buf.extend_from_slice(&[ch(24, 0), ch(16, 2), ch(8, 4), 255]);
+        }
+    }
+    buf
+}
+
+/// Pixels `(x, y)` at which two RGBA buffers of width `w` differ.
+fn differing_pixels(a: &[u8], b: &[u8], w: u32) -> Vec<(u32, u32)> {
+    a.chunks(4)
+        .zip(b.chunks(4))
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| (i as u32 % w, i as u32 / w))
+        .collect()
+}
+
+/// Direction F.1 — our lossless encode of the anti-diagonal image, whose
+/// last block column elects the TR predictor, decodes through the
+/// reference decoder to the source pixels. Before #33 the encoder
+/// predicted the rightmost column from the row above, and the reference
+/// decoder reconstructed a different pixel on every row.
+#[test]
+fn direction_f_rightmost_column_tr_rule_encode_is_readable_by_reference_decoder() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH — install the WebP reference tools to exercise");
+        return;
+    };
+    // 4 block columns at the default 16-pixel predictor block (the last
+    // one 2 pixels wide), 37 rows.
+    let (w, h) = (50u32, 37u32);
+    let src = anti_diagonal_rgba(w, h);
+    let file = encode_rgba8(w, h, &src, &EncodeOptions::default()).expect("encode_rgba8");
+    assert_eq!(
+        decode(&file).expect("own decode").to_rgba8(),
+        src,
+        "own round trip"
+    );
+
+    let dir = tmp_dir("direction-f1");
+    let in_path = dir.join("our.webp");
+    let out_path = dir.join("ref.pam");
+    std::fs::write(&in_path, &file).expect("write our.webp");
+    let mut cmd = Command::new(&decoder_bin);
+    cmd.arg(&in_path)
+        .arg("-pam")
+        .arg("-o")
+        .arg(&out_path)
+        .arg("-quiet");
+    let _ = run_or_fail(&mut cmd);
+    let (rgba, ref_w, ref_h, depth) = parse_pam(&std::fs::read(&out_path).expect("read PAM"));
+    assert_eq!((ref_w, ref_h, depth), (w, h, 4));
+    let differing = differing_pixels(&rgba, &src, w);
+    assert!(
+        differing.is_empty(),
+        "reference decoder disagrees with the source at {} pixels (first: {:?})",
+        differing.len(),
+        differing.first()
+    );
+}
+
+/// Direction F.2 — the reference encoder's lossless file of the same
+/// image decodes here to the source pixels. The reference encoder uses
+/// the RFC rule, so a decoder reading the row above (pre-#33) differs
+/// wherever its last block column carries a TR-reading mode.
+#[test]
+fn direction_f_rightmost_column_tr_rule_reference_encode_decodes_here() {
+    let Some(encoder_bin) = which("cwebp") else {
+        eprintln!("skip: `cwebp` not on PATH — install the WebP reference tools to exercise");
+        return;
+    };
+    let (w, h) = (50u32, 37u32);
+    let src = anti_diagonal_rgba(w, h);
+    let dir = tmp_dir("direction-f2");
+    let pam_path = dir.join("src.pam");
+    let webp_path = dir.join("ref.webp");
+    let mut pam =
+        format!("P7\nWIDTH {w}\nHEIGHT {h}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n")
+            .into_bytes();
+    pam.extend_from_slice(&src);
+    std::fs::write(&pam_path, &pam).expect("write src.pam");
+    // Exhaustive lossless effort so the predictor transform (and the TR
+    // modes on the right edge) is elected; `-exact` keeps RGB under
+    // alpha as-is (all opaque here anyway).
+    let mut cmd = Command::new(&encoder_bin);
+    cmd.arg("-lossless")
+        .arg("-z")
+        .arg("9")
+        .arg("-exact")
+        .arg("-quiet")
+        .arg(&pam_path)
+        .arg("-o")
+        .arg(&webp_path);
+    let _ = run_or_fail(&mut cmd);
+    let file = std::fs::read(&webp_path).expect("read ref.webp");
+    let image = decode(&file).expect("decode the reference encoder's file");
+    assert_eq!((image.width(), image.height()), (w, h));
+    let differing = differing_pixels(&image.to_rgba8(), &src, w);
+    assert!(
+        differing.is_empty(),
+        "our decode of the reference encoder's file differs from the source at {} pixels (first: {:?})",
+        differing.len(),
+        differing.first()
+    );
+}
+
+/// Direction F.3 — a committed file this encoder wrote (after #33) for
+/// the anti-diagonal image, whose last block column carries a TR-reading
+/// predictor mode; the reference decoder reproduces the source from it
+/// (direction F.1 checks the live encode the same way). Decoding it here
+/// must give the source too, which a decoder reading the row above on
+/// the rightmost column (pre-#33) does not. Needs no external tool.
+#[test]
+fn direction_f_rightmost_column_tr_rule_fixture_decodes_to_source() {
+    let (w, h) = (50u32, 37u32);
+    let src = anti_diagonal_rgba(w, h);
+    let file = include_bytes!("data/lossless-tr-right-column-50x37.webp");
+    let image = decode(file).expect("decode the fixture");
+    assert_eq!((image.width(), image.height()), (w, h));
+    let differing = differing_pixels(&image.to_rgba8(), &src, w);
+    assert!(
+        differing.is_empty(),
+        "fixture decodes differently from its source at {} pixels (first: {:?})",
+        differing.len(),
+        differing.first()
+    );
 }

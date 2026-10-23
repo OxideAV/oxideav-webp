@@ -3183,7 +3183,7 @@ fn residual_magnitude(residual: u32) -> u32 {
 /// §4.1 border-aware prediction at `(x, y)`. Mirrors
 /// [`crate::vp8l_transform::inverse_predictor`]: top-left is solid
 /// black `0xff000000`; top row predicts L; left column predicts T;
-/// rightmost column uses the row's leftmost pixel as TR; otherwise
+/// rightmost column uses the same row's leftmost pixel as TR; otherwise
 /// `predictor_predict(mode, L, T, TR, TL)`.
 ///
 /// `pixels` is the `width × height` ARGB source (read-only — the
@@ -3203,11 +3203,10 @@ fn predictor_at(pixels: &[u32], width: usize, x: usize, y: usize, mode: u8) -> u
     let l = pixels[idx - 1];
     let t = pixels[idx - width];
     let tl = pixels[idx - width - 1];
-    let tr = if x == width - 1 {
-        pixels[idx - width - (width - 1)]
-    } else {
-        pixels[idx - width + 1]
-    };
+    // §4.1: on the rightmost column the leftmost pixel of the *same* row
+    // stands in for TR; in the contiguous buffer that is exactly
+    // `idx - width + 1`, so no branch is needed.
+    let tr = pixels[idx - width + 1];
     predictor_predict(mode, l, t, tr, tl)
 }
 
@@ -3279,9 +3278,10 @@ fn walk_block_residuals<P, S>(
         }
         y = 1;
     }
-    // The §4.1 right-column TR wraparound only applies when the block
-    // reaches the image's right edge.
-    let interior_end = if x_end == width { width - 1 } else { x_end };
+    // §4.1: on the rightmost column the leftmost pixel of the same row
+    // is TR, which in the contiguous buffer is `idx - width + 1` like
+    // every interior pixel, so one loop covers the whole row.
+    let interior_end = x_end;
     while y < y_end {
         let row = y * width;
         let mut x = x0;
@@ -3298,15 +3298,6 @@ fn walk_block_residuals<P, S>(
             let tr = pixels[idx - width + 1];
             sink.pixel(predictor_subtract(pixels[idx], predict(l, t, tr, tl)));
             x += 1;
-        }
-        if x < x_end {
-            // x == width - 1: §4.1 TR wraparound.
-            let idx = row + x;
-            let l = pixels[idx - 1];
-            let t = pixels[idx - width];
-            let tl = pixels[idx - width - 1];
-            let tr = pixels[idx - width - (width - 1)];
-            sink.pixel(predictor_subtract(pixels[idx], predict(l, t, tr, tl)));
         }
         if !sink.row_end() {
             return;

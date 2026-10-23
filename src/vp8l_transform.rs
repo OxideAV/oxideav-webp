@@ -353,10 +353,11 @@ pub fn inverse_predictor(
             dispatch_predict_run(mode, pixels, row, w, x, block_end);
             x = block_end;
         }
-        // Right column (x = w - 1): §4.1 rightmost-column rule uses the
-        // row's leftmost pixel as TR. `idx - w - (w - 1)` collapses to
-        // `idx - 2*w + 1` which is the top-row leftmost; equivalent to
-        // `row - w` (start of previous row).
+        // Right column (x = w - 1): the §4.1 rightmost-column rule uses
+        // the leftmost pixel of the *same* row as TR, which in the
+        // contiguous buffer is `idx - w + 1` — the same address every
+        // interior pixel reads — i.e. `pixels[row]`, already
+        // reconstructed by this row's left-column step.
         let x = w - 1;
         let idx = row + x;
         let block_index = block_row + (x >> size_bits);
@@ -364,7 +365,7 @@ pub fn inverse_predictor(
         let l = pixels[idx - 1];
         let t = pixels[idx - w];
         let tl = pixels[idx - w - 1];
-        let tr = pixels[row - w];
+        let tr = pixels[row];
         let pred = predict(mode, l, t, tr, tl);
         pixels[idx] = add_pred(pixels[idx], pred);
     }
@@ -1048,45 +1049,40 @@ mod tests {
 
     #[test]
     fn inverse_predictor_right_column_uses_row_leftmost_as_tr() {
-        // §4.1 rightmost-column rule: TR is `pixels[idx - w - (w - 1)]`
-        // i.e. the leftmost pixel of the row ABOVE (= start of the
-        // previous row), not the actual top-right (which doesn't exist
-        // at x = w - 1). This test pins that wraparound after the
-        // round-180 region-split rewrite.
+        // §4.1 rightmost-column rule (RFC 9649 §4.1, "Addressing the
+        // TR-pixel for pixels on the rightmost column is exceptional ...
+        // the leftmost pixel on the same row as the current pixel is
+        // instead used as the TR-pixel"). In the contiguous buffer that
+        // is `pixels[idx - w + 1]`, the address every interior pixel
+        // reads — NOT the leftmost pixel of the row above (`row - w`),
+        // which this decoder used before issue #33.
         //
         // Layout (2×2, mode 3 = TR predictor everywhere):
         //   row 0: [A, B]
         //   row 1: [C, D]    where D is the right-column case.
         //
-        // For pixel D (x=1, y=1): mode=3 picks `tr`. The §4.1 rule
-        // says tr = pixels[idx - w - (w-1)] = pixels[3 - 2 - 1] = A.
-        // So D's prediction is pixel A (the row's leftmost).
-        // After add_pred, pixels[D] = residual_D + A (per channel).
+        // C is given its own residual so that C != A: D must then be
+        // predicted from C (same row), and the old row-above rule
+        // (predict from A) is distinguishable.
         let a_after = pack_argb(255, 100, 50, 25); // value of A after decode
+        let res_c = pack_argb(0, 7, 9, 11); // C = A + res_c per channel
         let res_d = pack_argb(0, 1, 2, 3); // residual for D
         // Predictor image: 1 block, mode 3 (TR).
         let pred_img = vec![pack_argb(0, 0, 3, 0)];
-        // Set up so that pixel A decodes to `a_after`. A is the
-        // top-left pixel so its prediction is 0xff00_0000; with
-        // residual = a_after - 0xff00_0000 per channel, A ends up at
-        // `a_after`. We pick a_after with alpha=255 so the residual
-        // alpha is 0 (255 + 0 = 255).
+        // A is the top-left pixel: prediction 0xff00_0000, so this
+        // residual reconstructs it to `a_after`.
         let res_a = pack_argb(0, 100, 50, 25);
-        // Other pixels: residuals are zero; predictions handle them.
-        // B (x=1, y=0): top-row rule → predict L = A.
-        //   pixels[B] = 0 + A = A.
-        // C (x=0, y=1): left-column rule → predict T = A.
-        //   pixels[C] = 0 + A = A.
-        let mut px = vec![res_a, 0u32, 0u32, res_d];
+        // B (x=1, y=0): top-row rule → predict L = A; residual 0 → A.
+        // C (x=0, y=1): left-column rule → predict T = A; → A + res_c.
+        let mut px = vec![res_a, 0u32, res_c, res_d];
         inverse_predictor(&mut px, 2, 2, &pred_img, 1, 9);
-        // A reconstructed:
         assert_eq!(px[0], a_after);
-        // B and C predicted from A with residual 0:
         assert_eq!(px[1], a_after);
-        assert_eq!(px[2], a_after);
-        // D = residual + A (per channel, SWAR add):
-        let expected_d = add_pred(res_d, a_after);
-        assert_eq!(px[3], expected_d);
+        let c_after = add_pred(res_c, a_after);
+        assert_eq!(px[2], c_after);
+        assert_ne!(c_after, a_after);
+        // D = residual + C (the same row's leftmost pixel), per channel.
+        assert_eq!(px[3], add_pred(res_d, c_after));
     }
 
     #[test]
@@ -1123,11 +1119,9 @@ mod tests {
                         let l = pixels[idx - 1];
                         let t = pixels[idx - w];
                         let tl = pixels[idx - w - 1];
-                        let tr = if x == w - 1 {
-                            pixels[idx - w - (w - 1)]
-                        } else {
-                            pixels[idx - w + 1]
-                        };
+                        // §4.1: the rightmost column reads the same
+                        // row's leftmost pixel, which is `idx - w + 1`.
+                        let tr = pixels[idx - w + 1];
                         predict(mode, l, t, tr, tl)
                     };
                     pixels[idx] = add_pred(pixels[idx], pred);
