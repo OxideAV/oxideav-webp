@@ -47,24 +47,24 @@ pub const MAX_DECLARED_PIXELS: u64 = 1 << 22;
 pub fn declared_pixel_load(bytes: &[u8], c: &container::WebpContainer) -> u64 {
     let mut load: u64 = 0;
 
-    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8L) {
-        if let Ok(h) = vp8l_chunk::WebpLosslessChunk::from_payload(chunk.payload(bytes)) {
-            load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
-        }
+    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8L)
+        && let Ok(h) = vp8l_chunk::WebpLosslessChunk::from_payload(chunk.payload(bytes))
+    {
+        load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
     }
 
-    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8) {
-        if let Ok(h) = vp8_chunk::WebpLossyChunk::from_payload(chunk.payload(bytes)) {
-            load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
-        }
+    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8)
+        && let Ok(h) = vp8_chunk::WebpLossyChunk::from_payload(chunk.payload(bytes))
+    {
+        load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
     }
 
-    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8X) {
-        if let Ok(h) = vp8x::Vp8xHeader::parse(chunk.payload(bytes)) {
-            let canvas = u64::from(h.canvas_width) * u64::from(h.canvas_height);
-            let frames = c.chunks_with_fourcc(container::fourcc::ANMF).count() as u64;
-            load = load.saturating_add(canvas.saturating_mul(frames + 1));
-        }
+    if let Some(chunk) = c.first_chunk_with_fourcc(container::fourcc::VP8X)
+        && let Ok(h) = vp8x::Vp8xHeader::parse(chunk.payload(bytes))
+    {
+        let canvas = u64::from(h.canvas_width) * u64::from(h.canvas_height);
+        let frames = c.chunks_with_fourcc(container::fourcc::ANMF).count() as u64;
+        load = load.saturating_add(canvas.saturating_mul(frames + 1));
     }
 
     for anmf_chunk in c.chunks_with_fourcc(container::fourcc::ANMF) {
@@ -83,10 +83,10 @@ pub fn declared_pixel_load(bytes: &[u8], c: &container::WebpContainer) -> u64 {
                 if let Ok(h) = vp8l_chunk::WebpLosslessChunk::from_payload(sub) {
                     load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
                 }
-            } else if fourcc == container::fourcc::VP8 {
-                if let Ok(h) = vp8_chunk::WebpLossyChunk::from_payload(sub) {
-                    load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
-                }
+            } else if fourcc == container::fourcc::VP8
+                && let Ok(h) = vp8_chunk::WebpLossyChunk::from_payload(sub)
+            {
+                load = load.saturating_add(u64::from(h.width()) * u64::from(h.height()));
             }
             let advance = 8usize.saturating_add(size).saturating_add(size & 1);
             if advance > fd.len() {

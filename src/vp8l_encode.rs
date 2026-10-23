@@ -727,7 +727,7 @@ pub fn value_to_prefix(value: u32) -> (u32, u32, u32) {
     // Equivalently: let v0 = value - 1 (>= 4). The high bit of v0 selects
     // the magnitude; the next bit selects the (p & 1) parity sub-band.
     let v0 = value - 1; // >= 4
-                        // `msb` = floor(log2(v0)) >= 2.
+    // `msb` = floor(log2(v0)) >= 2.
     let msb = 31 - v0.leading_zeros();
     let extra_bits = msb - 1;
     // Parity bit: the bit just below the MSB distinguishes the two
@@ -1568,7 +1568,7 @@ fn tokenize_lz77_impl(
     let depth = lazy_depth.min(4);
     // Record a probe result without disturbing the parse.
     macro_rules! record {
-        ($p:expr, $r:expr) => {
+        ($p:expr_2021, $r:expr_2021) => {
             if let Some(rec) = probes.as_deref_mut() {
                 rec[$p] = FindProbe::record($r);
             }
@@ -1597,12 +1597,12 @@ fn tokenize_lz77_impl(
                 matcher.insert(pos);
                 let found_b = matcher.find(pos + 1);
                 record!(pos + 1, found_b);
-                if let Some((len_b, dist_b)) = found_b {
-                    if len_b > best_len {
-                        best_len = len_b;
-                        best_dist = dist_b;
-                        best_start = pos + 1;
-                    }
+                if let Some((len_b, dist_b)) = found_b
+                    && len_b > best_len
+                {
+                    best_len = len_b;
+                    best_dist = dist_b;
+                    best_start = pos + 1;
                 }
             }
             // Depth-2 probe: only meaningful if depth allows it, the
@@ -1616,12 +1616,12 @@ fn tokenize_lz77_impl(
                 matcher.insert(pos + 1);
                 let found_c = matcher.find(pos + 2);
                 record!(pos + 2, found_c);
-                if let Some((len_c, dist_c)) = found_c {
-                    if len_c > best_len {
-                        best_len = len_c;
-                        best_dist = dist_c;
-                        best_start = pos + 2;
-                    }
+                if let Some((len_c, dist_c)) = found_c
+                    && len_c > best_len
+                {
+                    best_len = len_c;
+                    best_dist = dist_c;
+                    best_start = pos + 2;
                 }
             }
             // Depth-3 probe: only meaningful if depth allows it, the
@@ -1635,12 +1635,12 @@ fn tokenize_lz77_impl(
                 matcher.insert(pos + 2);
                 let found_d = matcher.find(pos + 3);
                 record!(pos + 3, found_d);
-                if let Some((len_d, dist_d)) = found_d {
-                    if len_d > best_len {
-                        best_len = len_d;
-                        best_dist = dist_d;
-                        best_start = pos + 3;
-                    }
+                if let Some((len_d, dist_d)) = found_d
+                    && len_d > best_len
+                {
+                    best_len = len_d;
+                    best_dist = dist_d;
+                    best_start = pos + 3;
                 }
             }
             // Depth-4 probe (round 163): only meaningful if depth
@@ -1678,12 +1678,12 @@ fn tokenize_lz77_impl(
                 matcher.insert(pos + 3);
                 let found_e = matcher.find(pos + 4);
                 record!(pos + 4, found_e);
-                if let Some((len_e, dist_e)) = found_e {
-                    if len_e > best_len {
-                        best_len = len_e;
-                        best_dist = dist_e;
-                        best_start = pos + 4;
-                    }
+                if let Some((len_e, dist_e)) = found_e
+                    && len_e > best_len
+                {
+                    best_len = len_e;
+                    best_dist = dist_e;
+                    best_start = pos + 4;
                 }
             }
 
@@ -2234,20 +2234,20 @@ fn compute_dp_matches_with_probes(
         };
         matches[pos] = m0.map(|(len, dist)| DpMatch::new(len, dist, image_width));
         matcher.insert(pos);
-        if let Some((len, _)) = m0 {
-            if len >= DP_LONG_MATCH_INHERIT {
-                let inherit = len - DP_LONG_MATCH_INHERIT;
-                // The distance-code decomposition is shared by every
-                // inherited entry (same distance); only the length
-                // decomposition changes with `k`.
-                let base = matches[pos].expect("just stored");
-                for k in 1..=inherit {
-                    matches[pos + k] = Some(base.with_length(len - k));
-                    matcher.insert(pos + k);
-                }
-                pos += inherit + 1;
-                continue;
+        if let Some((len, _)) = m0
+            && len >= DP_LONG_MATCH_INHERIT
+        {
+            let inherit = len - DP_LONG_MATCH_INHERIT;
+            // The distance-code decomposition is shared by every
+            // inherited entry (same distance); only the length
+            // decomposition changes with `k`.
+            let base = matches[pos].expect("just stored");
+            for k in 1..=inherit {
+                matches[pos + k] = Some(base.with_length(len - k));
+                matcher.insert(pos + k);
             }
+            pos += inherit + 1;
+            continue;
         }
         pos += 1;
     }
@@ -2408,7 +2408,7 @@ fn dp_refine_tokens(
     if n == 0 {
         return Vec::new();
     }
-    debug_assert!(cache_hits.map_or(true, |h| h.len() == n));
+    debug_assert!(cache_hits.is_none_or(|h| h.len() == n));
 
     // ---- Pass-1 cost model: per-symbol bit costs from the previous
     // stream's shared [`StreamCostTables`] (round 388 — previously
@@ -2865,8 +2865,8 @@ const DIST_MAP_MIN_UNCLAMPED_WIDTH: u32 = 9;
 static DIST_MAP_INVERSE: [[u8; (DIST_MAP_X_MAX - DIST_MAP_X_MIN + 1) as usize];
     (DIST_MAP_Y_MAX + 1) as usize] = build_dist_map_inverse();
 
-const fn build_dist_map_inverse(
-) -> [[u8; (DIST_MAP_X_MAX - DIST_MAP_X_MIN + 1) as usize]; (DIST_MAP_Y_MAX + 1) as usize] {
+const fn build_dist_map_inverse()
+-> [[u8; (DIST_MAP_X_MAX - DIST_MAP_X_MIN + 1) as usize]; (DIST_MAP_Y_MAX + 1) as usize] {
     let mut lut =
         [[0u8; (DIST_MAP_X_MAX - DIST_MAP_X_MIN + 1) as usize]; (DIST_MAP_Y_MAX + 1) as usize];
     let mut i = 0;
@@ -3016,11 +3016,7 @@ fn predictor_select(l: u32, t: u32, tl: u32) -> u32 {
     let p_t =
         (p_a - ach(t)).abs() + (p_r - rch(t)).abs() + (p_g - gch(t)).abs() + (p_b - bch(t)).abs();
 
-    if p_l < p_t {
-        l
-    } else {
-        t
-    }
+    if p_l < p_t { l } else { t }
 }
 
 /// Compute the §4.1 prediction for `mode ∈ 0..=13` given the four
@@ -3107,11 +3103,7 @@ pub fn predictor_subtract(original: u32, pred: u32) -> u32 {
 fn residual_magnitude(residual: u32) -> u32 {
     let fold = |v: u32| -> u32 {
         let v = v & 0xff;
-        if v <= 128 {
-            v
-        } else {
-            256 - v
-        }
+        if v <= 128 { v } else { 256 - v }
     };
     fold(residual >> 24) + fold(residual >> 16) + fold(residual >> 8) + fold(residual)
 }
@@ -3269,7 +3261,7 @@ fn for_each_block_residual<S: ResidualSink>(
     sink: &mut S,
 ) {
     macro_rules! walk {
-        ($p:expr) => {
+        ($p:expr_2021) => {
             walk_block_residuals(pixels, width, height, x0, y0, bw, bh, $p, sink)
         };
     }
@@ -3464,12 +3456,12 @@ fn pick_block_mode_with_hint(
     // residual stream produced by the main image's forward transform
     // is unchanged (the cost is equal), so decode round-trips are
     // bit-identical.
-    if let Some(m) = prefer_mode {
-        if m != best_mode {
-            let cost = block_mode_cost(pixels, width, height, x0, y0, bw, bh, m);
-            if cost == best_cost {
-                best_mode = m;
-            }
+    if let Some(m) = prefer_mode
+        && m != best_mode
+    {
+        let cost = block_mode_cost(pixels, width, height, x0, y0, bw, bh, m);
+        if cost == best_cost {
+            best_mode = m;
         }
     }
     best_mode
@@ -3531,12 +3523,12 @@ fn pick_block_mode_with_hint_slack(
     // slack budget lets the encoder trade a small residual increase
     // for a predictor-sub-image entropy drop. `slack == 0` recovers
     // the round-159 strict tie-break behaviour exactly.
-    if let Some(m) = prefer_mode {
-        if m != best_mode {
-            let cost = block_mode_cost(pixels, width, height, x0, y0, bw, bh, m);
-            if cost <= best_cost.saturating_add(slack) {
-                best_mode = m;
-            }
+    if let Some(m) = prefer_mode
+        && m != best_mode
+    {
+        let cost = block_mode_cost(pixels, width, height, x0, y0, bw, bh, m);
+        if cost <= best_cost.saturating_add(slack) {
+            best_mode = m;
         }
     }
     best_mode
@@ -3800,12 +3792,12 @@ fn pick_block_mode_with_hint_entropy(
         }
     }
     // Round-159-style strict tie-break under the entropy cost.
-    if let Some(m) = prefer_mode {
-        if m != best_mode {
-            let cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, m);
-            if cost == best_cost {
-                best_mode = m;
-            }
+    if let Some(m) = prefer_mode
+        && m != best_mode
+    {
+        let cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, m);
+        if cost == best_cost {
+            best_mode = m;
         }
     }
     best_mode
@@ -3987,15 +3979,15 @@ fn pick_block_mode_with_hint_entropy_subaware(
             best_mode = mode;
         }
     }
-    if let Some(m) = prefer_mode {
-        if m != best_mode {
-            let residual_cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, m);
-            let sub_delta = sub_image_mode_cost_delta_milli(sub_image_hist, sub_image_total, m);
-            let weighted_sub = sub_delta.saturating_mul(lambda_milli) / 1000;
-            let cost = residual_cost.saturating_add(weighted_sub);
-            if cost == best_cost {
-                best_mode = m;
-            }
+    if let Some(m) = prefer_mode
+        && m != best_mode
+    {
+        let residual_cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, m);
+        let sub_delta = sub_image_mode_cost_delta_milli(sub_image_hist, sub_image_total, m);
+        let weighted_sub = sub_delta.saturating_mul(lambda_milli) / 1000;
+        let cost = residual_cost.saturating_add(weighted_sub);
+        if cost == best_cost {
+            best_mode = m;
         }
     }
     best_mode
@@ -4649,11 +4641,7 @@ const CTE_AXIS_CANDIDATES: [u8; 25] = [
 #[inline]
 fn channel_magnitude(v: u32) -> u32 {
     let v = v & 0xff;
-    if v <= 128 {
-        v
-    } else {
-        256 - v
-    }
+    if v <= 128 { v } else { 256 - v }
 }
 
 /// §3.5.2: pick the `(green_to_red, green_to_blue, red_to_blue)`
@@ -7510,7 +7498,7 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
     // Repack RGBA → ARGB and detect whether alpha is non-trivial.
     let mut pixels = Vec::with_capacity(rgba.len() / 4);
     let mut alpha_is_used = false;
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         if a != 0xff {
             alpha_is_used = true;
@@ -8042,10 +8030,10 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     // distinct UI regions) where separate per-region Huffman codes
     // shrink the LZ77 stream by more than the entropy-image +
     // additional code-length-table overhead.
-    if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
-        if mp_best.len() < best.len() {
-            best = mp_best;
-        }
+    if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height)
+        && mp_best.len() < best.len()
+    {
+        best = mp_best;
     }
 
     // Round 383: §3.5 (subtract-green →) predictor stack with a §6.2.2
@@ -8055,20 +8043,20 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     // neither the transform-free meta-prefix candidate above nor the
     // single-group predictor paths can reach this combination.
     // Non-regressing: kept only when strictly smaller.
-    if let Some(pmp_best) = sweep_predictor_meta_prefix_candidate(pixels, width, height) {
-        if pmp_best.len() < best.len() {
-            best = pmp_best;
-        }
+    if let Some(pmp_best) = sweep_predictor_meta_prefix_candidate(pixels, width, height)
+        && pmp_best.len() < best.len()
+    {
+        best = pmp_best;
     }
 
     // Round 383: §4.4 color-indexing + §6.2.2 multi-meta-prefix stack —
     // per-region prefix-code groups over the packed-index stream, swept
     // across palette orderings. Non-regressing: kept only when strictly
     // smaller.
-    if let Some(cimp_best) = sweep_color_indexing_meta_prefix(pixels, width, height) {
-        if cimp_best.len() < best.len() {
-            best = cimp_best;
-        }
+    if let Some(cimp_best) = sweep_color_indexing_meta_prefix(pixels, width, height)
+        && cimp_best.len() < best.len()
+    {
+        best = cimp_best;
     }
 
     best
@@ -8322,7 +8310,7 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
                 &mut ent_bits,
             ) {
                 let cand_len = (HEADER_BITS + bits).div_ceil(8);
-                if best.as_ref().map_or(true, |(b, ..)| cand_len < *b) {
+                if best.as_ref().is_none_or(|(b, ..)| cand_len < *b) {
                     *best = Some((cand_len, prefix_bits, codes.to_vec(), cache_opt));
                 }
             }
@@ -8451,7 +8439,7 @@ fn sweep_color_indexing_meta_prefix(pixels: &[u32], width: u32, height: u32) -> 
                         &mut ent_bits,
                     ) {
                         let cand_len = (header_bits + bits).div_ceil(8);
-                        if best.as_ref().map_or(true, |(_, (b, ..))| cand_len < *b) {
+                        if best.as_ref().is_none_or(|(_, (b, ..))| cand_len < *b) {
                             best =
                                 Some((ordering, (cand_len, prefix_bits, codes.clone(), cache_opt)));
                         }
@@ -8659,7 +8647,7 @@ fn sweep_predictor_meta_prefix_candidate(
                         &mut ent_bits,
                     ) {
                         let cand_len = (header_bits + bits).div_ceil(8);
-                        if best.as_ref().map_or(true, |(_, (b, ..))| cand_len < *b) {
+                        if best.as_ref().is_none_or(|(_, (b, ..))| cand_len < *b) {
                             *best = Some((
                                 subtract_green,
                                 (cand_len, prefix_bits, codes.to_vec(), cache_opt),
@@ -9833,9 +9821,10 @@ mod tests {
         let rgba = [0x12, 0x34, 0x56, 0xff];
         let file = encode_webp_lossless(&rgba, 1, 1).unwrap();
         let c = crate::parse_container(&file).unwrap();
-        assert!(c
-            .first_chunk_with_fourcc(crate::container::fourcc::VP8L)
-            .is_some());
+        assert!(
+            c.first_chunk_with_fourcc(crate::container::fourcc::VP8L)
+                .is_some()
+        );
     }
 
     #[test]
@@ -10650,7 +10639,7 @@ mod tests {
     /// `distance_code_to_pixel_distance` to the original distance.
     #[test]
     fn distance_chooser_reconstructs_each_distance_map_entry() {
-        use crate::vp8l_decode::{distance_code_to_pixel_distance, DISTANCE_MAP};
+        use crate::vp8l_decode::{DISTANCE_MAP, distance_code_to_pixel_distance};
         let width = 256u32;
         for &(xi, yi) in DISTANCE_MAP.iter() {
             let raw = xi + yi * width as i32;
@@ -11317,12 +11306,11 @@ mod tests {
             }
             for hint in std::iter::once(None).chain((0u8..=13).map(Some)) {
                 let mut want = ref_best_mode;
-                if let Some(m) = hint {
-                    if m != want
-                        && ref_cost(&pixels, width, height, x0, y0, bw, bh, m) == ref_best_cost
-                    {
-                        want = m;
-                    }
+                if let Some(m) = hint
+                    && m != want
+                    && ref_cost(&pixels, width, height, x0, y0, bw, bh, m) == ref_best_cost
+                {
+                    want = m;
                 }
                 assert_eq!(
                     pick_block_mode_with_hint(&pixels, width, height, x0, y0, bw, bh, hint),
@@ -11332,13 +11320,12 @@ mod tests {
                 );
                 for slack in [0u64, 1, 7, 64] {
                     let mut want_slack = ref_best_mode;
-                    if let Some(m) = hint {
-                        if m != want_slack
-                            && ref_cost(&pixels, width, height, x0, y0, bw, bh, m)
-                                <= ref_best_cost.saturating_add(slack)
-                        {
-                            want_slack = m;
-                        }
+                    if let Some(m) = hint
+                        && m != want_slack
+                        && ref_cost(&pixels, width, height, x0, y0, bw, bh, m)
+                            <= ref_best_cost.saturating_add(slack)
+                    {
+                        want_slack = m;
                     }
                     assert_eq!(
                         pick_block_mode_with_hint_slack(
@@ -12035,8 +12022,7 @@ mod tests {
             h,
             pre_color.len(),
             with_color.len(),
-            100.0 * (pre_color.len() as f64 - with_color.len() as f64)
-                / pre_color.len() as f64,
+            100.0 * (pre_color.len() as f64 - with_color.len() as f64) / pre_color.len() as f64,
         );
         assert!(
             with_color.len() <= pre_color.len(),
@@ -12548,7 +12534,7 @@ mod tests {
         let small = vec![0xff10_2030, 0xff40_5060, 0xff10_2030, 0xff70_8090];
         let (p, m) = collect_palette(&small).expect("4-color palette fits");
         assert_eq!(p.len(), 3); // 0xff10_2030 appears twice, so 3 uniques.
-                                // Sorted.
+        // Sorted.
         assert!(p.windows(2).all(|w| w[0] < w[1]));
         // Round-trip every pixel through the map.
         for px in &small {
@@ -13899,11 +13885,7 @@ mod tests {
         for y in 0..h_us {
             for x in 0..w_us {
                 let g = if y < h_us / 2 {
-                    if (x ^ y) & 1 == 0 {
-                        16u32
-                    } else {
-                        240u32
-                    }
+                    if (x ^ y) & 1 == 0 { 16u32 } else { 240u32 }
                 } else {
                     128u32
                 };
@@ -14740,10 +14722,10 @@ mod tests {
             }
         }
 
-        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
-            if mp_best.len() < best.len() {
-                best = mp_best;
-            }
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height)
+            && mp_best.len() < best.len()
+        {
+            best = mp_best;
         }
 
         best
@@ -16603,10 +16585,10 @@ mod tests {
             }
         }
 
-        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
-            if mp_best.len() < best.len() {
-                best = mp_best;
-            }
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height)
+            && mp_best.len() < best.len()
+        {
+            best = mp_best;
         }
 
         best
@@ -17207,10 +17189,10 @@ mod tests {
             }
         }
 
-        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
-            if mp_best.len() < best.len() {
-                best = mp_best;
-            }
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height)
+            && mp_best.len() < best.len()
+        {
+            best = mp_best;
         }
 
         best
@@ -17345,10 +17327,10 @@ mod tests {
             }
         }
 
-        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
-            if mp_best.len() < best.len() {
-                best = mp_best;
-            }
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height)
+            && mp_best.len() < best.len()
+        {
+            best = mp_best;
         }
 
         best
@@ -17971,10 +17953,10 @@ mod tests {
             }
         }
 
-        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height) {
-            if mp_best.len() < best.len() {
-                best = mp_best;
-            }
+        if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height)
+            && mp_best.len() < best.len()
+        {
+            best = mp_best;
         }
 
         best

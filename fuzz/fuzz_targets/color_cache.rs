@@ -83,7 +83,7 @@
 //!   wide with no range restriction).
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::vp8l_decode::{ColorCache, COLOR_CACHE_HASH_MULTIPLIER};
+use oxideav_webp::vp8l_decode::{COLOR_CACHE_HASH_MULTIPLIER, ColorCache};
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
@@ -122,7 +122,7 @@ fuzz_target!(|data: &[u8]| {
     // and assert the real cache matches.
     let mut shadow: Vec<u32> = vec![0u32; expected_size];
 
-    for chunk in data[1..].chunks_exact(4) {
+    for chunk in data[1..].as_chunks::<4>().0 {
         let argb = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         check_one(&mut cache, &mut shadow, argb, code_bits, expected_size);
     }
@@ -132,7 +132,7 @@ fuzz_target!(|data: &[u8]| {
     // catches any latent hidden state that would make the cache a
     // function of more than just `code_bits` + the insert sequence.
     let mut replay = ColorCache::new(code_bits);
-    for chunk in data[1..].chunks_exact(4) {
+    for chunk in data[1..].as_chunks::<4>().0 {
         let argb = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         replay.insert(argb);
     }

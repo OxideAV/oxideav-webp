@@ -14,7 +14,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_webp::{
-    decode, decode_all, encode_rgb8, encode_rgba8, info, probe, EncodeOptions, PixelFormat,
+    EncodeOptions, PixelFormat, decode, decode_all, encode_rgb8, encode_rgba8, info, probe,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -29,7 +29,13 @@ fuzz_target!(|data: &[u8]| {
     let len = (width * height) as usize * bpp;
     let body = &data[2..];
     let pixels: Vec<u8> = (0..len)
-        .map(|i| if body.is_empty() { 0 } else { body[i % body.len()] })
+        .map(|i| {
+            if body.is_empty() {
+                0
+            } else {
+                body[i % body.len()]
+            }
+        })
         .collect();
 
     // Lossless: exact.
@@ -63,7 +69,7 @@ fuzz_target!(|data: &[u8]| {
     let img = decode(&bytes).expect("lossy output decodes");
     assert_eq!((img.width, img.height), (width, height));
     let alpha: Vec<u8> = if rgba_in {
-        pixels.chunks_exact(4).map(|p| p[3]).collect()
+        pixels.as_chunks::<4>().0.iter().map(|p| p[3]).collect()
     } else {
         Vec::new()
     };

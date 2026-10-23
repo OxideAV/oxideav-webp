@@ -73,7 +73,7 @@
 //! therefore not included in the `payload` slice). This is enforced
 //! by the round-trip tests at the bottom of this module.
 
-use crate::container::{fourcc, FourCc};
+use crate::container::{FourCc, fourcc};
 
 /// Maximum 1-based canvas dimension representable in the §2.7.1 24-bit
 /// `Minus One` field — `2^24` (because the on-disk value is `dim - 1`
@@ -581,7 +581,7 @@ pub fn build_webp_file_with_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{parse, ContainerError};
+    use crate::container::{ContainerError, parse};
     use crate::vp8x::Vp8xHeader;
 
     /// §2.3 sanity: a chunk with even-length payload is exactly

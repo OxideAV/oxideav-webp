@@ -211,8 +211,8 @@ fuzz_target!(|data: &[u8]| {
 
     let orig_width = (u32::from(data[0]) & 0x1F) | 0x01; // [1, 32]
     let height = (u32::from(data[1]) & 0x1F) | 0x01; // [1, 32]
-                                                     // table_size ∈ [1, 256] per the §4.4 spec range. Use the full byte
-                                                     // value + 1 to get [1, 256] from [0, 255].
+    // table_size ∈ [1, 256] per the §4.4 spec range. Use the full byte
+    // value + 1 to get [1, 256] from [0, 255].
     let table_size: usize = (data[2] as usize) + 1;
     debug_assert!((1..=256).contains(&table_size));
 

@@ -13,8 +13,8 @@ use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, Error as CoreError, Frame as CoreFrame, Packet,
     PixelFormat, RuntimeContext, StreamInfo, TimeBase, VideoFrame,
 };
-use oxideav_webp::container_registry::{self, is_animation_stream, TIME_BASE};
-use oxideav_webp::{decode, decode_all, info, WebpImage, CODEC_ID_VP8, CODEC_ID_VP8L};
+use oxideav_webp::container_registry::{self, TIME_BASE, is_animation_stream};
+use oxideav_webp::{CODEC_ID_VP8, CODEC_ID_VP8L, WebpImage, decode, decode_all, info};
 
 const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
 const LOSSLESS_RGBA: &[u8] = include_bytes!("data/lossless-32x32-rgba.webp");
@@ -204,10 +204,11 @@ fn probe_names_webp_from_magic_alone_and_with_hint_and_rejects_foreign_files() {
         b"GIF89a\x01\0\x01\0\0\0\0;".to_vec(),
     ] {
         let mut cur = Cursor::new(foreign.clone());
-        assert!(ctx
-            .containers
-            .probe_input(&mut cur as &mut dyn oxideav_core::ReadSeek, None)
-            .is_err());
+        assert!(
+            ctx.containers
+                .probe_input(&mut cur as &mut dyn oxideav_core::ReadSeek, None)
+                .is_err()
+        );
         let reader: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(foreign));
         assert!(container_registry::open_demuxer(reader, &ctx.codecs).is_err());
     }
@@ -595,13 +596,15 @@ fn muxer_rejects_wrong_streams_and_non_webp_packets() {
         s.params.codec_id = CodecId::new(id);
         let sink: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::new()));
         let mut m = container_registry::open_muxer(sink, std::slice::from_ref(&s)).unwrap();
-        assert!(m
-            .write_packet(&Packet::new(0, TIME_BASE, LOSSLESS_1X1.to_vec()))
-            .is_err());
+        assert!(
+            m.write_packet(&Packet::new(0, TIME_BASE, LOSSLESS_1X1.to_vec()))
+                .is_err()
+        );
         m.write_header().unwrap();
-        assert!(m
-            .write_packet(&Packet::new(0, TIME_BASE, b"not a webp".to_vec()))
-            .is_err());
+        assert!(
+            m.write_packet(&Packet::new(0, TIME_BASE, b"not a webp".to_vec()))
+                .is_err()
+        );
         assert!(m.write_trailer().is_err(), "no packets");
     }
     // A bad option is refused when the muxer opens.
@@ -696,9 +699,10 @@ fn hostile_inputs_fail_cleanly() {
     let mut dec = ctx.codecs.first_decoder(&stream.params).unwrap();
     dec.send_packet(&packets[0]).unwrap();
     assert!(dec.receive_frame().is_ok());
-    assert!(dec
-        .send_packet(&Packet::new(0, TIME_BASE, LOSSLESS_1X1.to_vec()))
-        .is_err());
+    assert!(
+        dec.send_packet(&Packet::new(0, TIME_BASE, LOSSLESS_1X1.to_vec()))
+            .is_err()
+    );
     // A one-frame animated packet on a 6×4 canvas (built through the
     // muxer) does not belong to this stream's canvas.
     let hdr = info(ANIM_RGB).unwrap();

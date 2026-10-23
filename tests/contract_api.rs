@@ -14,10 +14,10 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use oxideav_webp::{
-    decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
-    encode, encode_animation, encode_rgb8, encode_rgba8, encode_to, info, probe, ColorInfo,
-    ColorRange, DecodeOptions, EncodeOptions, Error, Frame, ImageInfo, Metadata, PixelFormat,
-    Plane, RgbImage, RgbaImage, WebpError, WebpImage,
+    ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Error, Frame, ImageInfo, Metadata,
+    PixelFormat, Plane, RgbImage, RgbaImage, WebpError, WebpImage, decode, decode_all,
+    decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with, encode, encode_animation,
+    encode_rgb8, encode_rgba8, encode_to, info, probe,
 };
 
 const LOSSLESS_1X1: &[u8] = include_bytes!("data/lossless-1x1.webp");
@@ -246,7 +246,7 @@ fn lossy_with_alph_decodes_to_yuva420p_with_the_alpha_plane() {
         .unwrap();
     assert_eq!(img.planes[3].data, plane);
     let rgba = img.to_rgba8();
-    let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
+    let alpha: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
     assert_eq!(alpha, plane, "to_rgba8 carries the alpha plane through");
     // to_rgb8 drops it.
     assert_eq!(img.to_rgb8().len(), 128 * 128 * 3);
@@ -394,7 +394,9 @@ fn lossless_round_trip_is_exact_for_planes_and_metadata() {
 
     // RGB8 in → opaque RGBA native.
     let rgb: Vec<u8> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
     let bytes = encode_rgb8(w, h, &rgb, &EncodeOptions::default()).unwrap();
@@ -403,9 +405,10 @@ fn lossless_round_trip_is_exact_for_planes_and_metadata() {
     assert!(!info(&bytes).unwrap().has_alpha);
     // Simple (non-VP8X) layout when there is nothing to declare.
     let c = oxideav_webp::parse_container(&bytes).unwrap();
-    assert!(c
-        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8X)
-        .is_none());
+    assert!(
+        c.first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8X)
+            .is_none()
+    );
 
     // The streaming variant writes the same bytes.
     let mut out = Vec::new();
@@ -491,11 +494,13 @@ fn lossy_rgba_with_transparency_emits_alph() {
     assert_eq!(i.format, PixelFormat::Yuva420P);
     assert!(i.has_alpha && i.is_lossy);
     let back = decode(&bytes).unwrap();
-    let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
+    let alpha: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
     assert_eq!(back.planes[3].data, alpha);
     // An opaque RGBA image stays plain Yuv420P (no ALPH).
     let opaque: Vec<u8> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2], 0xff])
         .collect();
     let bytes = encode_rgba8(w, h, &opaque, &EncodeOptions::default().with_quality(85.0)).unwrap();
@@ -567,7 +572,9 @@ fn encode_animation_round_trips_through_decode_all() {
         );
     }
     assert!(encode_animation(&[], &opts).unwrap_err().is_invalid_data());
-    assert!(encode_animation(&frames, &opts.clone().with_quality(50.0))
-        .unwrap_err()
-        .is_unsupported());
+    assert!(
+        encode_animation(&frames, &opts.clone().with_quality(50.0))
+            .unwrap_err()
+            .is_unsupported()
+    );
 }

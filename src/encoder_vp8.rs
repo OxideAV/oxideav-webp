@@ -82,8 +82,8 @@ pub fn quality_to_qindex(quality: f32) -> u8 {
 
 #[cfg(feature = "registry")]
 use oxideav_core::{
-    time::TimeBase, CodecId, CodecParameters, Encoder, Error as CoreError, Frame, MediaType,
-    Packet, Result as CoreResult,
+    CodecId, CodecParameters, Encoder, Error as CoreError, Frame, MediaType, Packet,
+    Result as CoreResult, time::TimeBase,
 };
 #[cfg(feature = "registry")]
 use std::collections::VecDeque;

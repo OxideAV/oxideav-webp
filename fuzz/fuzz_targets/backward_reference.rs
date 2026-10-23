@@ -85,7 +85,7 @@
 //! ~70 K constant-time pushes — well inside the libFuzzer budget.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::vp8l_decode::{apply_backward_reference, DecodeError};
+use oxideav_webp::vp8l_decode::{DecodeError, apply_backward_reference};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 {
@@ -108,7 +108,9 @@ fuzz_target!(|data: &[u8]| {
     // a deterministic fill (all zero) so the underflow / overflow guards
     // are exercised independently of the source content.
     let words: Vec<u32> = data[8..]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let mut pixels: Vec<u32> = Vec::with_capacity(prefill_len + length);

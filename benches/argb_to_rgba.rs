@@ -22,7 +22,7 @@
 //!   cargo bench -p oxideav-webp --bench argb_to_rgba -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l::Vp8lImage;
 
 /// Original `Vec::push` repack form (pre-pack-rewrite baseline). Pushes
@@ -44,7 +44,7 @@ fn repack_push_loop(pixels: &[u32]) -> Vec<u8> {
 /// fixed-width chunk, which the compiler auto-vectorises.
 fn repack_chunks_exact(pixels: &[u32]) -> Vec<u8> {
     let mut out = vec![0u8; pixels.len() * 4];
-    for (chunk, &argb) in out.chunks_exact_mut(4).zip(pixels.iter()) {
+    for (chunk, &argb) in out.as_chunks_mut::<4>().0.iter_mut().zip(pixels.iter()) {
         chunk[0] = (argb >> 16) as u8;
         chunk[1] = (argb >> 8) as u8;
         chunk[2] = argb as u8;

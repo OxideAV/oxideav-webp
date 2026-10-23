@@ -67,10 +67,10 @@ mod image;
 mod yuv;
 
 pub use api::{
-    animation_params, decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8,
-    decode_with, encode, encode_all, encode_animation, encode_animation_frames, encode_rgb8,
-    encode_rgba8, encode_to, info, probe, read_metadata, AnimFrame, AnimFrameMode, DecodeOptions,
-    DeltaConfig, DownsampleKernel, EncodeOptions, MAX_DIMENSION,
+    AnimFrame, AnimFrameMode, DecodeOptions, DeltaConfig, DownsampleKernel, EncodeOptions,
+    MAX_DIMENSION, animation_params, decode, decode_all, decode_all_with, decode_from, decode_rgb8,
+    decode_rgba8, decode_with, encode, encode_all, encode_animation, encode_animation_frames,
+    encode_rgb8, encode_rgba8, encode_to, info, probe, read_metadata,
 };
 pub use image::{
     ColorInfo, ColorRange, Frame, ImageInfo, Metadata, Palette, PixelFormat, Plane, RgbImage,
@@ -140,7 +140,7 @@ pub mod vp8x;
 use oxideav_core::RuntimeContext;
 
 #[cfg(feature = "registry")]
-pub use registry::{make_decoder, make_encoder, WebpDecoder};
+pub use registry::{WebpDecoder, make_decoder, make_encoder};
 
 /// Stable codec identifier the VP8L lossless encoder registers under in the
 /// codec registry — the published `"webp_vp8l"` name.
@@ -564,7 +564,7 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
 
 #[doc(inline)]
 #[allow(deprecated)]
-pub use anim_encode::{build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions};
+pub use anim_encode::{AnimEncoderOptions, build_animated_webp, build_animated_webp_with_options};
 
 // ─────────────────────────────── registration ────────────────────────────
 

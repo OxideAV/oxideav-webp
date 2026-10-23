@@ -67,7 +67,7 @@
 //!   cargo bench -p oxideav-webp --bench read_lz77_value -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_decode::read_lz77_value;
 use oxideav_webp::vp8l_stream::BitReader;
 

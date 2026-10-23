@@ -47,8 +47,8 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_webp::build::{self, FileMetadata, ImageKind};
 use oxideav_webp::container::{self, fourcc};
 use oxideav_webp::{
-    decode_webp, encode_vp8l_argb_with, encode_vp8l_argb_with_metadata, parse_vp8x_header,
-    WebpMetadata,
+    WebpMetadata, decode_webp, encode_vp8l_argb_with, encode_vp8l_argb_with_metadata,
+    parse_vp8x_header,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -93,7 +93,9 @@ fuzz_target!(|data: &[u8]| {
     let n_pixels = (width as usize) * (height as usize);
     let pixel_bytes = take(0, n_pixels * 4);
     let argb: Vec<u32> = pixel_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 

@@ -30,7 +30,7 @@
 //! of `8 * 32 * 32 * 4 = 32 KiB` of pixel data per round-trip.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::{build_animated_webp, decode_webp, AnimFrame};
+use oxideav_webp::{AnimFrame, build_animated_webp, decode_webp};
 
 // Per-frame upper bounds. Kept small so a single fuzz iteration completes
 // in milliseconds and the worst-case RGBA working set stays under ~32 KiB.

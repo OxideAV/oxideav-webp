@@ -58,7 +58,7 @@
 //! * No `oxideav-vp8` runtime dependency. Routing the payload to a
 //!   VP8 decoder is the caller's responsibility.
 
-use crate::container::{fourcc, WebpChunk, WebpContainer};
+use crate::container::{WebpChunk, WebpContainer, fourcc};
 
 /// RFC 6386 §9.1 start code byte 0 — the first of the three sync
 /// bytes that follow the 3-byte frame tag in a key frame.

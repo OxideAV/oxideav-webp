@@ -92,7 +92,7 @@
 //!   cargo bench -p oxideav-webp --bench value_to_prefix -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::value_to_prefix;
 
 /// Per-`b.iter` inner-loop length. Sized to amortise Criterion's

@@ -11,7 +11,7 @@ use crate::alph;
 use crate::anim;
 use crate::anmf;
 use crate::build::{self, Vp8xFlags};
-use crate::container::{self, fourcc, WebpContainer};
+use crate::container::{self, WebpContainer, fourcc};
 use crate::image::{Frame, ImageInfo, Metadata, Plane, RgbImage, RgbaImage, WebpImage};
 use crate::vp8_chunk;
 use crate::vp8l_chunk;
@@ -493,23 +493,23 @@ fn decode_still(
         Some(ch) => Some(vp8x::Vp8xHeader::parse(ch.payload(bytes))?),
         None => None,
     };
-    if opts.strict {
-        if let Some(x) = &vp8x {
-            if x.has_unknown {
-                return Err(WebpError::invalid("VP8X reserved bits set"));
-            }
-        }
+    if opts.strict
+        && let Some(x) = &vp8x
+        && x.has_unknown
+    {
+        return Err(WebpError::invalid("VP8X reserved bits set"));
     }
     let kind = still_kind(bytes, c)?
         .ok_or_else(|| WebpError::unsupported("no VP8L/VP8 image-data chunk"))?;
     let (w, h) = kind.dims();
-    if let Some(x) = &vp8x {
-        if opts.strict && (x.canvas_width, x.canvas_height) != (w, h) {
-            return Err(WebpError::invalid(format!(
-                "VP8X canvas {}x{} disagrees with bitstream {w}x{h}",
-                x.canvas_width, x.canvas_height
-            )));
-        }
+    if let Some(x) = &vp8x
+        && opts.strict
+        && (x.canvas_width, x.canvas_height) != (w, h)
+    {
+        return Err(WebpError::invalid(format!(
+            "VP8X canvas {}x{} disagrees with bitstream {w}x{h}",
+            x.canvas_width, x.canvas_height
+        )));
     }
     opts.check_dimensions(w, h)?;
     let alph = c
@@ -799,7 +799,7 @@ fn fill_canvas_rect(
     let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
     for row in 0..h {
         let off = (y + row) * cw_bytes + x * 4;
-        for px in canvas[off..off + w * 4].chunks_exact_mut(4) {
+        for px in canvas[off..off + w * 4].as_chunks_mut::<4>().0 {
             px.copy_from_slice(&rgba);
         }
     }
@@ -907,7 +907,7 @@ pub(crate) fn find_subchunk(mut data: &[u8], target: container::FourCc) -> Optio
 /// `[R, G, B, A]` bytes.
 pub(crate) fn argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
     let mut out = vec![0u8; pixels.len() * 4];
-    for (chunk, &argb) in out.chunks_exact_mut(4).zip(pixels.iter()) {
+    for (chunk, &argb) in out.as_chunks_mut::<4>().0.iter_mut().zip(pixels.iter()) {
         chunk[0] = (argb >> 16) as u8;
         chunk[1] = (argb >> 8) as u8;
         chunk[2] = argb as u8;
@@ -1017,7 +1017,7 @@ fn encode_lossless(
         other => {
             return Err(WebpError::unsupported(format!(
                 "lossless WebP carries RGB(A) only, not {other:?}; convert with to_rgba8 or set a quality"
-            )))
+            )));
         }
     };
     let plane = &image.planes[0];
@@ -1074,8 +1074,9 @@ fn encode_lossy(
                 let mut a = Vec::with_capacity(w * h);
                 let mut used = false;
                 for row in 0..h {
-                    for px in
-                        plane.data[row * plane.stride..row * plane.stride + w * 4].chunks_exact(4)
+                    for px in plane.data[row * plane.stride..row * plane.stride + w * 4]
+                        .as_chunks::<4>()
+                        .0
                     {
                         used |= px[3] != 0xff;
                         a.push(px[3]);
@@ -1507,7 +1508,7 @@ mod tests {
         assert!(i.has_alpha);
         let back = decode(&bytes).unwrap();
         assert_eq!(back.format, WebpPixelFormat::Yuva420P);
-        let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
+        let alpha: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
         assert_eq!(back.planes[3].data, alpha, "ALPH is lossless");
         // A Yuva420P image encodes straight through.
         let again = encode(&back, &EncodeOptions::default().with_quality(80.0)).unwrap();

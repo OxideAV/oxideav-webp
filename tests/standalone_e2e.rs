@@ -29,11 +29,11 @@
 // over the contract API for one release; they stay the regression gate.
 #![allow(deprecated)]
 
-use oxideav_webp::build::{build_chunk, ImageKind};
+use oxideav_webp::build::{ImageKind, build_chunk};
 use oxideav_webp::{
-    build_animated_webp, build_webp_file, decode_lossless_image, decode_webp, encode_vp8l_argb,
-    encode_vp8l_argb_with_metadata, encode_webp_lossless, extract_metadata, AnimFrame, WebpError,
-    WebpFileMetadata, WebpMetadata,
+    AnimFrame, WebpError, WebpFileMetadata, WebpMetadata, build_animated_webp, build_webp_file,
+    decode_lossless_image, decode_webp, encode_vp8l_argb, encode_vp8l_argb_with_metadata,
+    encode_webp_lossless, extract_metadata,
 };
 
 // ─────────────────────────── fixture builders ───────────────────────────

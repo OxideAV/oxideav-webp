@@ -62,8 +62,8 @@
 //!   cargo bench -p oxideav-webp --bench alpha_decode -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::alph::{decode_alpha, AlphFiltering};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use oxideav_webp::alph::{AlphFiltering, decode_alpha};
 use oxideav_webp::container::{self, fourcc};
 
 /// The committed 128×128 extended-lossy fixture (`VP8 ` + `ALPH`). The

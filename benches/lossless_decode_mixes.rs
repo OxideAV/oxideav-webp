@@ -30,9 +30,9 @@
 //!   cargo bench -p oxideav-webp --bench lossless_decode_mixes -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_stream::TransformType;
-use oxideav_webp::{decode_rgba8, encode_rgba8, read_vp8l_transform_list, EncodeOptions};
+use oxideav_webp::{EncodeOptions, decode_rgba8, encode_rgba8, read_vp8l_transform_list};
 
 const W: u32 = 256;
 const H: u32 = 256;

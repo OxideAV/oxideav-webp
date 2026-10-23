@@ -15,7 +15,7 @@
 //! the caller hands over the extracted `VP8 ` bitstream; alpha is filled
 //! opaque (the `ALPH` plane is layered on by the caller).
 
-use oxideav_vp8::{decode_vp8, DecodeError, Vp8DecodedFrame};
+use oxideav_vp8::{DecodeError, Vp8DecodedFrame, decode_vp8};
 
 /// Decode a §2.5 `VP8 ` lossy bitstream (the `VP8 ` chunk payload, RFC
 /// 6386 §9.1 frame tag included) to `(width, height, rgba)` — packed
@@ -83,7 +83,9 @@ mod tests {
         let rgba = yuv420_to_rgba(&frame);
         assert_eq!(
             rgba,
-            vec![128, 128, 128, 0xff, 128, 128, 128, 0xff, 128, 128, 128, 0xff]
+            vec![
+                128, 128, 128, 0xff, 128, 128, 128, 0xff, 128, 128, 128, 0xff
+            ]
         );
     }
 

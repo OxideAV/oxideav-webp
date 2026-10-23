@@ -38,7 +38,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::{
-    build_animated_webp_with_options, decode_webp, AnimEncoderOptions, AnimFrame, AnimFrameMode,
+    AnimEncoderOptions, AnimFrame, AnimFrameMode, build_animated_webp_with_options, decode_webp,
 };
 
 /// Frame-dimension cap. Offsets are capped at 14 (7 × 2, kept even), so
@@ -152,7 +152,7 @@ fuzz_target!(|data: &[u8]| {
     // Independent §2.7.1.1 canvas simulation: bg-filled canvas, previous
     // frame's dispose applied before each render, per-frame blend.
     let mut canvas = vec![0u8; (canvas_w * canvas_h * 4) as usize];
-    for px in canvas.chunks_exact_mut(4) {
+    for px in canvas.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&background_rgba);
     }
     let mut prev_dispose: Option<(u32, u32, u32, u32)> = None;

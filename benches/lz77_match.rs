@@ -15,7 +15,7 @@
 //!   cargo bench -p oxideav-webp --bench lz77_match -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::encode_argb_literals_with_width;
 
 /// Build a 4096-pixel ARGB tile with a repeating 8-pixel period so the

@@ -70,7 +70,7 @@
 //! completes in microseconds regardless of input length.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::vp8l_prefix::{PrefixCode, MAX_CODE_LENGTH};
+use oxideav_webp::vp8l_prefix::{MAX_CODE_LENGTH, PrefixCode};
 use oxideav_webp::vp8l_stream::BitReader;
 
 /// §6.2.1 Kraft denominator: the sum of `2^(MAX_CODE_LENGTH - len)`

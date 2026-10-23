@@ -39,8 +39,8 @@
 //!   cargo bench -p oxideav-webp --bench stacked_transform_encode -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::{encode_rgba8, EncodeOptions};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use oxideav_webp::{EncodeOptions, encode_rgba8};
 
 /// 128×128 RGBA tile drawn from a fixed 8-colour palette in
 /// spatially-coherent horizontal bands. The small distinct-colour count makes

@@ -653,32 +653,32 @@ mod tests {
         w.write_bits(1, 1); // color-cache enabled
         w.write_bits(cache_bits, 4); // code_bits = 4
         w.write_bits(0, 1); // meta-prefix = 0 → single group
-                            // GREEN: simple, 1 symbol, is_first_8bits = 0 → 1-bit sym field
-                            // can't reach 295. Force the 8-bit form, but 8 bits only reach
-                            // 255 — so use two symbols, first 8-bit symbol = 255, second
-                            // 8-bit symbol = (extended_green - 256) → wait, no: simple-code
-                            // symbol is a *literal* index in [0..alphabet_size). We need
-                            // the actual two-stage 1/8-bit accommodation the simple code
-                            // can only express up to value 255. For larger values we must
-                            // use the normal code length code. So instead exercise the
-                            // alphabet by reading a normal code that covers an extended
-                            // alphabet without actually emitting a wide symbol.
-                            //
-                            // Simpler check: read a GREEN code with a 2-symbol normal CLC
-                            // that emits lengths only for symbols 0 and 1, then RED/BLUE/
-                            // ALPHA/DIST as simple single-symbol codes. The point is just
-                            // that the alphabet size is propagated; the read uses the
-                            // value to size `lengths`.
-                            //
-                            // GREEN normal CLC with one symbol at length 1 (single-leaf):
-                            // flag=0 (normal), num_code_lengths=4 (=4+0), then 4 CLC
-                            // entries in kCodeLengthCodeOrder (17, 18, 0, 1). Set pos1=1
-                            // (literal len 1), everything else 0. max_symbol gate = 0
-                            // (alphabet_size). Then emit a code-18 zero-run to skip ahead
-                            // — but the simpler approach is: don't gate, and just emit a
-                            // single length-1 literal for symbol 0 plus a long code-18 run.
-                            //
-                            // Easiest test: use a *simple* GREEN code with symbol 0.
+        // GREEN: simple, 1 symbol, is_first_8bits = 0 → 1-bit sym field
+        // can't reach 295. Force the 8-bit form, but 8 bits only reach
+        // 255 — so use two symbols, first 8-bit symbol = 255, second
+        // 8-bit symbol = (extended_green - 256) → wait, no: simple-code
+        // symbol is a *literal* index in [0..alphabet_size). We need
+        // the actual two-stage 1/8-bit accommodation the simple code
+        // can only express up to value 255. For larger values we must
+        // use the normal code length code. So instead exercise the
+        // alphabet by reading a normal code that covers an extended
+        // alphabet without actually emitting a wide symbol.
+        //
+        // Simpler check: read a GREEN code with a 2-symbol normal CLC
+        // that emits lengths only for symbols 0 and 1, then RED/BLUE/
+        // ALPHA/DIST as simple single-symbol codes. The point is just
+        // that the alphabet size is propagated; the read uses the
+        // value to size `lengths`.
+        //
+        // GREEN normal CLC with one symbol at length 1 (single-leaf):
+        // flag=0 (normal), num_code_lengths=4 (=4+0), then 4 CLC
+        // entries in kCodeLengthCodeOrder (17, 18, 0, 1). Set pos1=1
+        // (literal len 1), everything else 0. max_symbol gate = 0
+        // (alphabet_size). Then emit a code-18 zero-run to skip ahead
+        // — but the simpler approach is: don't gate, and just emit a
+        // single length-1 literal for symbol 0 plus a long code-18 run.
+        //
+        // Easiest test: use a *simple* GREEN code with symbol 0.
         w.write_simple_single_symbol(0); // GREEN sym = 0
         w.write_simple_single_symbol(10); // RED
         w.write_simple_single_symbol(20); // BLUE

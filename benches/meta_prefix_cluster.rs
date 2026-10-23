@@ -55,7 +55,7 @@
 //!   cargo bench -p oxideav-webp --bench meta_prefix_cluster -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::cluster_blocks_by_histogram_distance;
 
 /// Encoder-default §6.2.2 entropy-image block size: `prefix_bits = 4`

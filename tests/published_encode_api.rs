@@ -17,8 +17,8 @@
 #![allow(deprecated)]
 
 use oxideav_webp::{
-    decode_webp, encode_vp8l_argb, encode_vp8l_argb_with, encode_vp8l_argb_with_metadata,
-    extract_metadata, WebpMetadata,
+    WebpMetadata, decode_webp, encode_vp8l_argb, encode_vp8l_argb_with,
+    encode_vp8l_argb_with_metadata, extract_metadata,
 };
 
 /// Build a deterministic `width * height` ARGB ramp (packed

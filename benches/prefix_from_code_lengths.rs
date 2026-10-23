@@ -55,7 +55,7 @@
 //!   cargo bench -p oxideav-webp --bench prefix_from_code_lengths -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::build_code_lengths;
 use oxideav_webp::vp8l_prefix::PrefixCode;
 

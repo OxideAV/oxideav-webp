@@ -124,8 +124,8 @@
 //! the success path of the two façades under test.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::{container, decode_webp, decode_webp_image, DecodedWebp};
-use oxideav_webp_fuzz::{declared_pixel_load, MAX_DECLARED_PIXELS};
+use oxideav_webp::{DecodedWebp, container, decode_webp, decode_webp_image};
+use oxideav_webp_fuzz::{MAX_DECLARED_PIXELS, declared_pixel_load};
 
 /// Re-check the §2.5 / §2.6 flat-buffer carrier invariant on a decoded
 /// still image: `rgba.len() == width * height * 4`, non-empty iff both

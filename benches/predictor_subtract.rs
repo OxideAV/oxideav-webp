@@ -35,7 +35,7 @@
 //!   cargo bench -p oxideav-webp --bench predictor_subtract -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::predictor_subtract;
 
 const W: usize = 256;

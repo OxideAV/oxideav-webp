@@ -4,6 +4,10 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
 
 ### Other

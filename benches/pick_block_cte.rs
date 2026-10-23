@@ -33,7 +33,7 @@
 //!   cargo bench -p oxideav-webp --bench pick_block_cte -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::pick_block_cte;
 
 /// Image side (pixels). 256×256 matches the `lossless_encode` /

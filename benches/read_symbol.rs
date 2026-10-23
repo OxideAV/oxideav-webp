@@ -72,8 +72,8 @@
 //!   cargo bench -p oxideav-webp --bench read_symbol -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use oxideav_webp::vp8l_encode::{build_code_lengths, canonical_codes, BitWriter};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use oxideav_webp::vp8l_encode::{BitWriter, build_code_lengths, canonical_codes};
 use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::BitReader;
 
@@ -117,9 +117,9 @@ fn lengths_uniform8() -> Vec<u8> {
 /// 0.75 + 0.125 + 0.125 = 1.
 fn lengths_long9_11() -> Vec<u8> {
     let mut l = Vec::with_capacity(768);
-    l.extend(std::iter::repeat(9u8).take(384));
-    l.extend(std::iter::repeat(10u8).take(128));
-    l.extend(std::iter::repeat(11u8).take(256));
+    l.extend(std::iter::repeat_n(9u8, 384));
+    l.extend(std::iter::repeat_n(10u8, 128));
+    l.extend(std::iter::repeat_n(11u8, 256));
     l
 }
 
@@ -176,7 +176,7 @@ fn pack_stream(lengths: &[u8]) -> Vec<u8> {
     let used: Vec<usize> = lengths
         .iter()
         .enumerate()
-        .filter(|(_, &l)| l > 0)
+        .filter(|&(_, &l)| l > 0)
         .map(|(s, _)| s)
         .collect();
     debug_assert!(!used.is_empty(), "length table has no used symbols");

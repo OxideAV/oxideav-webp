@@ -27,7 +27,7 @@
 //!   cargo bench -p oxideav-webp --bench inverse_color_indexing -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_transform::inverse_color_indexing;
 
 const W: u32 = 256;

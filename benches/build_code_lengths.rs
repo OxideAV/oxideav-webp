@@ -58,7 +58,7 @@
 //!   cargo bench -p oxideav-webp --bench build_code_lengths -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::build_code_lengths;
 
 /// Deterministic LCG fill matching the constants used across the §4.x

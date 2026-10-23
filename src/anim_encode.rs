@@ -341,7 +341,7 @@ pub(crate) fn build_animation(
                 .ok_or_else(|| WebpError::invalid("animation frame y + height overflows"))?;
         canvas_width = canvas_width.max(right);
         canvas_height = canvas_height.max(bottom);
-        if f.pixels.chunks_exact(4).any(|px| px[3] != 0xff) {
+        if f.pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0xff) {
             any_alpha = true;
         }
     }
@@ -742,7 +742,7 @@ fn emit_full_anmf(
     pixels: &[u8],
 ) -> Result<Vec<u8>, WebpError> {
     let argb = rgba_to_argb(pixels);
-    let has_alpha = pixels.chunks_exact(4).any(|px| px[3] != 0xff);
+    let has_alpha = pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0xff);
     let bitstream =
         vp8l_encode::encode_vp8l_argb_with(&argb, w, h, has_alpha).map_err(WebpError::from)?;
     let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
@@ -768,7 +768,7 @@ fn emit_full_anmf(
 /// [`build_anmf_payload_with_prev`]), so `D = 0` *is* the caller's flag.
 fn emit_dirty_anmf(f: &AnimFrame, rect: DirtyRect, sub_rgba: &[u8]) -> Result<Vec<u8>, WebpError> {
     let argb = rgba_to_argb(sub_rgba);
-    let has_alpha = sub_rgba.chunks_exact(4).any(|px| px[3] != 0xff);
+    let has_alpha = sub_rgba.as_chunks::<4>().0.iter().any(|px| px[3] != 0xff);
     let bitstream = vp8l_encode::encode_vp8l_argb_with(&argb, rect.w, rect.h, has_alpha)
         .map_err(WebpError::from)?;
     let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
@@ -826,7 +826,9 @@ fn push_u24_le(out: &mut Vec<u8>, v: u32) {
 /// Repack interleaved `[R, G, B, A]` bytes into packed ARGB
 /// (`(a<<24)|(r<<16)|(g<<8)|b`) — the layout the VP8L encoder consumes.
 fn rgba_to_argb(rgba: &[u8]) -> Vec<u32> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .map(|px| {
             let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
             (a << 24) | (r << 16) | (g << 8) | b

@@ -20,13 +20,13 @@
 
 use oxideav_webp::alph::{AlphCompression, AlphFiltering, AlphPreprocessing};
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
-use oxideav_webp::build::{build_chunk, ImageKind, Vp8xFlags};
+use oxideav_webp::build::{ImageKind, Vp8xFlags, build_chunk};
 use oxideav_webp::container::fourcc;
 use oxideav_webp::meta_prefix::{ImageRole, MetaPrefixCodes, MetaPrefixHeader};
-use oxideav_webp::vp8_chunk::{WebpLossyChunk, VP8_KEYFRAME_HEADER_LEN};
-use oxideav_webp::vp8l_chunk::{WebpLosslessChunk, VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE};
+use oxideav_webp::vp8_chunk::{VP8_KEYFRAME_HEADER_LEN, WebpLossyChunk};
+use oxideav_webp::vp8l_chunk::{VP8L_IMAGE_HEADER_LEN, VP8L_SIGNATURE, WebpLosslessChunk};
 use oxideav_webp::vp8l_decode::{
-    decode_argb, decode_entropy_image, decode_image, DecodeError, MetaPrefixIndex,
+    DecodeError, MetaPrefixIndex, decode_argb, decode_entropy_image, decode_image,
 };
 use oxideav_webp::vp8l_prefix::PrefixCode;
 use oxideav_webp::vp8l_stream::{BitReader, Transform, TransformList, TransformType};
@@ -1005,7 +1005,7 @@ fn round106_meta_prefix_argb_multi_group_records_entropy_image_boundary() {
     write_bits(&mut bytes, &mut bit_pos, 0, 1); // color-cache=0
     write_bits(&mut bytes, &mut bit_pos, 1, 1); // meta-prefix=1
     write_bits(&mut bytes, &mut bit_pos, 2, 3); // prefix_bits raw=2 → 4
-                                                // pad another byte so the bit reader has slack past the boundary.
+    // pad another byte so the bit reader has slack past the boundary.
     bytes.push(0);
 
     let mut reader = BitReader::new(&bytes);
@@ -1152,7 +1152,7 @@ fn round108_decode_argb_multi_group_through_public_api() {
     w.write_bits(0, 1); // main color-cache-info = disabled
     w.write_bits(1, 1); // meta-prefix = 1 → multi-group
     w.write_bits(0, 3); // prefix_bits raw = 0 → 2 (block 4)
-                        // entropy image: 2×1 entropy-coded-image
+    // entropy image: 2×1 entropy-coded-image
     w.write_bits(0, 1); // entropy color-cache-info = disabled
     w.simple_two(0, 1); // GREEN {0, 1}
     w.simple_single(0); // RED
@@ -1161,7 +1161,7 @@ fn round108_decode_argb_multi_group_through_public_api() {
     w.simple_single(0); // DIST
     w.write_bits(0, 1); // entropy pixel 0 GREEN = 0 → meta-code 0
     w.write_bits(1, 1); // entropy pixel 1 GREEN = 1 → meta-code 1
-                        // 2 prefix-code groups
+    // 2 prefix-code groups
     w.group_single(111, 0x10, 0x20, 0x30, 0);
     w.group_single(222, 0x40, 0x50, 0x60, 0);
     // main image data: 8 single-symbol literals → no bits.
@@ -1467,7 +1467,7 @@ fn round124_decode_webp_lossy_with_alpha_decodes_to_128x128() {
     );
     // The fixture's ALPH chunk decodes a non-trivial alpha plane, so at
     // least one pixel must be non-opaque (the alpha override took effect).
-    let has_transparency = frame.rgba.chunks_exact(4).any(|p| p[3] != 0xff);
+    let has_transparency = frame.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0xff);
     assert!(
         has_transparency,
         "ALPH plane should have introduced transparency"
@@ -1534,12 +1534,14 @@ fn round115_encoded_file_is_a_well_formed_simple_lossless_container() {
     let file = encode_webp_lossless(&original.rgba, original.width, original.height).unwrap();
     // RIFF/WEBP framing with a single VP8L chunk, no VP8X.
     let c = parse_container(&file).expect("encoded file walks");
-    assert!(c
-        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8L)
-        .is_some());
-    assert!(c
-        .first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8X)
-        .is_none());
+    assert!(
+        c.first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8L)
+            .is_some()
+    );
+    assert!(
+        c.first_chunk_with_fourcc(oxideav_webp::container::fourcc::VP8X)
+            .is_none()
+    );
     // The typed lossless chunk handle agrees on the dimensions.
     let chunk = extract_lossless_chunk(&file).unwrap().unwrap();
     assert_eq!(chunk.width(), original.width);
@@ -1713,7 +1715,7 @@ fn round322_lossless_32x32_rgb_carries_synthetic_opaque_alpha() {
     let img = decode_webp(LOSSLESS_32X32_RGB).expect("rgb fixture decodes");
     let f = &img.frames[0];
     assert!(
-        f.rgba.chunks_exact(4).all(|p| p[3] == 0xff),
+        f.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0xff),
         "every alpha byte is opaque for an RGB lossless file"
     );
 }
@@ -1825,7 +1827,7 @@ fn round327_animated_3_frames_rgb_decodes_three_distinct_frames_to_expected_pngs
         }
         // Every pixel is fully opaque (RGB source, alpha synthesised 0xff).
         assert!(
-            f.rgba.chunks_exact(4).all(|p| p[3] == 0xff),
+            f.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0xff),
             "frame {i} alpha is opaque everywhere"
         );
     }

@@ -4,10 +4,10 @@
 //! New code uses [`crate::info`] (presence flags) or
 //! [`crate::decode`]`(..).metadata` (payloads).
 
-pub use crate::{info, read_metadata, ImageInfo, Metadata};
+pub use crate::{ImageInfo, Metadata, info, read_metadata};
 
 #[allow(deprecated)]
-pub use crate::{extract_metadata, WebpFileMetadata};
+pub use crate::{WebpFileMetadata, extract_metadata};
 
 /// Result alias for this module's entry points — `Result<T, WebpError>`.
 pub use crate::error::Result;

@@ -24,7 +24,7 @@
 //!   cargo bench -p oxideav-webp --bench inverse_subtract_green -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_transform::inverse_subtract_green;
 
 const W: usize = 256;

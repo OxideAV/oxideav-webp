@@ -73,7 +73,7 @@
 //!   cargo bench -p oxideav-webp --bench distance_code -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::pixel_distance_to_distance_code;
 
 /// Per-`b.iter` inner-loop length. Sized so the 120-iteration scan

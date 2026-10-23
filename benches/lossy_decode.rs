@@ -48,7 +48,7 @@
 //!   cargo bench -p oxideav-webp --bench lossy_decode -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_vp8::Vp8DecodedFrame;
 use oxideav_webp::container::{self, fourcc};
 use oxideav_webp::vp8_chunk::WebpLossyChunk;

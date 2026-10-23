@@ -4,13 +4,13 @@
 //! New code uses [`crate::encode_animation`] with [`crate::EncodeOptions`].
 
 pub use crate::{
-    encode_animation, encode_animation_frames, AnimFrame, AnimFrameMode, DeltaConfig,
-    DownsampleKernel, EncodeOptions, Frame,
+    AnimFrame, AnimFrameMode, DeltaConfig, DownsampleKernel, EncodeOptions, Frame,
+    encode_animation, encode_animation_frames,
 };
 
 #[allow(deprecated)]
 pub use crate::anim_encode::{
-    build_animated_webp, build_animated_webp_with_options, AnimEncoderOptions,
+    AnimEncoderOptions, build_animated_webp, build_animated_webp_with_options,
 };
 
 /// Result alias for this module's entry points — `Result<T, WebpError>`.

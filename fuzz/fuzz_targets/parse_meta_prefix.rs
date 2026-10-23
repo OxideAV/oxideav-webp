@@ -127,8 +127,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_webp::meta_prefix::{
-    ColorCacheInfo, ImageRole, MetaPrefixCodes, MetaPrefixError, MetaPrefixHeader,
-    COLOR_CACHE_BITS_MAX, COLOR_CACHE_BITS_MIN, PREFIX_BITS_MAX, PREFIX_BITS_MIN,
+    COLOR_CACHE_BITS_MAX, COLOR_CACHE_BITS_MIN, ColorCacheInfo, ImageRole, MetaPrefixCodes,
+    MetaPrefixError, MetaPrefixHeader, PREFIX_BITS_MAX, PREFIX_BITS_MIN,
 };
 use oxideav_webp::vp8l_stream::BitReader;
 
@@ -168,7 +168,8 @@ fuzz_target!(|data: &[u8]| {
             // in the compliant `[1, 11]` range (enabled).
             let code_bits = header.color_cache.code_bits;
             assert!(
-                code_bits == 0 || (COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&code_bits),
+                code_bits == 0
+                    || (COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).contains(&code_bits),
                 "§5.2.3 ColorCacheInfo.code_bits {code_bits} must be 0 or in [{COLOR_CACHE_BITS_MIN}, {COLOR_CACHE_BITS_MAX}]",
             );
 

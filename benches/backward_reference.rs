@@ -48,7 +48,7 @@
 //!   cargo bench -p oxideav-webp --bench backward_reference -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_decode::apply_backward_reference;
 
 /// One backward-reference run: §5.2.2 length `L` and scan-line pixel

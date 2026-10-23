@@ -515,7 +515,7 @@ impl WebpImage {
         let h = self.height as usize;
         let mut out = vec![0u8; w * h * out_bpp];
         if out_bpp == 4 {
-            for px in out.chunks_exact_mut(4) {
+            for px in out.as_chunks_mut::<4>().0 {
                 px[3] = 0xff;
             }
         }
@@ -789,13 +789,15 @@ mod tests {
             vec![Plane::new(5, vec![0; 6])],
         ));
         // The last row may be unpadded.
-        assert!(WebpImage::new(
-            1,
-            2,
-            WebpPixelFormat::Rgba,
-            vec![Plane::new(8, vec![0; 12])]
-        )
-        .is_ok());
+        assert!(
+            WebpImage::new(
+                1,
+                2,
+                WebpPixelFormat::Rgba,
+                vec![Plane::new(8, vec![0; 12])]
+            )
+            .is_ok()
+        );
         assert!(WebpImage::from_rgba8(2, 2, vec![0; 16]).is_ok());
     }
 

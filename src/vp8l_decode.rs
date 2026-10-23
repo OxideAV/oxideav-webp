@@ -86,8 +86,8 @@
 //! of the entropy-image pixel: `(entropy_pixel >> 8) & 0xffff`.
 
 use crate::meta_prefix::{
-    ImageRole, MetaPrefixCodes, MetaPrefixError, MetaPrefixHeader, PrefixCodeGroup,
-    PREFIX_BITS_MAX, PREFIX_BITS_MIN,
+    ImageRole, MetaPrefixCodes, MetaPrefixError, MetaPrefixHeader, PREFIX_BITS_MAX,
+    PREFIX_BITS_MIN, PrefixCodeGroup,
 };
 use crate::vp8l_prefix::PrefixError;
 use crate::vp8l_stream::{BitReader, BitReaderEof};
@@ -592,11 +592,7 @@ pub fn distance_code_to_pixel_distance(distance_code: u32, image_width: u32) -> 
     // distance_code is in 1..=120 here.
     let (xi, yi) = DISTANCE_MAP[(distance_code - 1) as usize];
     let dist = xi + yi * image_width as i32;
-    if dist < 1 {
-        1
-    } else {
-        dist as usize
-    }
+    if dist < 1 { 1 } else { dist as usize }
 }
 
 /// §5.2.2: assemble a single backward-reference run into the decoded
@@ -2035,7 +2031,7 @@ mod tests {
         // Pixel 1: green=1, red=0 → meta-code 1. (meta = (red<<8)|green.)
         let mut w = BitWriter::new();
         w.write_bits(0, 1); // entropy-image color-cache-info = disabled
-                            // GREEN code carries greens {0, 1}; RED/BLUE/ALPHA/DIST single 0.
+        // GREEN code carries greens {0, 1}; RED/BLUE/ALPHA/DIST single 0.
         w.write_simple_two_symbols(0, 1); // GREEN: 0 → bit 0, 1 → bit 1
         w.write_simple_single_symbol(0); // RED  = 0
         w.write_simple_single_symbol(0); // BLUE = 0
@@ -2081,7 +2077,7 @@ mod tests {
         w.write_bits(0, 1); // main color-cache-info = disabled
         w.write_bits(1, 1); // meta-prefix = 1 → multiple groups
         w.write_bits(0, 3); // prefix_bits raw = 0 → 2 (block 4)
-                            // --- entropy image (2x1 entropy-coded-image) ---
+        // --- entropy image (2x1 entropy-coded-image) ---
         w.write_bits(0, 1); // entropy color-cache-info = disabled
         w.write_simple_two_symbols(0, 1); // GREEN {0,1}
         w.write_simple_single_symbol(0); // RED
@@ -2090,10 +2086,10 @@ mod tests {
         w.write_simple_single_symbol(0); // DIST
         w.write_bits(0, 1); // entropy pixel 0 GREEN = 0 → meta 0
         w.write_bits(1, 1); // entropy pixel 1 GREEN = 1 → meta 1
-                            // --- num_prefix_groups = 2 prefix-code groups ---
+        // --- num_prefix_groups = 2 prefix-code groups ---
         w.write_single_symbol_group(100, 0x10, 0x20, 0x30, 0); // group 0
         w.write_single_symbol_group(200, 0x40, 0x50, 0x60, 0); // group 1
-                                                               // --- main image data: 8 single-symbol literals, no bits ---
+        // --- main image data: 8 single-symbol literals, no bits ---
         let data = w.into_bytes();
         let mut r = BitReader::new(&data);
         let img = decode_argb(&mut r, 8, 1).unwrap();
@@ -2162,7 +2158,7 @@ mod tests {
         w.write_bits(cache_bits, 4); // code_bits = 4
         w.write_bits(1, 1); // meta-prefix = 1 → multi
         w.write_bits(0, 3); // prefix_bits → 2 (block 4)
-                            // entropy image 2x1, codes {0, 1}, no cache.
+        // entropy image 2x1, codes {0, 1}, no cache.
         w.write_bits(0, 1);
         w.write_simple_two_symbols(0, 1);
         w.write_simple_single_symbol(0);
@@ -2171,7 +2167,7 @@ mod tests {
         w.write_simple_single_symbol(0);
         w.write_bits(0, 1); // entropy pixel 0 → meta 0
         w.write_bits(1, 1); // entropy pixel 1 → meta 1
-                            // 2 prefix-code groups, sized against the main cache.
+        // 2 prefix-code groups, sized against the main cache.
         w.write_single_symbol_group(50, 0x11, 0x22, 0x33, 0);
         w.write_single_symbol_group(60, 0x44, 0x55, 0x66, 0);
         let data = w.into_bytes();
@@ -2238,7 +2234,7 @@ mod tests {
         w.write_bits(0, 1); // §5.2.3 main color-cache-info = disabled
         w.write_bits(1, 1); // §6.2.2 meta-prefix = 1 → multiple groups
         w.write_bits(0, 3); // §6.2.2 prefix_bits raw = 0 → 2 (block 4)
-                            // §6.2.2 entropy image (2x1 entropy-coded-image)
+        // §6.2.2 entropy image (2x1 entropy-coded-image)
         w.write_bits(0, 1); // entropy color-cache-info = disabled
         w.write_simple_two_symbols(0, 1); // GREEN {0,1}
         w.write_simple_single_symbol(0); // RED
@@ -2247,7 +2243,7 @@ mod tests {
         w.write_simple_single_symbol(0); // DIST
         w.write_bits(0, 1); // entropy pixel 0 GREEN = 0 → meta 0
         w.write_bits(1, 1); // entropy pixel 1 GREEN = 1 → meta 1
-                            // num_prefix_groups = 2 prefix-code groups
+        // num_prefix_groups = 2 prefix-code groups
         w.write_single_symbol_group(100, 0x10, 0x20, 0x30, 0);
         w.write_single_symbol_group(200, 0x40, 0x50, 0x60, 0);
         // main image data: 8 single-symbol literals, no bits.
@@ -2363,17 +2359,17 @@ mod tests {
         w.write_bits(0, 1); // color-cache disabled
         w.write_bits(1, 1); // meta-prefix = 1 → multiple groups
         w.write_bits(7, 3); // prefix_bits raw 7 → derived 9 → block 512
-                            // For a 1x1 image with block 512, the entropy image
-                            // dimensions are (1+511)/512 = 1, so we still need
-                            // a valid entropy image. Make it minimal: one
-                            // single-meta-code pixel = 0.
+        // For a 1x1 image with block 512, the entropy image
+        // dimensions are (1+511)/512 = 1, so we still need
+        // a valid entropy image. Make it minimal: one
+        // single-meta-code pixel = 0.
         w.write_bits(0, 1); // entropy color-cache disabled
         w.write_simple_single_symbol(0); // GREEN single 0
         w.write_simple_single_symbol(0); // RED
         w.write_simple_single_symbol(0); // BLUE
         w.write_simple_single_symbol(0); // ALPHA
         w.write_simple_single_symbol(0); // DIST
-                                         // One prefix-code group (max = 0 → count = 1).
+        // One prefix-code group (max = 0 → count = 1).
         w.write_single_symbol_group(0x77, 0, 0, 0, 0);
         let data = w.into_bytes();
         let mut r = BitReader::new(&data);

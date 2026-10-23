@@ -9,6 +9,6 @@
 //! types.
 
 pub use crate::build::{
-    build_chunk, build_vp8x_chunk, build_webp_file, BuildError, ImageKind, Vp8xFlags,
+    BuildError, ImageKind, Vp8xFlags, build_chunk, build_vp8x_chunk, build_webp_file,
 };
-pub use crate::container::{fourcc, parse, ContainerError, FourCc, WebpChunk, WebpContainer};
+pub use crate::container::{ContainerError, FourCc, WebpChunk, WebpContainer, fourcc, parse};

@@ -95,12 +95,12 @@ fuzz_target!(|data: &[u8]| {
                     return;
                 }
             }
-        } else if let Some(vp8) = c.first_chunk_with_fourcc(container::fourcc::VP8) {
-            if let Ok(hdr) = vp8_chunk::WebpLossyChunk::from_payload(vp8.payload(data)) {
-                let pixels = u64::from(hdr.width()) * u64::from(hdr.height());
-                if pixels > MAX_DECODE_PIXELS {
-                    return;
-                }
+        } else if let Some(vp8) = c.first_chunk_with_fourcc(container::fourcc::VP8)
+            && let Ok(hdr) = vp8_chunk::WebpLossyChunk::from_payload(vp8.payload(data))
+        {
+            let pixels = u64::from(hdr.width()) * u64::from(hdr.height());
+            if pixels > MAX_DECODE_PIXELS {
+                return;
             }
         }
     }

@@ -89,7 +89,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_webp::vp8l_decode::{
-    distance_code_to_pixel_distance, DISTANCE_MAP, NUM_DISTANCE_MAP_CODES,
+    DISTANCE_MAP, NUM_DISTANCE_MAP_CODES, distance_code_to_pixel_distance,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -110,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
     // wire encoding never produces it; the pure function would index
     // DISTANCE_MAP at `u32::MAX as usize` after the unchecked
     // subtraction).
-    for chunk in data[4..].chunks_exact(4) {
+    for chunk in data[4..].as_chunks::<4>().0 {
         let raw_code = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let distance_code = raw_code.max(1);
         check_one(distance_code, image_width);

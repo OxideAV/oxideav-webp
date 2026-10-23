@@ -100,7 +100,9 @@ fuzz_target!(|data: &[u8]| {
     // Supply the meta-prefix codes verbatim from the fuzz tail, cycled
     // to the requested count.
     let words: Vec<u16> = data[4..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     let exact = (block_width as usize) * (block_height as usize);

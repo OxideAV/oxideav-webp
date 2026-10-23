@@ -30,9 +30,9 @@
 //!   cargo bench -p oxideav-webp --bench anim_decode -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::decode_all;
-use oxideav_webp::{encode_animation_frames, AnimFrame, AnimFrameMode, EncodeOptions, Metadata};
+use oxideav_webp::{AnimFrame, AnimFrameMode, EncodeOptions, Metadata, encode_animation_frames};
 
 const W: u32 = 128;
 const H: u32 = 128;

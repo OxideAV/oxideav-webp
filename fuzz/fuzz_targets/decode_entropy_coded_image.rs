@@ -102,7 +102,7 @@
 //! `usize` across the slice so every read is clamped at the slice end.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::vp8l_decode::{decode_entropy_coded_image, decode_entropy_image, DecodeError};
+use oxideav_webp::vp8l_decode::{DecodeError, decode_entropy_coded_image, decode_entropy_image};
 use oxideav_webp::vp8l_stream::BitReader;
 
 fuzz_target!(|data: &[u8]| {

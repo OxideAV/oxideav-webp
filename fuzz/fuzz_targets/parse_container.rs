@@ -130,7 +130,7 @@
 //! is the right shape: pure byte-in, structured-result-out.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_webp::container::{fourcc, parse, ContainerError, WebpContainer};
+use oxideav_webp::container::{ContainerError, WebpContainer, fourcc, parse};
 
 fuzz_target!(|data: &[u8]| {
     match parse(data) {
@@ -543,7 +543,8 @@ fn check_err(buf: &[u8], err: &ContainerError) {
                 buf[*offset + 7],
             ]);
             assert_eq!(
-                *declared, on_disk_size,
+                *declared,
+                on_disk_size,
                 "§2.3 ChunkPayloadOverflowsRiff.declared {declared} must equal LE uint32 at buf[{}..{}] = {}",
                 *offset + 4,
                 *offset + 8,

@@ -51,7 +51,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxideav_webp::{build_animated_webp, decode_webp, encode_webp_lossless, AnimFrame};
+use oxideav_webp::{AnimFrame, build_animated_webp, decode_webp, encode_webp_lossless};
 
 // ──────────────────────────── shared utilities ──────────────────────────
 
@@ -351,20 +351,20 @@ fn parse_mux_info(stdout: &str) -> (u32, Vec<(u32, u32, u32)>) {
             // i.e. `<idx>:` then whitespace-separated numbers; we read
             // the first three after the colon as width / height / x_offset
             // and the sixth as duration.
-            if let Some((idx, rest)) = trimmed.split_once(':') {
-                if idx.trim().parse::<u32>().is_ok() {
-                    let cols: Vec<&str> = rest.split_whitespace().collect();
-                    if cols.len() >= 6 {
-                        // Defensive parse: skip non-numeric "alpha"/"yes"/"no"
-                        // column at index 2 — we only need cols 0/1 (w/h)
-                        // and 5 (duration).
-                        if let (Ok(w), Ok(h), Ok(dur)) = (
-                            cols[0].parse::<u32>(),
-                            cols[1].parse::<u32>(),
-                            cols[5].parse::<u32>(),
-                        ) {
-                            frames.push((w, h, dur));
-                        }
+            if let Some((idx, rest)) = trimmed.split_once(':')
+                && idx.trim().parse::<u32>().is_ok()
+            {
+                let cols: Vec<&str> = rest.split_whitespace().collect();
+                if cols.len() >= 6 {
+                    // Defensive parse: skip non-numeric "alpha"/"yes"/"no"
+                    // column at index 2 — we only need cols 0/1 (w/h)
+                    // and 5 (duration).
+                    if let (Ok(w), Ok(h), Ok(dur)) = (
+                        cols[0].parse::<u32>(),
+                        cols[1].parse::<u32>(),
+                        cols[5].parse::<u32>(),
+                    ) {
+                        frames.push((w, h, dur));
                     }
                 }
             }
@@ -536,8 +536,10 @@ fn direction_d_lossy_decode_matches_reference_nofancy_within_one() {
         let mut exact = 0usize;
         for (i, (a, b)) in ours
             .data
-            .chunks_exact(4)
-            .zip(theirs.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(theirs.as_chunks::<4>().0)
             .enumerate()
         {
             for k in 0..3 {
@@ -591,9 +593,11 @@ fn direction_e_our_lossy_encode_is_readable_by_reference_decoder() {
     let ours = oxideav_webp::decode_rgba8(&file).expect("our decode");
     let mut colour_err = 0u64;
     for (i, ((s, t), o)) in src
-        .chunks_exact(4)
-        .zip(theirs.chunks_exact(4))
-        .zip(ours.data.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(theirs.as_chunks::<4>().0)
+        .zip(ours.data.as_chunks::<4>().0)
         .enumerate()
     {
         assert_eq!(t[3], s[3], "pixel {i}: ALPH alpha must survive byte-exact");

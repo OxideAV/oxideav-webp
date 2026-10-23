@@ -51,7 +51,7 @@
 //!   cargo bench -p oxideav-webp --bench lz77_chain -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::encode_argb_literals_with_width;
 
 /// Pixels per tile. 8192 = 128 rows × 64 px; large enough that the

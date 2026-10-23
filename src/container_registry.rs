@@ -77,16 +77,16 @@ use std::io::{Read, SeekFrom, Write};
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ColorSignal, ContainerRegistry, Demuxer,
-    Error as CoreError, MediaType, Muxer, Packet, ProbeData, ProbeScore, ReadSeek,
-    Result as CoreResult, Rounding, StreamInfo, TimeBase, WriteSeek, MAX_PROBE_SCORE,
-    PROBE_SCORE_EXTENSION,
+    Error as CoreError, MAX_PROBE_SCORE, MediaType, Muxer, PROBE_SCORE_EXTENSION, Packet,
+    ProbeData, ProbeScore, ReadSeek, Result as CoreResult, Rounding, StreamInfo, TimeBase,
+    WriteSeek,
 };
 
 use crate::anim_encode::{build_anim_payload, build_anmf_header_then_data};
 use crate::anmf::{AnmfHeader, BlendingMethod, DisposalMethod};
-use crate::build::{build_chunk, build_vp8x_chunk, Vp8xFlags};
-use crate::container::{fourcc, FourCc, WebpChunk, WebpContainer};
-use crate::{WebpError, CODEC_ID_VP8, CODEC_ID_VP8L};
+use crate::build::{Vp8xFlags, build_chunk, build_vp8x_chunk};
+use crate::container::{FourCc, WebpChunk, WebpContainer, fourcc};
+use crate::{CODEC_ID_VP8, CODEC_ID_VP8L, WebpError};
 
 /// The §2.7.1.1 `Frame Duration` unit: milliseconds. Every packet and
 /// the stream use this time base.
@@ -239,10 +239,8 @@ pub fn open_demuxer(
             // §2.7 chunk order: VP8X, ICCP, ANIM, ANMF, EXIF, XMP.
             let mut body = Vec::new();
             body.extend_from_slice(&vp8x);
-            if first {
-                if let Some(ch) = iccp {
-                    body.extend_from_slice(ch);
-                }
+            if first && let Some(ch) = iccp {
+                body.extend_from_slice(ch);
             }
             body.extend_from_slice(&anim_chunk);
             body.extend_from_slice(raw_chunk(&buf, anmf));

@@ -24,8 +24,8 @@
 //!   cargo bench -p oxideav-webp --bench anim_encode -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::{encode_animation_frames, AnimFrame, AnimFrameMode, EncodeOptions, Metadata};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use oxideav_webp::{AnimFrame, AnimFrameMode, EncodeOptions, Metadata, encode_animation_frames};
 
 /// Canvas side (48 px keeps one full `Auto` sweep in the tens of
 /// milliseconds while still exercising multi-block predictor / LZ77

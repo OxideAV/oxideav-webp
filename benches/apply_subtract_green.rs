@@ -31,7 +31,7 @@
 //!   cargo bench -p oxideav-webp --bench apply_subtract_green -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_encode::apply_subtract_green;
 
 const W: usize = 256;

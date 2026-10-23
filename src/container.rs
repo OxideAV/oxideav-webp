@@ -487,9 +487,9 @@ mod tests {
         let mut bad = Vec::new();
         bad.extend_from_slice(b"VP8 ");
         bad.extend_from_slice(&100u32.to_le_bytes()); // declared size 100
-                                                      // Wrap in a §2.4 header that says File Size = 4 (just WEBP)
-                                                      // + 8 (the bad chunk header). The chunk's declared 100-byte
-                                                      // payload doesn't fit in the 0 remaining bytes.
+        // Wrap in a §2.4 header that says File Size = 4 (just WEBP)
+        // + 8 (the bad chunk header). The chunk's declared 100-byte
+        // payload doesn't fit in the 0 remaining bytes.
         let buf = webp(&bad);
         match parse(&buf) {
             Err(ContainerError::ChunkPayloadOverflowsRiff {

@@ -17,7 +17,7 @@
 // over the contract API for one release; they stay the regression gate.
 #![allow(deprecated)]
 
-use oxideav_webp::{decode_webp, encode_webp_lossless, WebpFrame};
+use oxideav_webp::{WebpFrame, decode_webp, encode_webp_lossless};
 
 /// Build a deterministic `width * height` RGBA8 ramp (no external input).
 fn make_rgba(width: u32, height: u32) -> Vec<u8> {

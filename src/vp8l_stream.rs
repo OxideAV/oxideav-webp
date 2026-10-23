@@ -838,11 +838,13 @@ mod tests {
         );
         assert!(Transform::Predictor { size_bits: 4 }.has_entropy_body());
         assert!(Transform::Color { size_bits: 4 }.has_entropy_body());
-        assert!(Transform::ColorIndexing {
-            color_table_size: 8,
-            width_bits: 1
-        }
-        .has_entropy_body());
+        assert!(
+            Transform::ColorIndexing {
+                color_table_size: 8,
+                width_bits: 1
+            }
+            .has_entropy_body()
+        );
         assert!(!Transform::SubtractGreen.has_entropy_body());
     }
 }

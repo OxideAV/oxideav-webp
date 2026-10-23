@@ -41,7 +41,7 @@
 //! No `oxideav-core` runtime dependency — this module compiles under
 //! `--no-default-features`.
 
-use crate::vp8l_decode::{decode_argb, decode_entropy_coded_image, DecodeError, DecodedImage};
+use crate::vp8l_decode::{DecodeError, DecodedImage, decode_argb, decode_entropy_coded_image};
 use crate::vp8l_stream::{BitReader, TransformType};
 
 /// `DIV_ROUND_UP(num, den)` from §4.1 (`((num) + (den) - 1) / (den)`).
@@ -160,11 +160,7 @@ fn select(l: u32, t: u32, tl: u32) -> u32 {
         + (red(l) as i32 - red(tl) as i32).abs()
         + (green(l) as i32 - green(tl) as i32).abs()
         + (blue(l) as i32 - blue(tl) as i32).abs();
-    if p_l < p_t {
-        l
-    } else {
-        t
-    }
+    if p_l < p_t { l } else { t }
 }
 
 /// §4.1: compute the prediction for `mode` `[0..13]` given the four
@@ -528,10 +524,10 @@ pub fn inverse_subtract_green(pixels: &mut [u32]) {
         // green delta).
         let g = (p >> 8) & 0xff;
         let mask = (g << 16) | g; // 0x00gg00gg
-                                  // Add the broadcast green into the [r, b] lanes using the
-                                  // `add_pred`-style SWAR pattern. `mask` only lives in the
-                                  // 0x00ff00ff lane group, so carry never enters the green or
-                                  // alpha lanes.
+        // Add the broadcast green into the [r, b] lanes using the
+        // `add_pred`-style SWAR pattern. `mask` only lives in the
+        // 0x00ff00ff lane group, so carry never enters the green or
+        // alpha lanes.
         let lo = (p & 0x00ff_00ff).wrapping_add(mask) & 0x00ff_00ff;
         let hi = p & 0xff00_ff00; // alpha + green unchanged
         *px = lo | hi;
@@ -941,11 +937,7 @@ mod tests {
                 + (p_red - red(t) as i32).abs()
                 + (p_green - green(t) as i32).abs()
                 + (p_blue - blue(t) as i32).abs();
-            if p_l < p_t {
-                l
-            } else {
-                t
-            }
+            if p_l < p_t { l } else { t }
         }
         // Hand-picked boundary triples: tl == t (forces p_l = 0 path),
         // tl == l (forces p_t = 0 path), all-equal (tie → returns t),
@@ -1072,7 +1064,7 @@ mod tests {
         // After add_pred, pixels[D] = residual_D + A (per channel).
         let a_after = pack_argb(255, 100, 50, 25); // value of A after decode
         let res_d = pack_argb(0, 1, 2, 3); // residual for D
-                                           // Predictor image: 1 block, mode 3 (TR).
+        // Predictor image: 1 block, mode 3 (TR).
         let pred_img = vec![pack_argb(0, 0, 3, 0)];
         // Set up so that pixel A decodes to `a_after`. A is the
         // top-left pixel so its prediction is 0xff00_0000; with

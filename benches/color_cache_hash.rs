@@ -66,7 +66,7 @@
 //!   cargo bench -p oxideav-webp --bench color_cache_hash -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_decode::ColorCache;
 
 /// Deterministic LCG fill matching the constants used across the §3.x

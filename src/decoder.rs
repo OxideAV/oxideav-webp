@@ -4,16 +4,16 @@
 //! New code uses the crate root ([`crate::decode`], [`crate::decode_all`],
 //! [`crate::WebpImage`]); this module only keeps the old paths resolving.
 
-pub use crate::{decode, decode_all, decode_rgb8, decode_rgba8, decode_with, Frame, WebpImage};
+pub use crate::{Frame, WebpImage, decode, decode_all, decode_rgb8, decode_rgba8, decode_with};
 
 #[allow(deprecated)]
-pub use crate::{decode_webp, DecodedWebpFile, WebpFrame};
+pub use crate::{DecodedWebpFile, WebpFrame, decode_webp};
 
 /// Result alias for this module's entry points — `Result<T, WebpError>`.
 pub use crate::error::Result;
 
 #[cfg(feature = "registry")]
-pub use crate::registry::{make_decoder, WebpDecoder};
+pub use crate::registry::{WebpDecoder, make_decoder};
 
 /// Direct factory for a framework [`WebpDecoder`] whose output parameters
 /// start from the given canvas dimensions — the dual-API convenience

@@ -17,8 +17,8 @@
 //!   cargo bench -p oxideav-webp --bench lossless_encode -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use oxideav_webp::{decode_rgba8, encode_rgba8, EncodeOptions};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use oxideav_webp::{EncodeOptions, decode_rgba8, encode_rgba8};
 
 /// Build a 256×256 RGBA gradient. `(x, y)` → `(x, y, (x ^ y), 0xff)`.
 fn gradient_rgba_256() -> Vec<u8> {

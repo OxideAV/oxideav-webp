@@ -19,8 +19,8 @@
 
 use oxideav_webp::anmf::{BlendingMethod, DisposalMethod};
 use oxideav_webp::{
-    build_animated_webp, build_animated_webp_with_options, decode_webp, AnimEncoderOptions,
-    AnimFrame, AnimFrameMode, DeltaConfig, DownsampleKernel, WebpError, WebpMetadata,
+    AnimEncoderOptions, AnimFrame, AnimFrameMode, DeltaConfig, DownsampleKernel, WebpError,
+    WebpMetadata, build_animated_webp, build_animated_webp_with_options, decode_webp,
 };
 
 /// Build a deterministic `width * height` RGBA ramp seeded by `seed` so each

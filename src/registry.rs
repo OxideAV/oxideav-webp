@@ -25,8 +25,8 @@ use oxideav_core::{
 };
 
 use crate::{
-    ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Metadata, Plane, WebpError, WebpImage,
-    WebpMetadataOwned, WebpPixelFormat, CODEC_ID_VP8L,
+    CODEC_ID_VP8L, ColorInfo, ColorRange, DecodeOptions, EncodeOptions, Metadata, Plane, WebpError,
+    WebpImage, WebpMetadataOwned, WebpPixelFormat,
 };
 
 /// Stable on-wire identifier this crate registers under in the codec
@@ -166,10 +166,10 @@ impl WebpImage {
             .map(|p| Plane::new(p.stride, p.data.clone()))
             .collect();
         let mut img = WebpImage::new(width, height, format, planes)?;
-        if let Some(sig) = frame.color_signal() {
-            if !sig.is_unspecified() {
-                img.color = sig.into();
-            }
+        if let Some(sig) = frame.color_signal()
+            && !sig.is_unspecified()
+        {
+            img.color = sig.into();
         }
         Ok(img)
     }
@@ -849,9 +849,10 @@ mod tests {
         enc.send_frame(&frame).unwrap();
         let pkt = enc.receive_packet().unwrap();
         let c = crate::parse_container(&pkt.data).unwrap();
-        assert!(c
-            .first_chunk_with_fourcc(crate::container::fourcc::VP8X)
-            .is_none());
+        assert!(
+            c.first_chunk_with_fourcc(crate::container::fourcc::VP8X)
+                .is_none()
+        );
         assert_eq!(crate::decode_rgb8(&pkt.data).unwrap().data, data);
     }
 

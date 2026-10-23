@@ -111,7 +111,12 @@ impl Vp8lImage {
     pub fn to_rgba_scalar(&self) -> Vec<u8> {
         let n = self.pixels.len();
         let mut out = vec![0u8; n * 4];
-        for (chunk, &argb) in out.chunks_exact_mut(4).zip(self.pixels.iter()) {
+        for (chunk, &argb) in out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.pixels.iter())
+        {
             // [R, G, B, A] order, matching `oxideav_core::PixelFormat::Rgba`.
             chunk[0] = (argb >> 16) as u8;
             chunk[1] = (argb >> 8) as u8;
@@ -164,7 +169,12 @@ impl Vp8lImage {
         }
         // Tail (0..3 pixels): scalar repack.
         let tail_pixels = &self.pixels[(n / 4) * 4..];
-        for (chunk, &argb) in out[main_len..].chunks_exact_mut(4).zip(tail_pixels.iter()) {
+        for (chunk, &argb) in out[main_len..]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(tail_pixels.iter())
+        {
             chunk[0] = (argb >> 16) as u8;
             chunk[1] = (argb >> 8) as u8;
             chunk[2] = argb as u8;

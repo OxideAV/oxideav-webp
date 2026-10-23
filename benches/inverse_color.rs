@@ -19,7 +19,7 @@
 //!   cargo bench -p oxideav-webp --bench inverse_color -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::vp8l_transform::inverse_color;
 
 const W: u32 = 256;

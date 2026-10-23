@@ -70,7 +70,7 @@
 //! * No `oxideav-vp8l` runtime dependency. Routing the payload to a
 //!   VP8L decoder is the caller's responsibility.
 
-use crate::container::{fourcc, WebpChunk, WebpContainer};
+use crate::container::{WebpChunk, WebpContainer, fourcc};
 
 /// WebP Lossless §3.4 / §7.1 signature byte — the first byte of
 /// every `VP8L` chunk's payload.

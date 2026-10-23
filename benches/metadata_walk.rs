@@ -29,10 +29,10 @@
 //!   cargo bench -p oxideav-webp --bench metadata_walk -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_webp::{
-    encode_animation_frames, encode_rgba8, encode_vp8l_argb_with_metadata, read_metadata,
-    AnimFrame, EncodeOptions, Metadata, WebpMetadata,
+    AnimFrame, EncodeOptions, Metadata, WebpMetadata, encode_animation_frames, encode_rgba8,
+    encode_vp8l_argb_with_metadata, read_metadata,
 };
 
 /// Deterministic LCG payload bytes (same constants as the other
@@ -64,7 +64,9 @@ fn gradient_rgba_64() -> Vec<u8> {
 /// entry point takes ARGB words).
 fn gradient_argb_64() -> Vec<u32> {
     gradient_rgba_64()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|px| {
             (u32::from(px[3]) << 24)
                 | (u32::from(px[0]) << 16)

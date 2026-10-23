@@ -172,9 +172,7 @@ impl core::fmt::Display for PrefixError {
             Self::OverSubscribed => {
                 f.write_str("VP8L §6.2.1 prefix code: over-subscribed (sum 2^-len > 1)")
             }
-            Self::Incomplete => {
-                f.write_str("VP8L §6.2.1 prefix code: incomplete (sum 2^-len < 1)")
-            }
+            Self::Incomplete => f.write_str("VP8L §6.2.1 prefix code: incomplete (sum 2^-len < 1)"),
             Self::LengthTooLarge { length } => write!(
                 f,
                 "VP8L §6.2.1 prefix code: code length {length} exceeds the {MAX_CODE_LENGTH}-bit ceiling"
@@ -943,17 +941,17 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_bits(0, 1); // normal
         w.write_bits(0, 4); // num_code_lengths - 4 = 0 → 4
-                            // CLC lengths in order [17,18,0,1]: we want pos0=1, pos1=1,
-                            // pos17=0, pos18=0.
+        // CLC lengths in order [17,18,0,1]: we want pos0=1, pos1=1,
+        // pos17=0, pos18=0.
         w.write_bits(0, 3); // pos 17 → 0
         w.write_bits(0, 3); // pos 18 → 0
         w.write_bits(1, 3); // pos 0  → 1
         w.write_bits(1, 3); // pos 1  → 1
-                            // max_symbol gate: use full alphabet.
+        // max_symbol gate: use full alphabet.
         w.write_bits(0, 1); // use_max = 0 → max_symbol = alphabet_size
-                            // Now read up to alphabet_size (4) literal code lengths via the
-                            // CLC. CLC-sym0 → bit 0, CLC-sym1 → bit 1.
-                            // We want literal lengths [1, 1, 0, 0] → CLC symbols [1,1,0,0].
+        // Now read up to alphabet_size (4) literal code lengths via the
+        // CLC. CLC-sym0 → bit 0, CLC-sym1 → bit 1.
+        // We want literal lengths [1, 1, 0, 0] → CLC symbols [1,1,0,0].
         w.write_bits(1, 1); // literal len for sym0 = 1
         w.write_bits(1, 1); // sym1 = 1
         w.write_bits(0, 1); // sym2 = 0
@@ -995,28 +993,28 @@ mod tests {
         w.write_bits(1, 3); // pos18 → 1
         w.write_bits(0, 3); // pos0  → 0
         w.write_bits(1, 3); // pos1  → 1
-                            // max_symbol gate: §6.2.1 says the CLC is "used to read up to
-                            // max_symbol code lengths" — i.e. max_symbol counts CLC symbols
-                            // *read*, not the literal-symbol cursor. We make exactly 3 CLC
-                            // reads below (one code-18 zero run + two literal-1 codes), so
-                            // gate at 3. use_max = 1, length_nbits = 2 + 2*ReadBits(3); pick
-                            // ReadBits(3) = 0 → length_nbits = 2; max_symbol = 2 +
-                            // ReadBits(2). Want max_symbol = 3 → ReadBits(2) = 1.
+        // max_symbol gate: §6.2.1 says the CLC is "used to read up to
+        // max_symbol code lengths" — i.e. max_symbol counts CLC symbols
+        // *read*, not the literal-symbol cursor. We make exactly 3 CLC
+        // reads below (one code-18 zero run + two literal-1 codes), so
+        // gate at 3. use_max = 1, length_nbits = 2 + 2*ReadBits(3); pick
+        // ReadBits(3) = 0 → length_nbits = 2; max_symbol = 2 +
+        // ReadBits(2). Want max_symbol = 3 → ReadBits(2) = 1.
         w.write_bits(1, 1); // use_max = 1
         w.write_bits(0, 3); // length_nbits = 2
         w.write_bits(1, 2); // max_symbol = 2 + 1 = 3
-                            // CLC is 2 leaves: CLC-sym1 and CLC-sym18, both length 1.
-                            // Canonical (value order): sym1 → bit 0, sym18 → bit 1.
-                            // CLC read #1: code 18 with run = 11 + ReadBits(7). We want 12
-                            // zeros, so ReadBits(7) = 1.
+        // CLC is 2 leaves: CLC-sym1 and CLC-sym18, both length 1.
+        // Canonical (value order): sym1 → bit 0, sym18 → bit 1.
+        // CLC read #1: code 18 with run = 11 + ReadBits(7). We want 12
+        // zeros, so ReadBits(7) = 1.
         w.write_bits(1, 1); // CLC-sym18 (bit 1)
         w.write_bits(1, 7); // run = 11 + 1 = 12 zeros (symbols 0..11)
-                            // Cursor at 12. CLC reads #2 and #3: two literal-len-1 codes for
-                            // sym12, sym13.
+        // Cursor at 12. CLC reads #2 and #3: two literal-len-1 codes for
+        // sym12, sym13.
         w.write_bits(0, 1); // CLC-sym1 → literal len 1 for sym12
         w.write_bits(0, 1); // CLC-sym1 → literal len 1 for sym13
-                            // After 3 CLC reads `emitted` hits max_symbol, so the loop stops
-                            // with sym14/sym15 at length 0.
+        // After 3 CLC reads `emitted` hits max_symbol, so the loop stops
+        // with sym14/sym15 at length 0.
         let data = w.into_bytes();
         let mut r = BitReader::new(&data);
         let code = PrefixCode::read(&mut r, 16).unwrap();
@@ -1042,19 +1040,19 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_bits(0, 1); // normal
         w.write_bits(5, 4); // num_code_lengths = 4 + 5 = 9
-                            // Order entries 0..8: 17,18,0,1,2,3,4,5,16.
+        // Order entries 0..8: 17,18,0,1,2,3,4,5,16.
         for pos in [17usize, 18, 0, 1, 2, 3, 4, 5, 16] {
             // pos2 → length 1, pos16 → length 1, everything else 0.
             let l = if pos == 2 || pos == 16 { 1 } else { 0 };
             w.write_bits(l, 3);
         }
         w.write_bits(0, 1); // max_symbol = alphabet_size (4)
-                            // CLC: 2 leaves, CLC-sym2 and CLC-sym16, both length 1.
-                            // Value order: sym2 → bit 0, sym16 → bit 1.
-                            // Emit literal len 2 for sym0 (CLC bit 0).
+        // CLC: 2 leaves, CLC-sym2 and CLC-sym16, both length 1.
+        // Value order: sym2 → bit 0, sym16 → bit 1.
+        // Emit literal len 2 for sym0 (CLC bit 0).
         w.write_bits(0, 1); // → literal length 2, sym0 = 2
-                            // Emit code 16 (CLC bit 1) repeat = 3 + ReadBits(2). Want 3
-                            // repeats for sym1,sym2,sym3 → ReadBits(2) = 0.
+        // Emit code 16 (CLC bit 1) repeat = 3 + ReadBits(2). Want 3
+        // repeats for sym1,sym2,sym3 → ReadBits(2) = 0.
         w.write_bits(1, 1); // CLC-sym16
         w.write_bits(0, 2); // repeat = 3
         let data = w.into_bytes();

@@ -116,8 +116,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_webp::vp8l_decode::{
-    decode_entropy_coded_image, decode_entropy_image, DecodeError, MetaPrefixIndex,
-    MetaPrefixIndexError,
+    DecodeError, MetaPrefixIndex, MetaPrefixIndexError, decode_entropy_coded_image,
+    decode_entropy_image,
 };
 use oxideav_webp::vp8l_stream::BitReader;
 
