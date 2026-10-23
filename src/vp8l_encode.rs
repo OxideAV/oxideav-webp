@@ -1233,6 +1233,18 @@ pub const MIN_MATCH: usize = 3;
 #[doc(hidden)]
 pub const MAX_MATCH: usize = 4096;
 
+/// Largest backward-reference distance a VP8L stream can encode.
+/// Distance prefix codes span an alphabet of 40 symbols (0..=39);
+/// the largest raw code with an in-range prefix is 1_048_576
+/// (prefix 39), and the scan-line fallback code for a distance `D`
+/// is `D + NUM_DISTANCE_MAP_CODES` (120), so distances above
+/// 1_048_576 - 120 = 1_048_456 have no encoding. (Distance-map
+/// codes can name a handful of offsets past this bound on images
+/// wider than ~150k pixels; the matcher does not chase them.)
+/// Matches farther back must never be emitted: counting one
+/// indexes the 40-entry distance histogram at 40 and panics.
+const MAX_ENCODABLE_DISTANCE: usize = 1_048_456;
+
 /// Number of low bits of the rolling pixel hash → hash-chain head buckets.
 /// `1 << HASH_BITS` heads; collisions are resolved by walking the chain.
 const HASH_BITS: usize = 14;
@@ -1340,6 +1352,12 @@ impl<'a> Lz77Matcher<'a> {
         let mut steps = 0usize;
         while cand >= 0 && steps < MAX_CHAIN {
             let c = cand as usize;
+            // Chain candidates are strictly older as the walk
+            // proceeds, so once one is past the largest encodable
+            // distance every later one is too.
+            if pos - c > MAX_ENCODABLE_DISTANCE {
+                break;
+            }
             // Candidates were all inserted at positions < pos.
             //
             // Round 409 quick-reject: only a strictly longer match can
@@ -2020,7 +2038,13 @@ impl Frequencies {
                 // code reconstructing to `D` for `image_width`.
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
                 let (dist_prefix, _, _) = value_to_prefix(raw_code);
-                self.distance[dist_prefix as usize] += 1;
+                // The matcher never emits distances past
+                // MAX_ENCODABLE_DISTANCE, so dist_prefix < 40 here.
+                // Guard anyway: an encoder must not panic on its
+                // input, whatever future token source appears.
+                if (dist_prefix as usize) < self.distance.len() {
+                    self.distance[dist_prefix as usize] += 1;
+                }
             }
         }
     }
