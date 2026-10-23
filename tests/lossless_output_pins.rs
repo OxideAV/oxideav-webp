@@ -8,8 +8,8 @@
 mod common;
 
 use oxideav_webp::{
-    decode_all, encode_animation, encode_animation_frames, encode_rgba8, AnimFrame, AnimFrameMode,
-    EncodeOptions, Metadata,
+    AnimFrame, AnimFrameMode, EncodeOptions, Metadata, decode_all, encode_animation,
+    encode_animation_frames, encode_rgba8,
 };
 
 /// `(fixture, frame, length, FNV-1a 64)` of `encode_rgba8` over every
