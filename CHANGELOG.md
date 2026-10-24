@@ -4,6 +4,27 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/OxideAV/oxideav-webp/compare/v0.3.1...v0.3.2) - 2026-10-24
+
+### Fixed
+
+- fixup for #44: CHANGELOG entry; rustfmt
+- fixup for #43: Vp8LossyEncoder is #[non_exhaustive]; rustfmt
+- fixup for #42: edition-2024 unsafe blocks in the counting allocator, tests/common helpers, doc-comment placement
+- fixup for #35: rustfmt (edition-2024 import ordering)
+
+### Other
+
+- lossless effort levels (EncodeOptions::method 0..=6, default 4); method 6 on worker threads ([#45](https://github.com/OxideAV/oxideav-webp/pull/45))
+- pin the §3.6.2.2 distance bound at the matcher ([#34](https://github.com/OxideAV/oxideav-webp/pull/34))
+- rightmost-column TR is the same row's leftmost pixel (RFC 9649 §4.1, #33)
+- never emit matches past the largest encodable distance
+- give the lossy encoder a direct constructor
+- copy the lossy bitstream into the RIFF container once
+- stream LZ77 tokens instead of collecting them
+- pin the lossless encoder's output bytes
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `EncodeOptions::method` / `with_method` (`0..=6`, default `4`): lossless
