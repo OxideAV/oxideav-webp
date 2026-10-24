@@ -874,3 +874,38 @@ fn direction_g_every_lossless_method_is_readable_by_reference_decoders() {
         }
     }
 }
+
+/// Direction H — the lossy path's fastest level (`method` 0, trellis
+/// off) and the default both decode in the reference decoder at the
+/// source geometry, alpha byte-exact (#47).
+#[test]
+fn direction_h_lossy_methods_are_readable_by_reference_decoder() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH — install the WebP reference tools to exercise");
+        return;
+    };
+    let (w, h) = (96u32, 72u32);
+    let src = synthetic_rgba(w, h, 11);
+    let dir = tmp_dir("direction-h");
+    for method in [0u8, 4] {
+        let opts = EncodeOptions::default()
+            .with_quality(70.0)
+            .with_method(method);
+        let file = encode_rgba8(w, h, &src, &opts).expect("lossy encode");
+        let in_path = dir.join(format!("m{method}.webp"));
+        let pam_path = dir.join(format!("m{method}.pam"));
+        std::fs::write(&in_path, &file).expect("write webp");
+        let mut cmd = Command::new(&decoder_bin);
+        cmd.arg(&in_path)
+            .arg("-pam")
+            .arg("-o")
+            .arg(&pam_path)
+            .arg("-quiet");
+        let _ = run_or_fail(&mut cmd);
+        let (rgba, rw, rh, depth) = parse_pam(&std::fs::read(&pam_path).expect("read PAM"));
+        assert_eq!((rw, rh, depth), (w, h, 4), "method {method}");
+        let ref_alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
+        let src_alpha: Vec<u8> = src.chunks(4).map(|p| p[3]).collect();
+        assert_eq!(ref_alpha, src_alpha, "method {method}: alpha plane");
+    }
+}

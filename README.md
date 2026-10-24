@@ -171,8 +171,9 @@ before any pixel buffer is allocated; a hit is `Error::LimitExceeded`.
 lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
 strength), `method` (`0..=6`, default `4`: encoder effort — lossless
 `6` is the exhaustive search, lower levels screen fewer candidates with
-a cheaper parse and write somewhat larger files much faster; every
-level is exactly lossless), `embed_icc` / `embed_exif` / `embed_xmp`
+a cheaper parse and write somewhat larger files much faster, every
+level exactly lossless; lossy `0..=2` turn the VP8 trellis quantiser
+off, about a third faster for a few percent more bytes), `embed_icc` / `embed_exif` / `embed_xmp`
 (default on — the image's metadata is written when present), and for
 animations
 `loop_count` (`0` = forever), `background_rgba`, `frame_mode`

@@ -29,6 +29,18 @@ All notable changes to `oxideav-webp` are recorded here.
   and animation frames follow the level) and oracle direction G (every
   level through `dwebp`, and `ffmpeg` when installed); bench cells
   `lossless_encode_photo_512x384/method_{0,4,6}`.
+- `EncodeOptions::method` on the lossy (`VP8 `) path (#47): `0..=2` turn
+  the VP8 trellis quantiser off (plain rounding quantisation, the
+  encoder's largest single cost); `3..=6` keep the quality-mapped
+  trellis, so the default lossy output is unchanged byte-for-byte
+  (`tests/lossy_output_pins.rs`). 800 x 533 photo at quality 80: 83 ms /
+  35 362 B / 37.16 dB at the default, 55 ms / 36 250 B / 37.22 dB at
+  method 0; both decode in `dwebp` and `ffmpeg`. With alpha the `ALPH`
+  plane follows the lossless levels and, from 64 x 64 pixels, is coded on
+  a second thread next to the VP8 encode (same bytes): 0.18 s at the
+  default and 0.055 s at method 0 for an 800 x 533 RGBA photo, against
+  about 5.4 s for the exhaustive plane every earlier version coded.
+  Tests: `tests/lossy_effort.rs`, oracle direction H.
 - `encode_vp8l_argb_with_method` / `encode_vp8l_argb_with_metadata_and_method`
   (hidden): the bare-bitstream helpers at a chosen level; the method-less
   helpers keep the exhaustive search.
@@ -51,6 +63,8 @@ All notable changes to `oxideav-webp` are recorded here.
 - **The default lossless encode is method 4**, not the exhaustive search:
   output bytes change for every lossless encode that does not set
   `with_method(6)`.
+  This includes the `ALPH` plane of a lossy encode with alpha (the `VP8 `
+  bitstream itself is unchanged at the default).
 - Method 6 evaluates its candidates on scoped worker threads (up to
   `available_parallelism`, fewer when the image is large: about 512 bytes
   a pixel per worker within a 1.5 GiB budget, one worker when threads are

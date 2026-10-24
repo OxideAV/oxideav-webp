@@ -179,8 +179,9 @@ pub struct EncodeOptions {
     pub frame_mode: AnimFrameMode,
     /// Animation only — delta-path tuning.
     pub delta: DeltaConfig,
-    /// Encoder effort, `0` (fastest) to `6` (slowest, smallest output);
-    /// see [`with_method`](Self::with_method). Default `4`.
+    /// Encoder effort, `0` (fastest) to `6` (slowest, smallest output),
+    /// lossless and lossy; see [`with_method`](Self::with_method).
+    /// Default `4`.
     pub method: u8,
 }
 
@@ -258,6 +259,11 @@ impl EncodeOptions {
     /// / parse search; `0..=5` screen fewer candidates with a cheaper
     /// parse. Every level is exactly lossless; lower levels write somewhat
     /// larger files much faster.
+    ///
+    /// Lossy (`VP8 `): `0..=2` turn the trellis quantiser off (about a
+    /// third faster, a few percent more bytes); `3..=6` use the
+    /// quality-mapped trellis (the output of earlier versions). The alpha
+    /// plane is a lossless image and follows the lossless levels.
     pub fn with_method(mut self, method: u8) -> Self {
         self.method = method.min(vp8l_encode::MAX_LOSSLESS_METHOD);
         self
@@ -1147,10 +1153,33 @@ fn encode_lossy(
     let frame = oxideav_vp8::I420Frame::packed(image.width, image.height, &y, &u, &v);
     let params = oxideav_vp8::KeyframeParams {
         y_ac_qi: oxideav_vp8::encoder::quality_to_qindex(quality),
-        trellis_strength: oxideav_vp8::encoder::quality_to_trellis_strength(quality),
+        trellis_strength: lossy_trellis_strength(quality, method),
         ..oxideav_vp8::KeyframeParams::default()
     };
-    let vp8 = oxideav_vp8::encode_keyframe(&frame, &params)?;
+    // The `ALPH` plane is an independent lossless encode: on images large
+    // enough to pay for a thread it runs next to the VP8 encode (same
+    // bytes either way); otherwise, or when no thread can be spawned, it
+    // runs after it.
+    let (width, height) = (image.width, image.height);
+    let (vp8, alph_payload) = std::thread::scope(|scope| {
+        let alpha_job = alpha
+            .as_ref()
+            .filter(|_| w * h >= LOSSY_ALPHA_THREAD_MIN_PIXELS)
+            .and_then(|a| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, move || build_alph_payload(a, width, height, method))
+                    .ok()
+            });
+        let vp8 = oxideav_vp8::encode_keyframe(&frame, &params);
+        let alph = match alpha_job {
+            Some(job) => Some(job.join().unwrap_or_else(|p| std::panic::resume_unwind(p))),
+            None => alpha
+                .as_ref()
+                .map(|a| build_alph_payload(a, width, height, method)),
+        };
+        (vp8, alph)
+    });
+    let vp8 = vp8?;
 
     // Simple-lossy layout when there is nothing to declare in a VP8X.
     if alpha.is_none() && meta.is_empty() {
@@ -1171,9 +1200,6 @@ fn encode_lossy(
         has_animation: false,
     };
     let vp8x_payload = build::build_vp8x_chunk(image.width, image.height, flags)?;
-    let alph_payload = alpha
-        .as_ref()
-        .map(|a| build_alph_payload(a, image.width, image.height, method));
     let chunks: [(container::FourCc, Option<&[u8]>); 6] = [
         (fourcc::VP8X, Some(&vp8x_payload)),
         (fourcc::ICCP, meta.icc),
@@ -1194,6 +1220,26 @@ fn encode_lossy(
         }
     }
     file.finish()
+}
+
+/// Highest `EncodeOptions::method` at which the lossy path turns the VP8
+/// trellis quantiser off: plain rounding quantisation, about a third
+/// faster for a few percent more bytes. From the next level up the
+/// quality-mapped trellis strength applies (the v0.3.1 behaviour).
+const LOSSY_TRELLIS_OFF_MAX_METHOD: u8 = 2;
+
+/// Alpha planes at least this many pixels are coded on their own thread
+/// next to the VP8 encode.
+const LOSSY_ALPHA_THREAD_MIN_PIXELS: usize = 64 * 64;
+
+/// The VP8 trellis strength the lossy path uses at `quality` and
+/// `method`.
+fn lossy_trellis_strength(quality: f32, method: u8) -> oxideav_vp8::TrellisStrength {
+    if method <= LOSSY_TRELLIS_OFF_MAX_METHOD {
+        oxideav_vp8::TrellisStrength::OFF
+    } else {
+        oxideav_vp8::encoder::quality_to_trellis_strength(quality)
+    }
 }
 
 /// A `RIFF` / `WEBP` file assembled chunk by chunk in one buffer: each
