@@ -46,6 +46,65 @@ the medians are still stable to a few percent.
 | `benches/anim_encode.rs` | `anim_encode_{lossless,delta,auto}_4f_48` | §2.7.1.1 animation *encode* path (`build_animated_webp`) — the encode mirror of `anim_decode` (round 409): the dirty-rect diff against the previous canvas, the `Auto` mode's keyframe-vs-delta arbitration (two full inner VP8L encodes per frame), and the `ANMF`/`ANIM`/`VP8X` container assembly. Three cells drive one deterministic 4-frame 48×48 moving-square timeline (LCG-textured background + a 12×12 square stepping 8 px/frame) through each `AnimFrameMode` |
 | `benches/distance_code.rs` | `distance_code_{dist1_rle,dist_row_above,dist_small_neighbor,dist_large_nomatch}` | Encoder-side §5.2.2 `pixel_distance_to_distance_code` — the distance-code chooser run (at least) twice per emitted LZ77 backward reference (once in `count_frequencies` to build the DISTANCE frequency table, once in the emit loop). It scans `DISTANCE_MAP` for the smallest distance-map code `c ∈ 1..=120` reconstructing to `D` for the image width, falling back to the scan-line code `D + 120` when none matches (round 301 added a smallest-code early-out that returns on the first match instead of always walking all 120 entries; the matching cells now cost a partial scan, the genuine no-match cell still walks all 120). The `lz77_match` / `lz77_chain` benches time the matcher that *finds* a run and `value_to_prefix` the per-symbol prefix split; the distance→code mapping between them had no isolated harness. Four cells fix `image_width = 256` and vary `distance`: `dist1_rle` (flat-colour RLE, multiple clamp-to-1 map hits), `dist_row_above` (`distance == width`, the `(0,1)` "pixel above" match at index 0 → code 1, cheapest), `dist_small_neighbor` (`distance = 2`, close horizontal neighbour matched mid-scan), and `dist_large_nomatch` (`distance = 70_000`, no map entry matches → full 120-scan + scan-line fallback). Each cell runs an inner loop of 1024 chooser calls, XOR-accumulating the codes |
 
+## Round 480 (2026-10-24) — lossless effort levels (#45)
+
+`EncodeOptions::method` (`0..=6`, default `4`). Method 6 is the
+exhaustive search, byte-identical to v0.3.1 (output pins), now run on
+scoped worker threads; methods `0..=5` screen a short candidate list with
+one reduced-effort parse each (chain bound scaled up on small images,
+hash table sized with the image, "long enough" match cut-off), sweep the
+colour cache on the winner, add the cost-priced DP re-plan at `4..=5`
+and §6.2.2 multi-group layouts at `1..=5`.
+
+800 x 533 photo (an iPhone HEIC resized with Lanczos), release, Apple
+M-series, 18 hardware threads; every file decodes pixel-exact through
+`dwebp` 1.6.0 and `ffmpeg` 9.0.1:
+
+| method | time | bytes | vs method 6 |
+|---|---|---|---|
+| 0 | 0.10 s | 456 428 | +4.7 % |
+| 1 | 0.16 s | 445 476 | +2.2 % |
+| 2 | 0.21 s | 444 806 | +2.1 % |
+| 3 | 0.35 s | 443 764 | +1.8 % |
+| 4 (default) | 0.39-0.51 s | 440 872 | +1.2 % |
+| 5 | 0.53-0.69 s | 440 786 | +1.1 % |
+| 6 | 3.8-4.6 s (1 worker: ~25 s) | 435 790 | — |
+| v0.3.1 | 17-20 s | 435 790 | — |
+
+Reference encoder on the same PNG, for scale: `cwebp -lossless -m 0`
+485 402 B in 0.05 s, `-m 4` 414 458 B in 0.16 s, `-m 6` 409 524 B in
+0.28 s.
+
+Larger photos at the default: 2400 x 1600 in 5.2-5.9 s (2 979 802 B,
+peak RSS 1.0 GB); 4000 x 3000 (12 MP) in 17-20 s (7 496 458 B, peak RSS
+1.17 GB, DP re-plan skipped above 4 Mpx). Round 479 measured 2.3 GiB and
+a panic after 140 s on 12 MP (the panic is #34 / #44).
+
+Where the time went and what changed:
+
+* Method 6 (profile at v0.3.1 tip): `dp_refine_tokens` 28 %,
+  `Lz77Matcher::find` 18 %, `count_token` 10 %, the exact cost mirror 9 %,
+  cache rewrite 8 % — the ~59 candidates x 12 cache choices x greedy + up
+  to two DP passes. Candidates are independent and folded in a fixed
+  order with "strictly smaller replaces", so they now run on workers
+  (longest first: the §6.2.2 sweeps, 3-7 s each) and fold in submission
+  order. Peak RSS 1.2 GB at 7 workers (memory-capped).
+* Reduced levels at 2400 x 1600 were dominated by `find` (95 %): a fixed
+  2^14-bucket hash table puts ~234 positions in every chain, so each
+  lookup walked the whole bound through cache misses. An image-sized
+  table (about four pixels a bucket, up to 2^22) took 32 s to 10.6 s, and
+  the match-length cut-off to 5.2 s (same bytes).
+* `Token` shrank from 24 to 12 bytes (`u32` copy fields): 12 MP peak
+  RSS 2.05 GB to 1.17 GB.
+
+Criterion, `lossless_encode_photo_512x384` (synthetic photo-like):
+
+| cell | time |
+|---|---|
+| `method_0` | 43.2 ms |
+| `method_4` | 203 ms |
+| `method_6` | 871 ms |
+
 ## Round-170 baseline (pre-optimization)
 
 | Bench | Median |

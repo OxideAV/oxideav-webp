@@ -783,3 +783,94 @@ fn direction_f_rightmost_column_tr_rule_fixture_decodes_to_source() {
         differing.first()
     );
 }
+
+// ─────── Direction G: every lossless effort level (issue #45) ─────────
+
+/// Inputs for direction G: a photo-like image with a smooth alpha ramp,
+/// a palette image (colour-indexing paths) and the round-169 synthetic
+/// RGBA image at an odd size.
+fn direction_g_inputs() -> Vec<(&'static str, u32, u32, Vec<u8>)> {
+    let (pw, ph) = (160u32, 120u32);
+    let mut photo = Vec::with_capacity((pw * ph * 4) as usize);
+    let mut state = 0x2545_F491u32;
+    for y in 0..ph {
+        for x in 0..pw {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let n = (state & 7) as u8;
+            photo.extend_from_slice(&[
+                (x + n as u32) as u8,
+                (y * 2 + n as u32) as u8,
+                ((x + y) / 2) as u8,
+                (255 - y) as u8,
+            ]);
+        }
+    }
+    let (qw, qh) = (70u32, 50u32);
+    let mut palette = Vec::with_capacity((qw * qh * 4) as usize);
+    for y in 0..qh {
+        for x in 0..qw {
+            let c = ((x / 6) ^ (y / 5)) % 11;
+            palette.extend_from_slice(&[(c * 23) as u8, (200 - c * 17) as u8, (c * 7) as u8, 255]);
+        }
+    }
+    vec![
+        ("photo+alpha 160x120", pw, ph, photo),
+        ("palette 70x50", qw, qh, palette),
+        ("synthetic 37x29", 37, 29, synthetic_rgba(37, 29, 3)),
+    ]
+}
+
+/// Direction G — every `EncodeOptions::method` level (`0..=6`) writes a
+/// file the reference decoder reproduces bit-exactly, and so does
+/// `ffmpeg` when it is installed.
+#[test]
+fn direction_g_every_lossless_method_is_readable_by_reference_decoders() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: `dwebp` not on PATH — install the WebP reference tools to exercise");
+        return;
+    };
+    let ffmpeg_bin = which("ffmpeg");
+    let dir = tmp_dir("direction-g");
+    for (name, w, h, src) in direction_g_inputs() {
+        for method in 0..=6u8 {
+            let opts = EncodeOptions::default().with_method(method);
+            let file = encode_rgba8(w, h, &src, &opts).expect("encode_rgba8");
+            let in_path = dir.join(format!("m{method}.webp"));
+            let pam_path = dir.join(format!("m{method}.pam"));
+            std::fs::write(&in_path, &file).expect("write webp");
+            let mut cmd = Command::new(&decoder_bin);
+            cmd.arg(&in_path)
+                .arg("-pam")
+                .arg("-o")
+                .arg(&pam_path)
+                .arg("-quiet");
+            let _ = run_or_fail(&mut cmd);
+            let (rgba, rw, rh, depth) = parse_pam(&std::fs::read(&pam_path).expect("read PAM"));
+            assert_eq!((rw, rh, depth), (w, h, 4), "{name} method {method}");
+            assert!(
+                rgba == src,
+                "{name} method {method}: reference decoder differs"
+            );
+
+            if let Some(ffmpeg) = &ffmpeg_bin {
+                let raw_path = dir.join(format!("m{method}.rgba"));
+                let mut cmd = Command::new(ffmpeg);
+                cmd.arg("-y")
+                    .arg("-loglevel")
+                    .arg("error")
+                    .arg("-i")
+                    .arg(&in_path)
+                    .arg("-f")
+                    .arg("rawvideo")
+                    .arg("-pix_fmt")
+                    .arg("rgba")
+                    .arg(&raw_path);
+                let _ = run_or_fail(&mut cmd);
+                let raw = std::fs::read(&raw_path).expect("read ffmpeg output");
+                assert!(raw == src, "{name} method {method}: ffmpeg decode differs");
+            }
+        }
+    }
+}

@@ -1277,9 +1277,11 @@ enum Token {
     /// pixels back in scan-line order.
     Copy {
         /// Copy length in pixels (`MIN_MATCH..=MAX_MATCH`).
-        length: usize,
-        /// Scan-line pixel distance back to the copy source (`>= 1`).
-        distance: usize,
+        length: u32,
+        /// Scan-line pixel distance back to the copy source
+        /// (`1..=MAX_ENCODABLE_DISTANCE`). `u32` fields keep a token at
+        /// 12 bytes: a parse holds about one token per pixel.
+        distance: u32,
     },
 }
 
@@ -1297,15 +1299,62 @@ struct Lz77Matcher<'a> {
     pixels: &'a [u32],
     head: Vec<i32>,
     prev: Vec<i32>,
+    /// Chain links [`Self::find`] walks at most ([`MAX_CHAIN`] unless a
+    /// lower lossless effort asked for fewer).
+    max_chain: usize,
+    /// `head` has `1 << hash_bits` buckets ([`HASH_BITS`] unless a lower
+    /// lossless effort sized the table with the image).
+    hash_bits: u32,
+    /// [`Self::find`] stops walking the chain once it holds a match this
+    /// long ([`MAX_MATCH`], i.e. only a maximal match stops it, unless a
+    /// lower lossless effort settles for less).
+    nice_len: usize,
+}
+
+/// The search shape of a reduced-effort [`Lz77Matcher`]: chain bound,
+/// hash-table size and "long enough" match length. The DP match table
+/// must replay probes with the shape that recorded them.
+#[derive(Clone, Copy, Debug)]
+struct MatcherShape {
+    max_chain: usize,
+    hash_bits: u32,
+    nice_len: usize,
 }
 
 impl<'a> Lz77Matcher<'a> {
     /// Build a matcher over `pixels` with empty hash chains.
     fn new(pixels: &'a [u32]) -> Self {
+        Self::with_max_chain(pixels, MAX_CHAIN)
+    }
+
+    /// [`Self::new`] walking at most `max_chain` (>= 1) chain links per
+    /// [`Self::find`]: a shorter walk finds fewer (or shorter) matches in
+    /// proportionally less time.
+    fn with_max_chain(pixels: &'a [u32], max_chain: usize) -> Self {
+        Self::with_shape(
+            pixels,
+            MatcherShape {
+                max_chain,
+                hash_bits: HASH_BITS as u32,
+                nice_len: MAX_MATCH,
+            },
+        )
+    }
+
+    /// A matcher of the given [`MatcherShape`] (`hash_bits` clamped to
+    /// `1..=31`). More buckets keep chains short on large images, where a
+    /// fixed table fills every chain with unrelated windows and each
+    /// lookup walks the whole bound; a lower `nice_len` stops the walk
+    /// on smooth content, where every candidate matches at length.
+    fn with_shape(pixels: &'a [u32], shape: MatcherShape) -> Self {
+        let hash_bits = shape.hash_bits.clamp(1, 31);
         Self {
             pixels,
-            head: vec![-1; 1 << HASH_BITS],
+            head: vec![-1; 1 << hash_bits],
             prev: vec![-1; pixels.len()],
+            max_chain: shape.max_chain.max(1),
+            hash_bits,
+            nice_len: shape.nice_len.max(MIN_MATCH),
         }
     }
 
@@ -1318,7 +1367,7 @@ impl<'a> Lz77Matcher<'a> {
         for k in 0..4 {
             h = h.wrapping_mul(0x9e37_79b1).wrapping_add(p[pos + k]);
         }
-        (h >> (32 - HASH_BITS)) as usize
+        (h >> (32 - self.hash_bits)) as usize
     }
 
     /// Insert `pos` at the head of its hash bucket's chain.
@@ -1350,7 +1399,7 @@ impl<'a> Lz77Matcher<'a> {
         let mut best_len = 0usize;
         let mut best_dist = 0usize;
         let mut steps = 0usize;
-        while cand >= 0 && steps < MAX_CHAIN {
+        while cand >= 0 && steps < self.max_chain {
             let c = cand as usize;
             // Chain candidates are strictly older as the walk
             // proceeds, so once one is past the largest encodable
@@ -1408,7 +1457,7 @@ impl<'a> Lz77Matcher<'a> {
                 if len > best_len {
                     best_len = len;
                     best_dist = pos - c;
-                    if len >= max_len {
+                    if len >= max_len || len >= self.nice_len {
                         break;
                     }
                 }
@@ -1740,8 +1789,8 @@ fn lz77_parse(
                 emit(Token::Literal(skipped));
             }
             emit(Token::Copy {
-                length: best_len,
-                distance: best_dist,
+                length: best_len as u32,
+                distance: best_dist as u32,
             });
 
             // Hash-chain bookkeeping. Insert every covered position
@@ -1907,6 +1956,7 @@ fn cacheify_tokens(tokens: &[Token], pixels: &[u32], code_bits: u32) -> Vec<Toke
                 pos += 1;
             }
             Token::Copy { length, distance } => {
+                let (length, distance) = (length as usize, distance as usize);
                 out.push(tok);
                 // Mirror the decoder's §5.2.3 invariant: every pixel
                 // covered by a backward-reference copy is inserted in
@@ -1965,6 +2015,7 @@ fn cacheify_tokens_with_hits(tokens: &[Token], hits: &[Option<u16>]) -> Vec<Toke
                 pos += 1;
             }
             Token::Copy { length, .. } => {
+                let (length,) = (length as usize,);
                 out.push(tok);
                 pos += length;
             }
@@ -2030,6 +2081,7 @@ impl Frequencies {
                 self.green[sym] += 1;
             }
             Token::Copy { length, distance } => {
+                let (length, distance) = (length as usize, distance as usize);
                 // §5.2.2: length is a GREEN symbol `256 + length_prefix`.
                 let (len_prefix, _, _) = value_to_prefix(length as u32);
                 self.green[256 + len_prefix as usize] += 1;
@@ -2210,6 +2262,7 @@ fn token_stream_bits_from(
                 bits += tables.green.sym_bits(sym);
             }
             Token::Copy { length, distance } => {
+                let (length, distance) = (length as usize, distance as usize);
                 let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
                 bits += tables.green.sym_bits(256 + len_prefix as usize) + len_extra as usize;
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
@@ -2277,9 +2330,29 @@ fn compute_dp_matches_with_probes(
     image_width: u32,
     probes: &[FindProbe],
 ) -> Vec<Option<DpMatch>> {
+    compute_dp_matches_with_probes_chain(
+        pixels,
+        image_width,
+        probes,
+        MatcherShape {
+            max_chain: MAX_CHAIN,
+            hash_bits: HASH_BITS as u32,
+            nice_len: MAX_MATCH,
+        },
+    )
+}
+
+/// [`compute_dp_matches_with_probes`] with a matcher of `shape` — the
+/// shape the recorded `probes` were taken with.
+fn compute_dp_matches_with_probes_chain(
+    pixels: &[u32],
+    image_width: u32,
+    probes: &[FindProbe],
+    shape: MatcherShape,
+) -> Vec<Option<DpMatch>> {
     let n = pixels.len();
     let mut matches: Vec<Option<DpMatch>> = vec![None; n];
-    let mut matcher = Lz77Matcher::new(pixels);
+    let mut matcher = Lz77Matcher::with_shape(pixels, shape);
     let mut pos = 0usize;
     while pos < n {
         let m0 = match probes.get(pos) {
@@ -2610,8 +2683,8 @@ fn dp_refine_tokens(
             i += 1;
         } else {
             tokens.push(Token::Copy {
-                length: c as usize,
-                distance: choice_dist[i] as usize,
+                length: c as u32,
+                distance: choice_dist[i],
             });
             i += c as usize;
         }
@@ -2637,6 +2710,49 @@ fn best_stream_tokens(
     best_stream_tokens_with_cost(pixels, image_width, cache_code_bits).0
 }
 
+/// Single-slot per-thread memo for the two heavy per-pixel-buffer
+/// passes (the greedy parse and the DP match table). The
+/// super-chooser calls this function 12 times per candidate path —
+/// once per §5.2.3 cache-bits value — with an *identical* pixel
+/// buffer; only the cache-dependent cost model and the exact-cost
+/// arbitration differ. Keyed by full pixel equality (no hashing)
+/// **plus** the stream width (round 388 — the [`DpMatch`] table
+/// bakes in the width-dependent §5.2.2 distance-code
+/// decompositions), so a hit is exact and the output is
+/// byte-deterministic.
+///
+/// Round 409: the memo additionally caches the **finished plan per
+/// §5.2.3 cache choice** (`plans`, slot 0 = no cache, slot `b` =
+/// `cache_code_bits = b`). The §6.2.2 meta-prefix sweeps call this
+/// function once per `(prefix_bits, partition, cache)` tuple — up
+/// to ~30 times per cache value on the same buffer — and the whole
+/// greedy-vs-DP arbitration below is a pure function of
+/// `(pixels, width, cache_code_bits)`, so every repeat returned an
+/// identical stream after re-running the two DP re-parses and
+/// three exact-cost mirrors. The r409 profile attributed ~46% of
+/// corpus-encode self-time to exactly those redundant
+/// [`dp_refine_tokens`] replays.
+struct PlanMemo {
+    pixels: Vec<u32>,
+    width: u32,
+    greedy: Vec<Token>,
+    tables: DpMatchTables,
+    /// Winning `(tokens, exact body bits→cost)` per §5.2.3 cache
+    /// choice; index 0 = disabled cache, 1..=11 = `code_bits`.
+    plans: [Option<(Vec<Token>, usize)>; 12],
+}
+thread_local! {
+    static PLAN_MEMO: std::cell::RefCell<Option<PlanMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Drop this thread's [`PLAN_MEMO`] entry. Its tables cost about 150
+/// bytes a pixel, so a finished encode releases them instead of keeping
+/// the last image's alive for the life of the thread. Output-neutral:
+/// the memo only replays work for an identical buffer.
+fn clear_plan_memo() {
+    PLAN_MEMO.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// [`best_stream_tokens`] returning the winning stream **and** its
 /// exact [`prefix_codes_and_tokens_bits`] body cost (round 388). The
 /// arbitration already computes that cost for every contender; handing
@@ -2647,43 +2763,6 @@ fn best_stream_tokens_with_cost(
     image_width: u32,
     cache_code_bits: Option<u32>,
 ) -> (Vec<Token>, usize) {
-    use std::cell::RefCell;
-
-    /// Single-slot per-thread memo for the two heavy per-pixel-buffer
-    /// passes (the greedy parse and the DP match table). The
-    /// super-chooser calls this function 12 times per candidate path —
-    /// once per §5.2.3 cache-bits value — with an *identical* pixel
-    /// buffer; only the cache-dependent cost model and the exact-cost
-    /// arbitration differ. Keyed by full pixel equality (no hashing)
-    /// **plus** the stream width (round 388 — the [`DpMatch`] table
-    /// bakes in the width-dependent §5.2.2 distance-code
-    /// decompositions), so a hit is exact and the output is
-    /// byte-deterministic.
-    ///
-    /// Round 409: the memo additionally caches the **finished plan per
-    /// §5.2.3 cache choice** (`plans`, slot 0 = no cache, slot `b` =
-    /// `cache_code_bits = b`). The §6.2.2 meta-prefix sweeps call this
-    /// function once per `(prefix_bits, partition, cache)` tuple — up
-    /// to ~30 times per cache value on the same buffer — and the whole
-    /// greedy-vs-DP arbitration below is a pure function of
-    /// `(pixels, width, cache_code_bits)`, so every repeat returned an
-    /// identical stream after re-running the two DP re-parses and
-    /// three exact-cost mirrors. The r409 profile attributed ~46% of
-    /// corpus-encode self-time to exactly those redundant
-    /// [`dp_refine_tokens`] replays.
-    struct PlanMemo {
-        pixels: Vec<u32>,
-        width: u32,
-        greedy: Vec<Token>,
-        tables: DpMatchTables,
-        /// Winning `(tokens, exact body bits→cost)` per §5.2.3 cache
-        /// choice; index 0 = disabled cache, 1..=11 = `code_bits`.
-        plans: [Option<(Vec<Token>, usize)>; 12],
-    }
-    thread_local! {
-        static PLAN_MEMO: RefCell<Option<PlanMemo>> = const { RefCell::new(None) };
-    }
-
     PLAN_MEMO.with(|slot| {
         let mut slot = slot.borrow_mut();
         let hit = matches!(&*slot, Some(m) if m.width == image_width && m.pixels == pixels);
@@ -2715,76 +2794,97 @@ fn best_stream_tokens_with_cost(
             return (tokens.clone(), *bits);
         }
 
-        let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
-
-        // Round 388 — per-position §5.2.3 cache-hit table for the DP's
-        // cache-aware literal pricing. Cache state is tokenization-
-        // independent (every decoded pixel is inserted in stream
-        // order), so hit positions and indices are a pure function of
-        // `(pixels, cache_code_bits)` — exactly the update walk
-        // `cacheify_tokens` performs on the chosen stream.
-        let cache_hits: Option<Vec<Option<u16>>> = cache_code_bits.map(|bits| {
-            let mut cache = EncoderColorCache::new(bits);
-            pixels
-                .iter()
-                .map(|&argb| {
-                    let hit = cache.contains(argb).map(|ix| ix as u16);
-                    cache.insert(argb);
-                    hit
-                })
-                .collect()
-        });
-
-        // Round 409: the same tokenization-independence means the
-        // §5.2.3 rewrite itself can replay the precomputed hit table
-        // instead of re-walking the cache state per candidate stream
-        // (`cacheify_tokens_with_hits` == `cacheify_tokens`, pinned by
-        // `cacheify_with_hits_matches_stateful_cacheify`).
-        let finalize = |raw: Vec<Token>| -> Vec<Token> {
-            match cache_hits.as_deref() {
-                Some(hits) => cacheify_tokens_with_hits(&raw, hits),
-                None => raw,
-            }
-        };
-
-        // Round 388: each stream's cost tables are built once and
-        // shared between its exact-cost mirror and the next DP
-        // iteration's pass-1 model (previously each consumer
-        // re-counted frequencies and re-built the length tables).
-        let greedy = finalize(memo.greedy.clone());
-        let greedy_tables = StreamCostTables::build(&greedy, cache_size, image_width);
-        let greedy_bits = prefix_codes_and_tokens_bits_from(&greedy_tables, &greedy, image_width);
-
-        let dp1 = finalize(dp_refine_tokens(
+        let winner = arbitrate_stream_plan(
             pixels,
+            image_width,
+            cache_code_bits,
+            &memo.greedy,
             &memo.tables,
-            &greedy_tables,
-            cache_hits.as_deref(),
-        ));
-        let dp1_tables = StreamCostTables::build(&dp1, cache_size, image_width);
-        let dp1_bits = prefix_codes_and_tokens_bits_from(&dp1_tables, &dp1, image_width);
-
-        let winner = if dp1_bits >= greedy_bits {
-            (greedy, greedy_bits)
-        } else {
-            let dp2 = finalize(dp_refine_tokens(
-                pixels,
-                &memo.tables,
-                &dp1_tables,
-                cache_hits.as_deref(),
-            ));
-            let dp2_tables = StreamCostTables::build(&dp2, cache_size, image_width);
-            let dp2_bits = prefix_codes_and_tokens_bits_from(&dp2_tables, &dp2, image_width);
-
-            if dp2_bits < dp1_bits {
-                (dp2, dp2_bits)
-            } else {
-                (dp1, dp1_bits)
-            }
-        };
+        );
         memo.plans[plan_slot] = Some(winner.clone());
         winner
     })
+}
+
+/// The greedy-vs-DP arbitration behind [`best_stream_tokens_with_cost`]:
+/// the raw greedy parse `greedy_raw` and up to two cost-priced DP
+/// re-parses over the match `tables`, each rewritten for
+/// `cache_code_bits` and scored by the exact writer mirror; the cheapest
+/// stream and its body bit cost win (never worse than the greedy parse).
+fn arbitrate_stream_plan(
+    pixels: &[u32],
+    image_width: u32,
+    cache_code_bits: Option<u32>,
+    greedy_raw: &[Token],
+    tables: &DpMatchTables,
+) -> (Vec<Token>, usize) {
+    let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
+
+    // Round 388 — per-position §5.2.3 cache-hit table for the DP's
+    // cache-aware literal pricing. Cache state is tokenization-
+    // independent (every decoded pixel is inserted in stream
+    // order), so hit positions and indices are a pure function of
+    // `(pixels, cache_code_bits)` — exactly the update walk
+    // `cacheify_tokens` performs on the chosen stream.
+    let cache_hits: Option<Vec<Option<u16>>> = cache_code_bits.map(|bits| {
+        let mut cache = EncoderColorCache::new(bits);
+        pixels
+            .iter()
+            .map(|&argb| {
+                let hit = cache.contains(argb).map(|ix| ix as u16);
+                cache.insert(argb);
+                hit
+            })
+            .collect()
+    });
+
+    // Round 409: the same tokenization-independence means the
+    // §5.2.3 rewrite itself can replay the precomputed hit table
+    // instead of re-walking the cache state per candidate stream
+    // (`cacheify_tokens_with_hits` == `cacheify_tokens`, pinned by
+    // `cacheify_with_hits_matches_stateful_cacheify`).
+    let finalize = |raw: Vec<Token>| -> Vec<Token> {
+        match cache_hits.as_deref() {
+            Some(hits) => cacheify_tokens_with_hits(&raw, hits),
+            None => raw,
+        }
+    };
+
+    // Round 388: each stream's cost tables are built once and
+    // shared between its exact-cost mirror and the next DP
+    // iteration's pass-1 model (previously each consumer
+    // re-counted frequencies and re-built the length tables).
+    let greedy = finalize(greedy_raw.to_vec());
+    let greedy_tables = StreamCostTables::build(&greedy, cache_size, image_width);
+    let greedy_bits = prefix_codes_and_tokens_bits_from(&greedy_tables, &greedy, image_width);
+
+    let dp1 = finalize(dp_refine_tokens(
+        pixels,
+        tables,
+        &greedy_tables,
+        cache_hits.as_deref(),
+    ));
+    let dp1_tables = StreamCostTables::build(&dp1, cache_size, image_width);
+    let dp1_bits = prefix_codes_and_tokens_bits_from(&dp1_tables, &dp1, image_width);
+
+    if dp1_bits >= greedy_bits {
+        (greedy, greedy_bits)
+    } else {
+        let dp2 = finalize(dp_refine_tokens(
+            pixels,
+            tables,
+            &dp1_tables,
+            cache_hits.as_deref(),
+        ));
+        let dp2_tables = StreamCostTables::build(&dp2, cache_size, image_width);
+        let dp2_bits = prefix_codes_and_tokens_bits_from(&dp2_tables, &dp2, image_width);
+
+        if dp2_bits < dp1_bits {
+            (dp2, dp2_bits)
+        } else {
+            (dp1, dp1_bits)
+        }
+    }
 }
 
 /// Legacy §5.2.2 *scan-line* distance encoding (`distance_code = D + 120`).
@@ -6562,7 +6662,7 @@ fn split_tokens_by_group(
         buckets[g].push(tok);
         let consumed = match tok {
             Token::Literal(_) | Token::CacheRef { .. } => 1usize,
-            Token::Copy { length, .. } => length,
+            Token::Copy { length, .. } => length as usize,
         };
         pos += consumed;
     }
@@ -6764,6 +6864,36 @@ fn plan_meta_prefix_image_with_codes(
     image_width: u32,
     entropy_image_bits: &mut Option<usize>,
 ) -> Option<usize> {
+    let actual_groups = codes.iter().copied().max().map_or(0, |c| c as usize + 1);
+    if actual_groups < 2 {
+        // Same degenerate gate as the writer.
+        return None;
+    }
+    let tokens = best_stream_tokens(pixels, width, cache_code_bits);
+    plan_meta_prefix_tokens_with_codes(
+        &tokens,
+        width,
+        prefix_bits,
+        codes,
+        cache_code_bits,
+        image_width,
+        entropy_image_bits,
+    )
+}
+
+/// [`plan_meta_prefix_image_with_codes`] over a caller-supplied token
+/// stream (already rewritten for `cache_code_bits`, as
+/// [`best_stream_tokens`] returns it), so a reduced-effort encode can
+/// price a meta-prefix layout on its own parse.
+fn plan_meta_prefix_tokens_with_codes(
+    tokens: &[Token],
+    width: u32,
+    prefix_bits: u8,
+    codes: &[u16],
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+    entropy_image_bits: &mut Option<usize>,
+) -> Option<usize> {
     let block_side = 1u32 << prefix_bits;
     let pw = width.div_ceil(block_side) as usize;
     let actual_groups = codes.iter().copied().max().map_or(0, |c| c as usize + 1);
@@ -6773,7 +6903,6 @@ fn plan_meta_prefix_image_with_codes(
     }
     let wpx = width as usize;
 
-    let tokens = best_stream_tokens(pixels, width, cache_code_bits);
     let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
 
     // Round 440: one shared prepass over the token stream for the two
@@ -6798,7 +6927,7 @@ fn plan_meta_prefix_image_with_codes(
     let mut rows: Vec<TokenPlanRow> = Vec::with_capacity(tokens.len());
     {
         let (mut x, mut y) = (0usize, 0usize);
-        for &tok in &tokens {
+        for &tok in tokens {
             let group = codes[(y >> prefix_bits) * pw + (x >> prefix_bits)];
             let (advance, row) = match tok {
                 Token::Literal(_) | Token::CacheRef { .. } => (
@@ -6812,6 +6941,7 @@ fn plan_meta_prefix_image_with_codes(
                     },
                 ),
                 Token::Copy { length, distance } => {
+                    let (length, distance) = (length as usize, distance as usize);
                     let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
                     let raw_code = pixel_distance_to_distance_code(distance, image_width);
                     let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
@@ -6961,8 +7091,64 @@ fn write_meta_prefix_image_with_codes(
     // whichever stream the proxy picked, so the result stays a valid
     // §6.2.3 emission either way.
     let tokens = best_stream_tokens(pixels, width, cache_code_bits);
+    write_meta_prefix_tokens_with_index(
+        w,
+        &tokens,
+        width,
+        index,
+        actual_groups,
+        cache_code_bits,
+        image_width,
+    )
+}
 
-    let buckets = split_tokens_by_group(&tokens, &index, width, actual_groups);
+/// [`write_meta_prefix_image_with_codes`] over a caller-supplied token
+/// stream (already rewritten for `cache_code_bits`); the writer half of
+/// [`plan_meta_prefix_tokens_with_codes`].
+fn write_meta_prefix_tokens_with_codes(
+    w: &mut BitWriter,
+    tokens: &[Token],
+    width: u32,
+    prefix_bits: u8,
+    codes: Vec<u16>,
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+) -> Option<()> {
+    let block_side = 1u32 << prefix_bits;
+    let pw = width.div_ceil(block_side);
+    let index = EncoderMetaIndex {
+        prefix_bits,
+        block_width: pw,
+        codes,
+    };
+    let actual_groups = index.num_groups();
+    if actual_groups < 2 {
+        return None;
+    }
+    write_meta_prefix_tokens_with_index(
+        w,
+        tokens,
+        width,
+        index,
+        actual_groups,
+        cache_code_bits,
+        image_width,
+    )
+}
+
+/// Shared tail of the two meta-prefix writers: the §6.2.2 image over an
+/// already-built [`EncoderMetaIndex`] and token stream.
+fn write_meta_prefix_tokens_with_index(
+    w: &mut BitWriter,
+    tokens: &[Token],
+    width: u32,
+    index: EncoderMetaIndex,
+    actual_groups: u32,
+    cache_code_bits: Option<u32>,
+    image_width: u32,
+) -> Option<()> {
+    let prefix_bits = index.prefix_bits;
+    let buckets = split_tokens_by_group(tokens, &index, width, actual_groups);
     let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
     let group_codes = build_group_codes(&buckets, cache_size, image_width);
 
@@ -7010,7 +7196,7 @@ fn write_meta_prefix_image_with_codes(
     // see `bucket_aligns_with_decoder_groups_test`).
     let mut pos = 0usize;
     let w_pixels = width as usize;
-    for &tok in &tokens {
+    for &tok in tokens {
         let x = (pos % w_pixels) as u32;
         let y = (pos / w_pixels) as u32;
         let g = index.group_for(x, y) as usize;
@@ -7039,6 +7225,7 @@ fn write_meta_prefix_image_with_codes(
                 pos += 1;
             }
             Token::Copy { length, distance } => {
+                let (length, distance) = (length as usize, distance as usize);
                 write_lz77_value(w, green_code, 256, length as u32);
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
                 write_lz77_value(w, dist_code, 0, raw_code);
@@ -7533,6 +7720,7 @@ fn write_prefix_codes_and_token_stream<I>(
                 green_code.write_symbol(w, sym);
             }
             Token::Copy { length, distance } => {
+                let (length, distance) = (length as usize, distance as usize);
                 // §5.2.2: length via a GREEN length symbol (base 256), then
                 // distance via prefix code #5 (base 0). The chooser must
                 // agree with `count_frequencies` so the prefix-code Huffman
@@ -7600,7 +7788,7 @@ pub fn encode_webp_lossless(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
         pixels.push((a << 24) | (r << 16) | (g << 8) | b);
     }
 
-    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used);
+    let payload = encode_vp8l_payload(&pixels, width, height, alpha_is_used, MAX_LOSSLESS_METHOD);
 
     // §2.4 / §2.6 RIFF/WEBP framing around the VP8L payload.
     let file = build::build_webp_file(&payload, ImageKind::Lossless, width, height)?;
@@ -7636,11 +7824,18 @@ fn validate_argb(pixels: &[u32], width: u32, height: u32) -> Result<(), EncodeEr
 /// becomes the §3.4 `alpha_is_used` header bit. This is the inner payload a
 /// `VP8L` chunk wraps — *not* a RIFF/WEBP file. Callers wanting the framed
 /// file use [`encode_webp_lossless`] / [`encode_vp8l_argb_with_metadata`].
-fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: bool) -> Vec<u8> {
+fn encode_vp8l_payload(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Vec<u8> {
     // Production path: thread the actual image width so the §5.2.2
     // distance-map chooser can swap row-style scan-line codes for
     // small distance-map codes (round 130).
-    let stream = encode_argb_with_predictor_chooser(pixels, width, height);
+    let stream = encode_argb_with_method(pixels, width, height, method);
+    clear_plan_memo();
     let header = build_image_header(width, height, alpha_is_used);
     let mut payload = Vec::with_capacity(header.len() + stream.len());
     payload.extend_from_slice(&header);
@@ -7667,7 +7862,18 @@ fn encode_vp8l_payload(pixels: &[u32], width: u32, height: u32, alpha_is_used: b
 /// for smaller images or photo-like content the existing
 /// no-transform / subtract-green chooser remains the only path.
 fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
-    let mut best = encode_argb_literals_with_width(pixels, width);
+    // Every candidate below is an independent job; they run on worker
+    // threads (see `run_chooser_jobs`) and are folded in this
+    // submission order with the original "strictly smaller replaces"
+    // rule, so the result is byte-identical to evaluating them one by
+    // one.
+    let mut jobs: Vec<ChooserJob<'_>> = Vec::new();
+    macro_rules! job {
+        ($e:expr) => {
+            jobs.push(Box::new(move || Some($e)))
+        };
+    }
+    job!(encode_argb_literals_with_width(pixels, width));
 
     // The §4.1 predictor and §4.2 color transform pay off once the
     // image is at least one block wide AND tall, so each block
@@ -7709,9 +7915,13 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // Round 148: per `size_bits`, sweep §5.2.3
         // `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline
         // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
-        let mut pred_candidates: Vec<Vec<u8>> = vec![select_best_cache_bits_prepared(
-            &prepare_with_predictor(pixels, width, height, pred_size_bits, width),
-        )];
+        job!(select_best_cache_bits_prepared(&prepare_with_predictor(
+            pixels,
+            width,
+            height,
+            pred_size_bits,
+            width
+        ),));
         // Round 160: add §4.1 slack-cost tie-break candidates.
         // `slack > 0` lets the per-block chooser swap to the
         // preferred-neighbour mode at a small residual-cost
@@ -7729,7 +7939,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             2 * pred_block_pixels,
             4 * pred_block_pixels,
         ] {
-            pred_candidates.push(select_best_cache_bits_prepared(
+            job!(select_best_cache_bits_prepared(
                 &prepare_with_predictor_slack(pixels, width, height, pred_size_bits, width, slack),
             ));
         }
@@ -7744,7 +7954,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // keeps both the entropy and L1 candidates and emits the
         // byte-shortest stream so the round-161 path cannot
         // regress against the round-160 baseline.
-        pred_candidates.push(select_best_cache_bits_prepared(
+        job!(select_best_cache_bits_prepared(
             &prepare_with_predictor_entropy(pixels, width, height, pred_size_bits, width),
         ));
         // Round 162: add the *sub-image-aware* Shannon-entropy
@@ -7771,7 +7981,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // image's mass dominates and converging the mode set pays
         // back through a much smaller §7.2 prefix-code header.
         for lambda_milli in [4_000u64, 16_000u64, 64_000u64, 256_000u64] {
-            pred_candidates.push(select_best_cache_bits_prepared(
+            job!(select_best_cache_bits_prepared(
                 &prepare_with_predictor_entropy_subaware(
                     pixels,
                     width,
@@ -7783,7 +7993,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             ));
         }
         if try_pred_single_block {
-            pred_candidates.push(select_best_cache_bits_prepared(&prepare_with_predictor(
+            job!(select_best_cache_bits_prepared(&prepare_with_predictor(
                 pixels,
                 width,
                 height,
@@ -7805,7 +8015,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                 2 * single_pred_block_pixels,
                 4 * single_pred_block_pixels,
             ] {
-                pred_candidates.push(select_best_cache_bits_prepared(
+                job!(select_best_cache_bits_prepared(
                     &prepare_with_predictor_slack(
                         pixels,
                         width,
@@ -7824,7 +8034,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             // bit cost" — still a strict improvement over the L1
             // proxy on fixtures whose distribution skews the
             // ordering between the two metrics.
-            pred_candidates.push(select_best_cache_bits_prepared(
+            job!(select_best_cache_bits_prepared(
                 &prepare_with_predictor_entropy(
                     pixels,
                     width,
@@ -7833,11 +8043,6 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                     width,
                 ),
             ));
-        }
-        for cand in pred_candidates {
-            if cand.len() < best.len() {
-                best = cand;
-            }
         }
 
         // Round 383: §3.5 stacked-transform candidate — §4.3
@@ -7858,16 +8063,15 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         }
         for &sb in &sgp_size_bits {
             for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
-                let cand = select_best_cache_bits_prepared(&prepare_with_subtract_green_predictor(
-                    pixels,
-                    width,
-                    height,
-                    sb,
-                    pred_strategy,
+                job!(select_best_cache_bits_prepared(
+                    &prepare_with_subtract_green_predictor(
+                        pixels,
+                        width,
+                        height,
+                        sb,
+                        pred_strategy,
+                    )
                 ));
-                if cand.len() < best.len() {
-                    best = cand;
-                }
             }
         }
     }
@@ -7895,7 +8099,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // Round 148: per `size_bits`, sweep §5.2.3
         // `cache_code_bits ∈ [1..11]` plus the disabled-cache baseline
         // (was hardcoded at `DEFAULT_COLOR_CACHE_BITS = 8`).
-        let mut candidates: Vec<Vec<u8>> = vec![select_best_cache_bits_prepared(
+        job!(select_best_cache_bits_prepared(
             &prepare_with_color_transform_strategy(
                 pixels,
                 width,
@@ -7904,7 +8108,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                 width,
                 ColorTransformStrategy::L1,
             ),
-        )];
+        ));
         // Round 308: §4.2 entropy-cost per-block CTE candidate at the
         // per-region `size_bits`. Where the L1 chooser above scores
         // each candidate by the folded residual magnitude, this one
@@ -7915,7 +8119,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // the byte-shortest stream, so this candidate cannot regress
         // against the L1 path, and round-trip output is identical
         // regardless of which CTE the cost model records.
-        candidates.push(select_best_cache_bits_prepared(
+        job!(select_best_cache_bits_prepared(
             &prepare_with_color_transform_strategy(
                 pixels,
                 width,
@@ -7926,7 +8130,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             ),
         ));
         if try_single_block {
-            candidates.push(select_best_cache_bits_prepared(
+            job!(select_best_cache_bits_prepared(
                 &prepare_with_color_transform_strategy(
                     pixels,
                     width,
@@ -7941,7 +8145,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
             // image's per-channel residual distribution, so the entropy
             // metric selects the single CTE whose red / blue residual
             // streams carry the cheapest §5.x prefix codes.
-            candidates.push(select_best_cache_bits_prepared(
+            job!(select_best_cache_bits_prepared(
                 &prepare_with_color_transform_strategy(
                     pixels,
                     width,
@@ -7951,11 +8155,6 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                     ColorTransformStrategy::Entropy,
                 ),
             ));
-        }
-        for cand in candidates {
-            if cand.len() < best.len() {
-                best = cand;
-            }
         }
 
         // Round 303: §3.5 stacked-transform candidate — §4.2 cross-color
@@ -7981,17 +8180,15 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // byte-shortest candidate is kept.
         for &sb in &ctp_size_bits {
             for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
-                let cand =
-                    select_best_cache_bits_prepared(&prepare_with_color_transform_predictor(
+                job!(select_best_cache_bits_prepared(
+                    &prepare_with_color_transform_predictor(
                         pixels,
                         width,
                         height,
                         sb,
                         pred_strategy,
-                    ));
-                if cand.len() < best.len() {
-                    best = cand;
-                }
+                    )
+                ));
             }
         }
 
@@ -8014,7 +8211,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // Round 305: sweep the predictor-sub-image strategy here too.
         for &sb in &ctp_size_bits {
             for &pred_strategy in &STACKED_PREDICTOR_STRATEGIES {
-                let cand = select_best_cache_bits_prepared(
+                job!(select_best_cache_bits_prepared(
                     &prepare_with_color_transform_subtract_green_predictor(
                         pixels,
                         width,
@@ -8022,10 +8219,7 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                         sb,
                         pred_strategy,
                     ),
-                );
-                if cand.len() < best.len() {
-                    best = cand;
-                }
+                ));
             }
         }
     }
@@ -8048,12 +8242,10 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
         // numeric baseline stays in the sweep and the byte-shortest
         // stream wins.
         for &ordering in &PALETTE_ORDERINGS {
-            let prep = prepare_with_color_indexing_ordered(pixels, width, height, ordering)
-                .expect("palette feasibility already confirmed");
-            let ci_best = select_best_cache_bits_prepared(&prep);
-            if ci_best.len() < best.len() {
-                best = ci_best;
-            }
+            job!(select_best_cache_bits_prepared(
+                &prepare_with_color_indexing_ordered(pixels, width, height, ordering)
+                    .expect("palette feasibility already confirmed"),
+            ));
         }
 
         // Round 302: §3.5 stacked-transform candidate — §4.4
@@ -8093,19 +8285,17 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
                     // `None` = packed image too small for this
                     // `size_bits`; the single-transform candidate
                     // already covers the input.
-                    if let Some(prep) = prepare_with_color_indexing_predictor_ordered(
-                        pixels,
-                        width,
-                        height,
-                        sb,
-                        pred_strategy,
-                        ordering,
-                    ) {
-                        let cand = select_best_cache_bits_prepared(&prep);
-                        if cand.len() < best.len() {
-                            best = cand;
-                        }
-                    }
+                    jobs.push(Box::new(move || {
+                        prepare_with_color_indexing_predictor_ordered(
+                            pixels,
+                            width,
+                            height,
+                            sb,
+                            pred_strategy,
+                            ordering,
+                        )
+                        .map(|prep| select_best_cache_bits_prepared(&prep))
+                    }));
                 }
             }
         }
@@ -8124,11 +8314,11 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     // distinct UI regions) where separate per-region Huffman codes
     // shrink the LZ77 stream by more than the entropy-image +
     // additional code-length-table overhead.
-    if let Some(mp_best) = sweep_meta_prefix_candidate(pixels, width, height)
-        && mp_best.len() < best.len()
-    {
-        best = mp_best;
-    }
+    // One job: its slices share the raw-pixel token plans through the
+    // worker's memo, so splitting it would redo that work per slice.
+    jobs.push(Box::new(move || {
+        sweep_meta_prefix_candidate_over(pixels, width, height, &META_PREFIX_BITS_SWEEP)
+    }));
 
     // Round 383: §3.5 (subtract-green →) predictor stack with a §6.2.2
     // multi-meta-prefix main image. On photo-like content the predictor
@@ -8137,23 +8327,503 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     // neither the transform-free meta-prefix candidate above nor the
     // single-group predictor paths can reach this combination.
     // Non-regressing: kept only when strictly smaller.
-    if let Some(pmp_best) = sweep_predictor_meta_prefix_candidate(pixels, width, height)
-        && pmp_best.len() < best.len()
-    {
-        best = pmp_best;
+    for subtract_green in [false, true] {
+        jobs.push(Box::new(move || {
+            sweep_predictor_meta_prefix_candidate_over(pixels, width, height, &[subtract_green])
+        }));
     }
 
     // Round 383: §4.4 color-indexing + §6.2.2 multi-meta-prefix stack —
     // per-region prefix-code groups over the packed-index stream, swept
     // across palette orderings. Non-regressing: kept only when strictly
     // smaller.
-    if let Some(cimp_best) = sweep_color_indexing_meta_prefix(pixels, width, height)
-        && cimp_best.len() < best.len()
-    {
-        best = cimp_best;
+    jobs.push(Box::new(move || {
+        sweep_color_indexing_meta_prefix(pixels, width, height)
+    }));
+
+    run_chooser_jobs(jobs, pixels.len())
+}
+
+/// One exhaustive-chooser candidate: the full stream it encodes to, or
+/// `None` when the candidate does not apply to the image.
+type ChooserJob<'a> = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync + 'a>;
+
+/// Peak memory the exhaustive chooser budgets per worker thread: about
+/// 512 bytes a pixel (residual and transform buffers, the token
+/// planner's per-pixel match tables and its per-cache plans; measured
+/// at about 410 on an 800 x 533 photo).
+const CHOOSER_BYTES_PER_PIXEL: usize = 512;
+
+/// Working-memory budget the exhaustive chooser spreads over extra
+/// worker threads (the first worker is always allowed).
+const CHOOSER_MEMORY_BUDGET: usize = 3 << 29;
+
+/// Run every job — on up to `available_parallelism` scoped worker
+/// threads (no more than [`CHOOSER_MEMORY_BUDGET`] allows for a
+/// `pixel_count`-pixel image, one when threads are unavailable) — and
+/// return the shortest stream, the earliest job winning ties: exactly
+/// what evaluating them one by one in order with "strictly smaller
+/// replaces" returns. Each worker's thread-local token-plan memo dies
+/// with the worker.
+fn run_chooser_jobs(jobs: Vec<ChooserJob<'_>>, pixel_count: usize) -> Vec<u8> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let by_memory = CHOOSER_MEMORY_BUDGET
+        / pixel_count
+            .max(1)
+            .saturating_mul(CHOOSER_BYTES_PER_PIXEL)
+            .max(1);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(by_memory.max(1))
+        .min(jobs.len());
+    let fold = |results: Vec<Option<Vec<u8>>>| -> Vec<u8> {
+        let mut best: Option<Vec<u8>> = None;
+        for cand in results.into_iter().flatten() {
+            if best.as_ref().is_none_or(|b| cand.len() < b.len()) {
+                best = Some(cand);
+            }
+        }
+        best.expect("the literal candidate always encodes")
+    };
+    if workers <= 1 {
+        return fold(jobs.iter().map(|job| job()).collect());
+    }
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<Vec<u8>>>> = jobs.iter().map(|_| Mutex::new(None)).collect();
+    let spawned = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let worker = || {
+                loop {
+                    // Start from the end of the list: the §6.2.2 sweeps,
+                    // submitted last, are the longest jobs, so they go
+                    // first and the short candidates fill in around them.
+                    // Results still land in submission-order slots.
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(i) = jobs.len().checked_sub(k + 1) else {
+                        break;
+                    };
+                    let job = &jobs[i];
+                    let out = job();
+                    *results[i].lock().unwrap_or_else(|e| e.into_inner()) = out;
+                }
+            };
+            match std::thread::Builder::new().spawn_scoped(scope, worker) {
+                Ok(h) => handles.push(h),
+                Err(_) => break,
+            }
+        }
+        let spawned = handles.len();
+        for h in handles {
+            if let Err(panic) = h.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        spawned
+    });
+    if spawned == 0 {
+        // No thread could be spawned: run everything here.
+        return fold(jobs.iter().map(|job| job()).collect());
+    }
+    fold(
+        results
+            .into_iter()
+            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .collect(),
+    )
+}
+
+/// Highest lossless effort level: the exhaustive search
+/// (`encode_argb_with_predictor_chooser`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub const MAX_LOSSLESS_METHOD: u8 = 6;
+
+/// The lossless effort level [`crate::EncodeOptions`] starts at.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub const DEFAULT_LOSSLESS_METHOD: u8 = 4;
+
+/// Images above this many pixels skip the cost-priced DP re-parse
+/// below [`MAX_LOSSLESS_METHOD`]: its per-pixel match tables take about
+/// 150 bytes a pixel, which a greedy parse does not need.
+const EFFORT_DP_MAX_PIXELS: usize = 4 << 20;
+
+/// What one lossless effort level below [`MAX_LOSSLESS_METHOD`] spends.
+#[derive(Clone, Copy, Debug)]
+struct EffortParams {
+    /// Hash-chain links the screening parse walks per position.
+    chain: usize,
+    /// Match length at which a lookup stops walking its chain.
+    nice_len: usize,
+    /// Lazy-matching look-ahead of the screening parse (`0..=4`).
+    lazy: u32,
+    /// §6.2.2 `prefix_bits` values the meta-prefix stage tries on the
+    /// elected candidate (each with 2..=[`MAX_META_GROUPS`] k-means
+    /// groups); empty = single prefix-code group only.
+    meta_prefix_bits: &'static [u8],
+    /// Re-plan the elected candidate with the full-effort parse and the
+    /// cost-priced DP.
+    dp: bool,
+}
+
+impl EffortParams {
+    fn for_method(method: u8) -> Self {
+        #[allow(clippy::type_complexity)]
+        let (chain, nice_len, lazy, meta_prefix_bits, dp): (
+            usize,
+            usize,
+            u32,
+            &'static [u8],
+            bool,
+        ) = match method {
+            0 => (8, 32, 0, &[], false),
+            1 => (16, 64, 1, &[5], false),
+            2 => (24, 128, 1, &[4, 5], false),
+            3 => (32, 256, 2, &[4, 5, 6], false),
+            4 => (48, 512, 2, &[4, 5, 6], true),
+            _ => (96, 1024, 3, &[4, 5, 6, 7], true),
+        };
+        Self {
+            chain,
+            nice_len,
+            lazy,
+            meta_prefix_bits,
+            dp,
+        }
     }
 
-    best
+    /// The matcher shape for a `pixel_count`-pixel stream. The chain
+    /// bound grows as the image shrinks below [`EFFORT_CHAIN_PIXELS`]
+    /// (up to [`MAX_CHAIN`]): a parse costs about `pixels x chain`, and
+    /// content built from repeats (tiles, screenshots) only finds its
+    /// matches deep in the chains.
+    fn shape(&self, pixel_count: usize) -> MatcherShape {
+        let scale = (EFFORT_CHAIN_PIXELS / pixel_count.max(1)).max(1);
+        MatcherShape {
+            max_chain: self.chain.saturating_mul(scale).min(MAX_CHAIN),
+            hash_bits: effort_hash_bits(pixel_count),
+            nice_len: self.nice_len,
+        }
+    }
+}
+
+/// Below this many pixels the reduced-effort chain bound scales up
+/// (see [`EffortParams::shape`]).
+const EFFORT_CHAIN_PIXELS: usize = 1 << 19;
+
+/// Hash-table size of the reduced-effort matcher: about four pixels a
+/// bucket, from [`HASH_BITS`] (up to 64 K pixels) to 2^22 buckets.
+fn effort_hash_bits(pixel_count: usize) -> u32 {
+    let bits = usize::BITS - (pixel_count.max(1) - 1).leading_zeros();
+    bits.saturating_sub(2).clamp(HASH_BITS as u32, 22)
+}
+
+/// The greedy §3.6.2.2 parse of `pixels` at a reduced effort: a matcher
+/// of `shape` and `lazy` positions of lazy look-ahead. With `record`,
+/// every `find` result is kept (see [`FindProbe`]) so the DP match table
+/// can replay it instead of searching again; otherwise the probe list is
+/// empty.
+fn effort_greedy_tokens(
+    pixels: &[u32],
+    shape: MatcherShape,
+    lazy: u32,
+    record: bool,
+) -> (Vec<Token>, Vec<FindProbe>) {
+    let mut matcher = Lz77Matcher::with_shape(pixels, shape);
+    let mut tokens = Vec::with_capacity(pixels.len() / 4);
+    let mut probes = if record {
+        vec![FindProbe::NOT_PROBED; pixels.len()]
+    } else {
+        Vec::new()
+    };
+    lz77_parse(
+        &mut matcher,
+        lazy,
+        |pos, found| {
+            if let Some(slot) = probes.get_mut(pos) {
+                *slot = FindProbe::record(found);
+            }
+        },
+        |tok| tokens.push(tok),
+    );
+    tokens.shrink_to_fit();
+    (tokens, probes)
+}
+
+/// Exact byte length the single-group writer produces for `prep` with
+/// `tokens` (a raw, un-cached parse of `prep.residuals`) at §5.2.3 cache
+/// choice `cache`, plus the cache-rewritten token stream when a cache is
+/// on.
+fn effort_stream_bytes(
+    prep: &PreparedTransform,
+    tokens: &[Token],
+    cache: Option<u32>,
+) -> (usize, Option<Vec<Token>>) {
+    let cached = cache.map(|bits| cacheify_tokens(tokens, &prep.residuals, bits));
+    let stream = cached.as_deref().unwrap_or(tokens);
+    let cache_size = cache.map_or(0, |b| 1usize << b);
+    let tables = StreamCostTables::build(stream, cache_size, prep.stream_width);
+    let body = prefix_codes_and_tokens_bits_from(&tables, stream, prep.stream_width);
+    let info_bits = if cache.is_some() { 5 } else { 1 };
+    let bits = prep.prelude.bit_position() + info_bits + 1 + body;
+    (bits.div_ceil(8), cached)
+}
+
+/// The §5.2.3 cache choices a screening pass prices per candidate; the
+/// elected candidate then sweeps every choice.
+const EFFORT_SCREEN_CACHES: [Option<u32>; 3] = [None, Some(6), Some(10)];
+
+/// Lossless encode below [`MAX_LOSSLESS_METHOD`] (`method` `0..=5`).
+///
+/// 1. A short, effort-dependent list of transform candidates is screened
+///    by the exact size of a reduced-effort greedy parse (one parse per
+///    candidate, priced at three cache choices). Only the best
+///    candidate's residuals stay alive.
+/// 2. The elected candidate sweeps all twelve §5.2.3 cache choices on
+///    that parse.
+/// 3. At `method >= 4` (images up to [`EFFORT_DP_MAX_PIXELS`]) it is
+///    re-planned with the full-effort parse + cost-priced DP; the
+///    smaller stream is kept.
+/// 4. At `method >= 1` the final token stream is also priced as a
+///    §6.2.2 multi-group (meta-prefix) image over k-means block
+///    clusterings, and kept when smaller.
+///
+/// Every step compares exact writer sizes, so the output is a valid,
+/// exactly lossless `VP8L` stream; it is usually somewhat larger than
+/// the exhaustive path's.
+fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) -> Vec<u8> {
+    let params = EffortParams::for_method(method);
+    let w = width as usize;
+    let h = height as usize;
+    let pred_bits = DEFAULT_PREDICTOR_SIZE_BITS;
+    let block = 1usize << pred_bits;
+    let blocks_fit = w >= block && h >= block;
+    let l1 = PredictorSubImageStrategy::L1;
+
+    // Candidate builders, cheapest-first; later ones only at higher
+    // efforts. Each yields the forward-transformed residuals + prelude.
+    type Build<'a> = Box<dyn Fn() -> Option<PreparedTransform> + 'a>;
+    let mut builds: Vec<Build<'_>> = Vec::new();
+    builds.push(Box::new(|| Some(prepare_literals(pixels, true, width))));
+    if blocks_fit {
+        builds.push(Box::new(move || {
+            Some(prepare_with_subtract_green_predictor(
+                pixels, width, height, pred_bits, l1,
+            ))
+        }));
+    }
+    if method >= 1 {
+        builds.push(Box::new(|| Some(prepare_literals(pixels, false, width))));
+        if blocks_fit {
+            builds.push(Box::new(|| {
+                Some(prepare_with_predictor(
+                    pixels, width, height, pred_bits, width,
+                ))
+            }));
+        }
+    }
+    if method >= 2 && blocks_fit {
+        builds.push(Box::new(move || {
+            Some(prepare_with_color_transform_subtract_green_predictor(
+                pixels, width, height, pred_bits, l1,
+            ))
+        }));
+    }
+    if method >= 3 && blocks_fit {
+        for strategy in [
+            PredictorSubImageStrategy::Entropy,
+            PredictorSubImageStrategy::EntropySubaware {
+                lambda_milli: 4_000,
+            },
+        ] {
+            builds.push(Box::new(move || {
+                Some(prepare_with_subtract_green_predictor(
+                    pixels, width, height, pred_bits, strategy,
+                ))
+            }));
+        }
+    }
+    if method >= 4 && blocks_fit {
+        builds.push(Box::new(move || {
+            Some(prepare_with_color_transform_predictor(
+                pixels, width, height, pred_bits, l1,
+            ))
+        }));
+    }
+    if method >= 5 && blocks_fit {
+        for strategy in [
+            PredictorSubImageStrategy::Entropy,
+            PredictorSubImageStrategy::EntropySubaware {
+                lambda_milli: 16_000,
+            },
+        ] {
+            builds.push(Box::new(move || {
+                Some(prepare_with_color_transform_subtract_green_predictor(
+                    pixels, width, height, pred_bits, strategy,
+                ))
+            }));
+        }
+    }
+    if collect_palette(pixels).is_some() {
+        let orderings: &[PaletteOrdering] = if method >= 3 {
+            &PALETTE_ORDERINGS
+        } else {
+            &[PaletteOrdering::FrequencyDesc]
+        };
+        for &ordering in orderings {
+            builds.push(Box::new(move || {
+                prepare_with_color_indexing_ordered(pixels, width, height, ordering)
+            }));
+        }
+        if method >= 2 && blocks_fit {
+            builds.push(Box::new(move || {
+                prepare_with_color_indexing_predictor_ordered(
+                    pixels,
+                    width,
+                    height,
+                    pred_bits,
+                    l1,
+                    PaletteOrdering::FrequencyDesc,
+                )
+            }));
+        }
+    }
+
+    let run_dp = params.dp && pixels.len() <= EFFORT_DP_MAX_PIXELS;
+
+    // 1. Screening: one reduced-effort parse per candidate.
+    /// A screened candidate: its residuals, its parse (tokens + probes)
+    /// and the smallest size it priced at.
+    type Screened = (PreparedTransform, (Vec<Token>, Vec<FindProbe>), usize);
+    let mut best: Option<Screened> = None;
+    for build in &builds {
+        let Some(prep) = build() else { continue };
+        let parse = effort_greedy_tokens(
+            &prep.residuals,
+            params.shape(prep.residuals.len()),
+            params.lazy,
+            run_dp,
+        );
+        let tokens = &parse.0;
+        let bytes = EFFORT_SCREEN_CACHES
+            .iter()
+            .map(|&cache| effort_stream_bytes(&prep, tokens, cache).0)
+            .min()
+            .expect("non-empty cache list");
+        if best.as_ref().is_none_or(|b| bytes < b.2) {
+            best = Some((prep, parse, bytes));
+        }
+    }
+    drop(builds);
+    let (prep, (tokens, probes), _) =
+        best.expect("the subtract-green literal candidate always builds");
+
+    // 2. Full §5.2.3 sweep on the elected candidate's parse.
+    let mut best_cache = None;
+    let mut best_len = effort_stream_bytes(&prep, &tokens, None).0;
+    let mut best_stream: Option<Vec<Token>> = None;
+    for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
+        let (len, cached) = effort_stream_bytes(&prep, &tokens, Some(bits));
+        if len < best_len {
+            best_len = len;
+            best_cache = Some(bits);
+            best_stream = cached;
+        }
+    }
+    // 3. Cost-priced DP re-plan of the winner at its cache choice, over
+    //    match tables built from the same reduced-effort parse.
+    let mut stream = best_stream;
+    if run_dp {
+        let sw = prep.stream_width;
+        let tables = DpMatchTables {
+            primary: compute_dp_matches_with_probes_chain(
+                &prep.residuals,
+                sw,
+                &probes,
+                params.shape(prep.residuals.len()),
+            ),
+            special: compute_special_matches(&prep.residuals, sw),
+        };
+        let (planned, body_bits) =
+            arbitrate_stream_plan(&prep.residuals, sw, best_cache, &tokens, &tables);
+        let info_bits = if best_cache.is_some() { 5 } else { 1 };
+        let len = (prep.prelude.bit_position() + info_bits + 1 + body_bits).div_ceil(8);
+        if len < best_len {
+            stream = Some(planned);
+            best_len = len;
+        }
+    }
+    drop(probes);
+    let stream = stream.unwrap_or(tokens);
+
+    // 4. §6.2.2 multi-group layouts over the final token stream.
+    let mut meta: Option<(u8, Vec<u16>)> = None;
+    let meta_ok = prep.stream_width == width && prep.residuals.len() == w * h;
+    for &prefix_bits in params.meta_prefix_bits.iter().filter(|_| meta_ok) {
+        let side = 1usize << prefix_bits;
+        let blocks = w.div_ceil(side) * h.div_ceil(side);
+        for num_groups in 2..=MAX_META_GROUPS {
+            if blocks < num_groups as usize {
+                continue;
+            }
+            let codes = cluster_blocks_by_histogram_distance(
+                &prep.residuals,
+                width,
+                height,
+                prefix_bits,
+                num_groups,
+            );
+            let Some(bits) = plan_meta_prefix_tokens_with_codes(
+                &stream,
+                width,
+                prefix_bits,
+                &codes,
+                best_cache,
+                width,
+                &mut None,
+            ) else {
+                continue;
+            };
+            let len = (prep.prelude.bit_position() + bits).div_ceil(8);
+            if len < best_len {
+                best_len = len;
+                meta = Some((prefix_bits, codes));
+            }
+        }
+    }
+
+    let mut out = prep.prelude.clone();
+    match meta {
+        Some((prefix_bits, codes)) => {
+            write_meta_prefix_tokens_with_codes(
+                &mut out,
+                &stream,
+                width,
+                prefix_bits,
+                codes,
+                best_cache,
+                width,
+            )
+            .expect("an elected meta-prefix layout has at least two groups");
+        }
+        None => write_spatially_coded_image(&mut out, &stream, best_cache, prep.stream_width),
+    }
+    let bytes = out.into_bytes();
+    debug_assert_eq!(bytes.len(), best_len, "effort size mirror drifted");
+    bytes
+}
+
+/// Dispatch a lossless image stream encode on `method`
+/// (`0..=MAX_LOSSLESS_METHOD`; larger values act as the maximum).
+fn encode_argb_with_method(pixels: &[u32], width: u32, height: u32, method: u8) -> Vec<u8> {
+    if method >= MAX_LOSSLESS_METHOD {
+        encode_argb_with_predictor_chooser(pixels, width, height)
+    } else {
+        encode_argb_with_effort(pixels, width, height, method)
+    }
 }
 
 /// Round 383 — generic Shannon entropy of a symbol histogram in
@@ -8256,6 +8926,7 @@ fn agglomerative_entropy_assignments(
                 pos += 1;
             }
             Token::Copy { length, distance } => {
+                let (length, distance) = (length as usize, distance as usize);
                 let (len_prefix, _, _) = value_to_prefix(length as u32);
                 h[256 + len_prefix as usize] += 1;
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
@@ -8375,7 +9046,22 @@ fn agglomerative_entropy_assignments(
 /// §5.2.3 cache choice).
 type MetaSweepPick = (usize, u8, Vec<u16>, Option<u32>);
 
+#[cfg(test)]
 fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Option<Vec<u8>> {
+    sweep_meta_prefix_candidate_over(pixels, width, height, &META_PREFIX_BITS_SWEEP)
+}
+
+/// [`sweep_meta_prefix_candidate`] restricted to the `prefix_bits`
+/// values in `prefix_bits_set` (walked in order, the sweep's outer loop),
+/// so the exhaustive chooser can run the sweep's slices as separate
+/// jobs; folding the slices in order with "strictly smaller replaces"
+/// returns what the whole sweep returns.
+fn sweep_meta_prefix_candidate_over(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    prefix_bits_set: &[u8],
+) -> Option<Vec<u8>> {
     // Round 409 — size-first sweep: every `(prefix_bits, partition,
     // cache)` tuple is priced through the exact
     // [`plan_meta_prefix_image_with_codes`] mirror and only the winner
@@ -8410,7 +9096,7 @@ fn sweep_meta_prefix_candidate(pixels: &[u32], width: u32, height: u32) -> Optio
             }
         }
     };
-    for &prefix_bits in META_PREFIX_BITS_SWEEP.iter() {
+    for &prefix_bits in prefix_bits_set {
         let block_side = 1u32 << prefix_bits;
         let pw = width.div_ceil(block_side);
         let ph = height.div_ceil(block_side);
@@ -8672,10 +9358,25 @@ fn encode_with_predictor_meta_prefix(
 /// cache_code_bits)` and return the byte-smallest non-degenerate
 /// stream, or `None` when every shape degenerates. Mirrors
 /// [`sweep_meta_prefix_candidate`]'s shape handling.
+#[cfg(test)]
 fn sweep_predictor_meta_prefix_candidate(
     pixels: &[u32],
     width: u32,
     height: u32,
+) -> Option<Vec<u8>> {
+    sweep_predictor_meta_prefix_candidate_over(pixels, width, height, &[false, true])
+}
+
+/// [`sweep_predictor_meta_prefix_candidate`] over the subtract-green
+/// branches in `subtract_green_set` (walked in order, the sweep's outer
+/// loop), so the exhaustive chooser can run each branch as its own job;
+/// folding them in order with "strictly smaller replaces" returns what
+/// the whole sweep returns.
+fn sweep_predictor_meta_prefix_candidate_over(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    subtract_green_set: &[bool],
 ) -> Option<Vec<u8>> {
     let size_bits = DEFAULT_PREDICTOR_SIZE_BITS;
     let block = 1u32 << size_bits;
@@ -8688,7 +9389,7 @@ fn sweep_predictor_meta_prefix_candidate(
     // is written. Same enumeration order + keep-first tie-break as the
     // previous write-everything sweep.
     let mut best: Option<(bool, MetaSweepPick)> = None;
-    for subtract_green in [false, true] {
+    for &subtract_green in subtract_green_set {
         // Round 388: the transform chain (§4.3 forward pass, §4.1
         // sub-image + residuals) depends only on `subtract_green` —
         // build it once per branch and share it between the kmeans and
@@ -8887,8 +9588,32 @@ pub fn encode_vp8l_argb_with(
     height: u32,
     alpha_is_used: bool,
 ) -> Result<Vec<u8>, EncodeError> {
+    encode_vp8l_argb_with_method(pixels, width, height, alpha_is_used, MAX_LOSSLESS_METHOD)
+}
+
+/// [`encode_vp8l_argb_with`] at lossless effort `method`: `0` (fastest)
+/// to [`MAX_LOSSLESS_METHOD`] (`6`, the exhaustive search the
+/// method-less helpers run); larger values act as `6`. Every level
+/// writes a valid, exactly lossless stream; lower levels try fewer
+/// transform / cache / parse combinations and usually write somewhat
+/// more bytes.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub fn encode_vp8l_argb_with_method(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    alpha_is_used: bool,
+    method: u8,
+) -> Result<Vec<u8>, EncodeError> {
     validate_argb(pixels, width, height)?;
-    Ok(encode_vp8l_payload(pixels, width, height, alpha_is_used))
+    Ok(encode_vp8l_payload(
+        pixels,
+        width,
+        height,
+        alpha_is_used,
+        method,
+    ))
 }
 
 #[cfg(test)]
@@ -9939,7 +10664,7 @@ mod tests {
         assert!(
             tokens.iter().any(|t| matches!(
                 t,
-                Token::Copy { distance, .. } if specials.contains(distance)
+                Token::Copy { distance, .. } if specials.contains(&(*distance as usize))
             )),
             "no special-distance copy in the planned stream"
         );
@@ -10453,7 +11178,7 @@ mod tests {
         for tok in &tokens {
             if let Token::Copy { length, .. } = tok {
                 assert!(
-                    *length <= MAX_MATCH,
+                    *length as usize <= MAX_MATCH,
                     "copy length {length} exceeded MAX_MATCH"
                 );
             }
@@ -14619,6 +15344,7 @@ mod tests {
                 }
                 Token::CacheRef { .. } => unreachable!("no cache in measurement"),
                 Token::Copy { length, distance } => {
+                    let (length, distance) = (length as usize, distance as usize);
                     write_lz77_value(&mut bw, green_code, 256, length as u32);
                     let raw_code = pixel_distance_to_distance_code(distance, w);
                     write_lz77_value(&mut bw, dist_code, 0, raw_code);
@@ -15220,7 +15946,7 @@ mod tests {
                 .map(|t| match *t {
                     Token::Literal(_) => 1,
                     Token::CacheRef { .. } => 1,
-                    Token::Copy { length, .. } => length,
+                    Token::Copy { length, .. } => length as usize,
                 })
                 .sum()
         };
@@ -15511,7 +16237,7 @@ mod tests {
                 .map(|t| match *t {
                     Token::Literal(_) => 1,
                     Token::CacheRef { .. } => 1,
-                    Token::Copy { length, .. } => length,
+                    Token::Copy { length, .. } => length as usize,
                 })
                 .sum()
         };
@@ -15842,7 +16568,7 @@ mod tests {
                 .map(|t| match *t {
                     Token::Literal(_) => 1,
                     Token::CacheRef { .. } => 1,
-                    Token::Copy { length, .. } => length,
+                    Token::Copy { length, .. } => length as usize,
                 })
                 .sum()
         };
@@ -16128,7 +16854,7 @@ mod tests {
                 .map(|t| match *t {
                     Token::Literal(_) => 1,
                     Token::CacheRef { .. } => 1,
-                    Token::Copy { length, .. } => length,
+                    Token::Copy { length, .. } => length as usize,
                 })
                 .sum()
         };

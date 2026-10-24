@@ -91,5 +91,46 @@ fn bench_lossless_encode(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_lossless_encode);
+/// A deterministic 512 x 384 photo-like RGBA image (gradients, a soft
+/// blob and per-channel noise): no long exact repeats, strong spatial
+/// correlation — the content the effort levels differ most on.
+fn photo_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut px = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height as f32;
+            let d = ((fx - 0.5).powi(2) + (fy - 0.4).powi(2)).sqrt();
+            let blob = (1.0 - (d * 3.0).min(1.0)) * 60.0;
+            let n = |s: u32| ((state >> s) & 0xF) as f32 - 8.0;
+            let r = (40.0 + 180.0 * fx + blob + n(0)).clamp(0.0, 255.0) as u8;
+            let g = (60.0 + 150.0 * fy + blob + n(4)).clamp(0.0, 255.0) as u8;
+            let b = (200.0 - 120.0 * fx * fy + n(8)).clamp(0.0, 255.0) as u8;
+            px.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    px
+}
+
+/// `EncodeOptions::method` cells (#45): the fastest level, the default
+/// and the exhaustive search on the same photo-like image.
+fn bench_lossless_methods(c: &mut Criterion) {
+    let (w, h) = (512u32, 384u32);
+    let photo = photo_rgba(w, h);
+    let mut group = c.benchmark_group("lossless_encode_photo_512x384");
+    group.sample_size(10);
+    for method in [0u8, 4, 6] {
+        let opts = EncodeOptions::default().with_method(method);
+        group.bench_function(format!("method_{method}"), |b| {
+            b.iter(|| black_box(encode_rgba8(w, h, black_box(&photo), &opts).expect("encode")))
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_lossless_encode, bench_lossless_methods);
 criterion_main!(benches);

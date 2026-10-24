@@ -45,7 +45,7 @@ fn assert_pin(what: &str, out: &[u8], len: usize, hash: u64) {
 
 #[test]
 fn every_fixture_encodes_to_its_pinned_lossy_bytes() {
-    let opts = EncodeOptions::default().with_quality(80.0);
+    let opts = EncodeOptions::default().with_quality(80.0).with_method(6);
     for &(name, len, hash) in FIXTURE_PINS {
         let path = format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"));
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -57,7 +57,7 @@ fn every_fixture_encodes_to_its_pinned_lossy_bytes() {
 
 #[test]
 fn photos_encode_to_their_pinned_lossy_bytes() {
-    let opts = EncodeOptions::default().with_quality(80.0);
+    let opts = EncodeOptions::default().with_quality(80.0).with_method(6);
     for (side, len, hash) in [
         (64u32, 328usize, 0x3480734f0a055024u64),
         (96, 532, 0xa0b46f8ea0b2283f),

@@ -169,8 +169,12 @@ before any pixel buffer is allocated; a hit is `Error::LimitExceeded`.
 
 `EncodeOptions` (`Default` + `with_*`): `quality: Option<f32>` (`None` =
 lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
-strength), `embed_icc` / `embed_exif` / `embed_xmp` (default on — the
-image's metadata is written when present), and for animations
+strength), `method` (`0..=6`, default `4`: encoder effort — lossless
+`6` is the exhaustive search, lower levels screen fewer candidates with
+a cheaper parse and write somewhat larger files much faster; every
+level is exactly lossless), `embed_icc` / `embed_exif` / `embed_xmp`
+(default on — the image's metadata is written when present), and for
+animations
 `loop_count` (`0` = forever), `background_rgba`, `frame_mode`
 (`Auto` / `Delta` / `Lossless` dirty-rectangle strategy) and `delta`.
 One struct for stills and animations; behaviour variants are fields.
@@ -216,12 +220,16 @@ profile is carried, not applied.
   `build_animated_webp_with_options` / `AnimEncoderOptions`,
   `WebpFileMetadata` — is kept for one release as `#[deprecated]` thin
   wrappers over the contract functions.
-* The lossless encoder is a byte-cost super-chooser over every §3 / §4 /
-  §3.5 transform candidate, cost-priced LZ77 planning and §6.2.2
-  entropy-image clustering; on a 10-image corpus its output is smaller
-  than the reference encoder's best effort on 9 of 10 images (up to
-  −28%). Every stream is re-verified bit-exact through a black-box
-  reference decode. See [`BENCHMARKS.md`](./BENCHMARKS.md) for the
+* The lossless encoder at `method` 6 is a byte-cost super-chooser over
+  every §3 / §4 / §3.5 transform candidate, cost-priced LZ77 planning
+  and §6.2.2 entropy-image clustering, run on worker threads (byte-
+  identical to a one-by-one search); on a 10-image corpus its output is
+  smaller than the reference encoder's best effort on 9 of 10 images (up
+  to −28%). The default `method` 4 screens a short candidate list with
+  one cheap parse each and plans only the winner: an 800 x 533 photo
+  encodes in about 0.4 s at 1.2 % more bytes than method 6 (about 4 s).
+  Every level is re-verified bit-exact through black-box reference
+  decodes. See [`BENCHMARKS.md`](./BENCHMARKS.md) for the
   optimisation log.
 
 ## Benchmarks

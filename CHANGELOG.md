@@ -4,6 +4,80 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `EncodeOptions::method` / `with_method` (`0..=6`, default `4`): lossless
+  encoder effort (#45). It reaches every lossless encode — stills,
+  animation frames and the `ALPH` plane of a lossy encode — and the
+  registry encoder (which uses `EncodeOptions::default()`). `6` is the
+  exhaustive search this crate has always run, byte-for-byte
+  (`tests/lossless_output_pins.rs` now pins `with_method(6)`); `0..=5`
+  screen a short, effort-dependent list of transform candidates with one
+  reduced-effort parse each (chain bound, image-sized hash table, a
+  "long enough" match length), sweep the colour cache on the winner, then
+  at `4..=5` re-plan it with the cost-priced DP and at `1..=5` try
+  §6.2.2 multi-group layouts. Every level is exactly lossless; levels
+  below `6` write somewhat more bytes (default: at most +8.7 % on the
+  fixtures and synthetic inputs, typically under 1 %). On an 800 x 533
+  photo (release, 18-core Apple M-series): method 0 0.10 s / 456 428 B,
+  method 4 0.39-0.51 s / 440 872 B, method 6 3.8-4.6 s / 435 790 B
+  (v0.3.1: 17-20 s, the same 435 790 B). A 2400 x 1600 photo encodes in
+  about 6 s and a 12 MP photo in about 17 s at the default, in 1.2 GB
+  peak (r479: 2.3 GiB and a panic after 140 s). Tests:
+  `tests/lossless_effort.rs` (every level exact on every fixture frame and
+  synthetic inputs, default within 10 % + 8 bytes of method 6, alpha plane
+  and animation frames follow the level) and oracle direction G (every
+  level through `dwebp`, and `ffmpeg` when installed); bench cells
+  `lossless_encode_photo_512x384/method_{0,4,6}`.
+- `encode_vp8l_argb_with_method` / `encode_vp8l_argb_with_metadata_and_method`
+  (hidden): the bare-bitstream helpers at a chosen level; the method-less
+  helpers keep the exhaustive search.
+- Tests (`tests/lossless_output_pins.rs`) pinning the lossless encoder's
+  output bytes: every frame of every committed fixture, three synthetic
+  images, five animations, and the lossy encodes of the four fixture
+  frames with alpha, whose `ALPH` plane the lossless encoder codes. A
+  change meant to leave the encoder's output alone must leave every pin
+  as it is.
+- `encoder_vp8::Vp8LossyEncoder`, the lossy (`VP8 `) still encoder with
+  a direct constructor (`with_quality`, `with_qindex`): it needs neither
+  the `registry` feature nor a framework `Encoder`. `encode_yuv420`
+  reads a 4:2:0 picture's planes in place at the caller's strides and
+  writes a simple-lossy `.webp`, byte-identical to the `webp_vp8`
+  framework encoder's packet for the same picture and quality (a test
+  pins it, padded rows included).
+
+### Changed
+
+- **The default lossless encode is method 4**, not the exhaustive search:
+  output bytes change for every lossless encode that does not set
+  `with_method(6)`.
+- Method 6 evaluates its candidates on scoped worker threads (up to
+  `available_parallelism`, fewer when the image is large: about 512 bytes
+  a pixel per worker within a 1.5 GiB budget, one worker when threads are
+  unavailable) and folds them in the original order, so its output is
+  byte-identical to the one-by-one search. The predictor meta-prefix sweep
+  runs as one job per subtract-green branch.
+- A finished lossless encode frees the per-thread token-plan memo (about
+  150 bytes a pixel) instead of keeping the last image's tables alive.
+- Internal: LZ77 tokens are 12 bytes (`u32` copy fields), halving every
+  parse's memory; the matcher takes a chain bound, hash-table size and
+  match-length cut-off (the exhaustive path keeps 256 / 2^14 / 4096).
+- edition 2024, MSRV 1.95
+- Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
+  callback, and the frequency count, exact cost and writer of a
+  spatially-coded image take any token stream, so a parse no longer has
+  to be stored as a `Vec<Token>`. The output is unchanged (the output
+  pins hold).
+- The lossy path copies the `VP8 ` bitstream into the RIFF container
+  once. `build_webp_file` writes its chunks straight into the file
+  instead of building each chunk and copying it again (a 100,001-byte
+  bitstream now allocates about 100 KB instead of 200 KB), and the
+  extended lossy layout (`VP8X` with `ALPH` or metadata) appends every
+  chunk into one buffer instead of building a body and framing it (three
+  copies of the bitstream down to one). The output bytes are unchanged:
+  `tests/lossy_output_pins.rs` pins every fixture's quality-80 encode,
+  two photo-like images and the `webp_vp8` framework encoder's packet.
+
 ### Fixed
 
 - Predictor transform, rightmost column: RFC 9649 §4.1 makes the
@@ -25,40 +99,6 @@ All notable changes to `oxideav-webp` are recorded here.
   selected, and the frequency count guards the distance histogram
   (#34, #44). Covered by `tests/lossless_far_match.rs`, a 1025 x 1024
   image whose only long match sits 1 048 500 pixels back.
-
-### Changed
-
-- edition 2024, MSRV 1.95
-- Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
-  callback, and the frequency count, exact cost and writer of a
-  spatially-coded image take any token stream, so a parse no longer has
-  to be stored as a `Vec<Token>`. The output is unchanged (the output
-  pins hold).
-- The lossy path copies the `VP8 ` bitstream into the RIFF container
-  once. `build_webp_file` writes its chunks straight into the file
-  instead of building each chunk and copying it again (a 100,001-byte
-  bitstream now allocates about 100 KB instead of 200 KB), and the
-  extended lossy layout (`VP8X` with `ALPH` or metadata) appends every
-  chunk into one buffer instead of building a body and framing it (three
-  copies of the bitstream down to one). The output bytes are unchanged:
-  `tests/lossy_output_pins.rs` pins every fixture's quality-80 encode,
-  two photo-like images and the `webp_vp8` framework encoder's packet.
-
-### Added
-
-- Tests (`tests/lossless_output_pins.rs`) pinning the lossless encoder's
-  output bytes: every frame of every committed fixture, three synthetic
-  images, five animations, and the lossy encodes of the four fixture
-  frames with alpha, whose `ALPH` plane the lossless encoder codes. A
-  change meant to leave the encoder's output alone must leave every pin
-  as it is.
-- `encoder_vp8::Vp8LossyEncoder`, the lossy (`VP8 `) still encoder with
-  a direct constructor (`with_quality`, `with_qindex`): it needs neither
-  the `registry` feature nor a framework `Encoder`. `encode_yuv420`
-  reads a 4:2:0 picture's planes in place at the caller's strides and
-  writes a simple-lossy `.webp`, byte-identical to the `webp_vp8`
-  framework encoder's packet for the same picture and quality (a test
-  pins it, padded rows included).
 
 ## [0.3.1](https://github.com/OxideAV/oxideav-webp/compare/v0.3.0...v0.3.1) - 2026-10-05
 

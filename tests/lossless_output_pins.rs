@@ -1,7 +1,7 @@
 //! Pins of the lossless (`VP8L`) encoder's output bytes.
 //!
 //! Every pin is the length and FNV-1a 64 fingerprint of a file the v0.3.1
-//! encoder wrote, including lossy files whose alpha plane (`ALPH`) the
+//! encoder wrote (method 6, its only search), including lossy files whose alpha plane (`ALPH`) the
 //! lossless encoder codes. A change meant to leave the encoder's output
 //! alone (a refactor, a speed-up) must leave every pin as it is.
 
@@ -61,9 +61,10 @@ const FIXTURE_PINS: &[(&str, usize, usize, u64)] = &[
     ),
 ];
 
-/// The options every pin was captured with.
+/// The options every pin was captured with: method 6, the exhaustive
+/// search (the encoder's default up to v0.3.1).
 fn pinned() -> EncodeOptions {
-    EncodeOptions::default()
+    EncodeOptions::default().with_method(6)
 }
 
 fn fixture(name: &str) -> Vec<u8> {
