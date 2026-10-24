@@ -8894,6 +8894,57 @@ pub fn encode_vp8l_argb_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #34: RFC 9649 §3.6.2.2 — the largest distance code value, prefix
+    /// 39 (`786433..1048576`), is 1 048 576; a scan-line distance `D` is
+    /// coded as `D + 120`, so `MAX_ENCODABLE_DISTANCE` is the largest `D`
+    /// whose code still has a prefix inside the 40-symbol alphabet.
+    #[test]
+    fn max_encodable_distance_is_the_last_prefix_39_scan_line_code() {
+        let code = |d: usize| d as u32 + 120;
+        assert_eq!(value_to_prefix(code(MAX_ENCODABLE_DISTANCE)).0, 39);
+        assert_eq!(value_to_prefix(code(MAX_ENCODABLE_DISTANCE + 1)).0, 40);
+        assert_eq!(
+            pixel_distance_to_distance_code(MAX_ENCODABLE_DISTANCE, 1),
+            code(MAX_ENCODABLE_DISTANCE)
+        );
+    }
+
+    /// #34: a 16-pixel pattern repeated exactly `MAX_ENCODABLE_DISTANCE`
+    /// pixels back is found; one pixel farther it is not, because no
+    /// distance code can express it (the matcher used to return it and
+    /// the frequency count then indexed the distance histogram at 40).
+    #[test]
+    fn matcher_stops_at_the_largest_encodable_distance() {
+        for (gap, reachable) in [
+            (MAX_ENCODABLE_DISTANCE, true),
+            (MAX_ENCODABLE_DISTANCE + 1, false),
+        ] {
+            // Pairwise-distinct background (an odd multiplier is a
+            // bijection on u32) so no other window repeats.
+            let mut px: Vec<u32> = (0..gap as u32 + 64)
+                .map(|i| i.wrapping_mul(0x9E37_79B1) | 0xff00_0000)
+                .collect();
+            for k in 0..16 {
+                let v = 0x0012_3400 + k as u32;
+                px[k] = v;
+                px[gap + k] = v;
+            }
+            let mut m = Lz77Matcher::new(&px);
+            for pos in 0..gap {
+                m.insert(pos);
+            }
+            let found = m.find(gap);
+            if reachable {
+                assert_eq!(found, Some((16, gap)), "match at the bound is used");
+            } else {
+                assert!(
+                    found.is_none_or(|(_, d)| d <= MAX_ENCODABLE_DISTANCE),
+                    "unencodable distance selected: {found:?}"
+                );
+            }
+        }
+    }
     use crate::vp8l_prefix::PrefixCode;
     use crate::vp8l_stream::BitReader;
 
