@@ -875,6 +875,17 @@ path = "fuzz_targets/contract_encode.rs"
 test = false
 doc = false
 
+# Round 481: the lossless effort levels 0..=6 (screening waves,
+# one-walk cache pricing, §6.2.2 layout stage) through `encode_rgba8`,
+# serial vs a 2..=5-worker budget: byte-identical output and an exact
+# round trip.
+[[bin]]
+name = "encode_effort_threads"
+path = "fuzz_targets/encode_effort_threads.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "demux"
 path = "fuzz_targets/demux.rs"

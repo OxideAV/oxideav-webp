@@ -2382,7 +2382,7 @@ const DP_LONG_MATCH_INHERIT: usize = 64;
 // recorded-probe table; the probe-free form remains the fused pass's
 // equivalence oracle.
 #[cfg(test)]
-fn compute_dp_matches(pixels: &[u32], image_width: u32) -> Vec<Option<DpMatch>> {
+fn compute_dp_matches(pixels: &[u32], image_width: u32) -> Vec<PackedMatch> {
     compute_dp_matches_with_probes(pixels, image_width, &[])
 }
 
@@ -2400,7 +2400,7 @@ fn compute_dp_matches_with_probes(
     pixels: &[u32],
     image_width: u32,
     probes: &[FindProbe],
-) -> Vec<Option<DpMatch>> {
+) -> Vec<PackedMatch> {
     compute_dp_matches_with_probes_chain(
         pixels,
         image_width,
@@ -2420,9 +2420,9 @@ fn compute_dp_matches_with_probes_chain(
     image_width: u32,
     probes: &[FindProbe],
     shape: MatcherShape,
-) -> Vec<Option<DpMatch>> {
+) -> Vec<PackedMatch> {
     let n = pixels.len();
-    let mut matches: Vec<Option<DpMatch>> = vec![None; n];
+    let mut matches: Vec<PackedMatch> = vec![PackedMatch::NONE; n];
     let mut matcher = Lz77Matcher::with_shape(pixels, shape);
     let mut pos = 0usize;
     while pos < n {
@@ -2438,7 +2438,8 @@ fn compute_dp_matches_with_probes_chain(
             }
             _ => matcher.find(pos),
         };
-        matches[pos] = m0.map(|(len, dist)| DpMatch::new(len, dist, image_width));
+        matches[pos] =
+            PackedMatch::pack(m0.map(|(len, dist)| DpMatch::new(len, dist, image_width)));
         matcher.insert(pos);
         if let Some((len, _)) = m0
             && len >= DP_LONG_MATCH_INHERIT
@@ -2447,9 +2448,9 @@ fn compute_dp_matches_with_probes_chain(
             // The distance-code decomposition is shared by every
             // inherited entry (same distance); only the length
             // decomposition changes with `k`.
-            let base = matches[pos].expect("just stored");
+            let base = matches[pos].get().expect("just stored");
             for k in 1..=inherit {
-                matches[pos + k] = Some(base.with_length(len - k));
+                matches[pos + k] = PackedMatch::pack(Some(base.with_length(len - k)));
                 matcher.insert(pos + k);
             }
             pos += inherit + 1;
@@ -2472,9 +2473,9 @@ fn compute_dp_matches_with_probes_chain(
 /// whose distance code is near-free — candidates the DP can only
 /// weigh if the table carries them.
 struct DpMatchTables {
-    primary: Vec<Option<DpMatch>>,
+    primary: Vec<PackedMatch>,
     /// One table per special distance, in [`special_distances`] order.
-    special: Vec<Vec<Option<DpMatch>>>,
+    special: Vec<SpecialRuns>,
 }
 
 /// The fixed §5.2.2 distances the DP carries per-position candidates
@@ -2503,29 +2504,82 @@ fn special_distances(image_width: u32, n: usize) -> Vec<usize> {
 /// self-referential case, because each decoded pixel reproduces the
 /// already-decoded pixel `d` back). Lengths cap at the §5.2.2 maximum
 /// the [`DP_LENGTH_LADDER`] tops out at.
-fn compute_special_matches(pixels: &[u32], image_width: u32) -> Vec<Vec<Option<DpMatch>>> {
-    const MAX_LEN: u32 = 4096;
+fn compute_special_matches(pixels: &[u32], image_width: u32) -> Vec<SpecialRuns> {
+    const MAX_LEN: u16 = MAX_MATCH as u16;
     let n = pixels.len();
     let mut tables = Vec::new();
     for d in special_distances(image_width, n) {
         // Decomposition template: the distance-code scan runs once
         // per distance, not once per position.
         let template = DpMatch::new(1, d, image_width);
-        let mut table: Vec<Option<DpMatch>> = vec![None; n];
-        let mut run = 0u32;
+        let mut runs = vec![0u16; n];
+        let mut run = 0u16;
         for i in (d..n).rev() {
             run = if pixels[i] == pixels[i - d] {
                 (run + 1).min(MAX_LEN)
             } else {
                 0
             };
-            if run > 0 {
-                table[i] = Some(template.with_length(run as usize));
-            }
+            runs[i] = run;
         }
-        tables.push(table);
+        tables.push(SpecialRuns { template, runs });
     }
     tables
+}
+
+/// One fixed-distance candidate table of [`DpMatchTables`]: the run
+/// length (`0` = none) of `pixels[i..]` repeating `pixels[i - d..]`
+/// per position, 2 bytes a pixel; the candidate is `template` (the
+/// distance's decomposition) at that length.
+struct SpecialRuns {
+    template: DpMatch,
+    runs: Vec<u16>,
+}
+
+/// An `Option<DpMatch>` in 8 bytes (the match tables hold one per
+/// pixel; the unpacked form is 20): `0` is `None`, otherwise the length
+/// (13 bits, `<= MAX_MATCH`), distance (21 bits, `<=
+/// MAX_ENCODABLE_DISTANCE` or a row-above distance `<= 2^14 + 1`) and
+/// the four §5.2.2 decomposition fields (5 + 4 + 6 + 5 bits; prefixes
+/// below 24 and 40, extra bits at most 10 and 18) side by side. Every
+/// stored match has `len >= MIN_MATCH`, so no match packs to `0`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PackedMatch(u64);
+
+impl PackedMatch {
+    const NONE: Self = Self(0);
+
+    #[inline]
+    fn pack(m: Option<DpMatch>) -> Self {
+        let Some(m) = m else { return Self::NONE };
+        debug_assert!(m.len >= 1 && m.len < 1 << 13 && m.dist < 1 << 21);
+        debug_assert!(m.len_prefix < 32 && m.len_extra_bits < 16);
+        debug_assert!(m.dist_prefix < 64 && m.dist_extra_bits < 32);
+        Self(
+            u64::from(m.len)
+                | u64::from(m.dist) << 13
+                | u64::from(m.len_prefix) << 34
+                | u64::from(m.len_extra_bits) << 39
+                | u64::from(m.dist_prefix) << 43
+                | u64::from(m.dist_extra_bits) << 49,
+        )
+    }
+
+    #[inline]
+    fn get(self) -> Option<DpMatch> {
+        let v = self.0;
+        if v == 0 {
+            return None;
+        }
+        Some(DpMatch {
+            len: (v & 0x1fff) as u32,
+            dist: (v >> 13 & 0x1f_ffff) as u32,
+            len_prefix: (v >> 34 & 0x1f) as u16,
+            len_extra_bits: (v >> 39 & 0xf) as u16,
+            dist_prefix: (v >> 43 & 0x3f) as u16,
+            dist_extra_bits: (v >> 49 & 0x1f) as u16,
+        })
+    }
 }
 
 /// One §5.2.2 copy candidate in the round-383 DP match table, with the
@@ -2696,7 +2750,7 @@ fn dp_refine_tokens(
         // explicit blocks — same candidate order, same tie-breaks
         // (strict `<` keeps the earlier candidate), no per-position
         // iterator-state overhead.
-        if let Some(m) = tables.primary[i] {
+        if let Some(m) = tables.primary[i].get() {
             let dist_bits = (dist_cost[m.dist_prefix as usize] + m.dist_extra_bits as u32) as u64;
             let max_len = m.len as usize;
             // Full match length (decomposition precomputed).
@@ -2728,7 +2782,11 @@ fn dp_refine_tokens(
             }
         }
         for t in &tables.special {
-            let Some(m) = t[i] else { continue };
+            let run = t.runs[i];
+            if run == 0 {
+                continue;
+            }
+            let m = t.template.with_length(run as usize);
             let dist_bits = (dist_cost[m.dist_prefix as usize] + m.dist_extra_bits as u32) as u64;
             let full_bits =
                 (green_cost[256 + m.len_prefix as usize] + m.len_extra_bits as u32) as u64;
@@ -8435,10 +8493,11 @@ fn parallel_map<T: Send>(n: usize, workers: usize, f: impl Fn(usize) -> T + Sync
 type ChooserJob<'a> = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync + 'a>;
 
 /// Peak memory the exhaustive chooser budgets per worker thread: about
-/// 512 bytes a pixel (residual and transform buffers, the token
-/// planner's per-pixel match tables and its per-cache plans; measured
-/// at about 410 on an 800 x 533 photo).
-const CHOOSER_BYTES_PER_PIXEL: usize = 512;
+/// 256 bytes a pixel (residual and transform buffers, the token
+/// planner's packed per-pixel match tables and its per-cache plans;
+/// measured at about 215 on a 1200 x 900 photo, 410 before the match
+/// tables were packed).
+const CHOOSER_BYTES_PER_PIXEL: usize = 256;
 
 /// Working-memory budget the exhaustive chooser and the screening pass
 /// spread over extra worker threads (the first worker is always
@@ -8531,8 +8590,10 @@ pub const MAX_LOSSLESS_METHOD: u8 = 6;
 pub const DEFAULT_LOSSLESS_METHOD: u8 = 4;
 
 /// Images above this many pixels skip the cost-priced DP re-parse
-/// below [`MAX_LOSSLESS_METHOD`]: its per-pixel match tables take about
-/// 150 bytes a pixel, which a greedy parse does not need.
+/// below [`MAX_LOSSLESS_METHOD`]: its probe record, packed match tables,
+/// cache-hit table, DP arrays and candidate streams take about 50
+/// bytes a pixel on top of the greedy parse (a 12 Mpx photo: 0.4 %
+/// smaller for 340 MB -> 930 MB heap and +2.7 s).
 const EFFORT_DP_MAX_PIXELS: usize = 4 << 20;
 
 /// What one lossless effort level below [`MAX_LOSSLESS_METHOD`] spends.
@@ -9156,14 +9217,16 @@ fn encode_argb_with_method(pixels: &[u32], width: u32, height: u32, method: u8) 
     }
 }
 
-/// Largest image (in pixels, 2048 x 2048) [`MAX_LOSSLESS_METHOD`] runs
-/// the exhaustive search on. That search keeps per-pixel match tables
-/// and a plan per cache choice for each of its ~60 candidates (about
-/// 500 bytes a pixel per worker) and takes tens of minutes on a 12 Mpx
-/// photo; above this size the maximum level runs the screened search at
-/// its highest setting instead (the exhaustive matcher shape, the widest
-/// candidate list, every §6.2.2 layout).
-const EXHAUSTIVE_MAX_PIXELS: usize = 4 << 20;
+/// Largest image (in pixels, 2 Mpx, e.g. 1448 x 1448)
+/// [`MAX_LOSSLESS_METHOD`] runs the exhaustive search on. That search
+/// plans each of its ~60 candidates at every cache choice (about 256
+/// bytes a pixel per worker) and its return shrinks with the image: on
+/// a photo it beat method 5 by 0.7 % at 0.48 Mpx and 0.3 % at 1.1 Mpx
+/// (27 s), by 0.01 % at 3 Mpx (148 s on one worker), and did not finish
+/// in ten minutes at 12 Mpx. Above this size the maximum level runs
+/// method 5's screened search plus an exhaustive-shape parse of the
+/// winner instead.
+const EXHAUSTIVE_MAX_PIXELS: usize = 2 << 20;
 
 /// Round 383 — generic Shannon entropy of a symbol histogram in
 /// milli-bits (the multi-alphabet analogue of
@@ -11720,6 +11783,30 @@ mod tests {
                         prefix_codes_and_tokens_bits(&stored, 1 << bits, width),
                         "cache bits {bits} width {width}"
                     );
+                }
+            }
+        }
+    }
+
+    /// `PackedMatch` round-trips every field at the extremes the match
+    /// tables can hold, and no match packs to the empty value.
+    #[test]
+    fn packed_match_round_trips_extremes() {
+        assert_eq!(PackedMatch::NONE.get(), None);
+        assert_eq!(PackedMatch::pack(None), PackedMatch::NONE);
+        for width in [1u32, 9, 4000, 16_383] {
+            for len in [MIN_MATCH, 4, 64, 1000, MAX_MATCH] {
+                for dist in [
+                    1usize,
+                    2,
+                    width as usize + 1,
+                    70_000,
+                    MAX_ENCODABLE_DISTANCE,
+                ] {
+                    let m = DpMatch::new(len, dist, width);
+                    let packed = PackedMatch::pack(Some(m));
+                    assert_ne!(packed, PackedMatch::NONE);
+                    assert_eq!(packed.get(), Some(m), "len {len} dist {dist} width {width}");
                 }
             }
         }

@@ -75,7 +75,14 @@ default threads: method 0 1.6 s, method 4 2.2 s (was 10.1 s, 1.70 GB
 RSS), method 6 3.9 s. Plasma fractal 4000 x 3000: method 4 4.0 s (was
 16.7 s). 6000 x 4000 synthetic photo at method 4: 17.6 s before.
 
-What changed (all output-neutral below 4 Mpx):
+Method 6 against the exhaustive search it replaces above 2 Mpx (photo
+resized, default threads): 800 x 600 4.9 s → 2.8 s and 1200 x 900
+26.9 s → 15.4 s (exhaustive, same bytes, more workers after the match
+tables were packed); 1500 x 2000 148 s → 1.5 s (screened: 2 873 798 B,
++0.013 % against the exhaustive 2 873 422 B). Methods 4/5 at
+1500 x 2000 (DP on): 525 → 233 MB heap, same bytes.
+
+What changed (all output-neutral at or below 2 Mpx):
 
 * Screening counted each candidate's parse while producing it (symbol
   counts, extra bits, a literal bitmap) instead of storing it; the
@@ -91,6 +98,8 @@ What changed (all output-neutral below 4 Mpx):
   12 MP).
 * Candidates screen in waves on the thread budget; §6.2.2 layouts and
   clusterings in parallel; all folded in submission order.
+* DP match tables packed: `Option<DpMatch>` 20 → 8 bytes, the five
+  fixed-distance tables 20 → 2 bytes each (run lengths).
 * Remaining serial profile (method 5): `Lz77Matcher::find` ~50 %, the
   predictor-mode search (`for_each_block_residual`,
   `block_mode_entropy_cost`) ~30 %.

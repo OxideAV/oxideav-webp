@@ -55,6 +55,10 @@ All notable changes to `oxideav-webp` are recorded here.
 - `encode_vp8l_argb_with_method` / `encode_vp8l_argb_with_metadata_and_method`
   (hidden): the bare-bitstream helpers at a chosen level; the method-less
   helpers keep the exhaustive search.
+- Fuzz target `encode_effort_threads`: a fuzz-controlled RGBA image at
+  every lossless level (method 6 up to 16 x 16), encoded serially and on
+  a 2..=5-worker budget — the bytes must match and decode exactly. The
+  screened levels had no fuzz coverage before. 32 k local runs clean.
 - Tests (`tests/lossless_output_pins.rs`) pinning the lossless encoder's
   output bytes: every frame of every committed fixture, three synthetic
   images, five animations, and the lossy encodes of the four fixture
@@ -87,6 +91,8 @@ All notable changes to `oxideav-webp` are recorded here.
   | 5 | 15.7 s, 510 MB | 15.4 s, 339 MB | 5.1 s, 883 MB |
   | 6 | > 590 s, > 7.5 GB RSS (killed) | 16.1 s, 390 MB | 6.3 s, 883 MB |
 
+  (A 6000 x 4000 image at method 4 took 17.6 s and 2.5 GB RSS before.)
+
   Methods 0..=5 write the same bytes as before (11 437 380 B at the
   default; method 6 now 11 416 536 B, below method 5's 11 428 592 B).
   Peak RSS (macOS) at method 4: 1.18 GB before; 0.55 GB serial, 1.15 GB
@@ -105,21 +111,29 @@ All notable changes to `oxideav-webp` are recorded here.
   - The §6.2.2 layout pricer walks the stream once, without a 10-byte
     per-token side table.
   - `Token` is 8 bytes (16-bit copy length; `MAX_MATCH` is 4096).
-- **Method 6 above 4 Mpx (2048 x 2048)** runs method 5's screened search
-  plus a second parse of the elected candidate with the exhaustive
-  matcher shape (full chain, no early stop, full lazy look-ahead); both
-  parses go through the §6.2.2 stage and the smaller file wins. The
-  exhaustive search keeps per-pixel match tables and a plan per cache
-  choice for each of ~60 candidates (about 500 bytes a pixel per
-  worker): on a 12 MP image it did not finish in ten minutes. Output at
-  or below 4 Mpx is unchanged (the method-6 output pins hold).
+- **Method 6 above 2 Mpx** runs method 5's screened search plus a second
+  parse of the elected candidate with the exhaustive matcher shape (full
+  chain, no early stop, full lazy look-ahead); both parses go through the
+  §6.2.2 stage and the smaller file wins. The exhaustive search plans
+  each of ~60 candidates at every cache choice and its return shrinks
+  with the image: on one photo it beat method 5 by 0.7 % at 0.48 Mpx and
+  0.3 % at 1.1 Mpx, by 0.01 % at 3 Mpx (148 s; the screened form takes
+  1.5 s), and did not finish in ten minutes at 12 Mpx. Output at or below
+  2 Mpx is unchanged (the method-6 output pins hold).
+- The cost-priced DP's per-pixel match tables are packed: the hash-chain
+  match in 8 bytes instead of 20, each fixed-distance candidate as a
+  2-byte run length instead of 20 bytes (five of them). Methods 4-5 at
+  3 Mpx: 525 MB to 233 MB heap, same bytes; the exhaustive search needs
+  about 215 bytes a pixel per worker instead of about 410, so it runs
+  twice as many workers in its 1.5 GiB budget (1200 x 900 photo: 26.9 s
+  to 15.4 s, 800 x 600: 4.9 s to 2.8 s, same bytes).
 - **The default lossless encode is method 4**, not the exhaustive search:
   output bytes change for every lossless encode that does not set
   `with_method(6)`.
   This includes the `ALPH` plane of a lossy encode with alpha (the `VP8 `
   bitstream itself is unchanged at the default).
 - Method 6 evaluates its candidates on scoped worker threads (up to the
-  `threads` budget, fewer when the image is large: about 512 bytes
+  `threads` budget, fewer when the image is large: about 256 bytes
   a pixel per worker within a 1.5 GiB budget, one worker when threads are
   unavailable) and folds them in the original order, so its output is
   byte-identical to the one-by-one search. The predictor meta-prefix sweep
