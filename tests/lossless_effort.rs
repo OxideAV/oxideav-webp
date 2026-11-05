@@ -228,3 +228,51 @@ fn output_is_identical_for_every_thread_budget() {
     };
     assert_eq!(lossy(1), lossy(2));
 }
+
+/// `encode_rgb8` / `encode_rgba8` read the caller's buffer in place on
+/// the lossless path: the bytes and every rejection match encoding the
+/// equivalent `WebpImage` (zero dimension, short buffer, oversize side;
+/// a longer buffer is accepted and its tail ignored).
+#[test]
+fn packed_lossless_entry_points_match_the_image_path() {
+    use oxideav_webp::{WebpImage, encode, encode_rgb8};
+    let opts = EncodeOptions::default().with_threads(1);
+    let rgba = common::photo_rgba(37, 21);
+    let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let via_image = |w, h, data: &[u8], bpp| {
+        let img = if bpp == 4 {
+            WebpImage::from_rgba8(w, h, data.to_vec())
+        } else {
+            WebpImage::from_rgb8(w, h, data.to_vec())
+        };
+        img.and_then(|img| encode(&img, &opts))
+            .map_err(|e| e.to_string())
+    };
+    let packed = |w, h, data: &[u8], bpp| {
+        if bpp == 4 {
+            encode_rgba8(w, h, data, &opts)
+        } else {
+            encode_rgb8(w, h, data, &opts)
+        }
+        .map_err(|e| e.to_string())
+    };
+    let mut long = rgba.clone();
+    long.extend_from_slice(&[9; 11]);
+    let cases: Vec<(u32, u32, &[u8], usize)> = vec![
+        (37, 21, &rgba, 4),
+        (37, 21, &rgb, 3),
+        (37, 21, &long, 4),
+        (0, 21, &rgba, 4),
+        (37, 0, &rgb, 3),
+        (37, 22, &rgba, 4),
+        (38, 21, &rgb, 3),
+        (16_384, 1, &[0u8; 16_384 * 4], 4),
+    ];
+    for (w, h, data, bpp) in cases {
+        assert_eq!(
+            packed(w, h, data, bpp),
+            via_image(w, h, data, bpp),
+            "{w}x{h} bpp {bpp}"
+        );
+    }
+}

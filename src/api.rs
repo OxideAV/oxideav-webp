@@ -1030,6 +1030,9 @@ pub fn encode_rgb8(
     rgb: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
+    if opts.quality.is_none() {
+        return encode_packed_lossless(width, height, rgb, 3, opts);
+    }
     encode(&WebpImage::from_rgb8(width, height, rgb.to_vec())?, opts)
 }
 
@@ -1040,7 +1043,50 @@ pub fn encode_rgba8(
     rgba: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
+    if opts.quality.is_none() {
+        return encode_packed_lossless(width, height, rgba, 4, opts);
+    }
     encode(&WebpImage::from_rgba8(width, height, rgba.to_vec())?, opts)
+}
+
+/// [`encode_rgb8`] / [`encode_rgba8`] on the lossless path, reading the
+/// caller's buffer in place instead of copying it into a [`WebpImage`]
+/// first (a 12 MP RGBA image saves 48 MB). The checks and errors are
+/// the ones [`WebpImage::new`] and [`encode`] apply, in the same order;
+/// there is no metadata to embed.
+fn encode_packed_lossless(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    bpp: usize,
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>, WebpError> {
+    if width == 0 || height == 0 {
+        return Err(WebpError::invalid(format!(
+            "image has a zero dimension ({width}x{height})"
+        )));
+    }
+    let row_bytes = width as usize * bpp;
+    let need = row_bytes
+        .checked_mul(height as usize - 1)
+        .and_then(|v| v.checked_add(row_bytes))
+        .ok_or_else(|| WebpError::invalid("plane geometry overflows"))?;
+    if data.len() < need {
+        return Err(WebpError::invalid(format!(
+            "plane 0: {} bytes, geometry needs {need}",
+            data.len()
+        )));
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(WebpError::invalid(format!(
+            "{width}x{height} exceeds the WebP {MAX_DIMENSION} per-side ceiling"
+        )));
+    }
+    let no_metadata = Metadata::default();
+    let meta = opts.filtered_metadata(&no_metadata);
+    vp8l_encode::with_thread_budget(opts.worker_budget(), || {
+        encode_lossless_packed(width, height, data, row_bytes, bpp, &meta, opts.method)
+    })
 }
 
 /// [`encode`] and write the bytes to `w`.
@@ -1069,40 +1115,44 @@ fn encode_lossless(
         }
     };
     let plane = &image.planes[0];
-    let (argb, has_alpha) = packed_to_argb(
-        image.width as usize,
-        image.height as usize,
+    encode_lossless_packed(
+        image.width,
+        image.height,
         &plane.data,
         plane.stride,
         bpp,
-    );
+        meta,
+        method,
+    )
+}
+
+/// The lossless encode of packed RGB(A) rows (`bpp` 3 or 4, geometry
+/// already checked).
+fn encode_lossless_packed(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    stride: usize,
+    bpp: usize,
+    meta: &crate::WebpMetadata<'_>,
+    method: u8,
+) -> Result<Vec<u8>, WebpError> {
+    let (argb, has_alpha) = packed_to_argb(width as usize, height as usize, data, stride, bpp);
     // RFC 9649 §2.6: the simple lossless layout carries alpha inside the
     // VP8L bitstream itself, so the extended VP8X header is only needed
     // when there is metadata to declare (the reference lossless-RGBA
     // fixtures in docs/ use the simple layout too).
     if meta.is_empty() {
-        let payload = vp8l_encode::encode_vp8l_argb_with_method(
-            &argb,
-            image.width,
-            image.height,
-            has_alpha,
-            method,
-        )?;
+        let payload =
+            vp8l_encode::encode_vp8l_argb_with_method(&argb, width, height, has_alpha, method)?;
         return Ok(build::build_webp_file(
             &payload,
             build::ImageKind::Lossless,
-            image.width,
-            image.height,
+            width,
+            height,
         )?);
     }
-    crate::encode_vp8l_argb_with_metadata_and_method(
-        image.width,
-        image.height,
-        &argb,
-        has_alpha,
-        meta,
-        method,
-    )
+    crate::encode_vp8l_argb_with_metadata_and_method(width, height, &argb, has_alpha, meta, method)
 }
 
 fn encode_lossy(

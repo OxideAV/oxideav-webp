@@ -120,6 +120,10 @@ All notable changes to `oxideav-webp` are recorded here.
   0.3 % at 1.1 Mpx, by 0.01 % at 3 Mpx (148 s; the screened form takes
   1.5 s), and did not finish in ten minutes at 12 Mpx. Output at or below
   2 Mpx is unchanged (the method-6 output pins hold).
+- `encode_rgb8` / `encode_rgba8` read the caller's buffer in place on the
+  lossless path instead of copying it into a `WebpImage` first (48 MB
+  less at 12 MP RGBA); bytes and rejections are those of the image path
+  (`packed_lossless_entry_points_match_the_image_path`).
 - The cost-priced DP's per-pixel match tables are packed: the hash-chain
   match in 8 bytes instead of 20, each fixed-distance candidate as a
   2-byte run length instead of 20 bytes (five of them). Methods 4-5 at
