@@ -728,3 +728,31 @@ fn hostile_inputs_fail_cleanly() {
     };
     assert_eq!(v.planes[0].data, want[0].image.as_bytes().unwrap());
 }
+
+/// The `webp_vp8l` framework encoder runs serial until
+/// `set_execution_context` grants workers, and the grant never changes
+/// the packet bytes (the parallel search folds in a fixed order); they
+/// equal the Layer 1 encode at the default options.
+#[test]
+fn vp8l_encoder_execution_context_keeps_packet_bytes() {
+    let ctx = ctx();
+    let img = decode(LOSSLESS_RGBA).expect("fixture");
+    let mut params = CodecParameters::video(CodecId::new(CODEC_ID_VP8L));
+    params.width = Some(img.width);
+    params.height = Some(img.height);
+    params.pixel_format = Some(img.format.into());
+    let encode_with = |threads: Option<usize>| {
+        let mut enc = ctx.codecs.first_encoder(&params).expect("first_encoder");
+        if let Some(t) = threads {
+            enc.set_execution_context(&oxideav_core::ExecutionContext::with_threads(t));
+        }
+        let vf: VideoFrame = img.clone().into();
+        enc.send_frame(&CoreFrame::Video(vf)).unwrap();
+        enc.receive_packet().unwrap().data
+    };
+    let serial = encode_with(None);
+    assert_eq!(encode_with(Some(1)), serial);
+    assert_eq!(encode_with(Some(6)), serial);
+    let layer1 = oxideav_webp::encode(&img, &oxideav_webp::EncodeOptions::default()).unwrap();
+    assert_eq!(serial, layer1);
+}

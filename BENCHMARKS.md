@@ -46,6 +46,55 @@ the medians are still stable to a few percent.
 | `benches/anim_encode.rs` | `anim_encode_{lossless,delta,auto}_4f_48` | §2.7.1.1 animation *encode* path (`build_animated_webp`) — the encode mirror of `anim_decode` (round 409): the dirty-rect diff against the previous canvas, the `Auto` mode's keyframe-vs-delta arbitration (two full inner VP8L encodes per frame), and the `ANMF`/`ANIM`/`VP8X` container assembly. Three cells drive one deterministic 4-frame 48×48 moving-square timeline (LCG-textured background + a 12×12 square stepping 8 px/frame) through each `AnimFrameMode` |
 | `benches/distance_code.rs` | `distance_code_{dist1_rle,dist_row_above,dist_small_neighbor,dist_large_nomatch}` | Encoder-side §5.2.2 `pixel_distance_to_distance_code` — the distance-code chooser run (at least) twice per emitted LZ77 backward reference (once in `count_frequencies` to build the DISTANCE frequency table, once in the emit loop). It scans `DISTANCE_MAP` for the smallest distance-map code `c ∈ 1..=120` reconstructing to `D` for the image width, falling back to the scan-line code `D + 120` when none matches (round 301 added a smallest-code early-out that returns on the first match instead of always walking all 120 entries; the matching cells now cost a partial scan, the genuine no-match cell still walks all 120). The `lz77_match` / `lz77_chain` benches time the matcher that *finds* a run and `value_to_prefix` the per-symbol prefix split; the distance→code mapping between them had no isolated harness. Four cells fix `image_width = 256` and vary `distance`: `dist1_rle` (flat-colour RLE, multiple clamp-to-1 map hits), `dist_row_above` (`distance == width`, the `(0,1)` "pixel above" match at index 0 → code 1, cheapest), `dist_small_neighbor` (`distance = 2`, close horizontal neighbour matched mid-scan), and `dist_large_nomatch` (`distance = 70_000`, no map entry matches → full 120-scan + scan-line fallback). Each cell runs an inner loop of 1024 chooser calls, XOR-accumulating the codes |
 
+## Round 481 (2026-11-05) — lossless encode at production sizes
+
+3000 x 4000 photo (camera JPEG resized with `magick -resize`), release,
+Apple M-series, 18 hardware threads. Heap = peak bytes live in a
+tracking global allocator (includes the caller's 48 MB RGBA and the
+API's 48 MB copy); every file decodes pixel-exact in `dwebp` 1.6.0 and
+in this crate.
+
+| method | before | after, `threads(1)` | after, default |
+|---|---|---|---|
+| 0 | 2.1 s / 510 MB | 1.3 s / 336 MB | 1.1 s / 355 MB |
+| 1 | 4.0 s / 510 MB | 3.0 s / 336 MB | 1.5 s / 573 MB |
+| 2 | 5.4 s / 509 MB | 4.1 s / 338 MB | 1.8 s / 619 MB |
+| 3 | 9.2 s / 510 MB | 7.4 s / 338 MB | 2.5 s / 774 MB |
+| 4 | 10.5 s / 510 MB | 8.4 s / 338 MB | 2.4 s / 883 MB |
+| 5 | 15.7 s / 510 MB | 15.4 s / 339 MB | 5.1 s / 883 MB |
+| 6 | > 590 s, > 7.5 GB RSS, killed | 16.1 s / 390 MB | 6.3 s / 883 MB |
+
+Bytes for 0..=5 are unchanged (12 035 376 / 11 515 328 / 11 461 890 /
+11 443 892 / 11 437 380 / 11 428 592); method 6 writes 11 416 536.
+macOS peak RSS runs above the heap peak (the allocator keeps freed
+large blocks): method 4 1.18 GB before, 0.55 GB serial, 1.15 GB on 18
+threads.
+
+Synthetic photo-like 4000 x 3000 (noisy gradients, `photo_rgba`),
+default threads: method 0 1.6 s, method 4 2.2 s (was 10.1 s, 1.70 GB
+RSS), method 6 3.9 s. Plasma fractal 4000 x 3000: method 4 4.0 s (was
+16.7 s). 6000 x 4000 synthetic photo at method 4: 17.6 s before.
+
+What changed (all output-neutral below 4 Mpx):
+
+* Screening counted each candidate's parse while producing it (symbol
+  counts, extra bits, a literal bitmap) instead of storing it; the
+  winner is parsed again. Per-candidate scratch fell from ~40 to ~11
+  bytes a pixel.
+* Cache choices are priced from the counts with one walk over the pixels
+  for all of them (a cache's state is parse-independent, so a hit moves
+  one count from the literal's channel symbols to the cache symbol); the
+  previous form rewrote and re-counted the stream per choice
+  (`count_token` + cache rewrite were ~15 % of method 4).
+* The §6.2.2 pricer walks the stream once without its 10-byte-per-token
+  side table (which also made parallel layouts cost ~120 MB each at
+  12 MP).
+* Candidates screen in waves on the thread budget; §6.2.2 layouts and
+  clusterings in parallel; all folded in submission order.
+* Remaining serial profile (method 5): `Lz77Matcher::find` ~50 %, the
+  predictor-mode search (`for_each_block_residual`,
+  `block_mode_entropy_cost`) ~30 %.
+
 ## Round 480 (2026-10-24) — lossless effort levels (#45)
 
 `EncodeOptions::method` (`0..=6`, default `4`). Method 6 is the

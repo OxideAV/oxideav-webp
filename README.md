@@ -173,7 +173,9 @@ strength), `method` (`0..=6`, default `4`: encoder effort — lossless
 `6` is the exhaustive search, lower levels screen fewer candidates with
 a cheaper parse and write somewhat larger files much faster, every
 level exactly lossless; lossy `0..=2` turn the VP8 trellis quantiser
-off, about a third faster for a few percent more bytes), `embed_icc` / `embed_exif` / `embed_xmp`
+off, about a third faster for a few percent more bytes), `threads`
+(default `0` = the host's parallelism, `1` = serial; never changes the
+output bytes), `embed_icc` / `embed_exif` / `embed_xmp`
 (default on — the image's metadata is written when present), and for
 animations
 `loop_count` (`0` = forever), `background_rgba`, `frame_mode`
@@ -228,7 +230,12 @@ profile is carried, not applied.
   smaller than the reference encoder's best effort on 9 of 10 images (up
   to −28%). The default `method` 4 screens a short candidate list with
   one cheap parse each and plans only the winner: an 800 x 533 photo
-  encodes in about 0.4 s at 1.2 % more bytes than method 6 (about 4 s).
+  encodes in about 0.4 s at 1.2 % more bytes than method 6 (about 4 s);
+  a 12 MP photo in 2.4 s (8.4 s on one thread, 340 MB heap). Above
+  4 Mpx method 6 runs the screened search with a second, exhaustive-shape
+  parse of the winner (12 MP: 6.3 s). The framework encoder honours the
+  `ExecutionContext` thread budget, and the output is byte-identical for
+  every budget.
   Every level is re-verified bit-exact through black-box reference
   decodes. See [`BENCHMARKS.md`](./BENCHMARKS.md) for the
   optimisation log.

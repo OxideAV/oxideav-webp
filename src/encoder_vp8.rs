@@ -372,6 +372,10 @@ impl Encoder for WebpVp8LossyEncoder {
         Ok(())
     }
 
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.inner.set_execution_context(ctx);
+    }
+
     fn receive_packet(&mut self) -> CoreResult<Packet> {
         if let Some(p) = self.pending.pop_front() {
             return Ok(p);

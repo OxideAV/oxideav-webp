@@ -1276,14 +1276,18 @@ enum Token {
     /// A §5.2.2 backward reference: copy `length` pixels from `distance`
     /// pixels back in scan-line order.
     Copy {
-        /// Copy length in pixels (`MIN_MATCH..=MAX_MATCH`).
-        length: u32,
+        /// Copy length in pixels (`MIN_MATCH..=MAX_MATCH`; `MAX_MATCH`
+        /// is 4096, so it fits 16 bits).
+        length: u16,
         /// Scan-line pixel distance back to the copy source
-        /// (`1..=MAX_ENCODABLE_DISTANCE`). `u32` fields keep a token at
-        /// 12 bytes: a parse holds about one token per pixel.
+        /// (`1..=MAX_ENCODABLE_DISTANCE`). With the 16-bit length a
+        /// token is 8 bytes: a parse holds up to one token per pixel.
         distance: u32,
     },
 }
+
+// A parse holds up to one token per pixel: keep the token at 8 bytes.
+const _: () = assert!(std::mem::size_of::<Token>() == 8);
 
 /// §5.2.2 hash-chain matcher over a scan-line ARGB pixel buffer.
 ///
@@ -1789,7 +1793,7 @@ fn lz77_parse(
                 emit(Token::Literal(skipped));
             }
             emit(Token::Copy {
-                length: best_len as u32,
+                length: best_len as u16,
                 distance: best_dist as u32,
             });
 
@@ -1928,59 +1932,78 @@ impl EncoderColorCache {
 /// `pixels` provides the underlying pixel sequence for backward
 /// references (needed to know which colors a `Copy` token covers so
 /// the cache state stays in sync).
-// Round 409: production streams go through `cacheify_tokens_with_hits`
-// over the plan memo's precomputed hit table; this stateful walk is
-// retained as the test suite's reference
-// (`cacheify_with_hits_matches_stateful_cacheify` et al.).
-#[cfg_attr(not(test), allow(dead_code))]
+// The exhaustive path rewrites through `cacheify_tokens_with_hits` over
+// the plan memo's precomputed hit table (equality pinned by
+// `cacheify_with_hits_matches_stateful_cacheify` et al.); the effort
+// levels below it price cache choices on the streamed form
+// ([`CacheifyStream`]) and rewrite only the elected one.
 fn cacheify_tokens(tokens: &[Token], pixels: &[u32], code_bits: u32) -> Vec<Token> {
-    let mut cache = EncoderColorCache::new(code_bits);
-    let mut out = Vec::with_capacity(tokens.len());
-    let mut pos = 0usize;
-    for &tok in tokens {
-        match tok {
-            Token::Literal(argb) => {
-                if let Some(idx) = cache.contains(argb) {
-                    out.push(Token::CacheRef { index: idx as u32 });
-                } else {
-                    out.push(Token::Literal(argb));
-                }
-                cache.insert(argb);
-                pos += 1;
-            }
-            Token::CacheRef { .. } => {
-                // Caller should not pre-emit cache refs into the
-                // input stream; keep tokens we don't recognise as
-                // literals from the matcher's output verbatim.
-                out.push(tok);
-                pos += 1;
-            }
-            Token::Copy { length, distance } => {
-                let (length, distance) = (length as usize, distance as usize);
-                out.push(tok);
-                // Mirror the decoder's §5.2.3 invariant: every pixel
-                // covered by a backward-reference copy is inserted in
-                // stream order. The source pixels live at
-                // `pos - distance .. pos - distance + length` in
-                // `pixels`; the destination at `pos .. pos + length`
-                // would be identical (copies always reproduce source
-                // bytes), so we read directly off the source slice.
-                let src_start = pos - distance;
-                for i in 0..length {
-                    let argb = pixels[src_start + i];
-                    cache.insert(argb);
-                }
-                pos += length;
-            }
+    CacheifyStream::new(tokens, pixels, code_bits).collect()
+}
+
+/// [`cacheify_tokens`] as an iterator: yields the rewritten stream one
+/// token at a time, so a caller can price a cache choice
+/// ([`token_stream_bits_single_pass`]) without storing a second copy of
+/// the parse.
+struct CacheifyStream<'a> {
+    tokens: std::slice::Iter<'a, Token>,
+    pixels: &'a [u32],
+    cache: EncoderColorCache,
+    pos: usize,
+}
+
+impl<'a> CacheifyStream<'a> {
+    fn new(tokens: &'a [Token], pixels: &'a [u32], code_bits: u32) -> Self {
+        Self {
+            tokens: tokens.iter(),
+            pixels,
+            cache: EncoderColorCache::new(code_bits),
+            pos: 0,
         }
     }
-    debug_assert_eq!(
-        pos,
-        pixels.len(),
-        "cacheify_tokens: token stream covered {pos} of {} pixels",
-        pixels.len()
-    );
-    out
+}
+
+impl Iterator for CacheifyStream<'_> {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Token> {
+        let tok = *self.tokens.next()?;
+        Some(match tok {
+            Token::Literal(argb) => {
+                let out = match self.cache.contains(argb) {
+                    Some(idx) => Token::CacheRef { index: idx as u32 },
+                    None => tok,
+                };
+                self.cache.insert(argb);
+                self.pos += 1;
+                out
+            }
+            // Callers do not pre-emit cache refs into the input stream;
+            // one passes through verbatim.
+            Token::CacheRef { .. } => {
+                self.pos += 1;
+                tok
+            }
+            Token::Copy { length, distance } => {
+                // Mirror the decoder's §5.2.3 invariant: every pixel
+                // covered by a backward-reference copy is inserted in
+                // stream order. A copy reproduces its source, so the
+                // covered colours are read straight off the source run
+                // `pos - distance .. pos - distance + length`.
+                let (length, distance) = (length as usize, distance as usize);
+                let src = self.pos - distance;
+                for &argb in &self.pixels[src..src + length] {
+                    self.cache.insert(argb);
+                }
+                self.pos += length;
+                tok
+            }
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.tokens.size_hint()
+    }
 }
 
 /// [`cacheify_tokens`] over a precomputed per-position §5.2.3 hit
@@ -2063,6 +2086,15 @@ impl Frequencies {
     /// materialising per-group token buckets).
     #[inline]
     fn count_token(&mut self, tok: Token, image_width: u32) {
+        self.count_token_extra_bits(tok, image_width);
+    }
+
+    /// [`Self::count_token`], returning the token's §5.2.2 extra
+    /// (raw, un-entropy-coded) bits: `0` for a literal or cache
+    /// reference, the length's plus the distance code's extra bits for
+    /// a copy.
+    #[inline]
+    fn count_token_extra_bits(&mut self, tok: Token, image_width: u32) -> usize {
         match tok {
             Token::Literal(p) => {
                 let a = ((p >> 24) & 0xff) as usize;
@@ -2073,23 +2105,25 @@ impl Frequencies {
                 self.red[r] += 1;
                 self.blue[b] += 1;
                 self.alpha[a] += 1;
+                0
             }
             Token::CacheRef { index } => {
                 // §5.2.3: GREEN symbol is `256 + 24 + index`.
                 let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
                 debug_assert!(sym < self.green.len());
                 self.green[sym] += 1;
+                0
             }
             Token::Copy { length, distance } => {
                 let (length, distance) = (length as usize, distance as usize);
                 // §5.2.2: length is a GREEN symbol `256 + length_prefix`.
-                let (len_prefix, _, _) = value_to_prefix(length as u32);
+                let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
                 self.green[256 + len_prefix as usize] += 1;
                 // Distance prefix code (#5). Width-aware chooser picks the
                 // smaller of scan-line `D + 120` and any §5.2.2 distance-map
                 // code reconstructing to `D` for `image_width`.
                 let raw_code = pixel_distance_to_distance_code(distance, image_width);
-                let (dist_prefix, _, _) = value_to_prefix(raw_code);
+                let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
                 // The matcher never emits distances past
                 // MAX_ENCODABLE_DISTANCE, so dist_prefix < 40 here.
                 // Guard anyway: an encoder must not panic on its
@@ -2097,9 +2131,46 @@ impl Frequencies {
                 if (dist_prefix as usize) < self.distance.len() {
                     self.distance[dist_prefix as usize] += 1;
                 }
+                len_extra as usize + dist_extra as usize
             }
         }
     }
+}
+
+/// Exact [`prefix_codes_and_tokens_bits`] of a token stream in one walk
+/// and without storing it: the five tables' symbol counts and the
+/// §5.2.2 extra bits are gathered together, then each symbol is priced
+/// once at its count (`sum(count x code length)` equals the per-token
+/// sum the writer mirror adds up). Lets a caller price a §5.2.3 cache
+/// rewrite of a parse ([`CacheifyStream`]) without materialising it.
+/// Test reference of [`effort_stream_bytes_many`]'s pricing.
+#[cfg(test)]
+fn token_stream_bits_single_pass(
+    tokens: impl IntoIterator<Item = Token>,
+    color_cache_size: usize,
+    image_width: u32,
+) -> usize {
+    let mut freqs = Frequencies::new(color_cache_size);
+    let mut extra = 0usize;
+    for tok in tokens {
+        extra += freqs.count_token_extra_bits(tok, image_width);
+    }
+    let tables = StreamCostTables::from_frequencies(&freqs);
+    let priced = |code: &CostLengths, counts: &[u32]| -> usize {
+        code.code_lengths_bits()
+            + counts
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c != 0)
+                .map(|(sym, &c)| c as usize * code.sym_bits(sym))
+                .sum::<usize>()
+    };
+    extra
+        + priced(&tables.green, &freqs.green)
+        + priced(&tables.red, &freqs.red)
+        + priced(&tables.blue, &freqs.blue)
+        + priced(&tables.alpha, &freqs.alpha)
+        + priced(&tables.distance, &freqs.distance)
 }
 
 // ---- Round 383: cost-priced LZ77 token planning ----------------------
@@ -2683,7 +2754,7 @@ fn dp_refine_tokens(
             i += 1;
         } else {
             tokens.push(Token::Copy {
-                length: c as u32,
+                length: c as u16,
                 distance: choice_dist[i],
             });
             i += c as usize;
@@ -6905,69 +6976,6 @@ fn plan_meta_prefix_tokens_with_codes(
 
     let cache_size = cache_code_bits.map(|b| 1usize << b).unwrap_or(0);
 
-    // Round 440: one shared prepass over the token stream for the two
-    // walks below. Each walk previously re-derived, per token, the
-    // §6.2.2 group of the token's starting pixel (a `div` + `mod` per
-    // token via the scan position) and — for `Copy` tokens — the two
-    // §5.2.2 `value_to_prefix` splits plus the distance-code probe.
-    // The prepass computes each exactly once: the group via
-    // incrementally-maintained block coordinates (identical to the
-    // `group_for(pos)` rule at the token's starting position), the
-    // decompositions via the same pure helpers. Both walks then read
-    // the precomputed rows, so every counted and priced symbol is
-    // unchanged.
-    struct TokenPlanRow {
-        group: u16,
-        /// `Copy` decomposition; unused (zero) for other tokens.
-        len_prefix: u16,
-        len_extra: u16,
-        dist_prefix: u16,
-        dist_extra: u16,
-    }
-    let mut rows: Vec<TokenPlanRow> = Vec::with_capacity(tokens.len());
-    {
-        let (mut x, mut y) = (0usize, 0usize);
-        for &tok in tokens {
-            let group = codes[(y >> prefix_bits) * pw + (x >> prefix_bits)];
-            let (advance, row) = match tok {
-                Token::Literal(_) | Token::CacheRef { .. } => (
-                    1usize,
-                    TokenPlanRow {
-                        group,
-                        len_prefix: 0,
-                        len_extra: 0,
-                        dist_prefix: 0,
-                        dist_extra: 0,
-                    },
-                ),
-                Token::Copy { length, distance } => {
-                    let (length, distance) = (length as usize, distance as usize);
-                    let (len_prefix, len_extra, _) = value_to_prefix(length as u32);
-                    let raw_code = pixel_distance_to_distance_code(distance, image_width);
-                    let (dist_prefix, dist_extra, _) = value_to_prefix(raw_code);
-                    (
-                        length,
-                        TokenPlanRow {
-                            group,
-                            len_prefix: len_prefix as u16,
-                            len_extra: len_extra as u16,
-                            dist_prefix: dist_prefix as u16,
-                            dist_extra: dist_extra as u16,
-                        },
-                    )
-                }
-            };
-            rows.push(row);
-            x += advance;
-            if x >= wpx {
-                y += x / wpx;
-                x %= wpx;
-            }
-        }
-    }
-
-    // color-cache-info (`%b0` or `%b1 4BIT`) + meta-prefix `%b1` +
-    // 3-bit `prefix_bits - 2`.
     let mut bits = match cache_code_bits {
         Some(_) => 5,
         None => 1,
@@ -7000,54 +7008,41 @@ fn plan_meta_prefix_tokens_with_codes(
     let mut group_freqs: Vec<Frequencies> = (0..actual_groups)
         .map(|_| Frequencies::new(cache_size))
         .collect();
-    for (&tok, row) in tokens.iter().zip(&rows) {
-        let freqs = &mut group_freqs[row.group as usize];
-        match tok {
-            Token::Literal(_) | Token::CacheRef { .. } => {
-                freqs.count_token(tok, image_width);
-            }
-            Token::Copy { .. } => {
-                // Same two symbols `count_token` derives, from the
-                // prepass decomposition.
-                freqs.green[256 + row.len_prefix as usize] += 1;
-                freqs.distance[row.dist_prefix as usize] += 1;
+    // One walk: each token's symbols land in its block's group, and its
+    // §5.2.2 extra bits (group-independent) are summed; each group's
+    // symbols are then priced once at their counts — the same total as
+    // pricing token by token.
+    {
+        let (mut x, mut y) = (0usize, 0usize);
+        for &tok in tokens {
+            let group = codes[(y >> prefix_bits) * pw + (x >> prefix_bits)];
+            bits += group_freqs[group as usize].count_token_extra_bits(tok, image_width);
+            x += match tok {
+                Token::Copy { length, .. } => length as usize,
+                _ => 1,
+            };
+            if x >= wpx {
+                y += x / wpx;
+                x %= wpx;
             }
         }
     }
-    let group_tables: Vec<StreamCostTables> = group_freqs
-        .iter()
-        .map(StreamCostTables::from_frequencies)
-        .collect();
-    for tables in &group_tables {
-        bits += tables.green.code_lengths_bits()
-            + tables.red.code_lengths_bits()
-            + tables.blue.code_lengths_bits()
-            + tables.alpha.code_lengths_bits()
-            + tables.distance.code_lengths_bits();
-    }
-    for (&tok, row) in tokens.iter().zip(&rows) {
-        let tables = &group_tables[row.group as usize];
-        match tok {
-            Token::Literal(p) => {
-                let a = ((p >> 24) & 0xff) as usize;
-                let r = ((p >> 16) & 0xff) as usize;
-                let g = ((p >> 8) & 0xff) as usize;
-                let b = (p & 0xff) as usize;
-                bits += tables.green.sym_bits(g)
-                    + tables.red.sym_bits(r)
-                    + tables.blue.sym_bits(b)
-                    + tables.alpha.sym_bits(a);
-            }
-            Token::CacheRef { index } => {
-                let sym = 256 + crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES + index as usize;
-                bits += tables.green.sym_bits(sym);
-            }
-            Token::Copy { .. } => {
-                bits += tables.green.sym_bits(256 + row.len_prefix as usize)
-                    + row.len_extra as usize
-                    + tables.distance.sym_bits(row.dist_prefix as usize)
-                    + row.dist_extra as usize;
-            }
+    for freqs in &group_freqs {
+        let tables = StreamCostTables::from_frequencies(freqs);
+        for (code, counts) in [
+            (&tables.green, &freqs.green),
+            (&tables.red, &freqs.red),
+            (&tables.blue, &freqs.blue),
+            (&tables.alpha, &freqs.alpha),
+            (&tables.distance, &freqs.distance),
+        ] {
+            bits += code.code_lengths_bits()
+                + counts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c != 0)
+                    .map(|(sym, &c)| c as usize * code.sym_bits(sym))
+                    .sum::<usize>();
         }
     }
     Some(bits)
@@ -8344,6 +8339,97 @@ fn encode_argb_with_predictor_chooser(pixels: &[u32], width: u32, height: u32) -
     run_chooser_jobs(jobs, pixels.len())
 }
 
+thread_local! {
+    /// Worker threads this thread's lossless encode may use (see
+    /// [`with_thread_budget`]). Unset = `1`: strictly serial, and the
+    /// value every spawned worker starts with, so nested searches never
+    /// fan out again.
+    static THREAD_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+/// Run `f` with this thread's encoder worker budget set to `threads`
+/// (at least 1), restoring the previous budget afterwards (also on
+/// unwind). Every parallel stage of the lossless search draws its
+/// workers from this budget and folds results in a fixed order, so the
+/// output bytes are the same for every budget.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub fn with_thread_budget<R>(threads: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            THREAD_BUDGET.with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(THREAD_BUDGET.with(|b| b.replace(threads.max(1))));
+    f()
+}
+
+/// This thread's encoder worker budget (see [`with_thread_budget`]).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub fn thread_budget() -> usize {
+    THREAD_BUDGET.with(|b| b.get())
+}
+
+/// Workers for `units` independent jobs that each hold about
+/// `bytes_per_job` bytes at once: the thread budget, capped so all of
+/// them fit in [`CHOOSER_MEMORY_BUDGET`] (one is always allowed).
+fn budgeted_workers(units: usize, bytes_per_job: usize) -> usize {
+    let by_memory = CHOOSER_MEMORY_BUDGET / bytes_per_job.max(1);
+    thread_budget().min(by_memory).min(units).max(1)
+}
+
+/// `f(0), f(1), ..., f(n - 1)` on up to `workers` scoped threads,
+/// returned in index order (so a caller folding them in order gets the
+/// serial answer). Runs everything on the calling thread when
+/// `workers <= 1` or no thread can be spawned.
+fn parallel_map<T: Send>(n: usize, workers: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workers = workers.min(n);
+    if workers <= 1 {
+        return (0..n).map(&f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let out = f(i);
+            *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+        }
+    };
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers - 1);
+        for _ in 1..workers {
+            match std::thread::Builder::new().spawn_scoped(scope, work) {
+                Ok(h) => handles.push(h),
+                Err(_) => break,
+            }
+        }
+        // The calling thread works too; with no helper it does it all.
+        work();
+        for h in handles {
+            if let Err(panic) = h.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every index ran")
+        })
+        .collect()
+}
+
 /// One exhaustive-chooser candidate: the full stream it encodes to, or
 /// `None` when the candidate does not apply to the image.
 type ChooserJob<'a> = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync + 'a>;
@@ -8354,11 +8440,12 @@ type ChooserJob<'a> = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync + 'a>;
 /// at about 410 on an 800 x 533 photo).
 const CHOOSER_BYTES_PER_PIXEL: usize = 512;
 
-/// Working-memory budget the exhaustive chooser spreads over extra
-/// worker threads (the first worker is always allowed).
+/// Working-memory budget the exhaustive chooser and the screening pass
+/// spread over extra worker threads (the first worker is always
+/// allowed).
 const CHOOSER_MEMORY_BUDGET: usize = 3 << 29;
 
-/// Run every job — on up to `available_parallelism` scoped worker
+/// Run every job — on up to [`thread_budget`] scoped worker
 /// threads (no more than [`CHOOSER_MEMORY_BUDGET`] allows for a
 /// `pixel_count`-pixel image, one when threads are unavailable) — and
 /// return the shortest stream, the earliest job winning ties: exactly
@@ -8374,10 +8461,7 @@ fn run_chooser_jobs(jobs: Vec<ChooserJob<'_>>, pixel_count: usize) -> Vec<u8> {
             .max(1)
             .saturating_mul(CHOOSER_BYTES_PER_PIXEL)
             .max(1);
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(by_memory.max(1))
-        .min(jobs.len());
+    let workers = thread_budget().min(by_memory.max(1)).min(jobs.len());
     let fold = |results: Vec<Option<Vec<u8>>>| -> Vec<u8> {
         let mut best: Option<Vec<u8>> = None;
         for cand in results.into_iter().flatten() {
@@ -8484,6 +8568,10 @@ impl EffortParams {
             2 => (24, 128, 1, &[4, 5], false),
             3 => (32, 256, 2, &[4, 5, 6], false),
             4 => (48, 512, 2, &[4, 5, 6], true),
+            // Method 6 reaches this screened search only above
+            // [`EXHAUSTIVE_MAX_PIXELS`] (see [`encode_argb_with_method`]),
+            // with method 5's screening plus a deep re-parse of the
+            // elected candidate (see `encode_argb_with_effort`).
             _ => (96, 1024, 3, &[4, 5, 6, 7], true),
         };
         Self {
@@ -8555,28 +8643,182 @@ fn effort_greedy_tokens(
 
 /// Exact byte length the single-group writer produces for `prep` with
 /// `tokens` (a raw, un-cached parse of `prep.residuals`) at §5.2.3 cache
-/// choice `cache`, plus the cache-rewritten token stream when a cache is
-/// on.
-fn effort_stream_bytes(
-    prep: &PreparedTransform,
-    tokens: &[Token],
-    cache: Option<u32>,
-) -> (usize, Option<Vec<Token>>) {
-    let cached = cache.map(|bits| cacheify_tokens(tokens, &prep.residuals, bits));
-    let stream = cached.as_deref().unwrap_or(tokens);
-    let cache_size = cache.map_or(0, |b| 1usize << b);
-    let tables = StreamCostTables::build(stream, cache_size, prep.stream_width);
-    let body = prefix_codes_and_tokens_bits_from(&tables, stream, prep.stream_width);
+/// choice `cache`. The cache rewrite is priced as a stream
+/// ([`CacheifyStream`]), never stored. Reference form of
+/// [`effort_stream_bytes_many`].
+#[cfg(test)]
+fn effort_stream_bytes(prep: &PreparedTransform, tokens: &[Token], cache: Option<u32>) -> usize {
+    let w = prep.stream_width;
+    let body = match cache {
+        Some(bits) => token_stream_bits_single_pass(
+            CacheifyStream::new(tokens, &prep.residuals, bits),
+            1usize << bits,
+            w,
+        ),
+        None => token_stream_bits_single_pass(tokens.iter().copied(), 0, w),
+    };
     let info_bits = if cache.is_some() { 5 } else { 1 };
     let bits = prep.prelude.bit_position() + info_bits + 1 + body;
-    (bits.div_ceil(8), cached)
+    bits.div_ceil(8)
 }
+
+/// [`effort_stream_bytes`] for several §5.2.3 cache choices at once,
+/// in `caches` order.
+///
+/// The parse is walked once (symbol counts, §5.2.2 extra bits and which
+/// positions are literals); then one walk over the pixels runs every
+/// requested cache. §5.2.3 inserts every decoded pixel in scan order
+/// whatever token covers it, so a cache's state at a position does not
+/// depend on the parse: a literal there becomes a cache reference
+/// exactly when that cache holds its colour. Each hit moves one count
+/// from the literal's four channel symbols to the cache symbol, which
+/// gives each choice's tables without rewriting or storing the stream.
+fn effort_stream_bytes_many(
+    prep: &PreparedTransform,
+    tokens: &[Token],
+    caches: &[Option<u32>],
+) -> Vec<usize> {
+    let mut counts = ParseCounts::new(prep.residuals.len(), prep.stream_width);
+    for &tok in tokens {
+        counts.add(tok);
+    }
+    counts.stream_bytes(prep, caches)
+}
+
+/// What [`ParseCounts::stream_bytes`] needs of a raw parse, gathered
+/// token by token as the parse is produced (so a screening pass never
+/// stores the parse): the uncached symbol counts, the §5.2.2 extra bits
+/// and which positions are literals.
+struct ParseCounts {
+    base: Frequencies,
+    extra: usize,
+    literal_at: Vec<u64>,
+    pos: usize,
+    width: u32,
+}
+
+impl ParseCounts {
+    fn new(pixel_count: usize, stream_width: u32) -> Self {
+        Self {
+            base: Frequencies::new(0),
+            extra: 0,
+            literal_at: vec![0u64; pixel_count.div_ceil(64)],
+            pos: 0,
+            width: stream_width,
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, tok: Token) {
+        self.extra += self.base.count_token_extra_bits(tok, self.width);
+        match tok {
+            Token::Copy { length, .. } => self.pos += length as usize,
+            _ => {
+                self.literal_at[self.pos / 64] |= 1 << (self.pos % 64);
+                self.pos += 1;
+            }
+        }
+    }
+
+    /// The exact single-group stream size of `prep` with the counted
+    /// parse at each §5.2.3 choice in `caches` (see
+    /// [`effort_stream_bytes_many`]).
+    fn stream_bytes(&self, prep: &PreparedTransform, caches: &[Option<u32>]) -> Vec<usize> {
+        const LEN_CODES: usize = crate::vp8l_decode::NUM_LENGTH_PREFIX_CODES;
+        let pixels = &prep.residuals;
+        let (base, extra, literal_at) = (&self.base, self.extra, &self.literal_at);
+        debug_assert_eq!(self.pos, pixels.len(), "parse does not cover the image");
+
+        /// One cache choice's running state: its §5.2.3 cache and the
+        /// count moves its hits make.
+        struct Lane {
+            bits: u32,
+            entries: Vec<u32>,
+            hits: Vec<u32>,
+            moved: [Vec<u32>; 4],
+        }
+        let mut lanes: Vec<Lane> = caches
+            .iter()
+            .flatten()
+            .map(|&bits| Lane {
+                bits,
+                entries: vec![0u32; 1 << bits],
+                hits: vec![0u32; 1 << bits],
+                moved: std::array::from_fn(|_| vec![0u32; 256]),
+            })
+            .collect();
+        if !lanes.is_empty() {
+            for (p, &argb) in pixels.iter().enumerate() {
+                let is_literal = literal_at[p / 64] >> (p % 64) & 1 != 0;
+                let mixed = crate::vp8l_decode::COLOR_CACHE_HASH_MULTIPLIER.wrapping_mul(argb);
+                for lane in &mut lanes {
+                    let idx = (mixed >> (32 - lane.bits)) as usize;
+                    if is_literal && lane.entries[idx] == argb {
+                        lane.hits[idx] += 1;
+                        lane.moved[0][((argb >> 8) & 0xff) as usize] += 1;
+                        lane.moved[1][((argb >> 16) & 0xff) as usize] += 1;
+                        lane.moved[2][(argb & 0xff) as usize] += 1;
+                        lane.moved[3][(argb >> 24) as usize] += 1;
+                    }
+                    lane.entries[idx] = argb;
+                }
+            }
+        }
+
+        let priced = |counts: &[u32]| -> usize {
+            let code = CostLengths::from_freqs(counts);
+            code.code_lengths_bits()
+                + counts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c != 0)
+                    .map(|(sym, &c)| c as usize * code.sym_bits(sym))
+                    .sum::<usize>()
+        };
+        let minus =
+            |a: &[u32], b: &[u32]| -> Vec<u32> { a.iter().zip(b).map(|(x, y)| x - y).collect() };
+        let distance_bits = priced(&base.distance);
+        let prelude_bits = prep.prelude.bit_position();
+        let mut lanes = lanes.into_iter();
+        caches
+            .iter()
+            .map(|&cache| {
+                let body = match cache {
+                    None => {
+                        priced(&base.green)
+                            + priced(&base.red)
+                            + priced(&base.blue)
+                            + priced(&base.alpha)
+                    }
+                    Some(_) => {
+                        let lane = lanes.next().expect("one lane per cache choice");
+                        let mut green = minus(&base.green[..256], &lane.moved[0]);
+                        green.extend_from_slice(&base.green[256..256 + LEN_CODES]);
+                        green.extend_from_slice(&lane.hits);
+                        priced(&green)
+                            + priced(&minus(&base.red, &lane.moved[1]))
+                            + priced(&minus(&base.blue, &lane.moved[2]))
+                            + priced(&minus(&base.alpha, &lane.moved[3]))
+                    }
+                };
+                let info_bits = if cache.is_some() { 5 } else { 1 };
+                (prelude_bits + info_bits + 1 + extra + distance_bits + body).div_ceil(8)
+            })
+            .collect()
+    }
+}
+
+/// Peak bytes per pixel one screened candidate holds: its residuals and
+/// transform scratch, and the matcher's chains while it is parsed (the
+/// parse itself is only counted).
+const EFFORT_SCREEN_BYTES_PER_PIXEL: usize = 16;
 
 /// The §5.2.3 cache choices a screening pass prices per candidate; the
 /// elected candidate then sweeps every choice.
 const EFFORT_SCREEN_CACHES: [Option<u32>; 3] = [None, Some(6), Some(10)];
 
-/// Lossless encode below [`MAX_LOSSLESS_METHOD`] (`method` `0..=5`).
+/// Lossless encode below [`MAX_LOSSLESS_METHOD`] (`method` `0..=5`), and
+/// at it above [`EXHAUSTIVE_MAX_PIXELS`].
 ///
 /// 1. A short, effort-dependent list of transform candidates is screened
 ///    by the exact size of a reduced-effort greedy parse (one parse per
@@ -8589,7 +8831,12 @@ const EFFORT_SCREEN_CACHES: [Option<u32>; 3] = [None, Some(6), Some(10)];
 ///    smaller stream is kept.
 /// 4. At `method >= 1` the final token stream is also priced as a
 ///    §6.2.2 multi-group (meta-prefix) image over k-means block
-///    clusterings, and kept when smaller.
+///    clusterings, and kept when smaller. At method 6 a second parse
+///    with the exhaustive matcher shape goes through this stage too.
+///
+/// Candidates, cache choices and layouts are folded in a fixed order
+/// with "strictly smaller replaces", so the parallel stages (on the
+/// [`thread_budget`]) write the same bytes as a serial run.
 ///
 /// Every step compares exact writer sizes, so the output is a valid,
 /// exactly lossless `VP8L` stream; it is usually somewhat larger than
@@ -8605,7 +8852,7 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
 
     // Candidate builders, cheapest-first; later ones only at higher
     // efforts. Each yields the forward-transformed residuals + prelude.
-    type Build<'a> = Box<dyn Fn() -> Option<PreparedTransform> + 'a>;
+    type Build<'a> = Box<dyn Fn() -> Option<PreparedTransform> + Send + Sync + 'a>;
     let mut builds: Vec<Build<'_>> = Vec::new();
     builds.push(Box::new(|| Some(prepare_literals(pixels, true, width))));
     if blocks_fit {
@@ -8695,47 +8942,72 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
     let run_dp = params.dp && pixels.len() <= EFFORT_DP_MAX_PIXELS;
 
     // 1. Screening: one reduced-effort parse per candidate.
-    /// A screened candidate: its residuals, its parse (tokens + probes)
-    /// and the smallest size it priced at.
-    type Screened = (PreparedTransform, (Vec<Token>, Vec<FindProbe>), usize);
-    let mut best: Option<Screened> = None;
-    for build in &builds {
-        let Some(prep) = build() else { continue };
-        let parse = effort_greedy_tokens(
-            &prep.residuals,
-            params.shape(prep.residuals.len()),
-            params.lazy,
-            run_dp,
-        );
-        let tokens = &parse.0;
-        let bytes = EFFORT_SCREEN_CACHES
-            .iter()
-            .map(|&cache| effort_stream_bytes(&prep, tokens, cache).0)
+    /// A screened candidate: its residuals and the smallest size its
+    /// parse priced at. The parse itself is counted as it is produced
+    /// and dropped; the elected candidate is parsed again below (the
+    /// parse is deterministic), so a screening worker never holds a
+    /// token stream.
+    type Screened = (PreparedTransform, usize);
+    let screen = |i: usize| -> Option<Screened> {
+        let prep = builds[i]()?;
+        let mut counts = ParseCounts::new(prep.residuals.len(), prep.stream_width);
+        let mut matcher =
+            Lz77Matcher::with_shape(&prep.residuals, params.shape(prep.residuals.len()));
+        lz77_parse(&mut matcher, params.lazy, |_, _| {}, |tok| counts.add(tok));
+        drop(matcher);
+        let bytes = counts
+            .stream_bytes(&prep, &EFFORT_SCREEN_CACHES)
+            .into_iter()
             .min()
             .expect("non-empty cache list");
-        if best.as_ref().is_none_or(|b| bytes < b.2) {
-            best = Some((prep, parse, bytes));
+        Some((prep, bytes))
+    };
+    // Candidates are screened in waves of up to `workers` at a time;
+    // folding each wave in submission order with "strictly smaller
+    // replaces" elects exactly the candidate a one-by-one pass would.
+    let workers = budgeted_workers(
+        builds.len(),
+        pixels.len().saturating_mul(EFFORT_SCREEN_BYTES_PER_PIXEL),
+    );
+    let mut best: Option<Screened> = None;
+    for wave in (0..builds.len()).step_by(workers) {
+        let wave_len = workers.min(builds.len() - wave);
+        for cand in parallel_map(wave_len, workers, |k| screen(wave + k))
+            .into_iter()
+            .flatten()
+        {
+            if best.as_ref().is_none_or(|b| cand.1 < b.1) {
+                best = Some(cand);
+            }
         }
     }
     drop(builds);
-    let (prep, (tokens, probes), _) =
-        best.expect("the subtract-green literal candidate always builds");
+    let (prep, _) = best.expect("the subtract-green literal candidate always builds");
+    let (tokens, probes) = effort_greedy_tokens(
+        &prep.residuals,
+        params.shape(prep.residuals.len()),
+        params.lazy,
+        run_dp,
+    );
 
     // 2. Full §5.2.3 sweep on the elected candidate's parse.
-    let mut best_cache = None;
-    let mut best_len = effort_stream_bytes(&prep, &tokens, None).0;
-    let mut best_stream: Option<Vec<Token>> = None;
-    for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
-        let (len, cached) = effort_stream_bytes(&prep, &tokens, Some(bits));
-        if len < best_len {
-            best_len = len;
-            best_cache = Some(bits);
-            best_stream = cached;
+    let sweep_caches = |tokens: &[Token]| -> (Option<u32>, usize) {
+        let sweep: Vec<Option<u32>> = std::iter::once(None)
+            .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+            .collect();
+        let swept = effort_stream_bytes_many(&prep, tokens, &sweep);
+        let mut best = (None, swept[0]);
+        for (&cache, &len) in sweep.iter().zip(&swept).skip(1) {
+            if len < best.1 {
+                best = (cache, len);
+            }
         }
-    }
+        best
+    };
+    let (best_cache, mut best_len) = sweep_caches(&tokens);
     // 3. Cost-priced DP re-plan of the winner at its cache choice, over
     //    match tables built from the same reduced-effort parse.
-    let mut stream = best_stream;
+    let mut stream: Option<Vec<Token>> = None;
     if run_dp {
         let sw = prep.stream_width;
         let tables = DpMatchTables {
@@ -8757,53 +9029,109 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
         }
     }
     drop(probes);
-    let stream = stream.unwrap_or(tokens);
+    let cached = |tokens: Vec<Token>, cache: Option<u32>| match cache {
+        Some(bits) => cacheify_tokens(&tokens, &prep.residuals, bits),
+        None => tokens,
+    };
+    // The finalists: (cache-rewritten stream, cache choice, single-group
+    // size), in fold order.
+    let mut finalists = vec![(
+        match stream {
+            Some(planned) => planned,
+            None => cached(tokens, best_cache),
+        },
+        best_cache,
+        best_len,
+    )];
+    // 3b. Method 6 (large images only): re-parse the elected candidate
+    //     with the exhaustive matcher shape — the full chain bound, no
+    //     early stop, the full lazy look-ahead — as a second finalist.
+    //     A longer greedy match is not always a cheaper one, so both
+    //     go on to the §6.2.2 stage and the smaller file wins.
+    if method >= MAX_LOSSLESS_METHOD {
+        let deep_shape = MatcherShape {
+            max_chain: MAX_CHAIN,
+            hash_bits: effort_hash_bits(prep.residuals.len()),
+            nice_len: MAX_MATCH,
+        };
+        let (deep, _) =
+            effort_greedy_tokens(&prep.residuals, deep_shape, LAZY_DEPTH_DEFAULT, false);
+        let (cache, len) = sweep_caches(&deep);
+        finalists.push((cached(deep, cache), cache, len));
+    }
 
-    // 4. §6.2.2 multi-group layouts over the final token stream.
-    let mut meta: Option<(u8, Vec<u16>)> = None;
+    // 4. §6.2.2 multi-group layouts over each finalist: every
+    //    (prefix_bits, group count) block clustering is computed once,
+    //    priced against every finalist independently, then everything is
+    //    folded in (finalist, layout) order.
     let meta_ok = prep.stream_width == width && prep.residuals.len() == w * h;
-    for &prefix_bits in params.meta_prefix_bits.iter().filter(|_| meta_ok) {
-        let side = 1usize << prefix_bits;
-        let blocks = w.div_ceil(side) * h.div_ceil(side);
-        for num_groups in 2..=MAX_META_GROUPS {
-            if blocks < num_groups as usize {
-                continue;
-            }
-            let codes = cluster_blocks_by_histogram_distance(
-                &prep.residuals,
-                width,
-                height,
-                prefix_bits,
-                num_groups,
-            );
-            let Some(bits) = plan_meta_prefix_tokens_with_codes(
-                &stream,
-                width,
-                prefix_bits,
-                &codes,
-                best_cache,
-                width,
-                &mut None,
-            ) else {
-                continue;
-            };
-            let len = (prep.prelude.bit_position() + bits).div_ceil(8);
-            if len < best_len {
+    let layouts: Vec<(u8, u32)> = params
+        .meta_prefix_bits
+        .iter()
+        .filter(|_| meta_ok)
+        .flat_map(|&prefix_bits| {
+            let side = 1usize << prefix_bits;
+            let blocks = w.div_ceil(side) * h.div_ceil(side);
+            (2..=MAX_META_GROUPS)
+                .filter(move |&g| blocks >= g as usize)
+                .map(move |g| (prefix_bits, g))
+        })
+        .collect();
+    let workers = thread_budget();
+    let clusterings = parallel_map(layouts.len(), workers, |i| {
+        let (prefix_bits, num_groups) = layouts[i];
+        cluster_blocks_by_histogram_distance(
+            &prep.residuals,
+            width,
+            height,
+            prefix_bits,
+            num_groups,
+        )
+    });
+    let priced = parallel_map(finalists.len() * layouts.len(), workers, |k| {
+        let (f, i) = (k / layouts.len(), k % layouts.len());
+        let (stream, cache, _) = &finalists[f];
+        let bits = plan_meta_prefix_tokens_with_codes(
+            stream,
+            width,
+            layouts[i].0,
+            &clusterings[i],
+            *cache,
+            width,
+            &mut None,
+        )?;
+        Some((prep.prelude.bit_position() + bits).div_ceil(8))
+    });
+    // (finalist, layout index or None for the single-group image).
+    let mut choice: (usize, Option<usize>) = (0, None);
+    let mut best_len = finalists[0].2;
+    for (f, finalist) in finalists.iter().enumerate() {
+        if finalist.2 < best_len {
+            best_len = finalist.2;
+            choice = (f, None);
+        }
+        for i in 0..layouts.len() {
+            if let Some(len) = priced[f * layouts.len() + i]
+                && len < best_len
+            {
                 best_len = len;
-                meta = Some((prefix_bits, codes));
+                choice = (f, Some(i));
             }
         }
     }
+    drop(priced);
+    let (stream, best_cache, _) = finalists.swap_remove(choice.0);
+    drop(finalists);
 
     let mut out = prep.prelude.clone();
-    match meta {
-        Some((prefix_bits, codes)) => {
+    match choice.1 {
+        Some(i) => {
             write_meta_prefix_tokens_with_codes(
                 &mut out,
                 &stream,
                 width,
-                prefix_bits,
-                codes,
+                layouts[i].0,
+                clusterings.into_iter().nth(i).expect("layout index"),
                 best_cache,
                 width,
             )
@@ -8819,12 +9147,23 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
 /// Dispatch a lossless image stream encode on `method`
 /// (`0..=MAX_LOSSLESS_METHOD`; larger values act as the maximum).
 fn encode_argb_with_method(pixels: &[u32], width: u32, height: u32, method: u8) -> Vec<u8> {
-    if method >= MAX_LOSSLESS_METHOD {
-        encode_argb_with_predictor_chooser(pixels, width, height)
-    } else {
+    if method < MAX_LOSSLESS_METHOD {
         encode_argb_with_effort(pixels, width, height, method)
+    } else if pixels.len() > EXHAUSTIVE_MAX_PIXELS {
+        encode_argb_with_effort(pixels, width, height, MAX_LOSSLESS_METHOD)
+    } else {
+        encode_argb_with_predictor_chooser(pixels, width, height)
     }
 }
+
+/// Largest image (in pixels, 2048 x 2048) [`MAX_LOSSLESS_METHOD`] runs
+/// the exhaustive search on. That search keeps per-pixel match tables
+/// and a plan per cache choice for each of its ~60 candidates (about
+/// 500 bytes a pixel per worker) and takes tens of minutes on a 12 Mpx
+/// photo; above this size the maximum level runs the screened search at
+/// its highest setting instead (the exhaustive matcher shape, the widest
+/// candidate list, every §6.2.2 layout).
+const EXHAUSTIVE_MAX_PIXELS: usize = 4 << 20;
 
 /// Round 383 — generic Shannon entropy of a symbol histogram in
 /// milli-bits (the multi-alphabet analogue of
@@ -11337,6 +11676,83 @@ mod tests {
                         cacheify_tokens(stream, pixels, bits),
                         "hit-table cacheify drifted (code_bits={bits})"
                     );
+                }
+            }
+        }
+    }
+
+    /// The one-walk pricer equals the writer mirror on the stored
+    /// stream, for every cache choice, at widths that do and do not
+    /// reach the §5.2.2 distance map; the streamed cache rewrite yields
+    /// exactly the stored one.
+    #[test]
+    fn single_pass_bits_match_writer_mirror() {
+        let mut state = 0x5eed_1234u32;
+        let mixed: Vec<u32> = (0..4096)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if (i / 64) % 3 == 0 {
+                    0xff00_0000 | (state >> 8)
+                } else {
+                    0xff00_0000 | (((i % 13) * 19) << 8) | ((i / 64) % 5)
+                }
+            })
+            .collect();
+        let flat = vec![0x8040_2010u32; 1000];
+        for (pixels, widths) in [(&mixed, [64u32, 1, 7]), (&flat, [10u32, 1, 1000])] {
+            let raw = tokenize_lz77(pixels);
+            for width in widths {
+                assert_eq!(
+                    token_stream_bits_single_pass(raw.iter().copied(), 0, width),
+                    prefix_codes_and_tokens_bits(&raw, 0, width),
+                    "uncached width {width}"
+                );
+                for bits in COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX {
+                    let stored = cacheify_tokens(&raw, pixels, bits);
+                    let streamed: Vec<Token> = CacheifyStream::new(&raw, pixels, bits).collect();
+                    assert_eq!(streamed, stored);
+                    assert_eq!(
+                        token_stream_bits_single_pass(
+                            CacheifyStream::new(&raw, pixels, bits),
+                            1 << bits,
+                            width
+                        ),
+                        prefix_codes_and_tokens_bits(&stored, 1 << bits, width),
+                        "cache bits {bits} width {width}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The one-pixel-walk multi-cache pricer equals pricing each cache
+    /// choice's rewritten stream, for parses with and without copies.
+    #[test]
+    fn many_cache_pricing_matches_streamed_rewrite() {
+        let mut state = 0x0bad_f00du32;
+        let pixels: Vec<u32> = (0..6000)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                match (i / 50) % 3 {
+                    0 => 0xff00_0000 | (state >> 8),
+                    1 => 0x8000_0000 | ((i % 9) * 0x0001_0101) as u32,
+                    _ => (state >> 28) * 0x1111_1111,
+                }
+            })
+            .collect();
+        let caches: Vec<Option<u32>> = std::iter::once(None)
+            .chain((COLOR_CACHE_BITS_MIN..=COLOR_CACHE_BITS_MAX).map(Some))
+            .collect();
+        for width in [60u32, 1] {
+            let prep = prepare_literals(&pixels, false, width);
+            let parses = [
+                tokenize_lz77(&prep.residuals),
+                prep.residuals.iter().map(|&p| Token::Literal(p)).collect(),
+            ];
+            for tokens in &parses {
+                let many = effort_stream_bytes_many(&prep, tokens, &caches);
+                for (&cache, &got) in caches.iter().zip(&many) {
+                    assert_eq!(got, effort_stream_bytes(&prep, tokens, cache), "{cache:?}");
                 }
             }
         }

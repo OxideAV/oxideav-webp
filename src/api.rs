@@ -183,6 +183,12 @@ pub struct EncodeOptions {
     /// lossless and lossy; see [`with_method`](Self::with_method).
     /// Default `4`.
     pub method: u8,
+    /// Worker threads the encoder may use: the lossless search's
+    /// candidate evaluations and, on a lossy encode with alpha, the
+    /// `ALPH` plane next to the `VP8 ` encode. `0` (the default) uses
+    /// the host's available parallelism, `1` runs strictly on the
+    /// calling thread. The output bytes are the same for every value.
+    pub threads: usize,
 }
 
 impl Default for EncodeOptions {
@@ -197,6 +203,7 @@ impl Default for EncodeOptions {
             frame_mode: AnimFrameMode::Auto,
             delta: DeltaConfig::default(),
             method: vp8l_encode::DEFAULT_LOSSLESS_METHOD,
+            threads: 0,
         }
     }
 }
@@ -267,6 +274,23 @@ impl EncodeOptions {
     pub fn with_method(mut self, method: u8) -> Self {
         self.method = method.min(vp8l_encode::MAX_LOSSLESS_METHOD);
         self
+    }
+
+    /// Builder: at most `threads` worker threads (`0` = the host's
+    /// available parallelism, `1` = serial); see
+    /// [`threads`](Self::threads). Never changes the output bytes.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// The worker budget [`threads`](Self::threads) resolves to (at
+    /// least 1).
+    pub(crate) fn worker_budget(&self) -> usize {
+        match self.threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        }
     }
 
     /// `true` when the lossy `VP8 ` path is selected.
@@ -993,10 +1017,10 @@ pub fn encode(image: &WebpImage, opts: &EncodeOptions) -> Result<Vec<u8>, WebpEr
         )));
     }
     let meta = opts.filtered_metadata(&image.metadata);
-    match opts.quality {
+    vp8l_encode::with_thread_budget(opts.worker_budget(), || match opts.quality {
         None => encode_lossless(image, &meta, opts.method),
         Some(q) => encode_lossy(image, q, &meta, opts.method),
-    }
+    })
 }
 
 /// Encode packed 8-bit RGB (3 bytes per pixel, `width × height × 3`).
@@ -1164,7 +1188,7 @@ fn encode_lossy(
     let (vp8, alph_payload) = std::thread::scope(|scope| {
         let alpha_job = alpha
             .as_ref()
-            .filter(|_| w * h >= LOSSY_ALPHA_THREAD_MIN_PIXELS)
+            .filter(|_| w * h >= LOSSY_ALPHA_THREAD_MIN_PIXELS && vp8l_encode::thread_budget() >= 2)
             .and_then(|a| {
                 std::thread::Builder::new()
                     .spawn_scoped(scope, move || build_alph_payload(a, width, height, method))
@@ -1385,14 +1409,16 @@ pub fn encode_animation(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8
         })
         .collect::<Result<_, WebpError>>()?;
     let meta = opts.filtered_metadata(&frames[0].image.metadata);
-    crate::anim_encode::build_animation(
-        &anim_frames,
-        opts.loop_count,
-        opts.background_rgba,
-        &meta,
-        &opts.delta,
-        opts.method,
-    )
+    vp8l_encode::with_thread_budget(opts.worker_budget(), || {
+        crate::anim_encode::build_animation(
+            &anim_frames,
+            opts.loop_count,
+            opts.background_rgba,
+            &meta,
+            &opts.delta,
+            opts.method,
+        )
+    })
 }
 
 /// Encode positioned animation frames — the WebP-specific depth under
@@ -1413,14 +1439,16 @@ pub fn encode_animation_frames(
         ));
     }
     let meta = opts.filtered_metadata(metadata);
-    crate::anim_encode::build_animation(
-        frames,
-        opts.loop_count,
-        opts.background_rgba,
-        &meta,
-        &opts.delta,
-        opts.method,
-    )
+    vp8l_encode::with_thread_budget(opts.worker_budget(), || {
+        crate::anim_encode::build_animation(
+            frames,
+            opts.loop_count,
+            opts.background_rgba,
+            &meta,
+            &opts.delta,
+            opts.method,
+        )
+    })
 }
 
 /// Read the `ICCP` / `EXIF` / `XMP ` payloads without decoding pixels.

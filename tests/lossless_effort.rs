@@ -172,3 +172,59 @@ fn animation_frames_follow_the_method_and_stay_exact() {
         }
     }
 }
+
+/// `EncodeOptions::threads` never changes the output: every level, on
+/// content with and without a palette and with alpha, writes the same
+/// bytes serially and on several worker budgets (the parallel stages
+/// fold their results in a fixed order).
+#[test]
+fn output_is_identical_for_every_thread_budget() {
+    let photo = common::photo_rgba(96, 72);
+    let mut alpha = common::photo_rgba(64, 48);
+    for (k, p) in alpha.chunks_mut(4).enumerate() {
+        p[3] = (k * 7 % 256) as u8;
+    }
+    let mut pal = Vec::new();
+    for i in 0..48 * 40u32 {
+        let c = ((i % 48) / 6 + (i / 48) / 5) % 5;
+        pal.extend_from_slice(&[(c * 50) as u8, (c * 20) as u8, 255 - (c * 40) as u8, 255]);
+    }
+    let inputs = [(96u32, 72u32, &photo), (64, 48, &alpha), (48, 40, &pal)];
+    for method in 0..=6u8 {
+        for &(w, h, px) in &inputs {
+            let serial = encode_rgba8(
+                w,
+                h,
+                px,
+                &EncodeOptions::default().with_method(method).with_threads(1),
+            )
+            .expect("serial encode");
+            for threads in [2usize, 3, 8, 0] {
+                let opts = EncodeOptions::default()
+                    .with_method(method)
+                    .with_threads(threads);
+                let par = encode_rgba8(w, h, px, &opts).expect("parallel encode");
+                assert_eq!(par, serial, "method {method} {w}x{h} threads {threads}");
+            }
+            assert_eq!(decode(&serial).expect("decode").to_rgba8(), *px);
+        }
+    }
+    // The alpha plane of a lossy encode, coded next to the VP8 encode
+    // when two or more workers are allowed.
+    let mut big = common::photo_rgba(80, 80);
+    for (k, p) in big.chunks_mut(4).enumerate() {
+        p[3] = if k % 80 < 40 { 255 } else { (k / 80 * 3) as u8 };
+    }
+    let lossy = |threads| {
+        encode_rgba8(
+            80,
+            80,
+            &big,
+            &EncodeOptions::default()
+                .with_quality(75.0)
+                .with_threads(threads),
+        )
+        .expect("lossy encode")
+    };
+    assert_eq!(lossy(1), lossy(2));
+}

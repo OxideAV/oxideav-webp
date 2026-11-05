@@ -449,6 +449,7 @@ pub fn make_encoder_with_metadata(
         metadata: metadata.into(),
         pending_out: VecDeque::new(),
         eof: false,
+        threads: 1,
     }))
 }
 
@@ -465,6 +466,9 @@ pub struct WebpVp8lEncoder {
     metadata: Metadata,
     pending_out: VecDeque<Packet>,
     eof: bool,
+    /// Worker budget from [`Encoder::set_execution_context`]; serial
+    /// until the framework grants more.
+    threads: usize,
 }
 
 impl Encoder for WebpVp8lEncoder {
@@ -482,13 +486,18 @@ impl Encoder for WebpVp8lEncoder {
         };
         let img = WebpImage::from_video_frame_parts(v, self.width, self.height, self.pix)?
             .with_metadata(self.metadata.clone());
-        let bytes = crate::encode(&img, &EncodeOptions::default())?;
+        let opts = EncodeOptions::default().with_threads(self.threads);
+        let bytes = crate::encode(&img, &opts)?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 1000), bytes);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
         pkt.flags.keyframe = true;
         self.pending_out.push_back(pkt);
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.threads = ctx.threads.max(1);
     }
 
     fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
@@ -525,7 +534,10 @@ pub fn encode_vp8l_frame(
             xmp: metadata.xmp.map(<[u8]>::to_vec),
             gamma: None,
         });
-    Ok(crate::encode(&img, &EncodeOptions::default())?)
+    Ok(crate::encode(
+        &img,
+        &EncodeOptions::default().with_threads(1),
+    )?)
 }
 
 // ───────────────────────── Registration ──────────────────────────────────

@@ -6,6 +6,18 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- `EncodeOptions::threads` / `with_threads` (default `0` = the host's
+  available parallelism, `1` = strictly serial): the worker budget of the
+  lossless search (stills, animation frames, the `ALPH` plane) and of the
+  alpha plane next to the lossy encode. Every parallel stage folds its
+  results in a fixed order, so the output bytes are the same for every
+  budget (`tests/lossless_effort.rs` checks budgets 1, 2, 3, 8 and auto
+  at every level). The `webp_vp8l` framework encoder runs serial until
+  `Encoder::set_execution_context` grants workers, as the framework's
+  threading contract asks; the `webp_vp8` encoder forwards the context
+  to the VP8 encoder it wraps. No code path queries the host's thread
+  count any more except `threads = 0` on the Layer 1 API.
+
 - `EncodeOptions::method` / `with_method` (`0..=6`, default `4`): lossless
   encoder effort (#45). It reaches every lossless encode — stills,
   animation frames and the `ALPH` plane of a lossy encode — and the
@@ -21,9 +33,8 @@ All notable changes to `oxideav-webp` are recorded here.
   fixtures and synthetic inputs, typically under 1 %). On an 800 x 533
   photo (release, 18-core Apple M-series): method 0 0.10 s / 456 428 B,
   method 4 0.39-0.51 s / 440 872 B, method 6 3.8-4.6 s / 435 790 B
-  (v0.3.1: 17-20 s, the same 435 790 B). A 2400 x 1600 photo encodes in
-  about 6 s and a 12 MP photo in about 17 s at the default, in 1.2 GB
-  peak (r479: 2.3 GiB and a panic after 140 s). Tests:
+  (v0.3.1: 17-20 s, the same 435 790 B). For 12 MP and larger images
+  see "Changed" below. Tests:
   `tests/lossless_effort.rs` (every level exact on every fixture frame and
   synthetic inputs, default within 10 % + 8 bytes of method 6, alpha plane
   and animation frames follow the level) and oracle direction G (every
@@ -60,21 +71,63 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- **Lossless encoding at production image sizes.** A 3000 x 4000 photo
+  (real camera JPEG, resized), release, 18-thread Apple M-series; heap
+  peak counted by a tracking allocator (includes the caller's 48 MB
+  input and the API's 48 MB copy), every file pixel-exact through
+  `dwebp` 1.6.0 and this crate's decoder:
+
+  | method | before | after, 1 thread | after, default threads |
+  |---|---|---|---|
+  | 0 | 2.1 s, 510 MB | 1.3 s, 336 MB | 1.1 s, 355 MB |
+  | 1 | 4.0 s, 510 MB | 3.0 s, 336 MB | 1.5 s, 573 MB |
+  | 2 | 5.4 s, 509 MB | 4.1 s, 338 MB | 1.8 s, 619 MB |
+  | 3 | 9.2 s, 510 MB | 7.4 s, 338 MB | 2.5 s, 774 MB |
+  | 4 (default) | 10.5 s, 510 MB | 8.4 s, 338 MB | 2.4 s, 883 MB |
+  | 5 | 15.7 s, 510 MB | 15.4 s, 339 MB | 5.1 s, 883 MB |
+  | 6 | > 590 s, > 7.5 GB RSS (killed) | 16.1 s, 390 MB | 6.3 s, 883 MB |
+
+  Methods 0..=5 write the same bytes as before (11 437 380 B at the
+  default; method 6 now 11 416 536 B, below method 5's 11 428 592 B).
+  Peak RSS (macOS) at method 4: 1.18 GB before; 0.55 GB serial, 1.15 GB
+  on 18 threads.
+  - The screening pass no longer stores a token stream: each candidate's
+    parse is counted as it is produced (symbol counts, extra bits, a
+    literal-position bitmap) and dropped, and the elected candidate is
+    parsed again (the parse is deterministic). Every §5.2.3 cache choice
+    is priced from those counts in one walk over the pixels — a cache's
+    state does not depend on the parse, so each hit just moves one count
+    from a literal's four channel symbols to the cache symbol — instead
+    of rewriting and re-counting a copy of the stream per choice.
+  - Screening candidates run in waves on the worker budget (capped so
+    their scratch fits in 1.5 GiB, about 16 bytes a pixel each), as do
+    the §6.2.2 layouts, each folded in submission order.
+  - The §6.2.2 layout pricer walks the stream once, without a 10-byte
+    per-token side table.
+  - `Token` is 8 bytes (16-bit copy length; `MAX_MATCH` is 4096).
+- **Method 6 above 4 Mpx (2048 x 2048)** runs method 5's screened search
+  plus a second parse of the elected candidate with the exhaustive
+  matcher shape (full chain, no early stop, full lazy look-ahead); both
+  parses go through the §6.2.2 stage and the smaller file wins. The
+  exhaustive search keeps per-pixel match tables and a plan per cache
+  choice for each of ~60 candidates (about 500 bytes a pixel per
+  worker): on a 12 MP image it did not finish in ten minutes. Output at
+  or below 4 Mpx is unchanged (the method-6 output pins hold).
 - **The default lossless encode is method 4**, not the exhaustive search:
   output bytes change for every lossless encode that does not set
   `with_method(6)`.
   This includes the `ALPH` plane of a lossy encode with alpha (the `VP8 `
   bitstream itself is unchanged at the default).
-- Method 6 evaluates its candidates on scoped worker threads (up to
-  `available_parallelism`, fewer when the image is large: about 512 bytes
+- Method 6 evaluates its candidates on scoped worker threads (up to the
+  `threads` budget, fewer when the image is large: about 512 bytes
   a pixel per worker within a 1.5 GiB budget, one worker when threads are
   unavailable) and folds them in the original order, so its output is
   byte-identical to the one-by-one search. The predictor meta-prefix sweep
   runs as one job per subtract-green branch.
 - A finished lossless encode frees the per-thread token-plan memo (about
   150 bytes a pixel) instead of keeping the last image's tables alive.
-- Internal: LZ77 tokens are 12 bytes (`u32` copy fields), halving every
-  parse's memory; the matcher takes a chain bound, hash-table size and
+- Internal: LZ77 tokens are 8 bytes (`u16` length, `u32` distance; 24
+  in v0.3.1); the matcher takes a chain bound, hash-table size and
   match-length cut-off (the exhaustive path keeps 256 / 2^14 / 4096).
 - edition 2024, MSRV 1.95
 - Encoder internals: the §3.6.2.2 LZ77 parse reports its tokens through a
