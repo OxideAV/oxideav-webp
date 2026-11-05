@@ -231,9 +231,9 @@ profile is carried, not applied.
   to −28%). The default `method` 4 screens a short candidate list with
   one cheap parse each and plans only the winner: an 800 x 533 photo
   encodes in about 0.4 s at 1.2 % more bytes than method 6 (about 4 s);
-  a 12 MP photo in 2.4 s (8.4 s on one thread, 340 MB heap). Above
+  a 12 MP photo in 2.4 s (8-9 s on one thread, under 300 MB heap). Above
   2 Mpx method 6 runs the screened search with a second, exhaustive-shape
-  parse of the winner (12 MP: 6.3 s). The framework encoder honours the
+  parse of the winner (12 MP: 5.9 s). The framework encoder honours the
   `ExecutionContext` thread budget, and the output is byte-identical for
   every budget.
   Every level is re-verified bit-exact through black-box reference

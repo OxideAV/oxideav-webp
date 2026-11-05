@@ -56,19 +56,28 @@ in this crate.
 
 | method | before | after, `threads(1)` | after, default |
 |---|---|---|---|
-| 0 | 2.1 s / 510 MB | 1.3 s / 336 MB | 1.1 s / 355 MB |
-| 1 | 4.0 s / 510 MB | 3.0 s / 336 MB | 1.5 s / 573 MB |
-| 2 | 5.4 s / 509 MB | 4.1 s / 338 MB | 1.8 s / 619 MB |
-| 3 | 9.2 s / 510 MB | 7.4 s / 338 MB | 2.5 s / 774 MB |
-| 4 | 10.5 s / 510 MB | 8.4 s / 338 MB | 2.4 s / 883 MB |
-| 5 | 15.7 s / 510 MB | 15.4 s / 339 MB | 5.1 s / 883 MB |
-| 6 | > 590 s, > 7.5 GB RSS, killed | 16.1 s / 390 MB | 6.3 s / 883 MB |
+| 0 | 2.1 s / 510 MB | 1.3 s / 290 MB | 0.9 s / 292 MB |
+| 1 | 4.0 s / 510 MB | 2.6 s / 290 MB | 1.2 s / 527 MB |
+| 2 | 5.4 s / 509 MB | 3.7 s / 292 MB | 1.6 s / 573 MB |
+| 3 | 9.2 s / 510 MB | 6.7 s / 293 MB | 2.3 s / 728 MB |
+| 4 | 10.5 s / 510 MB | 7.7-9.4 s / 293 MB | 2.4 s / 838 MB |
+| 5 | 15.7 s / 510 MB | 12.4 s / 293 MB | 4.6 s / 838 MB |
+| 6 | > 590 s, > 7.5 GB RSS, killed | 13.1 s / 344 MB | 5.9 s / 838 MB |
+
+4912 x 7360 (36 Mpx) photo at method 4: 27.0 s / 1.49 GB heap / 3.6 GB
+RSS before, 15.2 s / 1.0 GB / 1.65 GB after (method 0 3.2 s, method 6
+26.2 s; the screening workers are memory-capped to two at this size).
+Decode of the same files: 0.65-0.73 s, 421 MB heap (lossless, `cwebp
+-lossless` input) and 0.45 s (lossy); a 16 383 x 16 383 lossless file
+decodes in 4.7 s at 2.08 GB heap (the ARGB and RGBA buffers). Lossless
+decodes are pixel-exact and lossy Y'CbCr planes bit-exact against
+`dwebp -yuv` at 12 and 36 Mpx.
 
 Bytes for 0..=5 are unchanged (12 035 376 / 11 515 328 / 11 461 890 /
 11 443 892 / 11 437 380 / 11 428 592); method 6 writes 11 416 536.
 macOS peak RSS runs above the heap peak (the allocator keeps freed
-large blocks): method 4 1.18 GB before, 0.55 GB serial, 1.15 GB on 18
-threads.
+large blocks): method 4 1.18 GB before, 0.50 GB serial, 1.05 GB on 18
+threads. Times vary by about 20 % with host load.
 
 Synthetic photo-like 4000 x 3000 (noisy gradients, `photo_rgba`),
 default threads: method 0 1.6 s, method 4 2.2 s (was 10.1 s, 1.70 GB

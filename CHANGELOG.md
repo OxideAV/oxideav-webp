@@ -83,20 +83,21 @@ All notable changes to `oxideav-webp` are recorded here.
 
   | method | before | after, 1 thread | after, default threads |
   |---|---|---|---|
-  | 0 | 2.1 s, 510 MB | 1.3 s, 336 MB | 1.1 s, 355 MB |
-  | 1 | 4.0 s, 510 MB | 3.0 s, 336 MB | 1.5 s, 573 MB |
-  | 2 | 5.4 s, 509 MB | 4.1 s, 338 MB | 1.8 s, 619 MB |
-  | 3 | 9.2 s, 510 MB | 7.4 s, 338 MB | 2.5 s, 774 MB |
-  | 4 (default) | 10.5 s, 510 MB | 8.4 s, 338 MB | 2.4 s, 883 MB |
-  | 5 | 15.7 s, 510 MB | 15.4 s, 339 MB | 5.1 s, 883 MB |
-  | 6 | > 590 s, > 7.5 GB RSS (killed) | 16.1 s, 390 MB | 6.3 s, 883 MB |
+  | 0 | 2.1 s, 510 MB | 1.3 s, 290 MB | 0.9 s, 292 MB |
+  | 1 | 4.0 s, 510 MB | 2.6 s, 290 MB | 1.2 s, 527 MB |
+  | 2 | 5.4 s, 509 MB | 3.7 s, 292 MB | 1.6 s, 573 MB |
+  | 3 | 9.2 s, 510 MB | 6.7 s, 293 MB | 2.3 s, 728 MB |
+  | 4 (default) | 10.5 s, 510 MB | 7.7-9.4 s, 293 MB | 2.4 s, 838 MB |
+  | 5 | 15.7 s, 510 MB | 12.4 s, 293 MB | 4.6 s, 838 MB |
+  | 6 | > 590 s, > 7.5 GB RSS (killed) | 13.1 s, 344 MB | 5.9 s, 838 MB |
 
-  (A 6000 x 4000 image at method 4 took 17.6 s and 2.5 GB RSS before.)
+  (A 4912 x 7360 photo at method 4: 27.0 s, 1.49 GB heap, 3.6 GB RSS
+  before; 15.2 s, 1.0 GB heap, 1.65 GB RSS after.)
 
   Methods 0..=5 write the same bytes as before (11 437 380 B at the
   default; method 6 now 11 416 536 B, below method 5's 11 428 592 B).
-  Peak RSS (macOS) at method 4: 1.18 GB before; 0.55 GB serial, 1.15 GB
-  on 18 threads.
+  Peak RSS (macOS) at method 4: 1.18 GB before; 0.48-0.50 GB serial,
+  1.05-1.10 GB on 18 threads. Times vary by about 20 % with host load.
   - The screening pass no longer stores a token stream: each candidate's
     parse is counted as it is produced (symbol counts, extra bits, a
     literal-position bitmap) and dropped, and the elected candidate is
