@@ -267,10 +267,16 @@ impl EncodeOptions {
     /// parse. Every level is exactly lossless; lower levels write somewhat
     /// larger files much faster.
     ///
-    /// Lossy (`VP8 `): `0..=2` turn the trellis quantiser off (about a
-    /// third faster, a few percent more bytes); `3..=6` use the
-    /// quality-mapped trellis (the output of earlier versions). The alpha
-    /// plane is a lossless image and follows the lossless levels.
+    /// Lossy (`VP8 `): `3..=4` write the output of earlier versions;
+    /// `5` adds the RFC 6386 §13.4 token-probability updates fitted to
+    /// the picture (a second pass, 4-26 % fewer bytes at the same
+    /// pixels); `6` also picks the §9.4 loop-filter level that minimises
+    /// the reconstruction error (better quality at the same size, about
+    /// 4-5x the default's time). `0..=2` turn the trellis quantiser off at
+    /// quality 90 and above, where that is faster (1.3-2x, 5-40 % more
+    /// bytes); below 90 plain quantisation is not faster and they encode
+    /// like `4`. The alpha plane is a lossless image and follows the
+    /// lossless levels.
     pub fn with_method(mut self, method: u8) -> Self {
         self.method = method.min(vp8l_encode::MAX_LOSSLESS_METHOD);
         self
@@ -1225,11 +1231,6 @@ fn encode_lossy(
     };
 
     let frame = oxideav_vp8::I420Frame::packed(image.width, image.height, &y, &u, &v);
-    let params = oxideav_vp8::KeyframeParams {
-        y_ac_qi: oxideav_vp8::encoder::quality_to_qindex(quality),
-        trellis_strength: lossy_trellis_strength(quality, method),
-        ..oxideav_vp8::KeyframeParams::default()
-    };
     // The `ALPH` plane is an independent lossless encode: on images large
     // enough to pay for a thread it runs next to the VP8 encode (same
     // bytes either way); otherwise, or when no thread can be spawned, it
@@ -1244,7 +1245,7 @@ fn encode_lossy(
                     .spawn_scoped(scope, move || build_alph_payload(a, width, height, method))
                     .ok()
             });
-        let vp8 = oxideav_vp8::encode_keyframe(&frame, &params);
+        let vp8 = encode_vp8_keyframe(&frame, quality, method);
         let alph = match alpha_job {
             Some(job) => Some(job.join().unwrap_or_else(|p| std::panic::resume_unwind(p))),
             None => alpha
@@ -1296,11 +1297,26 @@ fn encode_lossy(
     file.finish()
 }
 
-/// Highest `EncodeOptions::method` at which the lossy path turns the VP8
-/// trellis quantiser off: plain rounding quantisation, about a third
-/// faster for a few percent more bytes. From the next level up the
-/// quality-mapped trellis strength applies (the v0.3.1 behaviour).
+/// Highest `EncodeOptions::method` at which the lossy path may turn the
+/// VP8 trellis quantiser off (plain rounding quantisation).
 const LOSSY_TRELLIS_OFF_MAX_METHOD: u8 = 2;
+
+/// Lowest quality at which those levels do turn it off. Plain
+/// quantisation only saves time when the quantiser is fine: on 800 x 533
+/// photo-like inputs it was 1.3-2x faster at quality 90-95 (5-40 % more
+/// bytes) but 0-50 % *slower* and 3-40 % larger at quality 30-85, so
+/// below this the low levels keep the trellis.
+const LOSSY_TRELLIS_OFF_MIN_QUALITY: f32 = 90.0;
+
+/// Lowest `EncodeOptions::method` that fits the RFC 6386 §13.4
+/// `token_prob_update()` layer to the picture (two passes; the smaller
+/// wire ships).
+const LOSSY_FITTED_PROBS_MIN_METHOD: u8 = 5;
+
+/// Lowest `EncodeOptions::method` that searches the §9.4 loop-filter
+/// level minimising the post-§15 reconstruction error (the default
+/// writes level 0, no filter).
+const LOSSY_AUTO_LOOP_FILTER_MIN_METHOD: u8 = 6;
 
 /// Alpha planes at least this many pixels are coded on their own thread
 /// next to the VP8 encode.
@@ -1309,11 +1325,38 @@ const LOSSY_ALPHA_THREAD_MIN_PIXELS: usize = 64 * 64;
 /// The VP8 trellis strength the lossy path uses at `quality` and
 /// `method`.
 fn lossy_trellis_strength(quality: f32, method: u8) -> oxideav_vp8::TrellisStrength {
-    if method <= LOSSY_TRELLIS_OFF_MAX_METHOD {
+    if method <= LOSSY_TRELLIS_OFF_MAX_METHOD && quality >= LOSSY_TRELLIS_OFF_MIN_QUALITY {
         oxideav_vp8::TrellisStrength::OFF
     } else {
         oxideav_vp8::encoder::quality_to_trellis_strength(quality)
     }
+}
+
+/// Encode the `VP8 ` key frame of a lossy still at `quality` and lossy
+/// effort `method` (see [`EncodeOptions::with_method`]). Methods `3..=4`
+/// (and `0..=2` below quality 90) are the single-pass encode of earlier
+/// versions, byte for byte.
+fn encode_vp8_keyframe(
+    frame: &oxideav_vp8::I420Frame<'_>,
+    quality: f32,
+    method: u8,
+) -> Result<Vec<u8>, oxideav_vp8::encoder::EncodeError> {
+    let params = oxideav_vp8::KeyframeParams {
+        y_ac_qi: oxideav_vp8::encoder::quality_to_qindex(quality),
+        trellis_strength: lossy_trellis_strength(quality, method),
+        ..oxideav_vp8::KeyframeParams::default()
+    };
+    if method < LOSSY_FITTED_PROBS_MIN_METHOD {
+        return oxideav_vp8::encode_keyframe(frame, &params);
+    }
+    let options = oxideav_vp8::encoder::KeyframeCodingOptions {
+        auto_loop_filter: method >= LOSSY_AUTO_LOOP_FILTER_MIN_METHOD,
+        fitted_token_prob_updates: true,
+    };
+    oxideav_vp8::encoder::encode_keyframe_with_reconstruction_and_coding_options(
+        frame, &params, &options,
+    )
+    .map(|(bytes, _planes)| bytes)
 }
 
 /// A `RIFF` / `WEBP` file assembled chunk by chunk in one buffer: each

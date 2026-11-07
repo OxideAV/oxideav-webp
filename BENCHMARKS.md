@@ -46,6 +46,41 @@ the medians are still stable to a few percent.
 | `benches/anim_encode.rs` | `anim_encode_{lossless,delta,auto}_4f_48` | §2.7.1.1 animation *encode* path (`build_animated_webp`) — the encode mirror of `anim_decode` (round 409): the dirty-rect diff against the previous canvas, the `Auto` mode's keyframe-vs-delta arbitration (two full inner VP8L encodes per frame), and the `ANMF`/`ANIM`/`VP8X` container assembly. Three cells drive one deterministic 4-frame 48×48 moving-square timeline (LCG-textured background + a 12×12 square stepping 8 px/frame) through each `AnimFrameMode` |
 | `benches/distance_code.rs` | `distance_code_{dist1_rle,dist_row_above,dist_small_neighbor,dist_large_nomatch}` | Encoder-side §5.2.2 `pixel_distance_to_distance_code` — the distance-code chooser run (at least) twice per emitted LZ77 backward reference (once in `count_frequencies` to build the DISTANCE frequency table, once in the emit loop). It scans `DISTANCE_MAP` for the smallest distance-map code `c ∈ 1..=120` reconstructing to `D` for the image width, falling back to the scan-line code `D + 120` when none matches (round 301 added a smallest-code early-out that returns on the first match instead of always walking all 120 entries; the matching cells now cost a partial scan, the genuine no-match cell still walks all 120). The `lz77_match` / `lz77_chain` benches time the matcher that *finds* a run and `value_to_prefix` the per-symbol prefix split; the distance→code mapping between them had no isolated harness. Four cells fix `image_width = 256` and vary `distance`: `dist1_rle` (flat-colour RLE, multiple clamp-to-1 map hits), `dist_row_above` (`distance == width`, the `(0,1)` "pixel above" match at index 0 → code 1, cheapest), `dist_small_neighbor` (`distance = 2`, close horizontal neighbour matched mid-scan), and `dist_large_nomatch` (`distance = 70_000`, no map entry matches → full 120-scan + scan-line fallback). Each cell runs an inner loop of 1024 chooser calls, XOR-accumulating the codes |
 
+## Round 484 (2026-11-07) — effort levels against `cwebp -m`
+
+800 x 533 photo-like image (generated: 1/f value noise, shaded disks,
+sensor noise), release, Apple M-series, 18 hardware threads. `cwebp`
+1.6.0 times include process start.
+
+Lossless (`-lossless -exact`; every file pixel-exact):
+
+| method | ours, default threads | ours, 1 thread | bytes | `cwebp -m N` |
+|---|---|---|---|---|
+| 0 | 0.043 s | 0.067 s | 543 440 | 0.01 s / 593 138 |
+| 1 | 0.049 s | — | 488 778 | 0.07 s / 489 452 |
+| 2 | 0.055 s | — | 487 430 | 0.10 s / 483 884 |
+| 3 | 0.070 s | — | 487 430 | 0.12 s / 483 466 |
+| 4 | 0.080 s | 0.254 s | 487 010 | 0.12 s / 483 466 |
+| 5 | 0.087 s | 0.333 s | 487 010 | 0.23 s / 482 008 |
+| 6 | 1.45 s | 11.7 s | 486 954 | 0.23 s / 482 008 (`-z 9`: 6.65 s / 477 996) |
+
+Twelve fixture frames (the lossless, alpha and extended fixtures),
+summed, one thread: method 0 70 046 B, 4 66 982 B, 5 66 980 B, 6
+66 586 B (2.9 s); `cwebp -m 0` 105 628, `-m 4` 67 234, `-m 6` 67 968,
+`-z 9` 66 968.
+
+Lossy at quality 80 (one thread; PSNR of the `dwebp` decode): methods
+0..=4 40 ms / 10 526 B / 39.75 dB, 5 84 ms / 9 676 B / 39.78 dB, 6
+190 ms / 9 676 B / 40.67 dB; `cwebp -m 0` 13 934 B / 40.57 dB, `-m 4`
+11 292 B / 41.04 dB, `-m 6` 11 130 B / 41.05 dB. At quality 95 methods
+0..=2 (trellis off) take 58 ms against 86 ms for 41 526 B against
+29 368 B.
+
+Method 6 on a 1024 x 1030 noise image (no repeats closer than the
+largest encodable distance): 30.6 s on one thread (35.4 s before the
+matcher's minimum-match quick reject), 13.5 s on 18; methods 0..=5
+0.1-0.27 s; `cwebp -z 9` 1.95 s. All levels write the same 3 164 222 B.
+
 ## Round 481 (2026-11-05) — lossless encode at production sizes
 
 3000 x 4000 photo (camera JPEG resized with `magick -resize`), release,

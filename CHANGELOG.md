@@ -4,6 +4,60 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Lossy `EncodeOptions::method` ladder** (#47). `3..=4` stay the
+  single-pass encode (the default output is unchanged byte-for-byte,
+  `tests/lossy_output_pins.rs`). New: `5` fits the RFC 6386 §13.4
+  token-probability updates to the picture (two passes, the smaller wire
+  ships: never larger than `4`); `6` also picks the §9.4 loop-filter
+  level that minimises the reconstruction error. Changed: `0..=2` turn
+  the trellis quantiser off only at quality 90 and above. Measured with
+  the current VP8 encoder, plain quantisation below 90 was slower *and*
+  3-40 % larger than the trellis, so those levels now encode like `4`
+  there (0.3.2 output changes for methods `0..=2` below quality 90 and
+  for `5..=6`). 800 x 533 photo-like image (generated: 1/f noise, shaded
+  disks, sensor noise), one thread, PSNR of the `dwebp` decode:
+
+  | quality | method | time | bytes | PSNR |
+  |---|---|---|---|---|
+  | 80 | 0..=4 | 40 ms | 10 526 | 39.75 dB |
+  | 80 | 5 | 84 ms | 9 676 | 39.78 dB |
+  | 80 | 6 | 190 ms | 9 676 | 40.67 dB |
+  | 95 | 0..=2 | 58 ms | 41 526 | 42.22 dB |
+  | 95 | 3..=4 | 86 ms | 29 368 | 42.33 dB |
+  | 95 | 5 | 176 ms | 27 364 | 42.32 dB |
+  | 95 | 6 | 311 ms | 27 364 | 42.49 dB |
+
+  (`cwebp -q 80`: `-m 0` 13 934 B / 40.57 dB, `-m 4` 11 292 B /
+  41.04 dB, `-m 6` 11 130 B / 41.05 dB.) A faster-than-default lossy
+  level below quality 90 needs a cheaper mode search in the VP8 encoder,
+  which exposes none. Oracle direction H now runs methods 0, 4, 5, 6 at
+  quality 70 and 0, 6 at 95 through `dwebp`.
+- The §5.2.2 hash-chain matcher starts its running best just below the
+  3-pixel minimum match, so a chain candidate must agree at offset 2
+  before its run is measured: hash-collision candidates (most of a long
+  chain on noisy content) are turned away with one compare. The result
+  is the same first-longest candidate, so lossless output is unchanged
+  (every pin holds); method 6 on a 1 Mpx noise image 35.4 s to 30.6 s
+  serial.
+- Test pins: the lossy pins are taken at the default method; the
+  method-6 `ALPH`-plane pins pin the `ALPH` payload (unchanged) rather
+  than the whole file, whose `VP8 ` part method 6 now refits.
+
+### Added
+
+- `tests/predictor_right_edge.rs` (#33): 17 x 121 `VP8L` streams
+  assembled bit by bit from RFC 9649, one per predictor mode `0..=13`,
+  whose last block column is the rightmost pixel column; each decodes to
+  the pixels of a §4.1 model written in the test (the same row's
+  leftmost pixel as TR) and, when installed, to `dwebp`'s pixels. A unit
+  test checks the encoder's residuals for every forced mode invert to
+  the source there and match the mode election's block walk.
+- `tests/lossless_far_match.rs` (#34): the reported shape — 1024 x 1030
+  pixels repeating with a period of 1 048 556, 100 past the largest
+  encodable distance — at methods 0..=5.
+
 ## [0.3.2](https://github.com/OxideAV/oxideav-webp/compare/v0.3.1...v0.3.2) - 2026-11-05
 
 ### Fixed

@@ -1,11 +1,13 @@
 //! `EncodeOptions::method` on the lossy (`VP8 `) path (#47).
 //!
-//! Methods `0..=2` turn the VP8 trellis quantiser off (faster, a few
-//! percent more bytes); `3..=6` keep the quality-mapped trellis, so the
-//! default (`4`) writes exactly what earlier versions wrote (pinned in
-//! `lossy_output_pins.rs`). The alpha plane follows the lossless levels
-//! and, on larger images, is coded on a second thread next to the VP8
-//! encode.
+//! Methods `3..=4` write the single-pass encode of earlier versions (the
+//! default, pinned in `lossy_output_pins.rs`); `5` fits the RFC 6386
+//! §13.4 token-probability updates to the picture (never larger than
+//! `4`); `6` also picks the §9.4 loop-filter level by reconstruction
+//! error. `0..=2` turn the trellis quantiser off at quality 90 and above
+//! and encode like `4` below it. The alpha plane follows the lossless
+//! levels and, on larger images, is coded on a second thread next to the
+//! VP8 encode.
 
 mod common;
 
@@ -25,39 +27,65 @@ fn rgb_of(rgba: &[u8]) -> Vec<u8> {
     rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
 }
 
+/// Every method's lossy encode at `quality`, methods `0..=6`.
+fn encode_every_method(w: u32, h: u32, rgba: &[u8], quality: f32) -> Vec<Vec<u8>> {
+    (0..=6u8)
+        .map(|m| {
+            encode_rgba8(
+                w,
+                h,
+                rgba,
+                &EncodeOptions::default()
+                    .with_quality(quality)
+                    .with_method(m),
+            )
+            .expect("lossy encode")
+        })
+        .collect()
+}
+
 #[test]
-fn lossy_methods_split_into_trellis_off_and_trellis_on() {
+fn lossy_method_ladder() {
     let (w, h) = (160u32, 112u32);
     let rgba = common::photo_rgba(w, h);
-    let enc = |m: u8| {
-        encode_rgba8(
-            w,
-            h,
-            &rgba,
-            &EncodeOptions::default().with_quality(80.0).with_method(m),
-        )
-        .expect("lossy encode")
-    };
-    let files: Vec<Vec<u8>> = (0..=6).map(enc).collect();
-    for m in 1..=2 {
-        assert_eq!(
-            files[m], files[0],
-            "methods 0..=2 share the trellis-off encode"
-        );
-    }
-    for m in 3..=6 {
-        assert_eq!(files[m], files[4], "methods 3..=6 share the default encode");
-    }
-    assert_ne!(files[0], files[4], "trellis off changes the bitstream");
+    let src = rgb_of(&rgba);
     let default = encode_rgba8(w, h, &rgba, &EncodeOptions::default().with_quality(80.0))
         .expect("lossy encode");
-    assert_eq!(default, files[4], "the default lossy encode is method 4");
 
-    let src = rgb_of(&rgba);
-    for (m, file) in [(0usize, &files[0]), (4, &files[4])] {
-        let back = rgb_of(&decode(file).expect("decode").to_rgba8());
-        let p = psnr(&back, &src);
-        assert!(p > 30.0, "method {m}: PSNR {p:.2} dB");
+    // Below quality 90 the low levels keep the trellis: 0..=4 are one
+    // encode, the default.
+    let q80 = encode_every_method(w, h, &rgba, 80.0);
+    for m in 0..=3 {
+        assert_eq!(q80[m], q80[4], "q80: method {m} encodes like 4");
+    }
+    assert_eq!(default, q80[4], "the default lossy encode is method 4");
+    // 5 fits the §13.4 probabilities: a different wire, never larger.
+    assert_ne!(q80[5], q80[4], "q80: method 5 refits the probabilities");
+    assert!(q80[5].len() <= q80[4].len(), "q80: method 5 larger than 4");
+    // 6 adds the loop-filter search: same coefficients as 5 here, so the
+    // same size class, and a reconstruction at least as close.
+    let p = |file: &[u8]| psnr(&rgb_of(&decode(file).expect("decode").to_rgba8()), &src);
+    assert!(
+        p(&q80[6]) >= p(&q80[5]) - 0.05,
+        "q80: method 6 {:.2} dB against method 5 {:.2} dB",
+        p(&q80[6]),
+        p(&q80[5])
+    );
+    for (m, file) in q80.iter().enumerate() {
+        let db = p(file);
+        assert!(db > 30.0, "q80 method {m}: PSNR {db:.2} dB");
+    }
+
+    // From quality 90, 0..=2 turn the trellis off.
+    let q95 = encode_every_method(w, h, &rgba, 95.0);
+    for m in 1..=2 {
+        assert_eq!(q95[m], q95[0], "q95: methods 0..=2 share one encode");
+    }
+    assert_eq!(q95[3], q95[4], "q95: method 3 encodes like 4");
+    assert_ne!(q95[0], q95[4], "q95: trellis off changes the bitstream");
+    for (m, file) in q95.iter().enumerate() {
+        let db = p(file);
+        assert!(db > 33.0, "q95 method {m}: PSNR {db:.2} dB");
     }
 }
 
@@ -74,7 +102,7 @@ fn concurrent_alpha_plane_is_exact_and_deterministic() {
         px[3] = if d < 1600 { 255 } else { (x * 2) as u8 };
     }
     let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
-    for m in [0u8, 4, 6] {
+    for m in [0u8, 4, 5, 6] {
         let opts = EncodeOptions::default().with_quality(75.0).with_method(m);
         let a = encode_rgba8(w, h, &rgba, &opts).expect("encode");
         let b = encode_rgba8(w, h, &rgba, &opts).expect("encode");

@@ -122,15 +122,31 @@ fn synthetic_images_encode_to_their_pinned_bytes() {
     }
 }
 
-/// `(fixture, frame, length, FNV-1a 64)` of `encode_rgba8` at quality 80
-/// over every fixture frame with a non-opaque pixel: lossy files whose
-/// `ALPH` plane the lossless encoder codes.
+/// `(fixture, frame, length, FNV-1a 64)` of the `ALPH` chunk payload of
+/// `encode_rgba8` at quality 80 over every fixture frame with a
+/// non-opaque pixel: the plane the lossless encoder codes. Only the
+/// payload is pinned: the `VP8 ` bitstream next to it is the lossy
+/// encoder's (at this method it refits its probabilities and loop
+/// filter, see `lossy_output_pins.rs` for its pins).
 const ALPHA_PLANE_PINS: &[(&str, usize, usize, u64)] = &[
-    ("animated-with-alpha.webp", 1, 676, 0x3592dd3085494c6d),
-    ("animated-with-alpha.webp", 2, 750, 0xf911162ad628de4e),
-    ("lossless-32x32-rgba.webp", 0, 200, 0x86a60121cd80db82),
-    ("lossy-with-alpha-128x128.webp", 0, 2924, 0x775f3dc1cb8da518),
+    ("animated-with-alpha.webp", 1, 86, 0x22845c083f843d56),
+    ("animated-with-alpha.webp", 2, 87, 0x043608e509314a57),
+    ("lossless-32x32-rgba.webp", 0, 19, 0x07bd01f92e2a30d3),
+    ("lossy-with-alpha-128x128.webp", 0, 1649, 0xe5f6ef4d564478d2),
 ];
+
+/// The payload of the first `ALPH` chunk of a `VP8X` file.
+fn alph_payload(file: &[u8]) -> &[u8] {
+    let mut at = 12;
+    while at + 8 <= file.len() {
+        let len = u32::from_le_bytes(file[at + 4..at + 8].try_into().unwrap()) as usize;
+        if &file[at..at + 4] == b"ALPH" {
+            return &file[at + 8..at + 8 + len];
+        }
+        at += 8 + len + (len & 1);
+    }
+    panic!("no ALPH chunk");
+}
 
 #[test]
 fn lossy_alpha_planes_encode_to_their_pinned_bytes() {
@@ -140,7 +156,12 @@ fn lossy_alpha_planes_encode_to_their_pinned_bytes() {
         let rgba = image.to_rgba8();
         let opts = pinned().with_quality(80.0);
         let out = encode_rgba8(image.width(), image.height(), &rgba, &opts).expect("encode");
-        assert_pin(&format!("{name} frame {frame}, lossy"), &out, len, hash);
+        assert_pin(
+            &format!("{name} frame {frame}, ALPH"),
+            alph_payload(&out),
+            len,
+            hash,
+        );
     }
 }
 

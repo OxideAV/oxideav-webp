@@ -8,11 +8,18 @@
 
 mod common;
 
+/// The pins are taken at the default method: its `VP8 ` bitstream is the
+/// single-pass encode every earlier version wrote (methods 5 and 6 refit
+/// the probabilities and the loop filter), and its `ALPH` plane is the
+/// default lossless level. `PIN_PRINT=1` prints the current values
+/// instead of checking them.
+const PIN_METHOD: u8 = 4;
+
 use common::{fnv1a64, photo_rgba};
 use oxideav_webp::{EncodeOptions, decode_all, encode, encode_rgba8};
 
 /// `(fixture, length, FNV-1a 64)` of the first frame of every committed
-/// fixture, encoded at quality 80 with its metadata.
+/// fixture, encoded at quality 80 with its metadata at [`PIN_METHOD`].
 const FIXTURE_PINS: &[(&str, usize, u64)] = &[
     ("animated-3-frames-rgb.webp", 674, 0x18457de5aca0d009),
     ("animated-with-alpha.webp", 674, 0x18457de5aca0d009),
@@ -32,10 +39,18 @@ const FIXTURE_PINS: &[(&str, usize, u64)] = &[
     ("lossless-cross-color-active.webp", 206, 0x5ec88d90d5a19a3c),
     ("lossy-1x1.webp", 58, 0x9f844a7d819ec54e),
     ("lossy-near-lossless-q40.webp", 1260, 0x10417e2004277fa4),
-    ("lossy-with-alpha-128x128.webp", 2926, 0xa98113323bfcf060),
+    ("lossy-with-alpha-128x128.webp", 3052, 0xbcf1047e0051f2d7),
 ];
 
 fn assert_pin(what: &str, out: &[u8], len: usize, hash: u64) {
+    if std::env::var_os("PIN_PRINT").is_some() {
+        eprintln!(
+            "PIN {what} {} {:#018x} (was {len} {hash:#018x})",
+            out.len(),
+            fnv1a64(out)
+        );
+        return;
+    }
     assert_eq!(
         (out.len(), fnv1a64(out)),
         (len, hash),
@@ -45,7 +60,9 @@ fn assert_pin(what: &str, out: &[u8], len: usize, hash: u64) {
 
 #[test]
 fn every_fixture_encodes_to_its_pinned_lossy_bytes() {
-    let opts = EncodeOptions::default().with_quality(80.0).with_method(6);
+    let opts = EncodeOptions::default()
+        .with_quality(80.0)
+        .with_method(PIN_METHOD);
     for &(name, len, hash) in FIXTURE_PINS {
         let path = format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"));
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -57,7 +74,9 @@ fn every_fixture_encodes_to_its_pinned_lossy_bytes() {
 
 #[test]
 fn photos_encode_to_their_pinned_lossy_bytes() {
-    let opts = EncodeOptions::default().with_quality(80.0).with_method(6);
+    let opts = EncodeOptions::default()
+        .with_quality(80.0)
+        .with_method(PIN_METHOD);
     for (side, len, hash) in [
         (64u32, 328usize, 0x3480734f0a055024u64),
         (96, 532, 0xa0b46f8ea0b2283f),

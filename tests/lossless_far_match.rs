@@ -59,3 +59,38 @@ fn lossless_encode_with_unencodable_match_distance_does_not_panic() {
     assert_eq!((decoded.width, decoded.height), (w as u32, h as u32));
     assert_eq!(decoded.data, rgb, "lossless round-trip must be exact");
 }
+
+/// The shape reported in #34: a 1024 x 1030 image whose pixels repeat
+/// with a period of 1 048 556 — 100 pixels past the largest encodable
+/// distance (RFC 9649 §3.6.2.2: distance prefix code 39 tops out at
+/// value 1 048 576, minus the 120 distance-map codes). The first period
+/// is noise, so every long match the matcher can find lies exactly one
+/// period back and has no code. Every screened effort level must encode
+/// it without panicking and round-trip exactly. (Method 6 walks the same
+/// matcher with a longer chain; the bound sits in that shared walk and is
+/// probed at the exhaustive shape by the library's unit test
+/// `matcher_stops_at_the_largest_encodable_distance`. Method 6 on a 1 Mpx
+/// noise image is a minute-long search in an unoptimised test build.)
+#[test]
+fn issue_34_period_just_past_the_distance_bound_at_every_screened_method() {
+    const PERIOD: usize = 1_048_556;
+    let (w, h) = (1024usize, 1030usize);
+    let n = w * h;
+    let mut state = 0x9E37_79B9u32;
+    let mut rgba = vec![0u8; n * 4];
+    for i in 0..PERIOD {
+        let px = &mut rgba[i * 4..i * 4 + 4];
+        px[0] = lcg(&mut state);
+        px[1] = lcg(&mut state);
+        px[2] = lcg(&mut state);
+        px[3] = 255;
+    }
+    rgba.copy_within(0..(n - PERIOD) * 4, PERIOD * 4);
+    for method in 0..=5u8 {
+        let opts = EncodeOptions::default().with_method(method);
+        let file = oxideav_webp::encode_rgba8(w as u32, h as u32, &rgba, &opts)
+            .unwrap_or_else(|e| panic!("method {method}: {e}"));
+        let back = oxideav_webp::decode_rgba8(&file).expect("decode own output");
+        assert!(back.data == rgba, "method {method}: round trip not exact");
+    }
+}

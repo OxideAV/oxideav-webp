@@ -887,13 +887,20 @@ fn direction_h_lossy_methods_are_readable_by_reference_decoder() {
     let (w, h) = (96u32, 72u32);
     let src = synthetic_rgba(w, h, 11);
     let dir = tmp_dir("direction-h");
-    for method in [0u8, 4] {
+    for (method, quality) in [
+        (0u8, 70.0f32),
+        (4, 70.0),
+        (5, 70.0),
+        (6, 70.0),
+        (0, 95.0),
+        (6, 95.0),
+    ] {
         let opts = EncodeOptions::default()
-            .with_quality(70.0)
+            .with_quality(quality)
             .with_method(method);
         let file = encode_rgba8(w, h, &src, &opts).expect("lossy encode");
-        let in_path = dir.join(format!("m{method}.webp"));
-        let pam_path = dir.join(format!("m{method}.pam"));
+        let in_path = dir.join(format!("m{method}-q{quality}.webp"));
+        let pam_path = dir.join(format!("m{method}-q{quality}.pam"));
         std::fs::write(&in_path, &file).expect("write webp");
         let mut cmd = Command::new(&decoder_bin);
         cmd.arg(&in_path)

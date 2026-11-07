@@ -172,8 +172,11 @@ lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
 strength), `method` (`0..=6`, default `4`: encoder effort — lossless
 `6` is the exhaustive search, lower levels screen fewer candidates with
 a cheaper parse and write somewhat larger files much faster, every
-level exactly lossless; lossy `0..=2` turn the VP8 trellis quantiser
-off, about a third faster for a few percent more bytes), `threads`
+level exactly lossless; lossy `5` fits the VP8 token probabilities to
+the picture (about 8 % smaller at quality 80, twice the time) and `6`
+also searches the loop-filter level (+0.9 dB at quality 80, about 5x the
+time); lossy `0..=2` drop the trellis quantiser at quality 90 and up,
+1.5x faster for larger files, and encode like `4` below), `threads`
 (default `0` = the host's parallelism, `1` = serial; never changes the
 output bytes), `embed_icc` / `embed_exif` / `embed_xmp`
 (default on — the image's metadata is written when present), and for

@@ -1400,7 +1400,15 @@ impl<'a> Lz77Matcher<'a> {
         let max_len = (n - pos).min(MAX_MATCH);
         let h = self.hash(pos);
         let mut cand = self.head[h];
-        let mut best_len = 0usize;
+        // The running best starts just below `MIN_MATCH`: a candidate
+        // shorter than that is never returned, and the result is the
+        // first chain candidate reaching the longest length, so skipping
+        // the short ones changes nothing — but the quick reject below
+        // then needs a match at offset `MIN_MATCH - 1` before walking a
+        // candidate, which turns away hash-collision candidates (most of
+        // a long chain on noisy content) with one compare.
+        // `MIN_MATCH - 1 < 4 <= max_len`, so the probe stays in bounds.
+        let mut best_len = MIN_MATCH - 1;
         let mut best_dist = 0usize;
         let mut steps = 0usize;
         while cand >= 0 && steps < self.max_chain {
@@ -1422,7 +1430,7 @@ impl<'a> Lz77Matcher<'a> {
             // `best_len`/`best_dist` or trigger the `len >= max_len`
             // early break, so the walk's result — and the emitted
             // byte stream — is unchanged.
-            if best_len == 0 || p[c + best_len] == p[pos + best_len] {
+            if p[c + best_len] == p[pos + best_len] {
                 // Round 440: block-compare extension walk. XOR-fold four
                 // pixel pairs per step so the loop carries no
                 // per-pixel data-dependent branch (ILP-friendly, and the
@@ -10021,6 +10029,62 @@ pub fn encode_vp8l_argb_with_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #33: RFC 9649 §4.1 — on the rightmost column the leftmost pixel of
+    /// the same row is TR. For every mode on a 17 x 121 image (4-pixel
+    /// blocks, so the last block column is the rightmost pixel column),
+    /// the residuals the encoder writes invert through the decoder's
+    /// predictor to the source, and the block walk the mode election
+    /// prices produces exactly those residuals, rightmost column included.
+    #[test]
+    fn forced_mode_residuals_invert_on_the_rightmost_column() {
+        struct Collect(Vec<u32>);
+        impl ResidualSink for Collect {
+            fn pixel(&mut self, residual: u32) {
+                self.0.push(residual);
+            }
+            fn row_end(&mut self) -> bool {
+                true
+            }
+        }
+        let (w, h, size_bits) = (17usize, 121usize, 2u8);
+        let mut s = 0x2545_f491u32;
+        let src: Vec<u32> = (0..w * h)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                s | 0xff00_0000
+            })
+            .collect();
+        let (tw, th) = (w.div_ceil(4), h.div_ceil(4));
+        for mode in 0..14u8 {
+            let sub = vec![u32::from(mode) << 8; tw * th];
+            let mut residuals = vec![0u32; w * h];
+            apply_forward_predictor(
+                &src,
+                &mut residuals,
+                w as u32,
+                h as u32,
+                &sub,
+                tw as u32,
+                size_bits,
+            );
+            let mut back = residuals.clone();
+            crate::vp8l_transform::inverse_predictor(
+                &mut back, w as u32, h as u32, &sub, tw as u32, size_bits,
+            );
+            assert_eq!(back, src, "mode {mode}: forward/inverse mismatch");
+            // The last block column, every block row below the first.
+            for by in 1..th {
+                let (x0, y0) = (16usize, by * 4);
+                let mut sink = Collect(Vec::new());
+                for_each_block_residual(&src, w, h, x0, y0, 4, 4, mode, &mut sink);
+                let want: Vec<u32> = (y0..(y0 + 4).min(h))
+                    .map(|y| residuals[y * w + x0])
+                    .collect();
+                assert_eq!(sink.0, want, "mode {mode}: block walk at y0={y0}");
+            }
+        }
+    }
 
     /// #34: RFC 9649 §3.6.2.2 — the largest distance code value, prefix
     /// 39 (`786433..1048576`), is 1 048 576; a scan-line distance `D` is
