@@ -4,6 +4,12 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/OxideAV/oxideav-webp/compare/v0.3.2...v0.3.3) - 2026-11-07
+
+### Other
+
+- lossy method ladder with fitted probabilities and loop filter; #33 / #34 issue-shape tests; matcher quick reject
+
 ### Changed
 
 - **Lossy `EncodeOptions::method` ladder** (#47). `3..=4` stay the
