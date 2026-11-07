@@ -110,17 +110,13 @@ fuzz_target!(|data: &[u8]| {
             });
         }
 
-        frames.push(AnimFrame {
-            pixels,
-            width,
-            height,
-            x,
-            y,
-            duration,
-            blend,
-            dispose,
-            mode,
-        });
+        frames.push(
+            AnimFrame::new(width, height, pixels, duration)
+                .with_position(x, y)
+                .with_blend(blend)
+                .with_dispose(dispose)
+                .with_mode(mode),
+        );
     }
 
     // §2.7.1.1: the canvas covers every frame rectangle.

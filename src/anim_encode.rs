@@ -70,6 +70,7 @@ const ANIM_PAYLOAD_LEN: usize = 6;
 /// delta choice is deferred until the `oxideav-vp8` lossy encoder is ready,
 /// at which point `Auto` will also evaluate a lossy candidate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum AnimFrameMode {
     /// Evaluate both the full-canvas VP8L keyframe and the dirty-rect VP8L
     /// sub-frame and emit whichever is smaller. Falls back to the
@@ -91,6 +92,7 @@ pub enum AnimFrameMode {
 /// to. `x` / `y` place the frame's upper-left corner on the canvas (must be
 /// even per §2.7.1.1, since the on-disk field is the coordinate / 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AnimFrame {
     /// `width * height * 4` interleaved `[R, G, B, A]` bytes, scan order.
     pub pixels: Vec<u8>,
@@ -138,6 +140,38 @@ impl AnimFrame {
             mode: AnimFrameMode::Lossless,
         }
     }
+
+    /// Builder: the frame's upper-left corner on the canvas (each even,
+    /// §2.7.1.1).
+    pub fn with_position(mut self, x: u32, y: u32) -> Self {
+        self.x = x;
+        self.y = y;
+        self
+    }
+
+    /// Builder: display duration in milliseconds.
+    pub fn with_duration(mut self, duration: u32) -> Self {
+        self.duration = duration;
+        self
+    }
+
+    /// Builder: §2.7.1.1 blending method.
+    pub fn with_blend(mut self, blend: BlendingMethod) -> Self {
+        self.blend = blend;
+        self
+    }
+
+    /// Builder: §2.7.1.1 disposal method.
+    pub fn with_dispose(mut self, dispose: DisposalMethod) -> Self {
+        self.dispose = dispose;
+        self
+    }
+
+    /// Builder: per-frame compression strategy.
+    pub fn with_mode(mut self, mode: AnimFrameMode) -> Self {
+        self.mode = mode;
+        self
+    }
 }
 
 /// Multi-scale SSIM downsample kernel selector for the (blocked) delta path.
@@ -145,6 +179,7 @@ impl AnimFrame {
 /// Re-exposed for published-API shape compatibility. Has no effect on the
 /// lossless path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum DownsampleKernel {
     /// Plain box (average) downsample.
     #[default]
@@ -159,6 +194,7 @@ pub enum DownsampleKernel {
 /// (still blocked) [`AnimFrameMode::Delta`] / [`AnimFrameMode::Auto`] paths;
 /// they have no effect on the lossless path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeltaConfig {
     /// Maximum number of disjoint dirty-rectangle components to keep when
     /// diffing two frames before falling back to a full keyframe.
@@ -181,6 +217,21 @@ impl Default for DeltaConfig {
 }
 
 impl DeltaConfig {
+    /// Builder: cap on dirty-rectangle components per delta frame.
+    pub fn with_max_components(self, n: usize) -> Self {
+        self.max_components_override(n)
+    }
+
+    /// Builder: `Auto` mode's inner-encode byte threshold.
+    pub fn with_auto_inner_threshold_bytes(self, bytes: Option<usize>) -> Self {
+        self.auto_inner_threshold_bytes(bytes)
+    }
+
+    /// Builder: MS-SSIM down-sampling kernel.
+    pub fn with_msssim_downsample_kernel(self, kernel: DownsampleKernel) -> Self {
+        self.msssim_downsample_kernel(kernel)
+    }
+
     /// Override the maximum dirty-rectangle component count (builder form).
     pub fn max_components_override(mut self, n: usize) -> Self {
         self.max_components = n;

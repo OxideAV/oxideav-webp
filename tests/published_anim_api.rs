@@ -99,11 +99,10 @@ fn build_animated_webp_with_options_carries_loop_bg_and_metadata() {
     let opts = AnimEncoderOptions {
         loop_count: 3,
         background_rgba: [10, 20, 30, 255],
-        metadata: WebpMetadata {
-            icc: Some(&icc),
-            exif: Some(&exif),
-            xmp: Some(&xmp),
-        },
+        metadata: WebpMetadata::new()
+            .with_icc(Some(&icc))
+            .with_exif(Some(&exif))
+            .with_xmp(Some(&xmp)),
         delta: DeltaConfig::default(),
     };
 
@@ -131,17 +130,11 @@ fn frame_blend_dispose_and_offset_fields_are_carried() {
     // by the input pixels and the rest left as the ANIM background
     // (transparent black by default).
     let (w, h) = (2u32, 2u32);
-    let frame = AnimFrame {
-        pixels: make_rgba(w, h, 5, true),
-        width: w,
-        height: h,
-        x: 2,
-        y: 4,
-        duration: 42,
-        blend: BlendingMethod::Overwrite,
-        dispose: DisposalMethod::Background,
-        mode: AnimFrameMode::Lossless,
-    };
+    let frame = AnimFrame::new(w, h, make_rgba(w, h, 5, true), 42)
+        .with_position(2, 4)
+        .with_blend(BlendingMethod::Overwrite)
+        .with_dispose(DisposalMethod::Background)
+        .with_mode(AnimFrameMode::Lossless);
     let file = build_animated_webp(&[frame]).expect("build offset frame");
     let img = decode_webp(&file).expect("decode");
     assert_eq!(img.frames.len(), 1);

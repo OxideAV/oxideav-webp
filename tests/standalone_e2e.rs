@@ -171,11 +171,10 @@ fn standalone_lossless_with_full_metadata_round_trips() {
     let xmp: Vec<u8> = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>"
         .as_bytes()
         .to_vec();
-    let meta = WebpMetadata {
-        icc: Some(&icc),
-        exif: Some(&exif),
-        xmp: Some(&xmp),
-    };
+    let meta = WebpMetadata::new()
+        .with_icc(Some(&icc))
+        .with_exif(Some(&exif))
+        .with_xmp(Some(&xmp));
 
     let file = encode_vp8l_argb_with_metadata(w, h, &argb, /* has_alpha = */ true, &meta)
         .expect("encode_vp8l_argb_with_metadata");
@@ -261,11 +260,10 @@ fn standalone_extract_metadata_reads_without_full_decode() {
     let icc: Vec<u8> = (0u8..=63).collect();
     let exif: Vec<u8> = b"Exif\x00\x00MM\x00*Hello".to_vec();
     let xmp: Vec<u8> = b"<?xpacket begin=''?><x/>".to_vec();
-    let meta = WebpMetadata {
-        icc: Some(&icc),
-        exif: Some(&exif),
-        xmp: Some(&xmp),
-    };
+    let meta = WebpMetadata::new()
+        .with_icc(Some(&icc))
+        .with_exif(Some(&exif))
+        .with_xmp(Some(&xmp));
     let file =
         encode_vp8l_argb_with_metadata(w, h, &argb, true, &meta).expect("metadata-bearing encode");
 

@@ -77,6 +77,10 @@ pub use image::{
     RgbaImage, WebpImage, WebpPixelFormat,
 };
 
+/// §2.7.1.1 `ANMF` blending and disposal methods (one bit each in the
+/// frame header), the types of [`AnimFrame`]'s `blend` / `dispose`.
+pub use anmf::{BlendingMethod, DisposalMethod};
+
 pub mod error;
 pub use error::WebpError;
 
@@ -291,6 +295,7 @@ pub fn decode_lossless_image(bytes: &[u8]) -> Result<Option<vp8l_decode::Decoded
 /// each `None` to omit the chunk. The contract-level counterpart is the
 /// owned [`Metadata`] on [`WebpImage`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WebpMetadata<'a> {
     /// §2.7.1.4 `ICCP` payload to embed, if any.
     pub icc: Option<&'a [u8]>,
@@ -300,7 +305,30 @@ pub struct WebpMetadata<'a> {
     pub xmp: Option<&'a [u8]>,
 }
 
-impl WebpMetadata<'_> {
+impl<'a> WebpMetadata<'a> {
+    /// No metadata (every chunk omitted); same as `Default`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builder: the §2.7.1.4 `ICCP` payload (`None` omits the chunk).
+    pub fn with_icc(mut self, icc: Option<&'a [u8]>) -> Self {
+        self.icc = icc;
+        self
+    }
+
+    /// Builder: the §2.7.1.5 `EXIF` payload (`None` omits the chunk).
+    pub fn with_exif(mut self, exif: Option<&'a [u8]>) -> Self {
+        self.exif = exif;
+        self
+    }
+
+    /// Builder: the §2.7.1.5 `XMP ` payload (`None` omits the chunk).
+    pub fn with_xmp(mut self, xmp: Option<&'a [u8]>) -> Self {
+        self.xmp = xmp;
+        self
+    }
+
     /// `true` if every field is `None`.
     pub fn is_empty(&self) -> bool {
         self.icc.is_none() && self.exif.is_none() && self.xmp.is_none()

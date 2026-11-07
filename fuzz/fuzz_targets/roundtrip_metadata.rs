@@ -155,11 +155,10 @@ fuzz_target!(|data: &[u8]| {
         height,
         &argb,
         has_alpha,
-        &WebpMetadata {
-            icc: iccp.as_deref(),
-            exif: exif.as_deref(),
-            xmp: xmp.as_deref(),
-        },
+        &WebpMetadata::new()
+            .with_icc(iccp.as_deref())
+            .with_exif(exif.as_deref())
+            .with_xmp(xmp.as_deref()),
     )
     .expect("small canvas + small payloads must encode");
 

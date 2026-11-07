@@ -80,11 +80,10 @@ fn bench_metadata_walk(c: &mut Criterion) {
     let icc = payload(3 * 1024, 0x11);
     let exif = payload(1024, 0x22);
     let xmp = payload(2 * 1024, 0x33);
-    let meta = WebpMetadata {
-        icc: Some(&icc),
-        exif: Some(&exif),
-        xmp: Some(&xmp),
-    };
+    let meta = WebpMetadata::new()
+        .with_icc(Some(&icc))
+        .with_exif(Some(&exif))
+        .with_xmp(Some(&xmp));
 
     // Cell 1: simple layout, no metadata.
     let simple = encode_rgba8(64, 64, &gradient_rgba_64(), &EncodeOptions::default())

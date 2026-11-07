@@ -101,11 +101,10 @@ fn encode_vp8l_argb_with_metadata_embeds_and_reads_back() {
     let icc = b"fake-icc-profile-bytes".to_vec();
     let exif = b"Exif\x00\x00MM\x00*".to_vec();
     let xmp = b"<?xpacket begin?>".to_vec();
-    let meta = WebpMetadata {
-        icc: Some(&icc),
-        exif: Some(&exif),
-        xmp: Some(&xmp),
-    };
+    let meta = WebpMetadata::new()
+        .with_icc(Some(&icc))
+        .with_exif(Some(&exif))
+        .with_xmp(Some(&xmp));
     let file = encode_vp8l_argb_with_metadata(w, h, &argb, false, &meta).expect("metadata .webp");
 
     // Metadata-only read.

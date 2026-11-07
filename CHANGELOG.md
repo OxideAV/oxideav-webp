@@ -45,8 +45,24 @@ All notable changes to `oxideav-webp` are recorded here.
   method-6 `ALPH`-plane pins pin the `ALPH` payload (unchanged) rather
   than the whole file, whose `VP8 ` part method 6 now refits.
 
+- API hygiene: `AnimFrameMode` and `DownsampleKernel` are
+  `#[non_exhaustive]` enums; `AnimFrame`, `DeltaConfig` and
+  `WebpMetadata` are `#[non_exhaustive]` records (build them with the
+  constructors below; `AnimFrame::new` and `DeltaConfig::default` /
+  `WebpMetadata::default` already existed). Left exhaustive:
+  `BlendingMethod` / `DisposalMethod` (one-bit §2.7.1.1 fields) and
+  `Vp8FreqDeltas` (the five RFC 6386 §9.6 quantiser deltas). Every
+  internal module was already `#[doc(hidden)]`.
+
 ### Added
 
+- `AnimFrame::with_position` / `with_duration` / `with_blend` /
+  `with_dispose` / `with_mode`; `DeltaConfig::with_max_components` /
+  `with_auto_inner_threshold_bytes` / `with_msssim_downsample_kernel`;
+  `WebpMetadata::new` / `with_icc` / `with_exif` / `with_xmp`.
+- `BlendingMethod` and `DisposalMethod` re-exported at the crate root
+  (the types of `AnimFrame::blend` / `dispose`, so far reachable only
+  through a hidden module).
 - `tests/predictor_right_edge.rs` (#33): 17 x 121 `VP8L` streams
   assembled bit by bit from RFC 9649, one per predictor mode `0..=13`,
   whose last block column is the rightmost pixel column; each decodes to
