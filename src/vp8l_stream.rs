@@ -231,6 +231,16 @@ impl<'a> BitReader<'a> {
         ((self.load_word() >> (self.bit_pos & 7)) & ((1u64 << n) - 1)) as u32
     }
 
+    /// Peek the stream from the cursor on as one word, LSB-first (bit 0
+    /// is the next bit a read would deliver), zero-padded past the end
+    /// of the slice. At least 57 bits of it are stream bits when that
+    /// many remain; the caller checks
+    /// [`bits_remaining`](Self::bits_remaining) for the bits it uses.
+    #[inline]
+    pub fn peek_word(&self) -> u64 {
+        self.load_word() >> (self.bit_pos & 7)
+    }
+
     /// Advance the cursor by `n` bits previously inspected via
     /// [`peek_bits`](Self::peek_bits). The caller must have checked
     /// `n <= bits_remaining()`.

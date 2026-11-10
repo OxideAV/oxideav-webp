@@ -222,8 +222,7 @@ pub struct PrefixCode {
     /// Direct length → [`length_rows`](Self::length_rows) index, sized
     /// `MAX_CODE_LENGTH + 1` and seeded with [`NO_ROW`] for lengths that
     /// carry no symbol. The per-bit walk
-    /// ([`read_symbol_walk`](Self::read_symbol_walk) /
-    /// [`read_symbol_long`](Self::read_symbol_long)) tests, at every bit,
+    /// ([`read_symbol_walk`](Self::read_symbol_walk)) tests, at every bit,
     /// whether a row exists at the current length; the pre-index code
     /// did this with a linear `length_rows.iter().find(..)` scan on every
     /// iteration, so a code with many distinct lengths re-scanned the row
@@ -234,6 +233,10 @@ pub struct PrefixCode {
     /// without slowing the dense short-code path. Empty for the
     /// single-leaf-node tree.
     len_to_row: Vec<u8>,
+    /// Index into [`length_rows`](Self::length_rows) of the first row a
+    /// primary-table miss can still match: the first row longer than
+    /// `LOOKUP_BITS` when the table is built, `0` when it is not.
+    first_unresolved_row: usize,
 }
 
 /// [`PrefixCode::len_to_row`] sentinel: no row carries a symbol at this
@@ -302,6 +305,7 @@ impl PrefixCode {
                 single_symbol: Some(sym),
                 lookup: Vec::new(),
                 len_to_row: Vec::new(),
+                first_unresolved_row: 0,
             });
         }
 
@@ -401,6 +405,11 @@ impl PrefixCode {
             }
         }
 
+        let first_unresolved_row = if lookup.is_empty() {
+            0
+        } else {
+            length_rows.partition_point(|row| row.length as usize <= LOOKUP_BITS)
+        };
         Ok(Self {
             code_lengths,
             length_rows,
@@ -408,94 +417,73 @@ impl PrefixCode {
             single_symbol: None,
             lookup,
             len_to_row,
+            first_unresolved_row,
         })
+    }
+
+    /// Resolve the symbol whose code starts at bit 0 of `word` — stream
+    /// bits in wire order, as [`BitReader::peek_word`] returns them, of
+    /// which at least `MAX_CODE_LENGTH` must be real stream bits —
+    /// without touching a reader: `Some((symbol, code_length))`, or
+    /// `None` when no code matches (impossible for the complete codes
+    /// [`from_code_lengths`](Self::from_code_lengths) accepts; the caller
+    /// then replays the per-bit walk for its error).
+    ///
+    /// The single-leaf-node tree answers with length 0. Codes up to
+    /// `LOOKUP_BITS` long resolve through the primary table; longer ones
+    /// (and every code of a table-less small alphabet) compare the next
+    /// `MAX_CODE_LENGTH` bits, taken as an MSB-first code value, against
+    /// each remaining length's canonical range in ascending length order
+    /// — the decisions of the per-bit walk, made on one peeked word.
+    #[inline]
+    pub fn peek_symbol(&self, word: u64) -> Option<(u16, usize)> {
+        if let Some(symbol) = self.single_symbol {
+            return Some((symbol, 0));
+        }
+        if !self.lookup.is_empty() {
+            let entry = self.lookup[(word as usize) & (LOOKUP_SIZE - 1)];
+            let len = (entry >> 16) as usize;
+            if len != 0 {
+                return Some((entry as u16, len));
+            }
+        }
+        let code =
+            ((word as u32) & ((1 << MAX_CODE_LENGTH) - 1)).reverse_bits() >> (32 - MAX_CODE_LENGTH);
+        for row in &self.length_rows[self.first_unresolved_row..] {
+            let offset =
+                (code >> (MAX_CODE_LENGTH - row.length as usize)).wrapping_sub(row.first_code);
+            if (offset as usize) < row.count {
+                let symbol = self.sorted_symbols[row.first_symbol_index + offset as usize];
+                return Some((symbol, row.length as usize));
+            }
+        }
+        None
     }
 
     /// Read one symbol from `reader` using this code.
     ///
     /// For the single-leaf-node tree this consumes no bits and returns
-    /// the lone symbol. Otherwise the next `LOOKUP_BITS` stream bits
-    /// are peeked (zero-padded at EOF, cursor unmoved) and resolved
-    /// through the primary lookup table: one load gives `(symbol,
-    /// code_length)` for any code of length ≤ `LOOKUP_BITS`, and the
-    /// cursor advances by exactly that length. Longer codes — and
-    /// near-EOF reads where the matched length exceeds the bits
-    /// actually remaining (so the match could have leaned on the zero
-    /// padding) — fall back to the per-bit row walk, which reproduces
-    /// the pre-table behaviour bit for bit, including the EOF error's
-    /// position fields.
+    /// the lone symbol. Otherwise, while at least `MAX_CODE_LENGTH` real
+    /// bits remain, the next bits are peeked once and resolved by
+    /// [`peek_symbol`](Self::peek_symbol) — one table load for a code of
+    /// length ≤ `LOOKUP_BITS`, a few range compares for a longer one —
+    /// and the cursor advances by exactly the code's length. Within
+    /// `MAX_CODE_LENGTH` bits of the end of the stream the per-bit row
+    /// walk decodes instead; it is the definition the peeked path is
+    /// checked against (`read_symbol_lut_diff`), so a raised EOF error
+    /// carries the walk's position fields.
+    #[inline]
     pub fn read_symbol(&self, reader: &mut BitReader<'_>) -> Result<u16, PrefixError> {
         if let Some(sym) = self.single_symbol {
             return Ok(sym);
         }
-        if self.lookup.is_empty() {
-            // Below the MIN_LOOKUP_USED gate: small codes resolve in a
-            // couple of per-bit iterations.
-            return self.read_symbol_walk(reader);
+        if reader.bits_remaining() >= MAX_CODE_LENGTH
+            && let Some((symbol, len)) = self.peek_symbol(reader.peek_word())
+        {
+            reader.advance_bits(len);
+            return Ok(symbol);
         }
-        let peeked = reader.peek_bits(LOOKUP_BITS);
-        let entry = self.lookup[peeked as usize];
-        let len = (entry >> 16) as usize;
-        let available = reader.bits_remaining();
-        if len != 0 {
-            if len <= available {
-                reader.advance_bits(len);
-                return Ok(entry as u16);
-            }
-            // The match leaned on the zero padding past EOF; replay the
-            // per-bit walk so the EOF error carries the exact pre-table
-            // position fields.
-            return self.read_symbol_walk(reader);
-        }
-        if available >= LOOKUP_BITS {
-            // The peeked LOOKUP_BITS bits are all real stream bits and —
-            // by the table's completeness — a strict prefix of a longer
-            // code. Consume them and continue the walk from there: the
-            // accumulated MSB-first code value of the first LOOKUP_BITS
-            // bits is the bit-reversal of the peeked (wire-order) value.
-            let code = peeked.reverse_bits() >> (32 - LOOKUP_BITS);
-            reader.advance_bits(LOOKUP_BITS);
-            return self.read_symbol_long(reader, code);
-        }
-        // Fewer than LOOKUP_BITS real bits remain and none of their
-        // prefixes completes a code (the table entry would have carried
-        // it): the per-bit walk runs the stream dry exactly as before.
         self.read_symbol_walk(reader)
-    }
-
-    /// Continuation of [`read_symbol`](Self::read_symbol) for codes
-    /// longer than `LOOKUP_BITS`: `code` is the accumulated MSB-first
-    /// value of the `LOOKUP_BITS` bits already consumed (none of whose
-    /// prefixes matched a row — guaranteed by the lookup table), so the
-    /// walk resumes at length `LOOKUP_BITS + 1` with decisions, bit
-    /// consumption, and error positions identical to the pre-table
-    /// per-bit loop.
-    fn read_symbol_long(
-        &self,
-        reader: &mut BitReader<'_>,
-        mut code: u32,
-    ) -> Result<u16, PrefixError> {
-        let mut len = LOOKUP_BITS;
-        loop {
-            len += 1;
-            if len > MAX_CODE_LENGTH {
-                return Err(PrefixError::NoMatchingSymbol);
-            }
-            // A canonical code reads MSB-first within the code: append
-            // the freshly read bit to the low end.
-            code = (code << 1) | reader.read_bits(1)?;
-            // Is there a row at this length whose code range contains
-            // `code`? `len_to_row` answers in one indexed load instead of
-            // a linear scan of `length_rows`.
-            let ri = self.len_to_row[len];
-            if ri != NO_ROW {
-                let row = &self.length_rows[ri as usize];
-                let offset = code.wrapping_sub(row.first_code);
-                if (offset as usize) < row.count {
-                    return Ok(self.sorted_symbols[row.first_symbol_index + offset as usize]);
-                }
-            }
-        }
     }
 
     /// Reference decoder: the pre-table per-bit walk, bypassing the

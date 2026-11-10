@@ -666,6 +666,28 @@ fn pack_argb(green: u8, red: u8, blue: u8, alpha: u8) -> u32 {
     ((alpha as u32) << 24) | ((red as u32) << 16) | ((green as u32) << 8) | (blue as u32)
 }
 
+/// The red, blue and alpha symbols of a §5.2.1 literal resolved from one
+/// peeked word instead of three reader round trips: three codes are at
+/// most 45 bits, a peeked word holds 57. `None` (cursor unmoved) within
+/// 45 bits of the end of the stream or when a code does not resolve; the
+/// caller then reads the three symbols one by one, which is the
+/// definition of the result and of any error.
+#[inline]
+fn peek_red_blue_alpha(
+    reader: &mut BitReader<'_>,
+    group: &PrefixCodeGroup,
+) -> Option<(u8, u8, u8)> {
+    if reader.bits_remaining() < 3 * crate::vp8l_prefix::MAX_CODE_LENGTH {
+        return None;
+    }
+    let word = reader.peek_word();
+    let (red, red_len) = group.red.peek_symbol(word)?;
+    let (blue, blue_len) = group.blue.peek_symbol(word >> red_len)?;
+    let (alpha, alpha_len) = group.alpha.peek_symbol(word >> (red_len + blue_len))?;
+    reader.advance_bits(red_len + blue_len + alpha_len);
+    Some((red as u8, blue as u8, alpha as u8))
+}
+
 /// Decode the single §6.2.3 symbol at the current position using
 /// `group`, appending the emitted pixel(s) to `pixels` and (when
 /// present) maintaining `color_cache` in stream order.
@@ -691,14 +713,44 @@ fn decode_one_symbol(
     alphabet_size: usize,
     cache_size: usize,
 ) -> Result<(), DecodeError> {
+    // A literal pixel resolved from one peeked word: green (at most 12
+    // of its 57 bits) and then the three other channels (at most 45).
+    // Anything else — a longer green code, a length or cache symbol, the
+    // last bytes of the stream — takes the symbol-by-symbol path below,
+    // which defines the result.
+    if reader.bits_remaining() >= 64 {
+        let word = reader.peek_word();
+        if let Some((green, green_len)) = group.green.peek_symbol(word)
+            && green < 256
+            && green_len <= 12
+            && let Some((red, red_len)) = group.red.peek_symbol(word >> green_len)
+            && let Some((blue, blue_len)) = group.blue.peek_symbol(word >> (green_len + red_len))
+            && let Some((alpha, alpha_len)) = group
+                .alpha
+                .peek_symbol(word >> (green_len + red_len + blue_len))
+        {
+            reader.advance_bits(green_len + red_len + blue_len + alpha_len);
+            let argb = pack_argb(green as u8, red as u8, blue as u8, alpha as u8);
+            pixels.push(argb);
+            if let Some(cache) = color_cache.as_mut() {
+                cache.insert(argb);
+            }
+            return Ok(());
+        }
+    }
     let s = group.green.read_symbol(reader)? as usize;
     match GreenSymbol::classify(s, alphabet_size)? {
         GreenSymbol::Literal { green } => {
             // §5.2.1: green came from prefix #1 (already read as S);
             // read red / blue / alpha from prefix #2 / #3 / #4.
-            let red = group.red.read_symbol(reader)? as u8;
-            let blue = group.blue.read_symbol(reader)? as u8;
-            let alpha = group.alpha.read_symbol(reader)? as u8;
+            let (red, blue, alpha) = match peek_red_blue_alpha(reader, group) {
+                Some(channels) => channels,
+                None => (
+                    group.red.read_symbol(reader)? as u8,
+                    group.blue.read_symbol(reader)? as u8,
+                    group.alpha.read_symbol(reader)? as u8,
+                ),
+            };
             let argb = pack_argb(green, red, blue, alpha);
             pixels.push(argb);
             if let Some(cache) = color_cache.as_mut() {
@@ -1196,17 +1248,38 @@ fn decode_argb_multi_group(
     // next undefined pixel. Group selection happens once per *symbol*,
     // keyed by the position of the next pixel to emit (the spec selects
     // the group for the pixel the decoder is about to decode).
+    //
+    // The group only changes when the cursor leaves the entropy-image
+    // block it was looked up for, so the lookup (and the row / column
+    // split of the position) is redone only then: `group_until` is the
+    // position where the current block ends on the current row.
+    let row_len = width as usize;
+    let block_len = 1usize << index.prefix_bits;
+    let (mut row, mut row_start) = (0usize, 0usize);
+    let mut group_until = 0usize;
+    let mut group = groups
+        .first()
+        .ok_or(DecodeError::MetaPrefixIndexOutOfRange {
+            meta_prefix_code: 0,
+            num_prefix_groups: 0,
+        })?;
     while pixels.len() < total_pixels {
         let position = pixels.len();
-        let x = (position % width as usize) as u32;
-        let y = (position / width as usize) as u32;
-        let meta_code = index.meta_code_for(x, y) as usize;
-        let group = groups
-            .get(meta_code)
-            .ok_or(DecodeError::MetaPrefixIndexOutOfRange {
-                meta_prefix_code: meta_code,
-                num_prefix_groups: groups.len(),
-            })?;
+        if position >= group_until {
+            while position - row_start >= row_len {
+                row_start += row_len;
+                row += 1;
+            }
+            let x = position - row_start;
+            let meta_code = index.meta_code_for(x as u32, row as u32) as usize;
+            group = groups
+                .get(meta_code)
+                .ok_or(DecodeError::MetaPrefixIndexOutOfRange {
+                    meta_prefix_code: meta_code,
+                    num_prefix_groups: groups.len(),
+                })?;
+            group_until = row_start + ((x / block_len + 1) * block_len).min(row_len);
+        }
         decode_one_symbol(
             reader,
             group,

@@ -495,7 +495,30 @@ pub fn decode_rgb8(bytes: &[u8]) -> Result<RgbImage, WebpError> {
 /// Decode to tightly packed 8-bit RGBA (alpha `255` when absent).
 pub fn decode_rgba8(bytes: &[u8]) -> Result<RgbaImage, WebpError> {
     let img = decode(bytes)?;
-    Ok(RgbaImage::new(img.width, img.height, img.to_rgba8()))
+    let (width, height) = (img.width, img.height);
+    Ok(RgbaImage::new(width, height, into_packed(img, 4)))
+}
+
+/// `image` as packed pixels of `bpp` bytes (3 or 4): the image's own
+/// buffer when it is already that layout, tightly packed — a lossless
+/// decode's `Rgba` plane becomes the result without another pass —
+/// otherwise [`WebpImage::to_rgb8`] / [`WebpImage::to_rgba8`].
+fn into_packed(mut image: WebpImage, bpp: usize) -> Vec<u8> {
+    let len = image.width as usize * image.height as usize * bpp;
+    if image.format.packed_bytes_per_pixel() == Some(bpp)
+        && let [plane] = &mut image.planes[..]
+        && plane.stride == image.width as usize * bpp
+        && plane.data.len() >= len
+    {
+        let mut data = std::mem::take(&mut plane.data);
+        data.truncate(len);
+        return data;
+    }
+    if bpp == 4 {
+        image.to_rgba8()
+    } else {
+        image.to_rgb8()
+    }
 }
 
 /// Decode every image: one [`Frame`] per `ANMF` chunk of an animation,

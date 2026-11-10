@@ -35,6 +35,22 @@ All notable changes to `oxideav-webp` are recorded here.
   opaque RGBA picture is recognised by a scan that allocates nothing;
   `Yuv420P` / `Yuva420P` planes go to the VP8 encoder in place at their
   strides instead of through tight copies.
+- Decode. `PrefixCode::read_symbol` resolves every code from one peeked
+  word: the primary table for codes up to 8 bits, then a range compare
+  per remaining code length on the same bits — the per-bit reader walk
+  is left for the last 15 bits of a stream (and stays the reference the
+  `read_symbol_lut_diff` fuzz target checks against). A literal pixel's
+  four symbols come from a single 64-bit peek, and the multi-group loop
+  looks its prefix-code group up once per entropy-image block instead of
+  dividing the position by the width for every symbol. `decode_rgba8` of
+  a lossless file returns the decoded plane itself (it used to copy it
+  pixel by pixel into a second buffer); `to_rgb8` / `to_rgba8` write each
+  output byte once (row copies for the packed layouts; a two-pixel
+  fixed-size kernel per chroma sample for Y′CbCr, range and pixel size
+  resolved outside the loop). Same pixels: every fixture, pin and oracle
+  test is unchanged. 2400 x 1600: lossless `decode_rgba8` 73 ms to
+  47 ms, lossy 27 ms to 17 ms (of which the Y′CbCr to RGBA pass 7.8 ms
+  to 1.8 ms).
 - The `webp_vp8` framework encoder is the same implementation as
   `encode` / `Vp8LossyEncoder` (planes read in place from the frame; it
   used to copy them twice through a wrapped VP8 framework encoder), and

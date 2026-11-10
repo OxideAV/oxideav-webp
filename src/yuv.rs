@@ -101,6 +101,56 @@ fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8, full: bool) -> [u8; 3] {
     ]
 }
 
+/// One 4:2:0 row to packed pixels of `BPP` bytes (3 or 4; the fourth
+/// byte is set to `255`), `FULL` selecting the full-range matrix. The
+/// loop body is two fixed-size pixels per chroma pair with no bounds
+/// checks or range switches left in it.
+#[inline(always)]
+fn convert_row_kernel<const BPP: usize, const FULL: bool>(
+    y_row: &[u8],
+    u_row: &[u8],
+    v_row: &[u8],
+    out: &mut [u8],
+) {
+    #[inline(always)]
+    fn put<const BPP: usize, const FULL: bool>(
+        px: &mut [u8; BPP],
+        y: u8,
+        (ro, go, bo): (i32, i32, i32),
+    ) {
+        let yl = luma_term(y, FULL);
+        px[0] = clamp_u8((yl + ro) >> 16);
+        px[1] = clamp_u8((yl + go) >> 16);
+        px[2] = clamp_u8((yl + bo) >> 16);
+        if let Some(alpha) = px.get_mut(3) {
+            *alpha = 0xff;
+        }
+    }
+    let (y_pairs, y_rest) = y_row.as_chunks::<2>();
+    let (pixels, _) = out.as_chunks_mut::<BPP>();
+    let (pixel_pairs, pixel_rest) = pixels.as_chunks_mut::<2>();
+    for (((ys, &cb), &cr), px) in y_pairs
+        .iter()
+        .zip(u_row.iter())
+        .zip(v_row.iter())
+        .zip(pixel_pairs.iter_mut())
+    {
+        let offsets = chroma_offsets(cb, cr, FULL);
+        let [first, second] = px;
+        put::<BPP, FULL>(first, ys[0], offsets);
+        put::<BPP, FULL>(second, ys[1], offsets);
+    }
+    // Odd width: the last luma sample has a chroma pair to itself.
+    if let (Some(&y), Some(&cb), Some(&cr), Some(px)) = (
+        y_rest.first(),
+        u_row.get(y_pairs.len()),
+        v_row.get(y_pairs.len()),
+        pixel_rest.first_mut(),
+    ) {
+        put::<BPP, FULL>(px, y, chroma_offsets(cb, cr, FULL));
+    }
+}
+
 /// Convert one 4:2:0 row. `y_row` is `w` luma samples; `u_row` / `v_row`
 /// are `⌈w/2⌉` chroma samples of the chroma row this luma row maps to;
 /// `a_row`, when present, is `w` alpha samples. `out` is `w × out_bpp`
@@ -118,26 +168,18 @@ pub(crate) fn convert_row(
     let w = y_row.len();
     debug_assert!(out.len() >= w * out_bpp);
     debug_assert!(u_row.len() >= w.div_ceil(2) && v_row.len() >= w.div_ceil(2));
-    for (k, (uv, out_pair)) in u_row
-        .iter()
-        .zip(v_row.iter())
-        .zip(out.chunks_mut(2 * out_bpp))
-        .enumerate()
+    let out = &mut out[..w * out_bpp];
+    match (out_bpp, full) {
+        (4, false) => convert_row_kernel::<4, false>(y_row, u_row, v_row, out),
+        (4, true) => convert_row_kernel::<4, true>(y_row, u_row, v_row, out),
+        (_, false) => convert_row_kernel::<3, false>(y_row, u_row, v_row, out),
+        (_, true) => convert_row_kernel::<3, true>(y_row, u_row, v_row, out),
+    }
+    if out_bpp == 4
+        && let Some(a_row) = a_row
     {
-        let (ro, go, bo) = chroma_offsets(*uv.0, *uv.1, full);
-        let x0 = 2 * k;
-        for (i, px) in out_pair.chunks_exact_mut(out_bpp).enumerate() {
-            let x = x0 + i;
-            if x >= w {
-                break;
-            }
-            let yl = luma_term(y_row[x], full);
-            px[0] = clamp_u8((yl + ro) >> 16);
-            px[1] = clamp_u8((yl + go) >> 16);
-            px[2] = clamp_u8((yl + bo) >> 16);
-            if out_bpp == 4 {
-                px[3] = a_row.and_then(|a| a.get(x).copied()).unwrap_or(0xff);
-            }
+        for (px, &a) in out.as_chunks_mut::<4>().0.iter_mut().zip(a_row) {
+            px[3] = a;
         }
     }
 }

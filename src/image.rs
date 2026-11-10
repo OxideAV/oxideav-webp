@@ -513,6 +513,12 @@ impl WebpImage {
     fn to_packed(&self, out_bpp: usize) -> Vec<u8> {
         let w = self.width as usize;
         let h = self.height as usize;
+        // The common shapes first: every plane holds its whole geometry,
+        // so each output byte is written exactly once.
+        if let Some(out) = self.to_packed_whole(out_bpp) {
+            return out;
+        }
+        // Short planes: the missing samples stay black (opaque).
         let mut out = vec![0u8; w * h * out_bpp];
         if out_bpp == 4 {
             for px in out.as_chunks_mut::<4>().0 {
@@ -561,6 +567,94 @@ impl WebpImage {
             }
         }
         out
+    }
+}
+
+impl WebpImage {
+    /// [`to_packed`](Self::to_packed) for an image whose planes all hold
+    /// their whole geometry; `None` sends the caller to the row-by-row
+    /// path that tolerates short planes.
+    fn to_packed_whole(&self, out_bpp: usize) -> Option<Vec<u8>> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let whole = |plane: &Plane, row_bytes: usize, rows: usize| {
+            rows == 0
+                || (plane.stride >= row_bytes
+                    && plane
+                        .stride
+                        .checked_mul(rows - 1)
+                        .and_then(|n| n.checked_add(row_bytes))
+                        .is_some_and(|need| plane.data.len() >= need))
+        };
+        match self.format {
+            WebpPixelFormat::Rgb24 | WebpPixelFormat::Rgba => {
+                let in_bpp = self.format.packed_bytes_per_pixel()?;
+                let plane = self.planes.first()?;
+                if !whole(plane, w * in_bpp, h) {
+                    return None;
+                }
+                let rows = (0..h).map(|y| &plane.data[y * plane.stride..][..w * in_bpp]);
+                let mut out = Vec::with_capacity(w * h * out_bpp);
+                match (in_bpp, out_bpp) {
+                    (3, 4) => {
+                        for row in rows {
+                            out.extend(
+                                row.as_chunks::<3>()
+                                    .0
+                                    .iter()
+                                    .flat_map(|px| [px[0], px[1], px[2], 0xff]),
+                            );
+                        }
+                    }
+                    (4, 3) => {
+                        for row in rows {
+                            out.extend(
+                                row.as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .flat_map(|px| [px[0], px[1], px[2]]),
+                            );
+                        }
+                    }
+                    _ => {
+                        for row in rows {
+                            out.extend_from_slice(row);
+                        }
+                    }
+                }
+                Some(out)
+            }
+            WebpPixelFormat::Yuv420P | WebpPixelFormat::Yuva420P => {
+                let full = self.color.range == ColorRange::Full;
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                let (yp, up, vp) = (
+                    self.planes.first()?,
+                    self.planes.get(1)?,
+                    self.planes.get(2)?,
+                );
+                let ap = if self.format == WebpPixelFormat::Yuva420P {
+                    self.planes.get(3)
+                } else {
+                    None
+                };
+                if !(whole(yp, w, h)
+                    && whole(up, cw, ch)
+                    && whole(vp, cw, ch)
+                    && ap.is_none_or(|a| whole(a, w, h)))
+                {
+                    return None;
+                }
+                let mut out = vec![0u8; w * h * out_bpp];
+                for (y, orow) in out.chunks_exact_mut((w * out_bpp).max(1)).enumerate() {
+                    let y_row = &yp.data[y * yp.stride..][..w];
+                    let u_row = &up.data[(y / 2) * up.stride..][..cw];
+                    let v_row = &vp.data[(y / 2) * vp.stride..][..cw];
+                    let a_row = ap.map(|a| &a.data[y * a.stride..][..w]);
+                    yuv::convert_row(y_row, u_row, v_row, a_row, orow, out_bpp, full);
+                }
+                Some(out)
+            }
+        }
     }
 }
 
@@ -816,5 +910,87 @@ mod tests {
         assert_eq!(rgba.len(), 64);
         assert_eq!(&rgba[0..4], &[9, 9, 9, 9]);
         assert_eq!(&rgba[60..64], &[0, 0, 0, 255]);
+    }
+
+    /// Padded strides and tight planes convert to the same pixels, for
+    /// every layout and both outputs, odd sizes included; RGBA output is
+    /// RGB output plus the alpha plane (or `255`).
+    #[test]
+    fn padded_planes_convert_like_tight_ones() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        };
+        let pad = |tight: &[u8], row: usize, rows: usize, stride: usize| -> Plane {
+            let mut data = vec![0xa5u8; stride * rows];
+            for r in 0..rows {
+                data[r * stride..r * stride + row].copy_from_slice(&tight[r * row..(r + 1) * row]);
+            }
+            // The last row may stop at its last sample.
+            data.truncate(stride * (rows - 1) + row);
+            Plane::new(stride, data)
+        };
+        for (w, h) in [(1usize, 1usize), (2, 3), (5, 4), (17, 9)] {
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            for format in [
+                WebpPixelFormat::Rgb24,
+                WebpPixelFormat::Rgba,
+                WebpPixelFormat::Yuv420P,
+                WebpPixelFormat::Yuva420P,
+            ] {
+                let shapes: Vec<(usize, usize)> = match format {
+                    WebpPixelFormat::Rgb24 => vec![(w * 3, h)],
+                    WebpPixelFormat::Rgba => vec![(w * 4, h)],
+                    WebpPixelFormat::Yuv420P => vec![(w, h), (cw, ch), (cw, ch)],
+                    WebpPixelFormat::Yuva420P => vec![(w, h), (cw, ch), (cw, ch), (w, h)],
+                };
+                let tight_data: Vec<Vec<u8>> = shapes
+                    .iter()
+                    .map(|&(row, rows)| (0..row * rows).map(|_| next()).collect())
+                    .collect();
+                let tight = WebpImage::new(
+                    w as u32,
+                    h as u32,
+                    format,
+                    shapes
+                        .iter()
+                        .zip(&tight_data)
+                        .map(|(&(row, _), data)| Plane::packed(row, data.clone()))
+                        .collect(),
+                )
+                .unwrap();
+                let padded = WebpImage::new(
+                    w as u32,
+                    h as u32,
+                    format,
+                    shapes
+                        .iter()
+                        .zip(&tight_data)
+                        .enumerate()
+                        .map(|(i, (&(row, rows), data))| pad(data, row, rows, row + 3 + i))
+                        .collect(),
+                )
+                .unwrap();
+                let (rgb, rgba) = (tight.to_rgb8(), tight.to_rgba8());
+                assert_eq!(padded.to_rgb8(), rgb, "{format:?} {w}x{h} rgb");
+                assert_eq!(padded.to_rgba8(), rgba, "{format:?} {w}x{h} rgba");
+                assert_eq!((rgb.len(), rgba.len()), (w * h * 3, w * h * 4));
+                for (i, (px3, px4)) in rgb.chunks(3).zip(rgba.chunks(4)).enumerate() {
+                    assert_eq!(px3, &px4[..3], "{format:?} {w}x{h} pixel {i}");
+                    let alpha = match format {
+                        WebpPixelFormat::Rgba => tight_data[0][i * 4 + 3],
+                        WebpPixelFormat::Yuva420P => tight_data[3][i],
+                        _ => 0xff,
+                    };
+                    assert_eq!(px4[3], alpha, "{format:?} {w}x{h} alpha {i}");
+                }
+                if format == WebpPixelFormat::Rgb24 {
+                    assert_eq!(rgb, tight_data[0]);
+                }
+            }
+        }
     }
 }
