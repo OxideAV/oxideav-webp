@@ -1,13 +1,13 @@
-//! `EncodeOptions::method` on the lossy (`VP8 `) path (#47).
+//! `EncodeOptions::method` and `threads` on the lossy (`VP8 `) path (#47).
 //!
-//! Methods `3..=4` write the single-pass encode of earlier versions (the
-//! default, pinned in `lossy_output_pins.rs`); `5` fits the RFC 6386
+//! Methods `0`, `1`, `2` are the three reduced macroblock mode searches;
+//! `3..=4` write the exhaustive single-pass encode of earlier versions
+//! (the default, pinned in `lossy_output_pins.rs`); `5` fits the RFC 6386
 //! §13.4 token-probability updates to the picture (never larger than
 //! `4`); `6` also picks the §9.4 loop-filter level by reconstruction
-//! error. `0..=2` turn the trellis quantiser off at quality 90 and above
-//! and encode like `4` below it. The alpha plane follows the lossless
-//! levels and, on larger images, is coded on a second thread next to the
-//! VP8 encode.
+//! error. The bytes are the same for every thread budget. The alpha
+//! plane follows the lossless levels and, on larger images, is coded on a
+//! second thread next to the VP8 encode.
 
 mod common;
 
@@ -52,12 +52,14 @@ fn lossy_method_ladder() {
     let default = encode_rgba8(w, h, &rgba, &EncodeOptions::default().with_quality(80.0))
         .expect("lossy encode");
 
-    // Below quality 90 the low levels keep the trellis: 0..=4 are one
+    // 0, 1, 2 are three different reduced searches; 3 and 4 are one
     // encode, the default.
     let q80 = encode_every_method(w, h, &rgba, 80.0);
-    for m in 0..=3 {
-        assert_eq!(q80[m], q80[4], "q80: method {m} encodes like 4");
+    for m in 0..=2 {
+        assert_ne!(q80[m], q80[4], "q80: method {m} is a reduced search");
+        assert_ne!(q80[m], q80[m + 1], "q80: methods {m} and {} differ", m + 1);
     }
+    assert_eq!(q80[3], q80[4], "q80: method 3 encodes like 4");
     assert_eq!(default, q80[4], "the default lossy encode is method 4");
     // 5 fits the §13.4 probabilities: a different wire, never larger.
     assert_ne!(q80[5], q80[4], "q80: method 5 refits the probabilities");
@@ -76,13 +78,10 @@ fn lossy_method_ladder() {
         assert!(db > 30.0, "q80 method {m}: PSNR {db:.2} dB");
     }
 
-    // From quality 90, 0..=2 turn the trellis off.
+    // The same ladder at a fine quantiser.
     let q95 = encode_every_method(w, h, &rgba, 95.0);
-    for m in 1..=2 {
-        assert_eq!(q95[m], q95[0], "q95: methods 0..=2 share one encode");
-    }
     assert_eq!(q95[3], q95[4], "q95: method 3 encodes like 4");
-    assert_ne!(q95[0], q95[4], "q95: trellis off changes the bitstream");
+    assert_ne!(q95[0], q95[4], "q95: method 0 is a reduced search");
     for (m, file) in q95.iter().enumerate() {
         let db = p(file);
         assert!(db > 33.0, "q95 method {m}: PSNR {db:.2} dB");
@@ -114,5 +113,75 @@ fn concurrent_alpha_plane_is_exact_and_deterministic() {
             .map(|p| p[3])
             .collect();
         assert_eq!(back, alpha, "method {m}: alpha plane exact");
+    }
+}
+
+/// The thread budget never changes a lossy file: every method, with and
+/// without alpha, on a picture whose VP8 rows run as a wavefront, and
+/// the fastest and default methods on one large enough for the RGB
+/// conversion to split into bands too.
+#[test]
+fn lossy_bytes_do_not_depend_on_the_thread_budget() {
+    for (w, h, methods) in [
+        (208u32, 136u32, &[0u8, 1, 2, 3, 4, 5, 6][..]),
+        (656, 420, &[0, 4][..]),
+    ] {
+        let opaque = common::photo_rgba(w, h);
+        let mut translucent = opaque.clone();
+        for (i, px) in translucent.chunks_mut(4).enumerate() {
+            px[3] = (i % 251) as u8;
+        }
+        for (name, rgba) in [("opaque", &opaque), ("alpha", &translucent)] {
+            if name == "alpha" && methods.len() < 7 {
+                // The alpha plane is its own (lossless) encode; the
+                // small picture covers it.
+                continue;
+            }
+            for &method in methods {
+                let opts = EncodeOptions::default()
+                    .with_quality(80.0)
+                    .with_method(method);
+                let serial =
+                    encode_rgba8(w, h, rgba, &opts.clone().with_threads(1)).expect("encode");
+                for threads in [2usize, 5, 0] {
+                    let file = encode_rgba8(w, h, rgba, &opts.clone().with_threads(threads))
+                        .expect("encode");
+                    assert!(
+                        file == serial,
+                        "{w}x{h} {name}, method {method}: {threads} threads changed the bytes"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `with_effort` is `with_method` under the registry option's name, and
+/// the RGB entry point writes what the image entry point writes.
+#[test]
+fn effort_alias_and_entry_points_agree() {
+    let (w, h) = (96u32, 64u32);
+    let rgba = common::photo_rgba(w, h);
+    let rgb = rgb_of(&rgba);
+    for level in [0u8, 2, 4] {
+        let by_method = EncodeOptions::default()
+            .with_quality(70.0)
+            .with_method(level);
+        let by_effort = EncodeOptions::default()
+            .with_quality(70.0)
+            .with_effort(level);
+        assert_eq!(by_method, by_effort);
+        let from_rgba = encode_rgba8(w, h, &rgba, &by_method).expect("encode");
+        let from_rgb = oxideav_webp::encode_rgb8(w, h, &rgb, &by_method).expect("encode");
+        let image = oxideav_webp::WebpImage::from_rgb8(w, h, rgb.clone()).expect("image");
+        let from_image = oxideav_webp::encode(&image, &by_method).expect("encode");
+        assert_eq!(
+            from_rgba, from_rgb,
+            "level {level}: opaque RGBA writes the RGB file"
+        );
+        assert_eq!(
+            from_rgb, from_image,
+            "level {level}: slice and image entry points"
+        );
     }
 }

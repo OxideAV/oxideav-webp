@@ -18,18 +18,19 @@
 //!   `round((100 - quality) * 1.27)`, clamped to `0..=127`; NaN
 //!   collapses to `127`. Standalone (no `oxideav-core` dependency).
 //!
-//! ## Round-168 wiring
+//! * [`WebpVp8EncoderOptions`], [`make_encoder_with_options`],
+//!   [`make_encoder_from_param_options`] — the typed options of the
+//!   registered `webp_vp8` encoder (`effort`, `threads`, `qindex`,
+//!   `quality`) and the factories that take them.
+//! * [`Vp8LossyEncoder`] — the same encoder with a direct constructor,
+//!   no framework types.
 //!
-//! As of `oxideav-vp8 0.2.1` the VP8 encoder factories are wired up: the
-//! `make_encoder*` family below delegates to
-//! [`oxideav_vp8::encoder::make_encoder_with_qindex`] /
-//! [`oxideav_vp8::encoder::make_encoder_with_quality`] and wraps the
-//! emitted raw VP8 keyframe bitstream in the §2.5 `RIFF/WEBP` container
-//! framing so the output decodes back through [`crate::decode_all`].
-//! The `_freq_deltas` variants pass through to the matching no-deltas
-//! factory in this round — the `Vp8FreqDeltas` argument is forwarded as
-//! a hint (the surface stays unchanged) and the per-band quantiser-delta
-//! plumbing into the underlying `oxideav-vp8` encoder is deferred.
+//! Every door ends in one implementation: the key frame is encoded by
+//! `oxideav-vp8` from the caller's 4:2:0 planes, read in place, and
+//! wrapped in the §2.5 simple-lossy `RIFF` / `WEBP` layout so the output
+//! decodes back through [`crate::decode_all`]. The `_freq_deltas`
+//! variants accept a [`Vp8FreqDeltas`] record for signature
+//! compatibility and encode as the matching no-deltas factory does.
 
 use crate::WebpError;
 
@@ -57,7 +58,7 @@ pub struct Vp8FreqDeltas {
     pub uv_ac_delta: i8,
 }
 
-/// Map a WebP-canonical `0.0..=100.0` quality scale to a VP8 qindex
+/// Map a `0.0..=100.0` quality (higher = better) to a VP8 qindex
 /// (`0..=127`, lower = better).
 ///
 /// The mapping is `round((100 - quality) * 1.27)`, clamped to the
@@ -87,9 +88,8 @@ const MAX_VP8_DIMENSION: u32 = 0x3FFF;
 /// the `registry` feature or a framework `Encoder`.
 ///
 /// [`encode_yuv420`](Self::encode_yuv420) reads a 4:2:0 picture's planes
-/// in place at the caller's strides (the framework encoder copies each
-/// plane into a tightly packed buffer first) and writes a simple-lossy
-/// `.webp`. For the same picture and quantiser the bytes are those of the
+/// in place at the caller's strides and writes a simple-lossy `.webp`.
+/// For the same picture, quantiser and effort the bytes are those of the
 /// `webp_vp8` framework encoder's packet.
 ///
 /// ```
@@ -99,6 +99,8 @@ const MAX_VP8_DIMENSION: u32 = 0x3FFF;
 /// let y = vec![128u8; 32 * 16];
 /// let (u, v) = (vec![128u8; 16 * 8], vec![128u8; 16 * 8]);
 /// let webp = Vp8LossyEncoder::with_quality(80.0)
+///     .with_effort(1) // a reduced mode search: faster, slightly larger
+///     .with_threads(4) // same bytes for every thread count
 ///     .encode_yuv420(w, h, &y, 32, &u, &v, 16)
 ///     .expect("encode");
 /// assert_eq!(&webp[..4], b"RIFF");
@@ -107,6 +109,8 @@ const MAX_VP8_DIMENSION: u32 = 0x3FFF;
 #[non_exhaustive]
 pub struct Vp8LossyEncoder {
     qindex: u8,
+    effort: u8,
+    threads: usize,
 }
 
 impl Vp8LossyEncoder {
@@ -118,16 +122,47 @@ impl Vp8LossyEncoder {
     }
 
     /// An encoder at VP8 quantiser index `qindex` (`0..=127`, lower is
-    /// better quality); larger values are treated as `127`.
+    /// better quality); larger values are treated as `127`. Effort
+    /// [`DEFAULT_EFFORT`], one thread.
     pub fn with_qindex(qindex: u8) -> Self {
         Self {
             qindex: qindex.min(127),
+            effort: DEFAULT_EFFORT,
+            threads: 1,
         }
+    }
+
+    /// Builder: encoder effort `0` (fastest) to `6` (slowest, smallest);
+    /// larger values are treated as `6`. The levels are the lossy ones of
+    /// [`EncodeOptions::with_method`](crate::EncodeOptions::with_method):
+    /// `0`, `1`, `2` are reduced mode searches, `3..=4` the exhaustive
+    /// search (the default, and the bytes of earlier versions), `5` adds
+    /// fitted token probabilities, `6` a loop-filter search.
+    pub fn with_effort(mut self, effort: u8) -> Self {
+        self.effort = effort.min(MAX_EFFORT);
+        self
+    }
+
+    /// Builder: encode on up to `threads` threads (`0` and `1` are both
+    /// serial, the default). The bytes are the same for every value.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
     }
 
     /// The VP8 quantiser index this encoder uses.
     pub fn qindex(&self) -> u8 {
         self.qindex
+    }
+
+    /// The effort level this encoder uses (`0..=6`).
+    pub fn effort(&self) -> u8 {
+        self.effort
+    }
+
+    /// The thread budget this encoder uses (at least 1).
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     /// Encode one `width x height` 4:2:0 picture to a simple-lossy
@@ -150,37 +185,73 @@ impl Vp8LossyEncoder {
         v: &[u8],
         uv_stride: usize,
     ) -> Result<Vec<u8>, WebpError> {
-        if width == 0 || height == 0 || width > MAX_VP8_DIMENSION || height > MAX_VP8_DIMENSION {
-            return Err(WebpError::invalid(format!(
-                "VP8 picture {width}x{height} is outside 1..={MAX_VP8_DIMENSION} per side"
-            )));
-        }
-        let (w, h) = (width as usize, height as usize);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        check_plane("Y", y, y_stride, w, h)?;
-        check_plane("U", u, uv_stride, cw, ch)?;
-        check_plane("V", v, uv_stride, cw, ch)?;
-        let frame = oxideav_vp8::I420Frame {
+        encode_yuv420_planes(
             width,
             height,
-            y,
-            u,
-            v,
-            y_stride,
-            uv_stride,
-        };
-        let params = oxideav_vp8::KeyframeParams {
-            y_ac_qi: self.qindex,
-            ..oxideav_vp8::KeyframeParams::default()
-        };
-        let vp8 = oxideav_vp8::encode_keyframe(&frame, &params)?;
-        Ok(crate::build::build_webp_file(
-            &vp8,
-            crate::build::ImageKind::Lossy,
-            width,
-            height,
-        )?)
+            (y, y_stride),
+            (u, uv_stride),
+            (v, uv_stride),
+            crate::api::LossyTuning::for_qindex(self.qindex, self.effort),
+            self.threads,
+        )
     }
+}
+
+/// Effort of the lossy encoders when none is asked for: the exhaustive
+/// mode search, one pass.
+pub const DEFAULT_EFFORT: u8 = 4;
+
+/// Highest effort level.
+pub const MAX_EFFORT: u8 = 6;
+
+/// Encode three 4:2:0 planes, each `(samples, stride)`, to a simple-lossy
+/// `.webp` under `tuning` on up to `threads` threads. The planes are read
+/// in place; only a chroma pair with two different strides is repacked.
+pub(crate) fn encode_yuv420_planes(
+    width: u32,
+    height: u32,
+    (y, y_stride): (&[u8], usize),
+    (u, u_stride): (&[u8], usize),
+    (v, v_stride): (&[u8], usize),
+    tuning: crate::api::LossyTuning,
+    threads: usize,
+) -> Result<Vec<u8>, WebpError> {
+    if width == 0 || height == 0 || width > MAX_VP8_DIMENSION || height > MAX_VP8_DIMENSION {
+        return Err(WebpError::invalid(format!(
+            "VP8 picture {width}x{height} is outside 1..={MAX_VP8_DIMENSION} per side"
+        )));
+    }
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    check_plane("Y", y, y_stride, w, h)?;
+    check_plane("U", u, u_stride, cw, ch)?;
+    check_plane("V", v, v_stride, cw, ch)?;
+    let repacked;
+    let (u, v, uv_stride) = if u_stride == v_stride {
+        (u, v, u_stride)
+    } else {
+        let tight = |plane: &[u8], stride: usize| -> Vec<u8> {
+            let mut out = Vec::with_capacity(cw * ch);
+            for row in 0..ch {
+                out.extend_from_slice(&plane[row * stride..row * stride + cw]);
+            }
+            out
+        };
+        repacked = (tight(u, u_stride), tight(v, v_stride));
+        (&repacked.0[..], &repacked.1[..], cw)
+    };
+    let frame = oxideav_vp8::I420Frame {
+        width,
+        height,
+        y,
+        u,
+        v,
+        y_stride,
+        uv_stride,
+    };
+    crate::vp8l_encode::with_thread_budget(threads, || {
+        crate::api::encode_lossy_planes(&frame, None, &crate::WebpMetadata::default(), tuning)
+    })
 }
 
 /// Check that `plane` holds `rows` rows of `row_width` bytes, `stride`
@@ -214,29 +285,171 @@ fn check_plane(
 
 #[cfg(feature = "registry")]
 use oxideav_core::{
-    CodecId, CodecParameters, Encoder, Error as CoreError, Frame, MediaType, Packet,
+    CodecId, CodecParameters, Encoder, Error as CoreError, Frame, MediaType, Packet, PixelFormat,
     Result as CoreResult, time::TimeBase,
 };
 #[cfg(feature = "registry")]
 use std::collections::VecDeque;
 
-/// Build a `Box<dyn Encoder>` for the published `"webp_vp8"` codec id.
+/// Typed options of the registered `webp_vp8` encoder — the struct behind
+/// the `CodecParameters::options` bag [`make_encoder_from_param_options`]
+/// parses, and the argument of [`make_encoder_with_options`].
 ///
-/// Routes to the `oxideav-vp8 0.2.1` framework factory
-/// [`oxideav_vp8::encoder::make_encoder`] (default `y_ac_qi = 32`) and
-/// wraps every emitted raw VP8 keyframe in a §2.5 simple-lossy
-/// `RIFF/WEBP` container so the output decodes through
-/// [`crate::decode_all`].
+/// | key | kind | default | meaning |
+/// |---|---|---|---|
+/// | `effort` | u32 | `4` | encoder effort `0` (fastest) ..= `6` (smallest); see [`EncodeOptions::with_method`](crate::EncodeOptions::with_method) |
+/// | `threads` | u32 | `0` | thread budget; `0` follows the `ExecutionContext` (serial when none is announced) |
+/// | `qindex` | u32 | `32` | RFC 6386 §9.6 quantiser index `0..=127`, lower is better |
+/// | `quality` | f32 | `-1` | `0..=100`, higher is better; when ≥ 0 it replaces `qindex` and also sets the trellis strength, giving the bytes of [`EncodeOptions::with_quality`](crate::EncodeOptions::with_quality) on the same planes |
+///
+/// The output bytes never depend on `threads`.
 #[cfg(feature = "registry")]
-pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
-    make_encoder_with_qindex(params, 32)
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct WebpVp8EncoderOptions {
+    /// Encoder effort, `0..=6`.
+    pub effort: u8,
+    /// Thread budget; `0` follows the announced `ExecutionContext`.
+    pub threads: usize,
+    /// Quantiser index `0..=127` (ignored when `quality` is set).
+    pub qindex: u8,
+    /// `0..=100` quality; `None` uses `qindex`.
+    pub quality: Option<f32>,
 }
 
-/// `make_encoder` plus a WebP-canonical `0.0..=100.0` quality knob.
-///
-/// `quality` is projected to a VP8 qindex (`0..=127`) via
-/// [`quality_to_qindex`] and forwarded to the underlying
-/// `oxideav-vp8 0.2.1` factory.
+#[cfg(feature = "registry")]
+impl Default for WebpVp8EncoderOptions {
+    fn default() -> Self {
+        Self {
+            effort: DEFAULT_EFFORT,
+            threads: 0,
+            qindex: DEFAULT_QINDEX,
+            quality: None,
+        }
+    }
+}
+
+/// Quantiser index of [`make_encoder`] and of the registered encoder when
+/// neither `qindex` nor `quality` is given.
+#[cfg(feature = "registry")]
+const DEFAULT_QINDEX: u8 = 32;
+
+#[cfg(feature = "registry")]
+impl WebpVp8EncoderOptions {
+    /// The defaults (see the table on the type).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `effort` (values above `6` are treated as `6`).
+    pub fn with_effort(mut self, effort: u8) -> Self {
+        self.effort = effort.min(MAX_EFFORT);
+        self
+    }
+
+    /// Set `threads`.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Set `qindex`.
+    pub fn with_qindex(mut self, qindex: u8) -> Self {
+        self.qindex = qindex;
+        self
+    }
+
+    /// Set `quality`.
+    pub fn with_quality(mut self, quality: Option<f32>) -> Self {
+        self.quality = quality;
+        self
+    }
+}
+
+#[cfg(feature = "registry")]
+impl oxideav_core::CodecOptionsStruct for WebpVp8EncoderOptions {
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[
+        oxideav_core::OptionField {
+            name: "effort",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(DEFAULT_EFFORT as u32),
+            help: "encoder effort: 0 fastest .. 6 smallest (0-2 reduced mode search, 3-4 exhaustive, 5 fitted token probabilities, 6 loop-filter search)",
+        },
+        oxideav_core::OptionField {
+            name: "threads",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "thread budget (0 = follow the execution context)",
+        },
+        oxideav_core::OptionField {
+            name: "qindex",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(DEFAULT_QINDEX as u32),
+            help: "quantiser index 0..=127 (lower = better)",
+        },
+        oxideav_core::OptionField {
+            name: "quality",
+            kind: oxideav_core::OptionKind::F32,
+            default: oxideav_core::OptionValue::F32(-1.0),
+            help: "quality 0..=100 (overrides qindex; negative = unset)",
+        },
+        oxideav_core::OptionField {
+            name: "loop_count",
+            kind: oxideav_core::OptionKind::String,
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "read by the webp muxer from the same stream parameters; the encoder ignores it",
+        },
+        oxideav_core::OptionField {
+            name: "background_color",
+            kind: oxideav_core::OptionKind::String,
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "read by the webp muxer from the same stream parameters; the encoder ignores it",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> CoreResult<()> {
+        let bounded = |v: u32, max: u32| {
+            if v > max {
+                Err(CoreError::invalid(format!(
+                    "webp_vp8 encoder: option '{key}' out of range (0..={max}), got {v}"
+                )))
+            } else {
+                Ok(v as u8)
+            }
+        };
+        match key {
+            "effort" => self.effort = bounded(value.as_u32()?, u32::from(MAX_EFFORT))?,
+            "threads" => self.threads = value.as_u32()? as usize,
+            "qindex" => self.qindex = bounded(value.as_u32()?, 127)?,
+            "quality" => {
+                let q = value.as_f32()?;
+                self.quality = (q >= 0.0).then_some(q);
+            }
+            // The muxer's keys ride in the same options bag.
+            "loop_count" | "background_color" => {}
+            other => {
+                return Err(CoreError::invalid(format!(
+                    "webp_vp8 encoder: unknown option '{other}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build a `Box<dyn Encoder>` for the published `"webp_vp8"` codec id at
+/// the default quantiser index (`32`): `Yuv420P` frames in, one
+/// simple-lossy `.webp` packet per frame out.
+#[cfg(feature = "registry")]
+pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
+    make_encoder_with_qindex(params, DEFAULT_QINDEX)
+}
+
+/// `make_encoder` plus a `0.0..=100.0` quality knob (higher is better),
+/// projected onto the quantiser index with [`quality_to_qindex`]; the
+/// trellis keeps its default strength, as in earlier versions. (The
+/// `quality` *option* of [`WebpVp8EncoderOptions`] also tunes the
+/// trellis, like [`EncodeOptions::with_quality`](crate::EncodeOptions::with_quality).)
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_quality(
     params: &CodecParameters,
@@ -246,17 +459,34 @@ pub fn make_encoder_with_quality(
 }
 
 /// `make_encoder` plus an explicit `qindex` (`0..=127`, lower = better).
-///
-/// Builds a [`WebpVp8LossyEncoder`] which delegates to the underlying
-/// `oxideav-vp8 0.2.1` framework encoder for the actual VP8 keyframe
-/// bitstream, then wraps each emitted packet in a §2.5 simple-lossy
-/// `RIFF/WEBP` container.
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_qindex(
     params: &CodecParameters,
     qindex: u8,
 ) -> CoreResult<Box<dyn Encoder>> {
-    let inner = oxideav_vp8::encoder::make_encoder_with_qindex(params, qindex)?;
+    make_encoder_with_options(
+        params,
+        &WebpVp8EncoderOptions::default().with_qindex(qindex),
+    )
+}
+
+/// The registry's `webp_vp8` encoder factory: parse `params.options`
+/// (strictly — an unknown key or a malformed value is an error) into
+/// [`WebpVp8EncoderOptions`] and build the encoder from it. An empty bag
+/// gives the same encoder as [`make_encoder`].
+#[cfg(feature = "registry")]
+pub fn make_encoder_from_param_options(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
+    let options = oxideav_core::parse_options::<WebpVp8EncoderOptions>(&params.options)?;
+    make_encoder_with_options(params, &options)
+}
+
+/// Build the `webp_vp8` encoder from typed [`WebpVp8EncoderOptions`] —
+/// the direct twin of the registered factory.
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_options(
+    params: &CodecParameters,
+    options: &WebpVp8EncoderOptions,
+) -> CoreResult<Box<dyn Encoder>> {
     let width = params
         .width
         .ok_or_else(|| CoreError::invalid("webp_vp8 encoder: missing width"))?;
@@ -268,6 +498,29 @@ pub fn make_encoder_with_qindex(
             "webp_vp8 encoder: width and height must be positive",
         ));
     }
+    if width > MAX_VP8_DIMENSION || height > MAX_VP8_DIMENSION {
+        return Err(CoreError::invalid(format!(
+            "webp_vp8 encoder: width/height exceed the VP8 14-bit size fields (max {MAX_VP8_DIMENSION})"
+        )));
+    }
+    if params
+        .pixel_format
+        .is_some_and(|format| format != PixelFormat::Yuv420P)
+    {
+        return Err(CoreError::unsupported(
+            "webp_vp8 encoder: only PixelFormat::Yuv420P is supported",
+        ));
+    }
+    if options.qindex > 127 {
+        return Err(CoreError::invalid(
+            "webp_vp8 encoder: qindex out of range (must be 0..=127)",
+        ));
+    }
+    let effort = options.effort.min(MAX_EFFORT);
+    let tuning = match options.quality {
+        Some(quality) => crate::api::LossyTuning::for_quality(quality, effort),
+        None => crate::api::LossyTuning::for_qindex(options.qindex, effort),
+    };
     let mut output_params = params.clone();
     output_params.media_type = MediaType::Video;
     output_params.codec_id = CodecId::new(crate::CODEC_ID_VP8);
@@ -277,7 +530,11 @@ pub fn make_encoder_with_qindex(
         .frame_rate
         .map_or(TimeBase::new(1, 1_000), |r| TimeBase::new(r.den, r.num));
     Ok(Box::new(WebpVp8LossyEncoder {
-        inner,
+        width,
+        height,
+        tuning,
+        option_threads: options.threads,
+        context_threads: 1,
         output_params,
         time_base,
         pending: VecDeque::new(),
@@ -288,10 +545,8 @@ pub fn make_encoder_with_qindex(
 /// `make_encoder` plus an explicit `qindex` and a [`Vp8FreqDeltas`]
 /// record of per-band quantiser deltas.
 ///
-/// In this round the `deltas` argument is forwarded as a hint only —
-/// the surface is preserved per the published 0.1.2 surface but plumbing the
-/// per-band deltas into the underlying `oxideav-vp8` encoder's
-/// `KeyframeParams` is deferred to a follow-up. The qindex IS honoured.
+/// The `deltas` argument is accepted for signature compatibility and not
+/// applied; the qindex is honoured.
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_qindex_and_freq_deltas(
     params: &CodecParameters,
@@ -301,12 +556,12 @@ pub fn make_encoder_with_qindex_and_freq_deltas(
     make_encoder_with_qindex(params, qindex)
 }
 
-/// `make_encoder` plus a WebP-canonical `0.0..=100.0` quality knob
-/// and a [`Vp8FreqDeltas`] record of per-band quantiser deltas.
+/// `make_encoder` plus a `0.0..=100.0` quality knob and a
+/// [`Vp8FreqDeltas`] record of per-band quantiser deltas.
 ///
-/// In this round the `deltas` argument is forwarded as a hint only —
-/// see [`make_encoder_with_qindex_and_freq_deltas`]. The quality IS
-/// honoured (projected via [`quality_to_qindex`]).
+/// The `deltas` argument is accepted for signature compatibility and not
+/// applied — see [`make_encoder_with_qindex_and_freq_deltas`]. The
+/// quality is honoured.
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_quality_and_freq_deltas(
     params: &CodecParameters,
@@ -316,12 +571,18 @@ pub fn make_encoder_with_quality_and_freq_deltas(
     make_encoder_with_quality(params, quality)
 }
 
-/// `Encoder` adapter that wraps an inner `oxideav-vp8` encoder and
-/// frames every emitted raw VP8 keyframe in a §2.5 simple-lossy
-/// `RIFF/WEBP` container. One source frame → one `.webp` packet.
+/// The `webp_vp8` framework encoder: each `Yuv420P` frame becomes one
+/// simple-lossy `.webp` packet, encoded from the frame's planes in place.
 #[cfg(feature = "registry")]
 pub(crate) struct WebpVp8LossyEncoder {
-    inner: Box<dyn Encoder>,
+    width: u32,
+    height: u32,
+    tuning: crate::api::LossyTuning,
+    /// Explicit thread budget from the options (`0` = none given).
+    option_threads: usize,
+    /// Budget announced through `set_execution_context` (`1` until one
+    /// is).
+    context_threads: usize,
     output_params: CodecParameters,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
@@ -332,11 +593,46 @@ pub(crate) struct WebpVp8LossyEncoder {
 impl std::fmt::Debug for WebpVp8LossyEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebpVp8LossyEncoder")
-            .field("width", &self.output_params.width)
-            .field("height", &self.output_params.height)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("tuning", &self.tuning)
             .field("pending", &self.pending.len())
             .field("flushed", &self.flushed)
             .finish()
+    }
+}
+
+#[cfg(feature = "registry")]
+impl WebpVp8LossyEncoder {
+    /// Follow a [`Frame::StreamParams`] event. Every packet is a key
+    /// frame restating its size, so a new size simply applies from the
+    /// next frame; a description that is not `Yuv420P` video inside the
+    /// RFC 6386 §9.1 size fields cannot be followed.
+    fn reconfigure(&mut self, params: &CodecParameters) -> CoreResult<()> {
+        if params.media_type != MediaType::Video {
+            return Err(CoreError::unsupported(
+                "webp_vp8 encoder: stream-params event does not describe video",
+            ));
+        }
+        if params
+            .pixel_format
+            .is_some_and(|format| format != PixelFormat::Yuv420P)
+        {
+            return Err(CoreError::unsupported(
+                "webp_vp8 encoder: cannot switch away from PixelFormat::Yuv420P mid-stream",
+            ));
+        }
+        let width = params.width.unwrap_or(self.width);
+        let height = params.height.unwrap_or(self.height);
+        if width == 0 || height == 0 || width > MAX_VP8_DIMENSION || height > MAX_VP8_DIMENSION {
+            return Err(CoreError::unsupported(format!(
+                "webp_vp8 encoder: stream-params size outside 1..={MAX_VP8_DIMENSION} per side"
+            )));
+        }
+        (self.width, self.height) = (width, height);
+        self.output_params.width = Some(width);
+        self.output_params.height = Some(height);
+        Ok(())
     }
 }
 
@@ -351,29 +647,42 @@ impl Encoder for WebpVp8LossyEncoder {
     }
 
     fn send_frame(&mut self, frame: &Frame) -> CoreResult<()> {
-        // Pass the source frame through to the inner VP8 encoder.
-        self.inner.send_frame(frame)?;
-        // Drain one keyframe packet, wrap in RIFF/WEBP, queue it.
-        let vp8_pkt = self.inner.receive_packet()?;
-        let width = self.output_params.width.unwrap_or(0);
-        let height = self.output_params.height.unwrap_or(0);
-        let webp_bytes = crate::build::build_webp_file(
-            &vp8_pkt.data,
-            crate::build::ImageKind::Lossy,
-            width,
-            height,
+        let video = match frame {
+            Frame::Video(video) => video,
+            Frame::StreamParams(params) => return self.reconfigure(params),
+            _ => return Err(CoreError::invalid("webp_vp8 encoder: video frames only")),
+        };
+        let [y, u, v, ..] = video.image_planes() else {
+            return Err(CoreError::invalid(
+                "webp_vp8 encoder: a frame must carry 3 planes (Y/U/V)",
+            ));
+        };
+        let threads = match self.option_threads {
+            0 => self.context_threads,
+            n => n,
+        };
+        let webp_bytes = encode_yuv420_planes(
+            self.width,
+            self.height,
+            (&y.data, y.stride),
+            (&u.data, u.stride),
+            (&v.data, v.stride),
+            self.tuning,
+            threads,
         )
-        .map_err(|e| CoreError::invalid(format!("webp_vp8 encoder: container framing: {e}")))?;
+        .map_err(|e| CoreError::invalid(format!("webp_vp8 encoder: {e}")))?;
         let mut pkt = Packet::new(0, self.time_base, webp_bytes);
-        pkt.pts = vp8_pkt.pts;
-        pkt.dts = vp8_pkt.pts;
+        pkt.pts = video.pts;
+        pkt.dts = video.pts;
         pkt.flags.keyframe = true;
         self.pending.push_back(pkt);
         Ok(())
     }
 
+    /// Record the announced thread budget; it applies unless the
+    /// `threads` option named one. The bytes do not depend on it.
     fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
-        self.inner.set_execution_context(ctx);
+        self.context_threads = ctx.threads.max(1);
     }
 
     fn receive_packet(&mut self) -> CoreResult<Packet> {
@@ -389,9 +698,6 @@ impl Encoder for WebpVp8LossyEncoder {
 
     fn flush(&mut self) -> CoreResult<()> {
         self.flushed = true;
-        // Propagate flush to the inner encoder. Ignore errors so we
-        // always honour our own flush state.
-        let _ = self.inner.flush();
         Ok(())
     }
 }

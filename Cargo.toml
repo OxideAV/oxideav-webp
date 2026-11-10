@@ -241,3 +241,10 @@ harness = false
 [[bench]]
 name = "distance_code"
 harness = false
+
+# Still-image timing matrix (size x effort x threads -> ms, bytes) for
+# lossy and lossless encode and decode through the public entry points;
+# a plain `main` that prints the README's Markdown tables.
+[[bench]]
+name = "still_matrix"
+harness = false

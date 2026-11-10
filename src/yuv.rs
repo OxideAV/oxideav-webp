@@ -196,11 +196,178 @@ pub(crate) fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> [u8; 3] {
     [clamp_u8(y), clamp_u8(cb), clamp_u8(cr)]
 }
 
+/// One row of packed RGB(A) (`BPP` 3 or 4) to full-resolution Y′, Cb and
+/// Cr samples (`y`, `cb`, `cr` each as long as the row has pixels). A
+/// straight map over fixed-size pixels, so the compiler vectorises it.
+#[inline]
+fn row_to_ycbcr<const BPP: usize>(src: &[u8], y: &mut [u8], cb: &mut [u8], cr: &mut [u8]) {
+    let (pixels, _) = src.as_chunks::<BPP>();
+    for (((px, y), cb), cr) in pixels
+        .iter()
+        .zip(y.iter_mut())
+        .zip(cb.iter_mut())
+        .zip(cr.iter_mut())
+    {
+        let [yy, u, v] = rgb_to_ycbcr(px[0], px[1], px[2]);
+        *y = yy;
+        *cb = u;
+        *cr = v;
+    }
+}
+
+/// Rounded mean of each 2×2 block of two full-resolution chroma rows
+/// (`top`, `bottom`, each `w` samples) into `out` (`⌈w/2⌉` samples); a
+/// trailing odd column averages its two samples.
+#[inline]
+fn chroma_pair_mean(top: &[u8], bottom: &[u8], out: &mut [u8]) {
+    let (top_pairs, top_rest) = top.as_chunks::<2>();
+    let (bottom_pairs, bottom_rest) = bottom.as_chunks::<2>();
+    for ((t, b), o) in top_pairs.iter().zip(bottom_pairs).zip(out.iter_mut()) {
+        *o = ((u16::from(t[0]) + u16::from(t[1]) + u16::from(b[0]) + u16::from(b[1]) + 2) >> 2)
+            as u8;
+    }
+    if let (Some(&t), Some(&b), Some(o)) = (top_rest.first(), bottom_rest.first(), out.last_mut()) {
+        *o = ((u16::from(t) + u16::from(b) + 1) >> 1) as u8;
+    }
+}
+
+/// Rounded mean of each horizontal pair of one full-resolution chroma
+/// row (the last row of an odd-height picture); a trailing odd column is
+/// copied.
+#[inline]
+fn chroma_row_mean(row: &[u8], out: &mut [u8]) {
+    let (pairs, rest) = row.as_chunks::<2>();
+    for (p, o) in pairs.iter().zip(out.iter_mut()) {
+        *o = ((u16::from(p[0]) + u16::from(p[1]) + 1) >> 1) as u8;
+    }
+    if let (Some(&v), Some(o)) = (rest.first(), out.last_mut()) {
+        *o = v;
+    }
+}
+
+/// Convert a band of packed RGB(A) rows to 4:2:0. `data` starts at the
+/// band's first row (an even picture row); `y` holds the band's luma
+/// rows, `cb` / `cr` its chroma rows (`⌈rows / 2⌉`).
+fn rgb_band_to_yuv420<const BPP: usize>(
+    width: usize,
+    data: &[u8],
+    stride: usize,
+    y: &mut [u8],
+    cb: &mut [u8],
+    cr: &mut [u8],
+) {
+    let cw = width.div_ceil(2);
+    // Full-resolution chroma of the row pair being averaged:
+    // [top Cb, top Cr, bottom Cb, bottom Cr].
+    let mut scratch = vec![0u8; 4 * width];
+    let (top, bottom) = scratch.split_at_mut(2 * width);
+    let (top_cb, top_cr) = top.split_at_mut(width);
+    let (bottom_cb, bottom_cr) = bottom.split_at_mut(width);
+    for (pair, ((y_rows, cb_row), cr_row)) in y
+        .chunks_mut(2 * width)
+        .zip(cb.chunks_exact_mut(cw))
+        .zip(cr.chunks_exact_mut(cw))
+        .enumerate()
+    {
+        let row = 2 * pair;
+        let src = &data[row * stride..row * stride + width * BPP];
+        if y_rows.len() == 2 * width {
+            let (y_top, y_bottom) = y_rows.split_at_mut(width);
+            row_to_ycbcr::<BPP>(src, y_top, top_cb, top_cr);
+            let src = &data[(row + 1) * stride..(row + 1) * stride + width * BPP];
+            row_to_ycbcr::<BPP>(src, y_bottom, bottom_cb, bottom_cr);
+            chroma_pair_mean(top_cb, bottom_cb, cb_row);
+            chroma_pair_mean(top_cr, bottom_cr, cr_row);
+        } else {
+            row_to_ycbcr::<BPP>(src, y_rows, top_cb, top_cr);
+            chroma_row_mean(top_cb, cb_row);
+            chroma_row_mean(top_cr, cr_row);
+        }
+    }
+}
+
+/// Pictures below this many pixels are converted on the calling thread
+/// whatever the budget: a thread costs more than it saves.
+const PARALLEL_CONVERT_MIN_PIXELS: usize = 256 * 1024;
+
 /// Convert packed 8-bit RGB(A) rows (`bpp` 3 or 4, `stride` bytes per row)
 /// to tightly packed limited-range 4:2:0 planes `(y, cb, cr)`. Each chroma
 /// sample is the rounded mean of the Cb / Cr of its 2×2 (or edge 2×1 /
 /// 1×2 / 1×1) luma block.
+///
+/// With `threads > 1` a large picture is split into bands of whole row
+/// pairs converted on scoped threads; every sample depends only on its
+/// own block, so the planes are the same for every `threads`.
 pub(crate) fn rgb_to_yuv420(
+    width: usize,
+    height: usize,
+    data: &[u8],
+    stride: usize,
+    bpp: usize,
+    threads: usize,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+    let mut y_plane = vec![0u8; width * height];
+    let mut cb_plane = vec![0u8; cw * ch];
+    let mut cr_plane = vec![0u8; cw * ch];
+    let band = |data: &[u8], y: &mut [u8], cb: &mut [u8], cr: &mut [u8]| {
+        if bpp == 3 {
+            rgb_band_to_yuv420::<3>(width, data, stride, y, cb, cr);
+        } else {
+            rgb_band_to_yuv420::<4>(width, data, stride, y, cb, cr);
+        }
+    };
+    let bands = if width * height < PARALLEL_CONVERT_MIN_PIXELS {
+        1
+    } else {
+        threads.clamp(1, ch)
+    };
+    if bands == 1 {
+        band(data, &mut y_plane, &mut cb_plane, &mut cr_plane);
+        return (y_plane, cb_plane, cr_plane);
+    }
+    // Chroma rows (= row pairs) per band, the first `ch % bands` bands
+    // taking one more.
+    let (base, extra) = (ch / bands, ch % bands);
+    let mut jobs = Vec::with_capacity(bands);
+    let (mut y_rest, mut cb_rest, mut cr_rest) =
+        (&mut y_plane[..], &mut cb_plane[..], &mut cr_plane[..]);
+    let mut first_pair = 0;
+    for index in 0..bands {
+        let pairs = base + usize::from(index < extra);
+        let luma_rows = (2 * pairs).min(height - 2 * first_pair);
+        let (y_band, y_tail) = y_rest.split_at_mut(luma_rows * width);
+        let (cb_band, cb_tail) = cb_rest.split_at_mut(pairs * cw);
+        let (cr_band, cr_tail) = cr_rest.split_at_mut(pairs * cw);
+        (y_rest, cb_rest, cr_rest) = (y_tail, cb_tail, cr_tail);
+        jobs.push((&data[2 * first_pair * stride..], y_band, cb_band, cr_band));
+        first_pair += pairs;
+    }
+    // Every thread (this one included) takes bands off the queue until
+    // it is empty, so a thread that fails to start costs nothing but
+    // time.
+    let queue = std::sync::Mutex::new(jobs);
+    let work = || {
+        loop {
+            let job = queue.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let Some((src, y, cb, cr)) = job else { break };
+            band(src, y, cb, cr);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..bands {
+            let _ = std::thread::Builder::new().spawn_scoped(scope, work);
+        }
+        work();
+    });
+    (y_plane, cb_plane, cr_plane)
+}
+
+/// The definition [`rgb_to_yuv420`] is checked against: per-block sums,
+/// counts and a rounded division, one sample at a time.
+#[cfg(test)]
+fn rgb_to_yuv420_reference(
     width: usize,
     height: usize,
     data: &[u8],
@@ -224,17 +391,13 @@ pub(crate) fn rgb_to_yuv420(
             cnt[ci] += 1;
         }
     }
-    let cb: Vec<u8> = cb_sum
-        .iter()
-        .zip(cnt.iter())
-        .map(|(&s, &n)| ((s + n / 2) / n.max(1)) as u8)
-        .collect();
-    let cr: Vec<u8> = cr_sum
-        .iter()
-        .zip(cnt.iter())
-        .map(|(&s, &n)| ((s + n / 2) / n.max(1)) as u8)
-        .collect();
-    (y_plane, cb, cr)
+    let mean = |sums: &[u32]| -> Vec<u8> {
+        sums.iter()
+            .zip(cnt.iter())
+            .map(|(&s, &n)| ((s + n / 2) / n.max(1)) as u8)
+            .collect()
+    };
+    (y_plane, mean(&cb_sum), mean(&cr_sum))
 }
 
 #[cfg(test)]
@@ -321,7 +484,7 @@ mod tests {
         for i in 0..9u8 {
             rgba.extend_from_slice(&[i * 20, 255 - i * 20, i * 7, 255]);
         }
-        let (y, cb, cr) = rgb_to_yuv420(w, 3, &rgba, w * 4, 4);
+        let (y, cb, cr) = rgb_to_yuv420(w, 3, &rgba, w * 4, 4, 1);
         assert_eq!(y.len(), 9);
         assert_eq!(cb.len(), 4);
         assert_eq!(cr.len(), 4);
@@ -329,5 +492,29 @@ mod tests {
         let [_, cb8, cr8] = rgb_to_ycbcr(160, 95, 56);
         assert_eq!(cb[3], cb8);
         assert_eq!(cr[3], cr8);
+    }
+
+    #[test]
+    fn rgb_to_yuv420_matches_the_per_sample_definition() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        };
+        // Odd / even sides, padded strides, both pixel sizes, and a
+        // picture large enough to split into bands.
+        for &(w, h) in &[(1, 1), (1, 2), (2, 1), (5, 4), (6, 7), (17, 33), (640, 411)] {
+            for bpp in [3usize, 4] {
+                let stride = w * bpp + 5;
+                let data: Vec<u8> = (0..stride * h).map(|_| next()).collect();
+                let want = rgb_to_yuv420_reference(w, h, &data, stride, bpp);
+                for threads in [1usize, 2, 3, 7, 64] {
+                    let got = rgb_to_yuv420(w, h, &data, stride, bpp, threads);
+                    assert!(got == want, "{w}x{h} bpp {bpp} threads {threads}");
+                }
+            }
+        }
     }
 }

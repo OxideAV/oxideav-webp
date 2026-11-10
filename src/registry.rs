@@ -406,12 +406,136 @@ impl Decoder for WebpDecoder {
 
 // ───────────────────────── Encoder + factory ─────────────────────────────
 
-/// Factory for the VP8L `Encoder` trait impl — installed in the codec
-/// registry under [`CODEC_ID_VP8L`]. Accepts `Rgba` / `Rgb24` input and
-/// always emits a lossless `.webp`; the framework path embeds no
-/// metadata (see [`make_encoder_with_metadata`]).
+/// Typed options of the registered `webp_vp8l` (lossless) encoder — the
+/// struct behind the `CodecParameters::options` bag
+/// [`make_encoder_from_param_options`] parses, and the argument of
+/// [`make_encoder_with_options`].
+///
+/// | key | kind | default | meaning |
+/// |---|---|---|---|
+/// | `effort` | u32 | `4` | search effort `0` (fastest) ..= `6` (exhaustive, smallest); every level is exactly lossless — see [`EncodeOptions::with_method`] |
+/// | `threads` | u32 | `0` | thread budget; `0` follows the `ExecutionContext` (serial when none is announced) |
+///
+/// The output bytes never depend on `threads`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WebpVp8lEncoderOptions {
+    /// Search effort, `0..=6`.
+    pub effort: u8,
+    /// Thread budget; `0` follows the announced `ExecutionContext`.
+    pub threads: usize,
+}
+
+impl Default for WebpVp8lEncoderOptions {
+    fn default() -> Self {
+        Self {
+            effort: crate::vp8l_encode::DEFAULT_LOSSLESS_METHOD,
+            threads: 0,
+        }
+    }
+}
+
+impl WebpVp8lEncoderOptions {
+    /// The defaults (see the table on the type).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `effort` (values above `6` are treated as `6`).
+    pub fn with_effort(mut self, effort: u8) -> Self {
+        self.effort = effort.min(crate::vp8l_encode::MAX_LOSSLESS_METHOD);
+        self
+    }
+
+    /// Set `threads`.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+}
+
+impl oxideav_core::CodecOptionsStruct for WebpVp8lEncoderOptions {
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[
+        oxideav_core::OptionField {
+            name: "effort",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(
+                crate::vp8l_encode::DEFAULT_LOSSLESS_METHOD as u32,
+            ),
+            help: "search effort: 0 fastest .. 6 exhaustive (always lossless)",
+        },
+        oxideav_core::OptionField {
+            name: "threads",
+            kind: oxideav_core::OptionKind::U32,
+            default: oxideav_core::OptionValue::U32(0),
+            help: "thread budget (0 = follow the execution context)",
+        },
+        oxideav_core::OptionField {
+            name: "loop_count",
+            kind: oxideav_core::OptionKind::String,
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "read by the webp muxer from the same stream parameters; the encoder ignores it",
+        },
+        oxideav_core::OptionField {
+            name: "background_color",
+            kind: oxideav_core::OptionKind::String,
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "read by the webp muxer from the same stream parameters; the encoder ignores it",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> oxideav_core::Result<()> {
+        match key {
+            "effort" => {
+                let v = value.as_u32()?;
+                let max = u32::from(crate::vp8l_encode::MAX_LOSSLESS_METHOD);
+                if v > max {
+                    return Err(CoreError::invalid(format!(
+                        "webp_vp8l encoder: option 'effort' out of range (0..={max}), got {v}"
+                    )));
+                }
+                self.effort = v as u8;
+            }
+            "threads" => self.threads = value.as_u32()? as usize,
+            // The muxer's keys ride in the same options bag.
+            "loop_count" | "background_color" => {}
+            other => {
+                return Err(CoreError::invalid(format!(
+                    "webp_vp8l encoder: unknown option '{other}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Factory for the VP8L `Encoder` trait impl at the default options.
+/// Accepts `Rgba` / `Rgb24` input and always emits a lossless `.webp`;
+/// the framework path embeds no metadata (see
+/// [`make_encoder_with_metadata`]).
 pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
-    make_encoder_with_metadata(params, WebpMetadataOwned::default())
+    make_encoder_with_options(params, &WebpVp8lEncoderOptions::default())
+}
+
+/// The registry's `webp_vp8l` encoder factory — installed under
+/// [`CODEC_ID_VP8L`]: parse `params.options` (strictly — an unknown key
+/// or a malformed value is an error) into [`WebpVp8lEncoderOptions`] and
+/// build the encoder from it. An empty bag gives the same encoder as
+/// [`make_encoder`].
+pub fn make_encoder_from_param_options(
+    params: &CodecParameters,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    let options = oxideav_core::parse_options::<WebpVp8lEncoderOptions>(&params.options)?;
+    make_encoder_with_options(params, &options)
+}
+
+/// Build the `webp_vp8l` encoder from typed [`WebpVp8lEncoderOptions`] —
+/// the direct twin of the registered factory.
+pub fn make_encoder_with_options(
+    params: &CodecParameters,
+    options: &WebpVp8lEncoderOptions,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    build_vp8l_encoder(params, WebpMetadataOwned::default(), options)
 }
 
 /// Direct factory: a VP8L encoder embedding `metadata` (ICC / Exif / XMP)
@@ -420,6 +544,14 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
 pub fn make_encoder_with_metadata(
     params: &CodecParameters,
     metadata: WebpMetadataOwned,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
+    build_vp8l_encoder(params, metadata, &WebpVp8lEncoderOptions::default())
+}
+
+fn build_vp8l_encoder(
+    params: &CodecParameters,
+    metadata: WebpMetadataOwned,
+    options: &WebpVp8lEncoderOptions,
 ) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -449,7 +581,9 @@ pub fn make_encoder_with_metadata(
         metadata: metadata.into(),
         pending_out: VecDeque::new(),
         eof: false,
-        threads: 1,
+        effort: options.effort,
+        option_threads: options.threads,
+        context_threads: 1,
     }))
 }
 
@@ -466,9 +600,13 @@ pub struct WebpVp8lEncoder {
     metadata: Metadata,
     pending_out: VecDeque<Packet>,
     eof: bool,
+    /// Search effort ([`WebpVp8lEncoderOptions::effort`]).
+    effort: u8,
+    /// Explicit thread budget from the options (`0` = none given).
+    option_threads: usize,
     /// Worker budget from [`Encoder::set_execution_context`]; serial
     /// until the framework grants more.
-    threads: usize,
+    context_threads: usize,
 }
 
 impl Encoder for WebpVp8lEncoder {
@@ -486,7 +624,13 @@ impl Encoder for WebpVp8lEncoder {
         };
         let img = WebpImage::from_video_frame_parts(v, self.width, self.height, self.pix)?
             .with_metadata(self.metadata.clone());
-        let opts = EncodeOptions::default().with_threads(self.threads);
+        let threads = match self.option_threads {
+            0 => self.context_threads,
+            n => n,
+        };
+        let opts = EncodeOptions::default()
+            .with_method(self.effort)
+            .with_threads(threads);
         let bytes = crate::encode(&img, &opts)?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 1000), bytes);
         pkt.pts = v.pts;
@@ -497,7 +641,7 @@ impl Encoder for WebpVp8lEncoder {
     }
 
     fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
-        self.threads = ctx.threads.max(1);
+        self.context_threads = ctx.threads.max(1);
     }
 
     fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
@@ -571,7 +715,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_VP8L))
             .capabilities(vp8l_caps)
             .decoder(make_decoder)
-            .encoder(make_encoder),
+            .encoder(make_encoder_from_param_options)
+            .encoder_options::<WebpVp8lEncoderOptions>(),
     );
 
     let vp8_caps = CodecCapabilities::video("webp_vp8_sw")
@@ -582,7 +727,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(crate::CODEC_ID_VP8))
             .capabilities(vp8_caps)
             .decoder(make_decoder)
-            .encoder(crate::encoder_vp8::make_encoder),
+            .encoder(crate::encoder_vp8::make_encoder_from_param_options)
+            .encoder_options::<crate::encoder_vp8::WebpVp8EncoderOptions>(),
     );
 }
 

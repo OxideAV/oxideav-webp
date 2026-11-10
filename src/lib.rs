@@ -144,7 +144,7 @@ pub mod vp8x;
 use oxideav_core::RuntimeContext;
 
 #[cfg(feature = "registry")]
-pub use registry::{WebpDecoder, make_decoder, make_encoder};
+pub use registry::{WebpDecoder, WebpVp8lEncoderOptions, make_decoder, make_encoder};
 
 /// Stable codec identifier the VP8L lossless encoder registers under in the
 /// codec registry — the published `"webp_vp8l"` name.

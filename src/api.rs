@@ -184,10 +184,11 @@ pub struct EncodeOptions {
     /// Default `4`.
     pub method: u8,
     /// Worker threads the encoder may use: the lossless search's
-    /// candidate evaluations and, on a lossy encode with alpha, the
-    /// `ALPH` plane next to the `VP8 ` encode. `0` (the default) uses
-    /// the host's available parallelism, `1` runs strictly on the
-    /// calling thread. The output bytes are the same for every value.
+    /// candidate evaluations; on a lossy encode the RGB to Y′CbCr
+    /// conversion, the `VP8 ` macroblock rows and, with alpha, the
+    /// `ALPH` plane next to them. `0` (the default) uses the host's
+    /// available parallelism, `1` runs strictly on the calling thread.
+    /// The output bytes are the same for every value.
     pub threads: usize,
 }
 
@@ -267,19 +268,29 @@ impl EncodeOptions {
     /// parse. Every level is exactly lossless; lower levels write somewhat
     /// larger files much faster.
     ///
-    /// Lossy (`VP8 `): `3..=4` write the output of earlier versions;
-    /// `5` adds the RFC 6386 §13.4 token-probability updates fitted to
-    /// the picture (a second pass, 4-26 % fewer bytes at the same
-    /// pixels); `6` also picks the §9.4 loop-filter level that minimises
-    /// the reconstruction error (better quality at the same size, about
-    /// 4-5x the default's time). `0..=2` turn the trellis quantiser off at
-    /// quality 90 and above, where that is faster (1.3-2x, 5-40 % more
-    /// bytes); below 90 plain quantisation is not faster and they encode
-    /// like `4`. The alpha plane is a lossless image and follows the
-    /// lossless levels.
+    /// Lossy (`VP8 `): `0`, `1` and `2` run a reduced macroblock mode
+    /// search — `2` compares every prediction mode with a cost model and
+    /// codes only the winners (about half the default's time for the
+    /// same size within a percent), `1` also shortlists the sub-block
+    /// modes, `0` shortlists harder and rounds coefficients plainly
+    /// (about a quarter of the time, a few percent more bytes). `3..=4`
+    /// are the exhaustive search and write the output of earlier
+    /// versions; `5` adds the RFC 6386 §13.4 token-probability updates
+    /// fitted to the picture (a second pass, 4-26 % fewer bytes at the
+    /// same pixels); `6` also picks the §9.4 loop-filter level that
+    /// minimises the reconstruction error (better quality at the same
+    /// size, about 3-4x the default's time). The alpha plane is a
+    /// lossless image and follows the lossless levels.
     pub fn with_method(mut self, method: u8) -> Self {
         self.method = method.min(vp8l_encode::MAX_LOSSLESS_METHOD);
         self
+    }
+
+    /// Builder: encoder effort — another name for
+    /// [`with_method`](Self::with_method), `0` (fastest) to `6` (slowest,
+    /// smallest output), matching the registry encoders' `effort` option.
+    pub fn with_effort(self, effort: u8) -> Self {
+        self.with_method(effort)
     }
 
     /// Builder: at most `threads` worker threads (`0` = the host's
@@ -1025,7 +1036,7 @@ pub fn encode(image: &WebpImage, opts: &EncodeOptions) -> Result<Vec<u8>, WebpEr
     let meta = opts.filtered_metadata(&image.metadata);
     vp8l_encode::with_thread_budget(opts.worker_budget(), || match opts.quality {
         None => encode_lossless(image, &meta, opts.method),
-        Some(q) => encode_lossy(image, q, &meta, opts.method),
+        Some(q) => encode_lossy(image, &meta, LossyTuning::for_quality(q, opts.method)),
     })
 }
 
@@ -1036,10 +1047,7 @@ pub fn encode_rgb8(
     rgb: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    if opts.quality.is_none() {
-        return encode_packed_lossless(width, height, rgb, 3, opts);
-    }
-    encode(&WebpImage::from_rgb8(width, height, rgb.to_vec())?, opts)
+    encode_packed(width, height, rgb, 3, opts)
 }
 
 /// Encode packed 8-bit RGBA (4 bytes per pixel, `width × height × 4`).
@@ -1049,18 +1057,15 @@ pub fn encode_rgba8(
     rgba: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    if opts.quality.is_none() {
-        return encode_packed_lossless(width, height, rgba, 4, opts);
-    }
-    encode(&WebpImage::from_rgba8(width, height, rgba.to_vec())?, opts)
+    encode_packed(width, height, rgba, 4, opts)
 }
 
-/// [`encode_rgb8`] / [`encode_rgba8`] on the lossless path, reading the
-/// caller's buffer in place instead of copying it into a [`WebpImage`]
-/// first (a 12 MP RGBA image saves 48 MB). The checks and errors are
-/// the ones [`WebpImage::new`] and [`encode`] apply, in the same order;
-/// there is no metadata to embed.
-fn encode_packed_lossless(
+/// [`encode_rgb8`] / [`encode_rgba8`]: the caller's buffer is read in
+/// place instead of being copied into a [`WebpImage`] first (a 12 MP
+/// RGBA image saves 48 MB). The checks and errors are the ones
+/// [`WebpImage::new`] and [`encode`] apply, in the same order; there is
+/// no metadata to embed.
+fn encode_packed(
     width: u32,
     height: u32,
     data: &[u8],
@@ -1090,8 +1095,13 @@ fn encode_packed_lossless(
     }
     let no_metadata = Metadata::default();
     let meta = opts.filtered_metadata(&no_metadata);
-    vp8l_encode::with_thread_budget(opts.worker_budget(), || {
-        encode_lossless_packed(width, height, data, row_bytes, bpp, &meta, opts.method)
+    vp8l_encode::with_thread_budget(opts.worker_budget(), || match opts.quality {
+        None => encode_lossless_packed(width, height, data, row_bytes, bpp, &meta, opts.method),
+        Some(q) => {
+            check_lossy_dimensions(width, height)?;
+            let tuning = LossyTuning::for_quality(q, opts.method);
+            encode_lossy_packed(width, height, data, row_bytes, bpp, &meta, tuning)
+        }
     })
 }
 
@@ -1161,49 +1171,114 @@ fn encode_lossless_packed(
     crate::encode_vp8l_argb_with_metadata_and_method(width, height, &argb, has_alpha, meta, method)
 }
 
-fn encode_lossy(
-    image: &WebpImage,
-    quality: f32,
-    meta: &crate::WebpMetadata<'_>,
-    method: u8,
-) -> Result<Vec<u8>, WebpError> {
-    let w = image.width as usize;
-    let h = image.height as usize;
-    let cw = w.div_ceil(2);
-    let ch = h.div_ceil(2);
-    // RFC 6386 §9.1: the key-frame width / height fields are 14 bits.
-    if image.width >= MAX_DIMENSION || image.height >= MAX_DIMENSION {
+/// The quantiser and effort of one lossy (`VP8 `) encode.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LossyTuning {
+    /// RFC 6386 §9.6 `y_ac_qi`, `0..=127`.
+    pub(crate) qindex: u8,
+    /// Strength of the trellis quantiser.
+    pub(crate) trellis: oxideav_vp8::TrellisStrength,
+    /// [`EncodeOptions::method`], `0..=6`.
+    pub(crate) method: u8,
+}
+
+impl LossyTuning {
+    /// The tuning of [`EncodeOptions::quality`] at effort `method`.
+    pub(crate) fn for_quality(quality: f32, method: u8) -> Self {
+        Self {
+            qindex: oxideav_vp8::encoder::quality_to_qindex(quality),
+            trellis: oxideav_vp8::encoder::quality_to_trellis_strength(quality),
+            method,
+        }
+    }
+
+    /// A bare quantiser index with the default trellis strength.
+    pub(crate) fn for_qindex(qindex: u8, method: u8) -> Self {
+        Self {
+            qindex: qindex.min(127),
+            trellis: oxideav_vp8::TrellisStrength::DEFAULT,
+            method,
+        }
+    }
+}
+
+/// RFC 6386 §9.1: the key-frame width / height fields are 14 bits.
+pub(crate) fn check_lossy_dimensions(width: u32, height: u32) -> Result<(), WebpError> {
+    if width >= MAX_DIMENSION || height >= MAX_DIMENSION {
         return Err(WebpError::invalid(format!(
-            "{}x{} exceeds the VP8 key-frame {} per-side ceiling",
-            image.width,
-            image.height,
+            "{width}x{height} exceeds the VP8 key-frame {} per-side ceiling",
             MAX_DIMENSION - 1
         )));
     }
+    Ok(())
+}
 
-    // Planes to feed the VP8 encoder, plus the alpha plane when any.
-    let (y, u, v, alpha): (Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>) = match image.format {
+/// The alpha samples of packed RGBA rows as one tight plane, or `None`
+/// when every pixel is opaque (the common case, answered by a scan that
+/// allocates nothing).
+fn packed_alpha_plane(width: usize, height: usize, data: &[u8], stride: usize) -> Option<Vec<u8>> {
+    let rows = || (0..height).map(|row| &data[row * stride..row * stride + width * 4]);
+    let opaque = rows().all(|row| {
+        row.as_chunks::<4>()
+            .0
+            .iter()
+            .fold(0xff, |all, px| all & px[3])
+            == 0xff
+    });
+    if opaque {
+        return None;
+    }
+    let mut alpha = Vec::with_capacity(width * height);
+    for row in rows() {
+        alpha.extend(row.as_chunks::<4>().0.iter().map(|px| px[3]));
+    }
+    Some(alpha)
+}
+
+/// The lossy encode of packed RGB(A) rows (`bpp` 3 or 4, geometry
+/// already checked): limited-range BT.601 4:2:0 conversion, then
+/// [`encode_lossy_planes`].
+fn encode_lossy_packed(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    stride: usize,
+    bpp: usize,
+    meta: &crate::WebpMetadata<'_>,
+    tuning: LossyTuning,
+) -> Result<Vec<u8>, WebpError> {
+    let (w, h) = (width as usize, height as usize);
+    let (y, u, v) = yuv::rgb_to_yuv420(w, h, data, stride, bpp, vp8l_encode::thread_budget());
+    let alpha = if bpp == 4 {
+        packed_alpha_plane(w, h, data, stride)
+    } else {
+        None
+    };
+    let frame = oxideav_vp8::I420Frame::packed(width, height, &y, &u, &v);
+    encode_lossy_planes(&frame, alpha.as_deref(), meta, tuning)
+}
+
+fn encode_lossy(
+    image: &WebpImage,
+    meta: &crate::WebpMetadata<'_>,
+    tuning: LossyTuning,
+) -> Result<Vec<u8>, WebpError> {
+    let w = image.width as usize;
+    let h = image.height as usize;
+    check_lossy_dimensions(image.width, image.height)?;
+    match image.format {
         WebpPixelFormat::Rgb24 | WebpPixelFormat::Rgba => {
             let bpp = image.format.packed_bytes_per_pixel().unwrap_or(4);
             let plane = &image.planes[0];
-            let (y, u, v) = yuv::rgb_to_yuv420(w, h, &plane.data, plane.stride, bpp);
-            let alpha = if bpp == 4 {
-                let mut a = Vec::with_capacity(w * h);
-                let mut used = false;
-                for row in 0..h {
-                    for px in plane.data[row * plane.stride..row * plane.stride + w * 4]
-                        .as_chunks::<4>()
-                        .0
-                    {
-                        used |= px[3] != 0xff;
-                        a.push(px[3]);
-                    }
-                }
-                used.then_some(a)
-            } else {
-                None
-            };
-            (y, u, v, alpha)
+            encode_lossy_packed(
+                image.width,
+                image.height,
+                &plane.data,
+                plane.stride,
+                bpp,
+                meta,
+                tuning,
+            )
         }
         WebpPixelFormat::Yuv420P | WebpPixelFormat::Yuva420P => {
             if image.color.range == crate::ColorRange::Full {
@@ -1211,6 +1286,9 @@ fn encode_lossy(
                     "VP8 cannot signal full-range Y'CbCr; supply limited-range planes or RGB",
                 ));
             }
+            // The VP8 encoder reads the planes in place at their strides;
+            // only a chroma pair with two different strides, or a padded
+            // alpha plane, is repacked.
             let tight = |p: &Plane, row_bytes: usize, rows: usize| -> Vec<u8> {
                 let mut out = Vec::with_capacity(row_bytes * rows);
                 for r in 0..rows {
@@ -1218,39 +1296,79 @@ fn encode_lossy(
                 }
                 out
             };
-            let y = tight(&image.planes[0], w, h);
-            let u = tight(&image.planes[1], cw, ch);
-            let v = tight(&image.planes[2], cw, ch);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let (y, u, v) = (&image.planes[0], &image.planes[1], &image.planes[2]);
+            // (A plane may also stop right after its last row's samples,
+            // short of a whole stride; the VP8 encoder wants whole rows.)
+            let whole_rows = |p: &Plane, rows: usize| p.data.len() / p.stride.max(1) >= rows;
+            let repacked_luma = (!whole_rows(y, h)).then(|| tight(y, w, h));
+            let (y_data, y_stride) = match &repacked_luma {
+                Some(y) => (&y[..], w),
+                None => (&y.data[..], y.stride),
+            };
+            let repacked_chroma =
+                (u.stride != v.stride || !whole_rows(u, ch) || !whole_rows(v, ch))
+                    .then(|| (tight(u, cw, ch), tight(v, cw, ch)));
+            let (u_data, v_data, uv_stride) = match &repacked_chroma {
+                Some((u, v)) => (&u[..], &v[..], cw),
+                None => (&u.data[..], &v.data[..], u.stride),
+            };
+            let frame = oxideav_vp8::I420Frame {
+                width: image.width,
+                height: image.height,
+                y: y_data,
+                u: u_data,
+                v: v_data,
+                y_stride,
+                uv_stride,
+            };
+            let repacked_alpha;
             let alpha = if image.format == WebpPixelFormat::Yuva420P {
-                Some(tight(&image.planes[3], w, h))
+                let a = &image.planes[3];
+                if a.stride == w {
+                    Some(&a.data[..w * h])
+                } else {
+                    repacked_alpha = tight(a, w, h);
+                    Some(&repacked_alpha[..])
+                }
             } else {
                 None
             };
-            (y, u, v, alpha)
+            encode_lossy_planes(&frame, alpha, meta, tuning)
         }
-    };
+    }
+}
 
-    let frame = oxideav_vp8::I420Frame::packed(image.width, image.height, &y, &u, &v);
+/// Encode 4:2:0 planes (read in place at their strides) plus an optional
+/// tight `width × height` alpha plane as a lossy `.webp`: the `VP8 ` key
+/// frame, the `ALPH` chunk, and the container around them.
+pub(crate) fn encode_lossy_planes(
+    frame: &oxideav_vp8::I420Frame<'_>,
+    alpha: Option<&[u8]>,
+    meta: &crate::WebpMetadata<'_>,
+    tuning: LossyTuning,
+) -> Result<Vec<u8>, WebpError> {
+    let (width, height) = (frame.width, frame.height);
+    let pixels = width as usize * height as usize;
+    let budget = vp8l_encode::thread_budget();
+    let method = tuning.method;
     // The `ALPH` plane is an independent lossless encode: on images large
     // enough to pay for a thread it runs next to the VP8 encode (same
     // bytes either way); otherwise, or when no thread can be spawned, it
     // runs after it.
-    let (width, height) = (image.width, image.height);
     let (vp8, alph_payload) = std::thread::scope(|scope| {
         let alpha_job = alpha
-            .as_ref()
-            .filter(|_| w * h >= LOSSY_ALPHA_THREAD_MIN_PIXELS && vp8l_encode::thread_budget() >= 2)
+            .filter(|_| pixels >= LOSSY_ALPHA_THREAD_MIN_PIXELS && budget >= 2)
             .and_then(|a| {
                 std::thread::Builder::new()
                     .spawn_scoped(scope, move || build_alph_payload(a, width, height, method))
                     .ok()
             });
-        let vp8 = encode_vp8_keyframe(&frame, quality, method);
+        let vp8_threads = budget - usize::from(alpha_job.is_some());
+        let vp8 = encode_vp8_keyframe(frame, tuning, vp8_threads);
         let alph = match alpha_job {
             Some(job) => Some(job.join().unwrap_or_else(|p| std::panic::resume_unwind(p))),
-            None => alpha
-                .as_ref()
-                .map(|a| build_alph_payload(a, width, height, method)),
+            None => alpha.map(|a| build_alph_payload(a, width, height, method)),
         };
         (vp8, alph)
     });
@@ -1261,8 +1379,8 @@ fn encode_lossy(
         return Ok(build::build_webp_file(
             &vp8,
             build::ImageKind::Lossy,
-            image.width,
-            image.height,
+            width,
+            height,
         )?);
     }
 
@@ -1274,7 +1392,7 @@ fn encode_lossy(
         has_xmp: meta.xmp.is_some(),
         has_animation: false,
     };
-    let vp8x_payload = build::build_vp8x_chunk(image.width, image.height, flags)?;
+    let vp8x_payload = build::build_vp8x_chunk(width, height, flags)?;
     let chunks: [(container::FourCc, Option<&[u8]>); 6] = [
         (fourcc::VP8X, Some(&vp8x_payload)),
         (fourcc::ICCP, meta.icc),
@@ -1297,17 +1415,6 @@ fn encode_lossy(
     file.finish()
 }
 
-/// Highest `EncodeOptions::method` at which the lossy path may turn the
-/// VP8 trellis quantiser off (plain rounding quantisation).
-const LOSSY_TRELLIS_OFF_MAX_METHOD: u8 = 2;
-
-/// Lowest quality at which those levels do turn it off. Plain
-/// quantisation only saves time when the quantiser is fine: on 800 x 533
-/// photo-like inputs it was 1.3-2x faster at quality 90-95 (5-40 % more
-/// bytes) but 0-50 % *slower* and 3-40 % larger at quality 30-85, so
-/// below this the low levels keep the trellis.
-const LOSSY_TRELLIS_OFF_MIN_QUALITY: f32 = 90.0;
-
 /// Lowest `EncodeOptions::method` that fits the RFC 6386 §13.4
 /// `token_prob_update()` layer to the picture (two passes; the smaller
 /// wire ships).
@@ -1322,41 +1429,36 @@ const LOSSY_AUTO_LOOP_FILTER_MIN_METHOD: u8 = 6;
 /// next to the VP8 encode.
 const LOSSY_ALPHA_THREAD_MIN_PIXELS: usize = 64 * 64;
 
-/// The VP8 trellis strength the lossy path uses at `quality` and
-/// `method`.
-fn lossy_trellis_strength(quality: f32, method: u8) -> oxideav_vp8::TrellisStrength {
-    if method <= LOSSY_TRELLIS_OFF_MAX_METHOD && quality >= LOSSY_TRELLIS_OFF_MIN_QUALITY {
-        oxideav_vp8::TrellisStrength::OFF
-    } else {
-        oxideav_vp8::encoder::quality_to_trellis_strength(quality)
+/// The VP8 mode-search effort of lossy `EncodeOptions::method` `0..=6`:
+/// `0`, `1` and `2` are the three reduced searches, everything above is
+/// the exhaustive one.
+pub(crate) fn lossy_mode_search(method: u8) -> oxideav_vp8::EncodeEffort {
+    match method {
+        0 => oxideav_vp8::EncodeEffort::Fastest,
+        1 => oxideav_vp8::EncodeEffort::Fast,
+        2 => oxideav_vp8::EncodeEffort::Balanced,
+        _ => oxideav_vp8::EncodeEffort::Thorough,
     }
 }
 
-/// Encode the `VP8 ` key frame of a lossy still at `quality` and lossy
-/// effort `method` (see [`EncodeOptions::with_method`]). Methods `3..=4`
-/// (and `0..=2` below quality 90) are the single-pass encode of earlier
-/// versions, byte for byte.
+/// Encode the `VP8 ` key frame of a lossy still under `tuning` (see
+/// [`EncodeOptions::with_method`]) on up to `threads` threads. Methods
+/// `3..=4` are the single-pass exhaustive encode of earlier versions,
+/// byte for byte; the bytes never depend on `threads`.
 fn encode_vp8_keyframe(
     frame: &oxideav_vp8::I420Frame<'_>,
-    quality: f32,
-    method: u8,
+    tuning: LossyTuning,
+    threads: usize,
 ) -> Result<Vec<u8>, oxideav_vp8::encoder::EncodeError> {
-    let params = oxideav_vp8::KeyframeParams {
-        y_ac_qi: oxideav_vp8::encoder::quality_to_qindex(quality),
-        trellis_strength: lossy_trellis_strength(quality, method),
-        ..oxideav_vp8::KeyframeParams::default()
-    };
-    if method < LOSSY_FITTED_PROBS_MIN_METHOD {
-        return oxideav_vp8::encode_keyframe(frame, &params);
-    }
-    let options = oxideav_vp8::encoder::KeyframeCodingOptions {
-        auto_loop_filter: method >= LOSSY_AUTO_LOOP_FILTER_MIN_METHOD,
-        fitted_token_prob_updates: true,
-    };
-    oxideav_vp8::encoder::encode_keyframe_with_reconstruction_and_coding_options(
-        frame, &params, &options,
-    )
-    .map(|(bytes, _planes)| bytes)
+    let params = oxideav_vp8::KeyframeParams::default()
+        .with_y_ac_qi(tuning.qindex)
+        .with_trellis_strength(tuning.trellis);
+    let options = oxideav_vp8::KeyframeEncodeOptions::new()
+        .with_effort(lossy_mode_search(tuning.method))
+        .with_threads(threads)
+        .with_fitted_token_prob_updates(tuning.method >= LOSSY_FITTED_PROBS_MIN_METHOD)
+        .with_auto_loop_filter(tuning.method >= LOSSY_AUTO_LOOP_FILTER_MIN_METHOD);
+    oxideav_vp8::encode_keyframe_with_options(frame, &params, &options)
 }
 
 /// A `RIFF` / `WEBP` file assembled chunk by chunk in one buffer: each

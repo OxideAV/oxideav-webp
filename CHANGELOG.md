@@ -6,34 +6,40 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
-- **Lossy `EncodeOptions::method` ladder** (#47). `3..=4` stay the
-  single-pass encode (the default output is unchanged byte-for-byte,
-  `tests/lossy_output_pins.rs`). New: `5` fits the RFC 6386 §13.4
+- **Lossy `EncodeOptions::method` ladder** (#47). `0`, `1` and `2` are
+  the VP8 encoder's three reduced macroblock mode searches (`2` compares
+  every prediction mode with a cost model and codes only the winners,
+  `1` also shortlists the sub-block modes, `0` shortlists harder and
+  rounds coefficients plainly); `3..=4` stay the exhaustive single-pass
+  encode (the default output is unchanged byte-for-byte,
+  `tests/lossy_output_pins.rs`); `5` fits the RFC 6386 §13.4
   token-probability updates to the picture (two passes, the smaller wire
   ships: never larger than `4`); `6` also picks the §9.4 loop-filter
-  level that minimises the reconstruction error. Changed: `0..=2` turn
-  the trellis quantiser off only at quality 90 and above. Measured with
-  the current VP8 encoder, plain quantisation below 90 was slower *and*
-  3-40 % larger than the trellis, so those levels now encode like `4`
-  there (0.3.2 output changes for methods `0..=2` below quality 90 and
-  for `5..=6`). 800 x 533 photo-like image (generated: 1/f noise, shaded
-  disks, sensor noise), one thread, PSNR of the `dwebp` decode:
-
-  | quality | method | time | bytes | PSNR |
-  |---|---|---|---|---|
-  | 80 | 0..=4 | 40 ms | 10 526 | 39.75 dB |
-  | 80 | 5 | 84 ms | 9 676 | 39.78 dB |
-  | 80 | 6 | 190 ms | 9 676 | 40.67 dB |
-  | 95 | 0..=2 | 58 ms | 41 526 | 42.22 dB |
-  | 95 | 3..=4 | 86 ms | 29 368 | 42.33 dB |
-  | 95 | 5 | 176 ms | 27 364 | 42.32 dB |
-  | 95 | 6 | 311 ms | 27 364 | 42.49 dB |
-
-  (`cwebp -q 80`: `-m 0` 13 934 B / 40.57 dB, `-m 4` 11 292 B /
-  41.04 dB, `-m 6` 11 130 B / 41.05 dB.) A faster-than-default lossy
-  level below quality 90 needs a cheaper mode search in the VP8 encoder,
-  which exposes none. Oracle direction H now runs methods 0, 4, 5, 6 at
-  quality 70 and 0, 6 at 95 through `dwebp`.
+  level that minimises the reconstruction error. (0.3.2 output changes
+  for methods `0..=2` and `5..=6`.) Timings and sizes: the README's
+  performance tables. Oracle direction H runs methods 0, 4, 5, 6 at
+  quality 70 and 0, 6 at 95 through a black-box decoder.
+- **The lossy encode uses the thread budget.** `EncodeOptions::threads`
+  (and the registry encoders' budget) now reaches the RGB to Y′CbCr
+  conversion (bands of row pairs) and the VP8 key-frame encode
+  (macroblock rows as a wavefront), next to the `ALPH` plane that
+  already ran on its own thread. The bytes are the same for every
+  budget (`tests/lossy_effort.rs`, `tests/registry_encoder_options.rs`,
+  fuzz target `lossy_effort_threads`).
+- Lossy encode, around the VP8 call: `encode_rgb8` / `encode_rgba8` read
+  the caller's buffer in place (no `WebpImage` copy); the RGB to 4:2:0
+  conversion is two straight per-row passes (fixed-size pixels, pairwise
+  rounded means) instead of per-pixel sum / count tables with a division
+  per chroma sample — same planes, checked against the per-sample
+  definition for odd sizes, padded strides and every band count; an
+  opaque RGBA picture is recognised by a scan that allocates nothing;
+  `Yuv420P` / `Yuva420P` planes go to the VP8 encoder in place at their
+  strides instead of through tight copies.
+- The `webp_vp8` framework encoder is the same implementation as
+  `encode` / `Vp8LossyEncoder` (planes read in place from the frame; it
+  used to copy them twice through a wrapped VP8 framework encoder), and
+  it follows a `Frame::StreamParams` size change, which used to surface
+  as an error from `send_frame`.
 - The §5.2.2 hash-chain matcher starts its running best just below the
   3-pixel minimum match, so a chain candidate must agree at offset 2
   before its run is measured: hash-collision candidates (most of a long
@@ -56,6 +62,22 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- Registry encoder options. `webp_vp8`: `effort` (`0..=6`, default `4`),
+  `threads` (`0` = follow the `ExecutionContext`), `qindex`, `quality`
+  — typed as `encoder_vp8::WebpVp8EncoderOptions`, with
+  `encoder_vp8::make_encoder_with_options` /
+  `make_encoder_from_param_options`. `webp_vp8l`: `effort`, `threads` —
+  `WebpVp8lEncoderOptions`, `registry::make_encoder_with_options` /
+  `make_encoder_from_param_options`. Both schemas are published through
+  `CodecRegistry::encoder_options_schema`; unknown keys and out-of-range
+  values are refused, except the muxer's `loop_count` /
+  `background_color`, which share the stream's options bag. An explicit
+  `threads` option wins over the execution context.
+- `EncodeOptions::with_effort` (the registry option's name for
+  `with_method`); `Vp8LossyEncoder::with_effort` / `with_threads` /
+  `effort` / `threads`; `encoder_vp8::DEFAULT_EFFORT` / `MAX_EFFORT`.
+- `benches/still_matrix.rs`: size x effort x threads -> ms and bytes for
+  lossy and lossless encode and decode (prints the README tables).
 - `AnimFrame::with_position` / `with_duration` / `with_blend` /
   `with_dispose` / `with_mode`; `DeltaConfig::with_max_components` /
   `with_auto_inner_threshold_bytes` / `with_msssim_downsample_kernel`;

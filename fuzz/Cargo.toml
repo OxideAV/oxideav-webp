@@ -886,6 +886,16 @@ test = false
 doc = false
 bench = false
 
+# The lossy effort levels 0..=6 (reduced mode searches, fitted token
+# probabilities, loop-filter search) through `encode_rgba8`, serial vs a
+# 2..=5-worker budget: byte-identical output, right size, exact alpha.
+[[bin]]
+name = "lossy_effort_threads"
+path = "fuzz_targets/lossy_effort_threads.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "demux"
 path = "fuzz_targets/demux.rs"

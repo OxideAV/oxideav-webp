@@ -169,21 +169,47 @@ before any pixel buffer is allocated; a hit is `Error::LimitExceeded`.
 
 `EncodeOptions` (`Default` + `with_*`): `quality: Option<f32>` (`None` =
 lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
-strength), `method` (`0..=6`, default `4`: encoder effort — lossless
-`6` is the exhaustive search, lower levels screen fewer candidates with
-a cheaper parse and write somewhat larger files much faster, every
-level exactly lossless; lossy `5` fits the VP8 token probabilities to
-the picture (about 8 % smaller at quality 80, twice the time) and `6`
-also searches the loop-filter level (+0.9 dB at quality 80, about 5x the
-time); lossy `0..=2` drop the trellis quantiser at quality 90 and up,
-1.5x faster for larger files, and encode like `4` below), `threads`
-(default `0` = the host's parallelism, `1` = serial; never changes the
-output bytes), `embed_icc` / `embed_exif` / `embed_xmp`
-(default on — the image's metadata is written when present), and for
-animations
-`loop_count` (`0` = forever), `background_rgba`, `frame_mode`
-(`Auto` / `Delta` / `Lossless` dirty-rectangle strategy) and `delta`.
-One struct for stills and animations; behaviour variants are fields.
+strength), `method` / `with_effort` (`0..=6`, default `4`: encoder
+effort, see the table below), `threads` (default `0` = the host's
+parallelism, `1` = serial; never changes the output bytes),
+`embed_icc` / `embed_exif` / `embed_xmp` (default on — the image's
+metadata is written when present), and for animations `loop_count`
+(`0` = forever), `background_rgba`, `frame_mode` (`Auto` / `Delta` /
+`Lossless` dirty-rectangle strategy) and `delta`. One struct for stills
+and animations; behaviour variants are fields.
+
+| Effort | Lossy (`VP8 `) | Lossless (`VP8L`, `ALPH`, animation frames) |
+|---|---|---|
+| `0` | prediction modes shortlisted by prediction error, plain coefficient rounding | two transform candidates screened with a reduced-effort parse, one prefix-code group |
+| `1` | sub-block modes shortlisted, winners trellis-quantised | four candidates; multi-group entropy layouts tried |
+| `2` | every mode compared with a cost model, only winners coded | + the colour-transform candidate |
+| `3` | exhaustive rate-distortion mode search | + entropy-driven predictor choices |
+| `4` (default) | as `3` | + the winner re-planned with the cost-priced parse |
+| `5` | `4` + token probabilities fitted to the picture (second pass) | + more colour-transform candidates |
+| `6` | `5` + loop-filter level chosen by reconstruction error | exhaustive transform / colour-cache / parse search (above 2 Mpx: `5`'s screening and a second, deeper parse) |
+
+Every lossless level is exactly lossless; every lossy level writes a
+conformant key frame. Measured times and sizes: [Performance](#performance).
+
+The registered encoders take the same controls as options
+(`CodecParameters::options`, schemas published through the codec
+registry): `webp_vp8` — `effort`, `threads`, `qindex`, `quality`
+(`encoder_vp8::WebpVp8EncoderOptions`); `webp_vp8l` — `effort`,
+`threads` (`WebpVp8lEncoderOptions`). `threads = 0` follows the
+`ExecutionContext` the framework announces (serial when none is).
+
+```rust
+# use oxideav_core::{CodecId, CodecParameters, ExecutionContext, RuntimeContext};
+# let mut ctx = RuntimeContext::new();
+# oxideav_webp::register(&mut ctx);
+let mut params = CodecParameters::video(CodecId::new(oxideav_webp::CODEC_ID_VP8));
+params.width = Some(800);
+params.height = Some(533);
+params.options = params.options.set("quality", "80").set("effort", "2");
+let mut encoder = ctx.codecs.first_encoder(&params)?;
+encoder.set_execution_context(&ExecutionContext::with_threads(4));
+# Ok::<(), oxideav_core::Error>(())
+```
 
 ## Metadata and colour
 
