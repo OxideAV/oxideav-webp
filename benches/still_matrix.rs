@@ -182,13 +182,19 @@ fn encode_section(
     sizes: &[(u32, u32)],
     runs: usize,
 ) {
-    encode_section_with(title, base, methods, threads, sizes, runs, false);
+    let rows: Vec<(String, EncodeOptions)> = methods
+        .iter()
+        .map(|&m| (m.to_string(), base.clone().with_method(m)))
+        .collect();
+    encode_rows(title, &rows, threads, sizes, runs, false);
 }
 
-fn encode_section_with(
+/// One table: a row per `(effort label, options)` and size, a column
+/// per thread budget. With `alpha` the input is RGBA with an alpha
+/// plane, else RGB.
+fn encode_rows(
     title: &str,
-    base: &EncodeOptions,
-    methods: &[u8],
+    rows: &[(String, EncodeOptions)],
     threads: &[usize],
     sizes: &[(u32, u32)],
     runs: usize,
@@ -207,12 +213,12 @@ fn encode_section_with(
         } else {
             photo_rgb(w, h)
         };
-        for &method in methods {
-            print!("| {w}x{h} | {method} |");
+        for (label, options) in rows {
+            print!("| {w}x{h} | {label} |");
             let mut bytes = None;
             let mut hash = 0u64;
             for &t in threads {
-                let opts = base.clone().with_method(method).with_threads(t);
+                let opts = options.clone().with_threads(t);
                 let (d, out) = time_median(runs, || {
                     if alpha {
                         encode_rgba8(w, h, &pixels, &opts).expect("encode")
@@ -364,10 +370,15 @@ fn main() {
         );
     }
     if wants("alpha") {
-        encode_section_with(
+        let lossy = EncodeOptions::default().with_quality(80.0);
+        encode_rows(
             "Lossy encode with an alpha plane, quality 80 (`encode_rgba8`)",
-            &EncodeOptions::default().with_quality(80.0),
-            &[0, 2, 4],
+            &[
+                ("0".into(), lossy.clone().with_method(0)),
+                ("2".into(), lossy.clone().with_method(2)),
+                ("4, alpha 2".into(), lossy.clone().with_alpha_method(2)),
+                ("4".into(), lossy),
+            ],
             &[1, 4, 8],
             &sizes,
             runs,

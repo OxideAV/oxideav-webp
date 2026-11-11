@@ -188,3 +188,66 @@ fn effort_alias_and_entry_points_agree() {
         );
     }
 }
+
+/// `with_alpha_method` sets the alpha plane's effort alone: the `VP8 `
+/// chunk is the one `method` writes, the `ALPH` chunk the one the alpha
+/// level writes, and the plane is exact.
+#[test]
+fn alpha_method_is_independent_of_the_picture_method() {
+    let (w, h) = (120u32, 88u32);
+    let mut rgba = common::photo_rgba(w, h);
+    for (i, px) in rgba.chunks_mut(4).enumerate() {
+        let (x, y) = (i as u32 % w, i as u32 / w);
+        let d = (x as i32 - 60).pow(2) + (y as i32 - 44).pow(2);
+        px[3] = (255 - (d / 12).min(255)) as u8;
+    }
+    let chunk = |file: &[u8], tag: &[u8; 4]| -> Vec<u8> {
+        let at = file
+            .windows(4)
+            .position(|c| c == tag)
+            .unwrap_or_else(|| panic!("no {} chunk", String::from_utf8_lossy(tag)));
+        let len = u32::from_le_bytes(file[at + 4..at + 8].try_into().unwrap()) as usize;
+        file[at + 8..at + 8 + len].to_vec()
+    };
+    let encode = |opts: &EncodeOptions| encode_rgba8(w, h, &rgba, opts).expect("encode");
+    let base = EncodeOptions::default().with_quality(80.0);
+    let default = encode(&base);
+    let quick_everything = encode(&base.clone().with_method(2));
+    let quick_alpha = encode(&base.clone().with_alpha_method(2));
+    assert_eq!(
+        chunk(&quick_alpha, b"VP8 "),
+        chunk(&default, b"VP8 "),
+        "the picture keeps the default bytes"
+    );
+    assert_eq!(
+        chunk(&quick_alpha, b"ALPH"),
+        chunk(&quick_everything, b"ALPH"),
+        "the alpha plane is the quick coder's"
+    );
+    assert_ne!(chunk(&quick_alpha, b"ALPH"), chunk(&default, b"ALPH"));
+    // The other way round: a quick picture with a searched alpha plane.
+    let searched_alpha = encode(&base.clone().with_method(2).with_alpha_effort(4));
+    assert_eq!(chunk(&searched_alpha, b"ALPH"), chunk(&default, b"ALPH"));
+    assert_eq!(
+        chunk(&searched_alpha, b"VP8 "),
+        chunk(&quick_everything, b"VP8 ")
+    );
+    // Naming the level `method` already implies changes nothing.
+    assert_eq!(encode(&base.clone().with_alpha_method(4)), default);
+    let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
+    for file in [&default, &quick_alpha, &searched_alpha] {
+        let back: Vec<u8> = decode(file)
+            .expect("decode")
+            .to_rgba8()
+            .chunks(4)
+            .map(|p| p[3])
+            .collect();
+        assert_eq!(back, alpha);
+    }
+    // A lossless encode has no separate alpha plane to tune.
+    let lossless = EncodeOptions::default();
+    assert_eq!(
+        encode(&lossless.clone().with_alpha_method(0)),
+        encode(&lossless)
+    );
+}

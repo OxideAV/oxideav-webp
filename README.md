@@ -171,7 +171,8 @@ before any pixel buffer is allocated; a hit is `Error::LimitExceeded`.
 `EncodeOptions` (`Default` + `with_*`): `quality: Option<f32>` (`None` =
 lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
 strength), `method` / `with_effort` (`0..=6`, default `4`: encoder
-effort, see the table below), `threads` (default `0` = the host's
+effort, see the table below), `alpha_method` (lossy only: the alpha
+plane's effort when it should differ from `method`), `threads` (default `0` = the host's
 parallelism, `1` = serial; never changes the output bytes),
 `embed_icc` / `embed_exif` / `embed_xmp` (default on — the image's
 metadata is written when present), and for animations `loop_count`
@@ -195,7 +196,8 @@ at efforts `0..=2` it is coded quickly (the §2.7.1.2 filter with the
 cheapest residuals, then one lossless stream), at `3..=6` by the
 lossless search of the same level — several times slower than the `VP8 `
 encode itself on a large picture, for an `ALPH` chunk that is usually
-within a few percent either way. Measured times and sizes: [Performance](#performance).
+within a few percent either way. `with_alpha_method(2)` picks the quick
+coder for the plane and leaves the picture at its effort. Measured times and sizes: [Performance](#performance).
 
 The `webp_vp8l` encoder takes `Rgba` / `Rgb24` frames; the `webp_vp8`
 encoder takes `Yuv420P` (limited-range BT.601, coded as given),
@@ -206,8 +208,8 @@ strides and becomes one `.webp` packet.
 
 The registered encoders take the same controls as options
 (`CodecParameters::options`, schemas published through the codec
-registry): `webp_vp8` — `effort`, `threads`, `qindex`, `quality`
-(`encoder_vp8::WebpVp8EncoderOptions`); `webp_vp8l` — `effort`,
+registry): `webp_vp8` — `effort`, `threads`, `qindex`, `quality`,
+`alpha_effort` (`encoder_vp8::WebpVp8EncoderOptions`); `webp_vp8l` — `effort`,
 `threads` (`WebpVp8lEncoderOptions`). `threads = 0` follows the
 `ExecutionContext` the framework announces (serial when none is).
 

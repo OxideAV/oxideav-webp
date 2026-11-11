@@ -21,7 +21,7 @@
 //! * [`WebpVp8EncoderOptions`], [`make_encoder_with_options`],
 //!   [`make_encoder_from_param_options`] — the typed options of the
 //!   registered `webp_vp8` encoder (`effort`, `threads`, `qindex`,
-//!   `quality`) and the factories that take them.
+//!   `quality`, `alpha_effort`) and the factories that take them.
 //! * [`Vp8LossyEncoder`] — the same encoder with a direct constructor,
 //!   no framework types.
 //!
@@ -355,6 +355,7 @@ use std::collections::VecDeque;
 /// | `effort` | u32 | `4` | encoder effort `0` (fastest) ..= `6` (smallest); see [`EncodeOptions::with_method`](crate::EncodeOptions::with_method) |
 /// | `threads` | u32 | `0` | thread budget; `0` follows the `ExecutionContext` (serial when none is announced) |
 /// | `qindex` | u32 | `32` | RFC 6386 §9.6 quantiser index `0..=127`, lower is better |
+/// | `alpha_effort` | i32 | `-1` | effort `0..=6` of the alpha plane's coder (`Yuva420P` / `Rgba` input); negative follows `effort` — see [`EncodeOptions::with_alpha_method`](crate::EncodeOptions::with_alpha_method) |
 /// | `quality` | f32 | `-1` | `0..=100`, higher is better; when ≥ 0 it replaces `qindex` and also sets the trellis strength, giving the bytes of [`EncodeOptions::with_quality`](crate::EncodeOptions::with_quality) on the same planes |
 ///
 /// The output bytes never depend on `threads`.
@@ -370,6 +371,9 @@ pub struct WebpVp8EncoderOptions {
     pub qindex: u8,
     /// `0..=100` quality; `None` uses `qindex`.
     pub quality: Option<f32>,
+    /// Effort of the alpha plane's coder, `0..=6`; `None` follows
+    /// `effort`.
+    pub alpha_effort: Option<u8>,
 }
 
 #[cfg(feature = "registry")]
@@ -380,6 +384,7 @@ impl Default for WebpVp8EncoderOptions {
             threads: 0,
             qindex: DEFAULT_QINDEX,
             quality: None,
+            alpha_effort: None,
         }
     }
 }
@@ -419,6 +424,12 @@ impl WebpVp8EncoderOptions {
         self.quality = quality;
         self
     }
+
+    /// Set `alpha_effort` (values above `6` are treated as `6`).
+    pub fn with_alpha_effort(mut self, alpha_effort: Option<u8>) -> Self {
+        self.alpha_effort = alpha_effort.map(|level| level.min(MAX_EFFORT));
+        self
+    }
 }
 
 #[cfg(feature = "registry")]
@@ -441,6 +452,12 @@ impl oxideav_core::CodecOptionsStruct for WebpVp8EncoderOptions {
             kind: oxideav_core::OptionKind::U32,
             default: oxideav_core::OptionValue::U32(DEFAULT_QINDEX as u32),
             help: "quantiser index 0..=127 (lower = better)",
+        },
+        oxideav_core::OptionField {
+            name: "alpha_effort",
+            kind: oxideav_core::OptionKind::I32,
+            default: oxideav_core::OptionValue::I32(-1),
+            help: "effort 0..=6 of the alpha plane's coder (negative = follow effort)",
         },
         oxideav_core::OptionField {
             name: "quality",
@@ -476,6 +493,15 @@ impl oxideav_core::CodecOptionsStruct for WebpVp8EncoderOptions {
             "effort" => self.effort = bounded(value.as_u32()?, u32::from(MAX_EFFORT))?,
             "threads" => self.threads = value.as_u32()? as usize,
             "qindex" => self.qindex = bounded(value.as_u32()?, 127)?,
+            "alpha_effort" => {
+                let level = value.as_i32()?;
+                if level > i32::from(MAX_EFFORT) {
+                    return Err(CoreError::invalid(format!(
+                        "webp_vp8 encoder: option 'alpha_effort' out of range (0..={MAX_EFFORT}), got {level}"
+                    )));
+                }
+                self.alpha_effort = u8::try_from(level).ok();
+            }
             "quality" => {
                 let q = value.as_f32()?;
                 self.quality = (q >= 0.0).then_some(q);
@@ -574,7 +600,8 @@ pub fn make_encoder_with_options(
     let tuning = match options.quality {
         Some(quality) => crate::api::LossyTuning::for_quality(quality, effort),
         None => crate::api::LossyTuning::for_qindex(options.qindex, effort),
-    };
+    }
+    .with_alpha_method(options.alpha_effort);
     let mut output_params = params.clone();
     output_params.media_type = MediaType::Video;
     output_params.codec_id = CodecId::new(crate::CODEC_ID_VP8);

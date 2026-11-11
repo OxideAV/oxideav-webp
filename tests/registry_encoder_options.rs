@@ -78,7 +78,7 @@ fn schemas_are_published() {
     for (codec, keys) in [
         (
             CODEC_ID_VP8,
-            &["effort", "threads", "qindex", "quality"][..],
+            &["effort", "threads", "qindex", "quality", "alpha_effort"][..],
         ),
         (CODEC_ID_VP8L, &["effort", "threads"][..]),
     ] {
@@ -387,6 +387,21 @@ fn lossy_encoder_takes_rgb_and_alpha_layouts() {
     assert_eq!(decoded.format, oxideav_webp::PixelFormat::Yuva420P);
     let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
     assert_eq!(decoded.planes[3].data, alpha);
+
+    // `alpha_effort` sets the alpha plane's coder alone.
+    let mut tuned = with_options(PixelFormat::Rgba);
+    tuned.options = tuned.options.set("effort", "4").set("alpha_effort", "1");
+    let file = one_packet(
+        ctx.codecs.first_encoder(&tuned).expect("encoder"),
+        &packed(w as usize * 4, w as usize * 4, &rgba),
+    );
+    let layer1_tuned = EncodeOptions::default()
+        .with_quality(70.0)
+        .with_alpha_effort(1);
+    assert!(file == oxideav_webp::encode_rgba8(w, h, &rgba, &layer1_tuned).expect("encode"));
+    let mut bad = with_options(PixelFormat::Rgba);
+    bad.options = bad.options.set("alpha_effort", "7");
+    assert!(ctx.codecs.first_encoder(&bad).is_err(), "alpha_effort 7");
 
     // RGB: the simple lossy layout.
     let file = one_packet(
