@@ -35,6 +35,24 @@ All notable changes to `oxideav-webp` are recorded here.
   opaque RGBA picture is recognised by a scan that allocates nothing;
   `Yuv420P` / `Yuva420P` planes go to the VP8 encoder in place at their
   strides instead of through tight copies.
+- **Alpha plane of a lossy encode.** At lossy methods `0..=2` the
+  `ALPH` chunk comes from a quick coder: the RFC 9649 §2.7.1.2 filter
+  (none / horizontal / vertical / gradient) with the lowest residual
+  entropy, then the residual plane as a single-candidate lossless stream
+  (through color indexing when it holds at most 16 values) — instead of
+  the lossless transform search, which at those levels screens
+  candidates built for three-channel pictures. The plane stays exact.
+  2400 x 1600, 8 threads, whole RGBA encode at method 2: 70-190 ms
+  against 0.8-2.8 s at method 4, with `ALPH` chunks from 85 % smaller to
+  23 % larger than the search's (five synthetic planes: soft disc, ramp,
+  wide falloff, sinusoid, blocks). Methods `3..=6` keep the search and
+  their bytes, but the search now runs on the larger half of the thread
+  budget (it used to run on one thread next to the VP8 encode): the same
+  encode at method 4, 8 threads, 1.4-4.2 s to 0.8-2.8 s.
+- Lossless: the palette lookup of the §4.4 color-indexing candidates is
+  an open-addressed table probed from a multiplicative hash, consulted
+  only where a pixel differs from its predecessor (it was a `HashMap`
+  hashed per pixel, per candidate). Same bytes.
 - **Animation frames are encoded concurrently.** The canvas a decoder
   holds before each frame follows from the caller's pixels alone, so the
   encoder snapshots it per frame and encodes up to `threads` frames at

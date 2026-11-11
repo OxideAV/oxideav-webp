@@ -1462,14 +1462,25 @@ fn encode_lossy_parts(
     // bytes either way); otherwise, or when no thread can be spawned, it
     // runs after it.
     let (vp8, alph_payload) = std::thread::scope(|scope| {
+        // The budget is split between the two encodes; the lossless
+        // search behind the alpha plane is the longer one at every
+        // effort, so it gets the larger half.
+        let alpha_threads = budget - budget / 2;
         let alpha_job = alpha
             .filter(|_| pixels >= LOSSY_ALPHA_THREAD_MIN_PIXELS && budget >= 2)
             .and_then(|a| {
                 std::thread::Builder::new()
-                    .spawn_scoped(scope, move || build_alph_payload(a, width, height, method))
+                    .spawn_scoped(scope, move || {
+                        vp8l_encode::with_thread_budget(alpha_threads, || {
+                            build_alph_payload(a, width, height, method)
+                        })
+                    })
                     .ok()
             });
-        let vp8_threads = budget - usize::from(alpha_job.is_some());
+        let vp8_threads = match alpha_job {
+            Some(_) => budget - alpha_threads,
+            None => budget,
+        };
         let vp8 = encode_vp8_keyframe(frame, tuning, vp8_threads);
         let alph = match alpha_job {
             Some(job) => Some(job.join().unwrap_or_else(|p| std::panic::resume_unwind(p))),
@@ -1489,6 +1500,11 @@ const LOSSY_FITTED_PROBS_MIN_METHOD: u8 = 5;
 /// level minimising the post-§15 reconstruction error (the default
 /// writes level 0, no filter).
 const LOSSY_AUTO_LOOP_FILTER_MIN_METHOD: u8 = 6;
+
+/// Highest `EncodeOptions::method` at which the alpha plane of a lossy
+/// encode goes through the quick `ALPH` coder (a §2.7.1.2 filter and a
+/// single-candidate lossless stream) instead of the lossless search.
+const LOSSY_QUICK_ALPHA_MAX_METHOD: u8 = vp8l_encode::MAX_VALUE_PLANE_EFFORT;
 
 /// Alpha planes at least this many pixels are coded on their own thread
 /// next to the VP8 encode.
@@ -1589,6 +1605,9 @@ pub(crate) fn frame_riff(body: Vec<u8>) -> Result<Vec<u8>, WebpError> {
 /// and method `0`, the raw plane. Filtering `F = 0`, preprocessing
 /// `P = 0`.
 pub(crate) fn build_alph_payload(alpha: &[u8], width: u32, height: u32, method: u8) -> Vec<u8> {
+    if method <= LOSSY_QUICK_ALPHA_MAX_METHOD {
+        return alph::build_alph_payload_quick(alpha, width, height, method);
+    }
     let argb: Vec<u32> = alpha
         .iter()
         .map(|&a| 0xff00_0000 | (u32::from(a) << 8))

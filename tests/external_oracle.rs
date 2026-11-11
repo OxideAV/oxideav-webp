@@ -916,3 +916,99 @@ fn direction_h_lossy_methods_are_readable_by_reference_decoder() {
         assert_eq!(ref_alpha, src_alpha, "method {method}: alpha plane");
     }
 }
+
+/// Direction I — the reduced lossy efforts (`method` 0, 1, 2): the
+/// black-box decoder reconstructs the pixels this crate's decoder does
+/// (within the ±1 of its own colour conversion) and the alpha plane
+/// exactly, for alpha planes that each make a different §2.7.1.2
+/// filtering method the cheapest (so every `F` value the quick `ALPH`
+/// coder writes is read back by an independent decoder), on one thread
+/// and on four.
+#[test]
+fn direction_i_reduced_efforts_and_filtered_alpha_decode_in_a_black_box_decoder() {
+    let Some(decoder_bin) = which("dwebp") else {
+        eprintln!("skip: no black-box WebP decoder on PATH");
+        return;
+    };
+    let (w, h) = (112u32, 80u32);
+    let base = synthetic_rgba(w, h, 23);
+    let mut state = 0x51ed_270bu32;
+    let mut noise = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8
+    };
+    let columns: Vec<u8> = (0..w).map(|_| noise()).collect();
+    let rows: Vec<u8> = (0..h).map(|_| noise()).collect();
+    // (name, expected ALPH `F` field, alpha of pixel (x, y)).
+    type AlphaOf<'a> = Box<dyn Fn(u32, u32) -> u8 + 'a>;
+    let planes: Vec<(&str, u8, AlphaOf<'_>)> = vec![
+        (
+            "two-level",
+            0,
+            Box::new(|x, y| if (x / 3 + y / 5) % 2 == 0 { 255 } else { 0 }),
+        ),
+        ("row-constant", 1, Box::new(|_, y| rows[y as usize])),
+        ("column-constant", 2, Box::new(|x, _| columns[x as usize])),
+        (
+            "separable",
+            3,
+            Box::new(|x, y| (columns[x as usize] / 2).wrapping_add(rows[y as usize] / 2)),
+        ),
+    ];
+    let dir = tmp_dir("direction-i");
+    for (name, filter, alpha_of) in &planes {
+        let mut src = base.clone();
+        for (i, px) in src.chunks_mut(4).enumerate() {
+            px[3] = alpha_of(i as u32 % w, i as u32 / w);
+        }
+        for method in 0..=2u8 {
+            let opts = EncodeOptions::default()
+                .with_quality(75.0)
+                .with_method(method);
+            let file = encode_rgba8(w, h, &src, &opts.clone().with_threads(1)).expect("encode");
+            let threaded = encode_rgba8(w, h, &src, &opts.with_threads(4)).expect("encode");
+            assert!(file == threaded, "{name}, method {method}: thread budget");
+            if *name != "two-level" {
+                let at = file
+                    .windows(4)
+                    .position(|c| c == b"ALPH")
+                    .expect("ALPH chunk");
+                assert_eq!(
+                    (file[at + 8] >> 2) & 3,
+                    *filter,
+                    "{name}, method {method}: ALPH filtering field"
+                );
+            }
+            let in_path = dir.join(format!("{name}-m{method}.webp"));
+            let pam_path = dir.join(format!("{name}-m{method}.pam"));
+            std::fs::write(&in_path, &file).expect("write webp");
+            let mut cmd = Command::new(&decoder_bin);
+            cmd.arg(&in_path)
+                .arg("-nofancy")
+                .arg("-pam")
+                .arg("-o")
+                .arg(&pam_path)
+                .arg("-quiet");
+            let _ = run_or_fail(&mut cmd);
+            let (theirs, rw, rh, depth) = parse_pam(&std::fs::read(&pam_path).expect("read PAM"));
+            assert_eq!((rw, rh, depth), (w, h, 4), "{name}, method {method}");
+            let ours = oxideav_webp::decode(&file).expect("our decode").to_rgba8();
+            for (i, (a, b)) in ours.chunks(4).zip(theirs.chunks(4)).enumerate() {
+                assert_eq!(a[3], b[3], "{name}, method {method}: alpha of pixel {i}");
+                assert_eq!(
+                    a[3],
+                    src[i * 4 + 3],
+                    "{name}, method {method}: alpha is exact"
+                );
+                for c in 0..3 {
+                    assert!(
+                        (i32::from(a[c]) - i32::from(b[c])).abs() <= 1,
+                        "{name}, method {method}: pixel {i} channel {c}: {} vs {}",
+                        a[c],
+                        b[c]
+                    );
+                }
+            }
+        }
+    }
+}

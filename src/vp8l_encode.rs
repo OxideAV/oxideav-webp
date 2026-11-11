@@ -5464,29 +5464,112 @@ const MAX_PALETTE_SIZE: usize = 256;
 /// Returns `None` as soon as the unique-color count exceeds
 /// [`MAX_PALETTE_SIZE`] (the §4.4 on-wire limit), so the early-exit
 /// cost on photo-like images is bounded.
-fn collect_palette(pixels: &[u32]) -> Option<(Vec<u32>, std::collections::HashMap<u32, u32>)> {
-    use std::collections::HashSet;
-    let mut set: HashSet<u32> = HashSet::new();
+fn collect_palette(pixels: &[u32]) -> Option<(Vec<u32>, PaletteIndex)> {
+    let mut seen = PaletteIndex::new();
+    let mut palette: Vec<u32> = Vec::new();
+    // Runs of one colour are the common case: only a pixel that differs
+    // from its predecessor is looked up.
+    let mut previous = None;
     for &p in pixels {
-        set.insert(p);
-        if set.len() > MAX_PALETTE_SIZE {
-            return None;
+        if previous == Some(p) {
+            continue;
+        }
+        previous = Some(p);
+        if seen.get(p).is_none() {
+            if palette.len() == MAX_PALETTE_SIZE {
+                return None;
+            }
+            seen.insert(p, 0);
+            palette.push(p);
         }
     }
-    let mut palette: Vec<u32> = set.into_iter().collect();
     palette.sort_unstable();
     let map = palette_index_map(&palette);
     Some((palette, map))
 }
 
 /// Build the ARGB → palette-index lookup map for a given palette order.
-fn palette_index_map(palette: &[u32]) -> std::collections::HashMap<u32, u32> {
-    let mut map: std::collections::HashMap<u32, u32> =
-        std::collections::HashMap::with_capacity(palette.len());
+fn palette_index_map(palette: &[u32]) -> PaletteIndex {
+    let mut map = PaletteIndex::new();
     for (i, &c) in palette.iter().enumerate() {
         map.insert(c, i as u32);
     }
     map
+}
+
+/// ARGB → palette-index lookup for at most [`MAX_PALETTE_SIZE`] colours:
+/// an open-addressed table four times that size, probed linearly from a
+/// multiplicative hash of the colour. It is consulted once per pixel, so
+/// the lookup is one multiply and (nearly always) one compare.
+#[derive(Debug, Clone)]
+struct PaletteIndex {
+    /// `(colour, index + 1)`; a zero second field marks an empty slot.
+    slots: Vec<(u32, u32)>,
+}
+
+impl PaletteIndex {
+    const SLOT_BITS: u32 = 10;
+
+    fn new() -> Self {
+        Self {
+            slots: vec![(0, 0); 1 << Self::SLOT_BITS],
+        }
+    }
+
+    #[inline]
+    fn first_slot(argb: u32) -> usize {
+        (argb.wrapping_mul(0x9E37_79B1) >> (32 - Self::SLOT_BITS)) as usize
+    }
+
+    /// Map `argb` to `index` (at most [`MAX_PALETTE_SIZE`] distinct
+    /// colours are ever inserted, so a free slot always exists).
+    fn insert(&mut self, argb: u32, index: u32) {
+        let mask = self.slots.len() - 1;
+        let mut slot = Self::first_slot(argb);
+        while self.slots[slot].1 != 0 && self.slots[slot].0 != argb {
+            slot = (slot + 1) & mask;
+        }
+        self.slots[slot] = (argb, index + 1);
+    }
+
+    /// The index of `argb`, if it was inserted.
+    #[inline]
+    fn get(&self, argb: u32) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut slot = Self::first_slot(argb);
+        loop {
+            let (colour, tagged) = self.slots[slot];
+            if tagged == 0 {
+                return None;
+            }
+            if colour == argb {
+                return Some(tagged - 1);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
+impl std::ops::Index<&u32> for PaletteIndex {
+    type Output = u32;
+
+    /// The index of a colour known to be in the palette (panics
+    /// otherwise, like a map lookup).
+    fn index(&self, argb: &u32) -> &u32 {
+        // Indices are below 256: answer from a static table so the
+        // operator can hand out a reference.
+        const INDICES: [u32; MAX_PALETTE_SIZE] = {
+            let mut table = [0u32; MAX_PALETTE_SIZE];
+            let mut i = 0;
+            while i < MAX_PALETTE_SIZE {
+                table[i] = i as u32;
+                i += 1;
+            }
+            table
+        };
+        let index = self.get(*argb).expect("colour is in the palette");
+        &INDICES[index as usize]
+    }
 }
 
 /// Round 383 — the §4.4 palette *orderings* the color-indexing chooser
@@ -5661,7 +5744,7 @@ fn forward_color_table(color_table: &mut [u32]) {
 /// (un-subtraction-encoded) palette.
 fn pack_indices_into_bundled_image(
     pixels: &[u32],
-    index_of: &std::collections::HashMap<u32, u32>,
+    index_of: &PaletteIndex,
     width: u32,
     height: u32,
     width_bits: u8,
@@ -5673,16 +5756,27 @@ fn pack_indices_into_bundled_image(
     let w = width as usize;
     let h = height as usize;
     let mut out = vec![0u32; pw * h];
-    for y in 0..h {
-        for x in 0..w {
-            let idx = *index_of
-                .get(&pixels[y * w + x])
-                .expect("collect_palette covered every pixel");
-            let packed_x = x / count as usize;
-            let sub = x % count as usize;
-            let shift = sub * bits_per_index as usize;
-            let bits = (idx & ((1u32 << bits_per_index) - 1)) << shift;
-            out[y * pw + packed_x] |= bits << 8; // pack into the green channel.
+    let per_packed = count as usize;
+    let index_mask = (1u32 << bits_per_index) - 1;
+    // A pixel equal to the one before it reuses that pixel's index.
+    let (mut last_pixel, mut last_index) = (0u32, u32::MAX);
+    for (row, out_row) in pixels
+        .chunks(w.max(1))
+        .zip(out.chunks_mut(pw.max(1)))
+        .take(h)
+    {
+        for (group, packed) in row.chunks(per_packed).zip(out_row.iter_mut()) {
+            let mut bits = 0u32;
+            for (sub, &pixel) in group.iter().enumerate() {
+                if pixel != last_pixel || last_index == u32::MAX {
+                    last_index = index_of
+                        .get(pixel)
+                        .expect("collect_palette covered every pixel");
+                    last_pixel = pixel;
+                }
+                bits |= (last_index & index_mask) << (sub * bits_per_index as usize);
+            }
+            *packed = bits << 8; // pack into the green channel.
         }
     }
     (out, packed_width)
@@ -8921,8 +9015,7 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
 
     // Candidate builders, cheapest-first; later ones only at higher
     // efforts. Each yields the forward-transformed residuals + prelude.
-    type Build<'a> = Box<dyn Fn() -> Option<PreparedTransform> + Send + Sync + 'a>;
-    let mut builds: Vec<Build<'_>> = Vec::new();
+    let mut builds: Vec<EffortBuild<'_>> = Vec::new();
     builds.push(Box::new(|| Some(prepare_literals(pixels, true, width))));
     if blocks_fit {
         builds.push(Box::new(move || {
@@ -9008,7 +9101,28 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
         }
     }
 
-    let run_dp = params.dp && pixels.len() <= EFFORT_DP_MAX_PIXELS;
+    encode_candidates_with_effort(builds, width, height, params, method >= MAX_LOSSLESS_METHOD)
+}
+
+/// One transform candidate of the screened search: builds the
+/// forward-transformed residuals and the prelude that announces them.
+type EffortBuild<'a> = Box<dyn Fn() -> Option<PreparedTransform> + Send + Sync + 'a>;
+
+/// Steps 1-4 of [`encode_argb_with_effort`] over a given candidate list
+/// (at least one of which must build) for a `width x height` image:
+/// screening, cache sweep, the optional DP re-plan, the optional
+/// `deep_parse` finalist and the §6.2.2 layouts `params` asks for.
+fn encode_candidates_with_effort(
+    builds: Vec<EffortBuild<'_>>,
+    width: u32,
+    height: u32,
+    params: EffortParams,
+    deep_parse: bool,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let pixel_count = w * h;
+    let run_dp = params.dp && pixel_count <= EFFORT_DP_MAX_PIXELS;
 
     // 1. Screening: one reduced-effort parse per candidate.
     /// A screened candidate: its residuals and the smallest size its
@@ -9036,7 +9150,7 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
     // replaces" elects exactly the candidate a one-by-one pass would.
     let workers = budgeted_workers(
         builds.len(),
-        pixels.len().saturating_mul(EFFORT_SCREEN_BYTES_PER_PIXEL),
+        pixel_count.saturating_mul(EFFORT_SCREEN_BYTES_PER_PIXEL),
     );
     let mut best: Option<Screened> = None;
     for wave in (0..builds.len()).step_by(workers) {
@@ -9051,7 +9165,7 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
         }
     }
     drop(builds);
-    let (prep, _) = best.expect("the subtract-green literal candidate always builds");
+    let (prep, _) = best.expect("at least one candidate builds");
     let (tokens, probes) = effort_greedy_tokens(
         &prep.residuals,
         params.shape(prep.residuals.len()),
@@ -9117,7 +9231,7 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
     //     early stop, the full lazy look-ahead — as a second finalist.
     //     A longer greedy match is not always a cheaper one, so both
     //     go on to the §6.2.2 stage and the smaller file wins.
-    if method >= MAX_LOSSLESS_METHOD {
+    if deep_parse {
         let deep_shape = MatcherShape {
             max_chain: MAX_CHAIN,
             hash_bits: effort_hash_bits(prep.residuals.len()),
@@ -9211,6 +9325,50 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
     let bytes = out.into_bytes();
     debug_assert_eq!(bytes.len(), best_len, "effort size mirror drifted");
     bytes
+}
+
+/// Highest `effort` of [`encode_value_plane_stream`].
+pub(crate) const MAX_VALUE_PLANE_EFFORT: u8 = 2;
+
+/// The §3 image-stream (no §3.4 image header) of a `width x height`
+/// plane of 8-bit values carried in the green channel of opaque pixels
+/// with zero red and blue — the shape of an `ALPH` plane (RFC 9649
+/// §2.7.1.2) — coded for speed.
+///
+/// A plane holding more than sixteen distinct values is coded as it
+/// stands, one candidate instead of a screened list; one holding fewer
+/// is also tried through the §4.4 color-indexing transform, which packs
+/// two to eight of its pixels into one (the caller has already removed
+/// the spatial redundancy with a §2.7.1.2 filter, and with one live
+/// channel the subtract-green and color transforms have nothing to
+/// decorrelate). `effort` `0..=`[`MAX_VALUE_PLANE_EFFORT`] sets the
+/// parse depth and the §6.2.2 layouts tried, as lossless efforts
+/// `0..=2` do.
+pub(crate) fn encode_value_plane_stream(
+    plane: &[u8],
+    width: u32,
+    height: u32,
+    distinct_values: usize,
+    effort: u8,
+) -> Vec<u8> {
+    let pixels: Vec<u32> = plane
+        .iter()
+        .map(|&v| 0xff00_0000 | (u32::from(v) << 8))
+        .collect();
+    let pixels = &pixels[..];
+    let mut builds: Vec<EffortBuild<'_>> = Vec::new();
+    if distinct_values <= 16 {
+        builds.push(Box::new(move || {
+            prepare_with_color_indexing_ordered(pixels, width, height, PaletteOrdering::Numeric)
+        }));
+    }
+    builds.push(Box::new(move || {
+        Some(prepare_literals(pixels, false, width))
+    }));
+    let params = EffortParams::for_method(effort.min(MAX_VALUE_PLANE_EFFORT));
+    let stream = encode_candidates_with_effort(builds, width, height, params, false);
+    clear_plan_memo();
+    stream
 }
 
 /// Dispatch a lossless image stream encode on `method`

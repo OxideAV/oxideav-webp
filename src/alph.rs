@@ -432,6 +432,192 @@ fn inverse_filter(filtered: Vec<u8>, w: usize, h: usize, filtering: AlphFilterin
     out
 }
 
+// ───────────────────────────── encode side ───────────────────────────────
+
+/// §2.7.1.2 forward filter: the residual `X = (alpha − predictor) mod
+/// 256` of every sample of a `w × h` plane under `filtering`, the
+/// inverse of what [`decode_alpha`] applies. The predictor reads the
+/// original plane — the samples a decoder has already reconstructed when
+/// it reaches `X` — with the §2.7.1.2 border rules: `(0, 0)` predicts 0,
+/// the left-most column predicts from the sample above for the
+/// horizontal and gradient methods, the top row from the sample to the
+/// left for the vertical and gradient methods.
+pub(crate) fn forward_filter(
+    plane: &[u8],
+    w: usize,
+    h: usize,
+    filtering: AlphFiltering,
+) -> Vec<u8> {
+    if filtering == AlphFiltering::None || w == 0 || h == 0 {
+        return plane.to_vec();
+    }
+    let mut out = vec![0u8; w * h];
+    let (first_in, first_out) = (&plane[..w], &mut out[..w]);
+    // Top row: (0, 0) predicts 0, the rest predict from the left under
+    // every method.
+    first_out[0] = first_in[0];
+    for (o, pair) in first_out[1..].iter_mut().zip(first_in.windows(2)) {
+        *o = pair[1].wrapping_sub(pair[0]);
+    }
+    for ((above, row), out_row) in plane
+        .chunks_exact(w)
+        .zip(plane.chunks_exact(w).skip(1))
+        .zip(out.chunks_exact_mut(w).skip(1))
+    {
+        match filtering {
+            AlphFiltering::Vertical => {
+                for ((o, &x), &b) in out_row.iter_mut().zip(row).zip(above) {
+                    *o = x.wrapping_sub(b);
+                }
+            }
+            AlphFiltering::Horizontal => {
+                out_row[0] = row[0].wrapping_sub(above[0]);
+                for (o, pair) in out_row[1..].iter_mut().zip(row.windows(2)) {
+                    *o = pair[1].wrapping_sub(pair[0]);
+                }
+            }
+            _ => {
+                out_row[0] = row[0].wrapping_sub(above[0]);
+                for ((o, cur), up) in out_row[1..]
+                    .iter_mut()
+                    .zip(row.windows(2))
+                    .zip(above.windows(2))
+                {
+                    let predictor = clip(i32::from(cur[0]) + i32::from(up[1]) - i32::from(up[0]));
+                    *o = cur[1].wrapping_sub(predictor);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The §2.7.1.2 filtering method whose residuals have the smallest
+/// zeroth-order entropy on a `w × h` plane, with the number of distinct
+/// residual values it leaves. One pass builds the four residual
+/// histograms; ties keep the lower method number.
+pub(crate) fn choose_filter(plane: &[u8], w: usize, h: usize) -> (AlphFiltering, usize) {
+    const METHODS: [AlphFiltering; 4] = [
+        AlphFiltering::None,
+        AlphFiltering::Horizontal,
+        AlphFiltering::Vertical,
+        AlphFiltering::Gradient,
+    ];
+    let mut histograms = [[0u32; 256]; 4];
+    if w > 0 && h > 0 {
+        let [none, horizontal, vertical, gradient] = &mut histograms;
+        let first = &plane[..w];
+        for &x in first {
+            none[usize::from(x)] += 1;
+        }
+        // Top row: every filter predicts 0 at (0, 0) and from the left
+        // after it.
+        for hist in [&mut *horizontal, &mut *vertical, &mut *gradient] {
+            hist[usize::from(first[0])] += 1;
+            for pair in first.windows(2) {
+                hist[usize::from(pair[1].wrapping_sub(pair[0]))] += 1;
+            }
+        }
+        for (above, row) in plane.chunks_exact(w).zip(plane.chunks_exact(w).skip(1)) {
+            let from_above = row[0].wrapping_sub(above[0]);
+            none[usize::from(row[0])] += 1;
+            horizontal[usize::from(from_above)] += 1;
+            vertical[usize::from(from_above)] += 1;
+            gradient[usize::from(from_above)] += 1;
+            for (cur, up) in row.windows(2).zip(above.windows(2)) {
+                let x = cur[1];
+                none[usize::from(x)] += 1;
+                horizontal[usize::from(x.wrapping_sub(cur[0]))] += 1;
+                vertical[usize::from(x.wrapping_sub(up[1]))] += 1;
+                let predictor = clip(i32::from(cur[0]) + i32::from(up[1]) - i32::from(up[0]));
+                gradient[usize::from(x.wrapping_sub(predictor))] += 1;
+            }
+        }
+    }
+    let mut best = 0;
+    let mut best_cost = u64::MAX;
+    for (method, histogram) in histograms.iter().enumerate() {
+        let cost = entropy_cost(histogram);
+        if cost < best_cost {
+            (best, best_cost) = (method, cost);
+        }
+    }
+    let distinct = histograms[best].iter().filter(|&&n| n != 0).count();
+    (METHODS[best], distinct)
+}
+
+/// Zeroth-order entropy of a histogram in 1/256 bit units, in integer
+/// arithmetic: `Σ n · (log2 N − log2 n)` with a fixed-point `log2`.
+fn entropy_cost(histogram: &[u32; 256]) -> u64 {
+    /// `log2(v)` in 1/256 units for `v ≥ 1`: the integer part from the
+    /// bit length, the fraction from eight squarings of the mantissa.
+    fn log2_q8(v: u64) -> u64 {
+        let int = u64::from(63 - v.leading_zeros());
+        // Mantissa in [1, 2) as Q32.
+        let mut m = if int >= 32 {
+            v >> (int - 32)
+        } else {
+            v << (32 - int)
+        };
+        let mut frac = 0u64;
+        for _ in 0..8 {
+            m = ((u128::from(m) * u128::from(m)) >> 32) as u64;
+            frac <<= 1;
+            if m >= 2 << 32 {
+                m >>= 1;
+                frac |= 1;
+            }
+        }
+        (int << 8) | frac
+    }
+    let total: u64 = histogram.iter().map(|&n| u64::from(n)).sum();
+    if total == 0 {
+        return 0;
+    }
+    let log_total = log2_q8(total);
+    histogram
+        .iter()
+        .filter(|&&n| n != 0)
+        .map(|&n| u64::from(n) * (log_total - log2_q8(u64::from(n))))
+        .sum()
+}
+
+/// Build an `ALPH` chunk payload for a `width × height` alpha plane with
+/// the quick coder: the §2.7.1.2 filter with the cheapest residuals
+/// ([`choose_filter`]), then the residual plane as a headerless §3
+/// image-stream from
+/// [`encode_value_plane_stream`](crate::vp8l_encode::encode_value_plane_stream)
+/// at `effort`; the raw plane (compression 0, no filter) when that is
+/// not smaller.
+pub(crate) fn build_alph_payload_quick(
+    alpha: &[u8],
+    width: u32,
+    height: u32,
+    effort: u8,
+) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let (filtering, distinct) = choose_filter(alpha, w, h);
+    let residuals = forward_filter(alpha, w, h, filtering);
+    let stream =
+        crate::vp8l_encode::encode_value_plane_stream(&residuals, width, height, distinct, effort);
+    let (info, body): (u8, &[u8]) = if stream.len() < alpha.len() {
+        let f = match filtering {
+            AlphFiltering::None => 0,
+            AlphFiltering::Horizontal => 1,
+            AlphFiltering::Vertical => 2,
+            AlphFiltering::Gradient => 3,
+        };
+        // Rsv = 0, P = 0, F, C = 1 (lossless).
+        ((f << 2) | 1, &stream)
+    } else {
+        (0, alpha)
+    };
+    let mut out = Vec::with_capacity(1 + body.len());
+    out.push(info);
+    out.extend_from_slice(body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,7 +977,7 @@ mod tests {
     /// decode the predictor the encoder reads equals the one the decoder
     /// reads from the reconstructed plane. Mirrors RFC 9649 §2.7.1.2
     /// Figure 11 + the per-method border rules.
-    fn forward_filter(plane: &[u8], w: usize, h: usize, f: AlphFiltering) -> Vec<u8> {
+    fn forward_filter_reference(plane: &[u8], w: usize, h: usize, f: AlphFiltering) -> Vec<u8> {
         let pred = |p: &[u8], x: usize, y: usize| -> i32 {
             if x == 0 && y == 0 {
                 return 0;
@@ -865,7 +1051,12 @@ mod tests {
                 AlphFiltering::Vertical,
                 AlphFiltering::Gradient,
             ] {
-                let residual = forward_filter(&plane, w, h, f);
+                let residual = forward_filter_reference(&plane, w, h, f);
+                assert_eq!(
+                    forward_filter(&plane, w, h, f),
+                    residual,
+                    "row-wise forward filter at {w}x{h} filter {f:?}"
+                );
                 // Method-1 carrier: residual byte → green channel of an
                 // opaque ARGB pixel. The VP8L stream is lossless, so the
                 // decoder's green channel is bit-for-bit this residual.
@@ -892,5 +1083,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Planes built so that each §2.7.1.2 filter is the cheapest one.
+    fn plane_for(filter: AlphFiltering, w: usize, h: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678u32;
+        let mut noise = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        // One random value per column / row / both; a plane constant
+        // along rows has zero horizontal residuals, and so on.
+        let columns: Vec<u8> = (0..w).map(|_| noise()).collect();
+        let rows: Vec<u8> = (0..h).map(|_| noise()).collect();
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                match filter {
+                    AlphFiltering::None => [0u8, 255][usize::from(noise() & 1)],
+                    AlphFiltering::Horizontal => rows[y],
+                    AlphFiltering::Vertical => columns[x],
+                    AlphFiltering::Gradient => (columns[x] / 2).wrapping_add(rows[y] / 2),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn choose_filter_picks_the_filter_that_flattens_the_plane() {
+        let (w, h) = (48usize, 40usize);
+        for filter in [
+            AlphFiltering::None,
+            AlphFiltering::Horizontal,
+            AlphFiltering::Vertical,
+            AlphFiltering::Gradient,
+        ] {
+            let plane = plane_for(filter, w, h);
+            let (chosen, distinct) = choose_filter(&plane, w, h);
+            assert_eq!(chosen, filter, "plane built for {filter:?}");
+            let residuals = forward_filter(&plane, w, h, chosen);
+            let mut seen = [false; 256];
+            for &r in &residuals {
+                seen[usize::from(r)] = true;
+            }
+            assert_eq!(distinct, seen.iter().filter(|&&s| s).count(), "{filter:?}");
+        }
+        // A constant plane: every filter costs the same, the lowest
+        // method number is kept.
+        assert_eq!(choose_filter(&[7u8; 30], 6, 5).0, AlphFiltering::None);
+    }
+
+    #[test]
+    fn entropy_cost_orders_histograms() {
+        let mut flat = [0u32; 256];
+        flat.fill(4);
+        let mut peaked = [0u32; 256];
+        peaked[0] = 1000;
+        peaked[1] = 24;
+        let mut single = [0u32; 256];
+        single[9] = 1024;
+        // 1024 samples spread evenly over 256 values cost 8 bits each.
+        assert_eq!(entropy_cost(&flat), 1024 * 8 * 256);
+        assert_eq!(entropy_cost(&single), 0);
+        assert!(entropy_cost(&peaked) > 0 && entropy_cost(&peaked) < entropy_cost(&flat) / 20);
+        assert_eq!(entropy_cost(&[0; 256]), 0);
+    }
+
+    #[test]
+    fn quick_payload_round_trips() {
+        let mut state = 0x0bad_5eedu32;
+        let mut noise = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let mut planes: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+        for filter in [
+            AlphFiltering::None,
+            AlphFiltering::Horizontal,
+            AlphFiltering::Vertical,
+            AlphFiltering::Gradient,
+        ] {
+            planes.push((48, 40, plane_for(filter, 48, 40)));
+        }
+        for (w, h) in [
+            (1usize, 1usize),
+            (1, 9),
+            (9, 1),
+            (2, 2),
+            (3, 5),
+            (33, 17),
+            (70, 64),
+        ] {
+            // Unstructured values: no compression helps, the raw plane
+            // is written.
+            planes.push((w, h, (0..w * h).map(|_| noise()).collect()));
+            // A soft-edged disc: runs of 0 and 255 with ramps between.
+            planes.push((
+                w,
+                h,
+                (0..w * h)
+                    .map(|i| {
+                        let (x, y) = ((i % w) as i32 - w as i32 / 2, (i / w) as i32 - h as i32 / 2);
+                        (255 - (x * x + y * y).min(255)) as u8
+                    })
+                    .collect(),
+            ));
+            // Two values: the color-indexing candidate applies.
+            planes.push((w, h, (0..w * h).map(|i| [0, 255][(i / 5) % 2]).collect()));
+        }
+        for (w, h, plane) in &planes {
+            for effort in 0..=3u8 {
+                let payload = build_alph_payload_quick(plane, *w as u32, *h as u32, effort);
+                assert!(
+                    payload.len() <= plane.len() + 1,
+                    "{w}x{h} effort {effort}: never larger than the raw plane"
+                );
+                let header = AlphHeader::parse(&payload).expect("info byte");
+                assert_eq!(header.preprocessing, AlphPreprocessing::None);
+                let back = decode_alpha(&payload, *w as u32, *h as u32).expect("decode");
+                assert_eq!(&back, plane, "{w}x{h} effort {effort}");
+            }
+        }
+        // A plane with structure does compress, through a filter.
+        let ramp = plane_for(AlphFiltering::Gradient, 48, 40);
+        let payload = build_alph_payload_quick(&ramp, 48, 40, 0);
+        let header = AlphHeader::parse(&payload).expect("info byte");
+        assert_eq!(header.compression, AlphCompression::Lossless);
+        assert_eq!(header.filtering, AlphFiltering::Gradient);
+        assert!(payload.len() < ramp.len() / 4, "{} bytes", payload.len());
     }
 }

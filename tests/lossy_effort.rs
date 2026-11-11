@@ -6,8 +6,11 @@
 //! §13.4 token-probability updates to the picture (never larger than
 //! `4`); `6` also picks the §9.4 loop-filter level by reconstruction
 //! error. The bytes are the same for every thread budget. The alpha
-//! plane follows the lossless levels and, on larger images, is coded on a
-//! second thread next to the VP8 encode.
+//! plane is always exact: at methods `0..=2` it goes through the quick
+//! `ALPH` coder (a §2.7.1.2 filter and a single-candidate lossless
+//! stream), above them through the lossless search at the same level;
+//! on larger images it is coded on its own threads next to the VP8
+//! encode.
 
 mod common;
 
@@ -101,7 +104,7 @@ fn concurrent_alpha_plane_is_exact_and_deterministic() {
         px[3] = if d < 1600 { 255 } else { (x * 2) as u8 };
     }
     let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
-    for m in [0u8, 4, 5, 6] {
+    for m in 0..=6u8 {
         let opts = EncodeOptions::default().with_quality(75.0).with_method(m);
         let a = encode_rgba8(w, h, &rgba, &opts).expect("encode");
         let b = encode_rgba8(w, h, &rgba, &opts).expect("encode");

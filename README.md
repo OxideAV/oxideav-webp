@@ -154,7 +154,8 @@ Nothing is converted silently: a lossless request for Y′CbCr planes and
 a lossy request for full-range planes are refused. Lossless round trips
 are exact — `decode(encode(img)) == img` for planes and metadata, pinned
 by `tests/contract_api.rs`. The `ALPH` plane of a lossy encode is itself
-lossless (method 1, headerless VP8L, falling back to raw when smaller).
+lossless (compression 1, a headerless VP8L stream, filtered per
+§2.7.1.2 at the quick efforts; the raw plane when that is smaller).
 
 ## Options
 
@@ -189,7 +190,12 @@ and animations; behaviour variants are fields.
 | `6` | `5` + loop-filter level chosen by reconstruction error | exhaustive transform / colour-cache / parse search (above 2 Mpx: `5`'s screening and a second, deeper parse) |
 
 Every lossless level is exactly lossless; every lossy level writes a
-conformant key frame. Measured times and sizes: [Performance](#performance).
+conformant key frame. The alpha plane of a lossy encode is always exact:
+at efforts `0..=2` it is coded quickly (the §2.7.1.2 filter with the
+cheapest residuals, then one lossless stream), at `3..=6` by the
+lossless search of the same level — several times slower than the `VP8 `
+encode itself on a large picture, for an `ALPH` chunk that is usually
+within a few percent either way. Measured times and sizes: [Performance](#performance).
 
 The registered encoders take the same controls as options
 (`CodecParameters::options`, schemas published through the codec
