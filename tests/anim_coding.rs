@@ -88,7 +88,9 @@ fn lossy_animation_round_trips_approximately() {
         size(AnimFrameMode::Delta),
         size(AnimFrameMode::Lossless),
     );
-    assert!(auto <= delta, "auto {auto} vs delta {delta}");
+    // (Auto takes a small dirty rectangle without coding the whole
+    // frame for comparison: here it is the delta file.)
+    assert_eq!(auto, delta, "auto {auto} vs delta {delta}");
     assert!(2 * delta < whole, "delta {delta} vs whole frames {whole}");
     // And a lossy animation is much smaller than the lossless one.
     let lossless = encode_animation(&frames, &EncodeOptions::default())

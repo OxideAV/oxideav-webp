@@ -76,7 +76,9 @@ pub enum AnimFrameMode {
     /// Evaluate both the full-frame keyframe and the dirty-rectangle
     /// sub-frame and emit whichever is smaller. Falls back to the
     /// full frame for the first frame and for frames whose dirty rect
-    /// happens to cover the whole frame.
+    /// happens to cover the whole frame. Under a quality, a dirty
+    /// rectangle of at most half the frame's area is emitted without
+    /// coding the whole frame for comparison.
     #[default]
     Auto,
     /// Always emit the dirty-rect sub-frame (the §2.7.1.1 `B = 1` / `D = 0`
@@ -517,11 +519,16 @@ fn needs_previous_canvas(f: &AnimFrame, is_first_frame: bool) -> bool {
     f.mode != AnimFrameMode::Lossless && !is_first_frame && f.dispose != DisposalMethod::Background
 }
 
+/// Share of a lossy frame's area its dirty-rectangle update is expected
+/// to cover when the window's thread budget is divided (a guess that only
+/// steers threads; no byte depends on it).
+const LOSSY_UPDATE_AREA_DIVISOR: u64 = 8;
+
 /// Encode one window of frames — each with the previous canvas it is
 /// diffed against, when it needs one — on up to `budget` threads, and
-/// return their `ANMF` payloads in frame order. Every worker passes its
-/// share of the budget on to the encodes it runs; a worker that cannot be
-/// started only leaves more frames to the others.
+/// return their `ANMF` payloads in frame order. Every frame's encode gets
+/// a share of the budget in proportion to its expected work; a worker
+/// that cannot be started only leaves more frames to the others.
 fn encode_window(
     jobs: &[(&AnimFrame, Option<Vec<u8>>, bool)],
     canvas_w: u32,
@@ -541,18 +548,36 @@ fn encode_window(
     if workers <= 1 {
         return jobs.iter().map(encode).collect();
     }
-    let inner_budget = (budget / workers).max(1);
+    // Each frame's share of the budget follows the pixels it is expected
+    // to code: its whole area, or — for a lossy frame that will be cut
+    // down to its dirty rectangle — a fraction of it. A window of one
+    // whole frame and seven small updates then gives the whole frame
+    // most of the threads instead of an eighth of them.
+    let weight = |&(f, ref prev, _): &(&AnimFrame, Option<Vec<u8>>, bool)| -> u64 {
+        let area = u64::from(f.width) * u64::from(f.height);
+        match (coding, prev) {
+            (FrameCoding::Lossy(_), Some(_)) => (area / LOSSY_UPDATE_AREA_DIVISOR).max(1),
+            _ => area.max(1),
+        }
+    };
+    let total_weight: u64 = jobs.iter().map(weight).sum();
+    let inner_budgets: Vec<usize> = jobs
+        .iter()
+        .map(|job| {
+            let share = (budget as u64 * weight(job) + total_weight / 2) / total_weight;
+            (share as usize).clamp(1, budget)
+        })
+        .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
-        vp8l_encode::with_thread_budget(inner_budget, || {
-            let mut done = Vec::new();
-            loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(job) = jobs.get(index) else { break };
-                done.push((index, encode(job)));
-            }
-            done
-        })
+        let mut done = Vec::new();
+        loop {
+            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(job) = jobs.get(index) else { break };
+            let result = vp8l_encode::with_thread_budget(inner_budgets[index], || encode(job));
+            done.push((index, result));
+        }
+        done
     };
     let mut results: Vec<Option<Result<Vec<u8>, WebpError>>> = jobs.iter().map(|_| None).collect();
     std::thread::scope(|scope| {
@@ -880,43 +905,73 @@ fn build_anmf_payload_with_prev(
             }
         }
         AnimFrameMode::Auto => {
-            // Always evaluate the full-frame candidate (and use it for the
-            // first frame / Background-dispose fallbacks regardless).
-            let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, coding)?;
+            // The full-frame candidate is always evaluated (and is the
+            // answer for the first frame / Background-dispose fallbacks).
+            let full = || emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, coding);
             if is_first_frame || f.dispose == DisposalMethod::Background {
-                return Ok(full);
+                return full();
             }
             let drawn = drawn_canvas(prev, canvas_w, f);
-            let Some(rect) = dirty_rect_canvas_coords(f, canvas_w, prev, &drawn) else {
+            let rect = match dirty_rect_canvas_coords(f, canvas_w, prev, &drawn) {
+                // If the dirty rect covers the whole declared frame rect
+                // and the frame is plain-overwrite, the full candidate
+                // carries the identical pixels — no win from a sub-frame.
+                Some(rect)
+                    if f.blend == BlendingMethod::Overwrite
+                        && rect.w == f.width
+                        && rect.h == f.height
+                        && rect.x == f.x
+                        && rect.y == f.y =>
+                {
+                    return full();
+                }
+                Some(rect) => rect,
                 // Frame leaves the canvas untouched — a 2×2 same-pixels
                 // delta is smaller than any non-trivial full frame.
-                let degen_rect = DirtyRect {
+                None => DirtyRect {
                     x: f.x,
                     y: f.y,
                     w: 2.min(f.width),
                     h: 2.min(f.height),
-                };
-                let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, degen_rect);
-                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba, coding)?;
-                return Ok(if delta.len() < full.len() {
-                    delta
-                } else {
-                    full
-                });
+                },
             };
-            // If the dirty rect covers the whole declared frame rect and
-            // the frame is plain-overwrite, the full candidate carries the
-            // identical pixels — no win from a sub-frame.
-            if f.blend == BlendingMethod::Overwrite
-                && rect.w == f.width
-                && rect.h == f.height
-                && rect.x == f.x
-                && rect.y == f.y
-            {
-                return Ok(full);
-            }
             let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, rect);
-            let delta = emit_dirty_anmf(f, rect, &sub_rgba, coding)?;
+            drop(drawn);
+            let delta = || emit_dirty_anmf(f, rect, &sub_rgba, coding);
+            // A lossy key frame costs about what its area costs: a
+            // sub-frame of at most half the frame is taken as it is,
+            // without coding the whole frame to compare. (A lossless
+            // sub-frame can lose to the whole frame — a small rectangle
+            // cut out of a repeating pattern — so there both are coded.)
+            let (frame_area, rect_area) = (
+                u64::from(f.width) * u64::from(f.height),
+                u64::from(rect.w) * u64::from(rect.h),
+            );
+            if matches!(coding, FrameCoding::Lossy(_)) && 2 * rect_area <= frame_area {
+                return delta();
+            }
+            // The two candidates are independent encodes: with threads to
+            // spare they run side by side, each on half the budget.
+            let budget = vp8l_encode::thread_budget();
+            let (full, delta) = if budget >= 2 {
+                std::thread::scope(|scope| {
+                    let spawned = std::thread::Builder::new()
+                        .spawn_scoped(scope, || vp8l_encode::with_thread_budget(budget / 2, delta));
+                    match spawned {
+                        Ok(job) => {
+                            let full = vp8l_encode::with_thread_budget(budget - budget / 2, full);
+                            let delta = job
+                                .join()
+                                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                            (full, delta)
+                        }
+                        Err(_) => (full(), delta()),
+                    }
+                })
+            } else {
+                (full(), delta())
+            };
+            let (full, delta) = (full?, delta?);
             Ok(if delta.len() < full.len() {
                 delta
             } else {

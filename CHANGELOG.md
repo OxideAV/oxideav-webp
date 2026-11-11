@@ -82,11 +82,12 @@ All notable changes to `oxideav-webp` are recorded here.
 - **Animation frames are encoded concurrently.** The canvas a decoder
   holds before each frame follows from the caller's pixels alone, so the
   encoder snapshots it per frame and encodes up to `threads` frames at
-  once (snapshots capped at 256 MiB per window), writing the `ANMF`
-  chunks in frame order — the same bytes for every budget, lossless and
+  once (snapshots capped at 256 MiB per window; each frame's share of
+  the thread budget follows the pixels it is expected to code), writing
+  the `ANMF` chunks in frame order — the same bytes for every budget, lossless and
   lossy, every frame mode (`tests/anim_coding.rs`). Eight 800 x 533
-  frames, lossless effort 2: 8 threads 470 ms to 157 ms, 4 threads
-  612 ms to 271 ms (1 thread unchanged; the budget used to reach only
+  frames, lossless effort 2: 8 threads 470 ms to 152 ms, 4 threads
+  612 ms to 260 ms (1 thread unchanged; the budget used to reach only
   the stages inside one frame).
 - Decode: a §5.2.2 backward reference is copied as slices (a run of one
   colour as a fill, an overlapping run in doubling pieces) instead of
@@ -144,7 +145,13 @@ All notable changes to `oxideav-webp` are recorded here.
   `AnimFrameMode` applies: the dirty rectangle is found on the caller's
   pixels and coded as an overwriting sub-frame, so a moving-square
   sequence costs a fraction of whole frames. `method` / `threads` apply
-  as for stills. `tests/anim_coding.rs` (round trip by PSNR, exact
+  as for stills. In `Auto` mode a dirty rectangle of at most half the
+  frame's area is emitted without coding the whole frame to compare (a
+  lossy key frame costs about what its area costs); the two candidates
+  of a larger one, and of every lossless frame, are coded side by side
+  when the frame has threads to spare. Eight 2400 x 1600 frames with a
+  moving square, quality 80: 519 / 176 / 119 ms on 1 / 4 / 8 threads.
+  `tests/anim_coding.rs` (round trip by PSNR, exact
   alpha, positioned alpha-blended sub-frames, the 16383 px frame limit,
   and a black-box container tool listing the frames).
 - `DecodeOptions::threads` / `with_threads` (default `1`: the calling

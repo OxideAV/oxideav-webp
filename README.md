@@ -384,16 +384,17 @@ with alpha decodes to its native planes in 15 ms instead of 28 ms
 (measured separately, minimum of nine runs).
 
 **Animation encode**, `encode_animation`, eight frames of the same
-picture with a square moving across it. Lossy animations are new.
+picture with a square moving across it. Lossy animations are new: after
+the first frame only the square's rectangle is coded.
 
 | size | frames | before: 1 / 4 / 8 threads ms | bytes | after: 1 / 4 / 8 threads ms | bytes |
 |---|---|---:|---:|---:|---:|
-| 800x533 | lossless, effort 2 | 946 / 612 / 470 | 861 144 | 966 / 271 / 157 | 861 144 |
-| 800x533 | lossy, quality 80, effort 4 | — | — | 402 / 111 / 57.3 | 36 672 |
-| 800x533 | lossy, quality 80, effort 1 | — | — | 185 / 53.1 / 28.9 | 38 912 |
-| 2400x1600 | lossless, effort 2 | 9042 / 6015 / 4663 | 7 626 936 | 9216 / 2984 / 1924 | 7 626 936 |
-| 2400x1600 | lossy, quality 80, effort 4 | — | — | 3292 / 880 / 487 | 286 802 |
-| 2400x1600 | lossy, quality 80, effort 1 | — | — | 1558 / 429 / 236 | 307 362 |
+| 800x533 | lossless, effort 2 | 946 / 612 / 470 | 861 144 | 921 / 260 / 152 | 861 144 |
+| 800x533 | lossy, quality 80, effort 4 | — | — | 66.9 / 23.0 / 16.1 | 36 672 |
+| 800x533 | lossy, quality 80, effort 1 | — | — | 32.0 / 12.0 / 9.02 | 38 912 |
+| 2400x1600 | lossless, effort 2 | 9042 / 6015 / 4663 | 7 626 936 | 8810 / 2883 / 1888 | 7 626 936 |
+| 2400x1600 | lossy, quality 80, effort 4 | — | — | 519 / 176 / 119 | 286 802 |
+| 2400x1600 | lossy, quality 80, effort 1 | — | — | 268 / 93.0 / 67.7 | 307 362 |
 
 ## Benchmarks
 
