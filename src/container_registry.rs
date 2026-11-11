@@ -66,9 +66,9 @@
 //! the stream's `loop_count` / `background_color` options (`0` = loop
 //! forever and transparent black by default); `ICCP` / `EXIF` / `XMP `
 //! come from the first packet. Because the merge is chunk-level, lossy
-//! (`webp_vp8`) and mixed frames mux fine even though Layer 1
-//! [`crate::encode_animation`] re-encodes from RGBA and refuses a
-//! `quality`. `decode_all(mux(frames)) == frames` for full-canvas `Rgba`
+//! (`webp_vp8`), lossless and mixed frames mux without a pixel being
+//! re-encoded (Layer 1 [`crate::encode_animation`] codes every frame
+//! from RGBA, all lossless or all lossy). `decode_all(mux(frames)) == frames` for full-canvas `Rgba`
 //! frames (lossless packets).
 //!
 //! Whole module gated behind the `registry` feature.

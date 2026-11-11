@@ -47,7 +47,7 @@ Root items, all available with `default-features = false`:
 | `encode` | `fn(&WebpImage, &EncodeOptions) -> Result<Vec<u8>, Error>` — writes the image as given; `Error::Unsupported` for a layout WebP cannot carry |
 | `encode_rgb8` / `encode_rgba8` | `fn(u32, u32, &[u8], &EncodeOptions) -> Result<Vec<u8>, Error>` |
 | `encode_to` | `fn<W: Write>(&WebpImage, &EncodeOptions, W) -> Result<(), Error>` |
-| `encode_all` | `fn(&[Frame], &EncodeOptions) -> Result<Vec<u8>, Error>` — the mirror of `decode_all`: a still for one delay-less frame, otherwise a lossless `ANIM` + `ANMF` animation of full-canvas `Rgba` frames (`decode_all(encode_all(f)) == f` for `Rgba` frames with whole-millisecond delays) |
+| `encode_all` | `fn(&[Frame], &EncodeOptions) -> Result<Vec<u8>, Error>` — the mirror of `decode_all`: a still for one delay-less frame, otherwise an `ANIM` + `ANMF` animation of full-canvas `Rgba` frames — lossless by default (`decode_all(encode_all(f)) == f` for `Rgba` frames with whole-millisecond delays), lossy `VP8 ` (+ `ALPH`) frames with a `quality` |
 | `encode_animation` | the WebP-specific depth name under `encode_all` — always an animation (and `encode_animation_frames` for positioned `AnimFrame`s with blend / dispose flags) |
 | `read_metadata` | `fn(&[u8]) -> Result<Metadata, Error>` — `ICCP` / `EXIF` / `XMP ` payloads without decoding pixels |
 | `WebpImage` | `{ width, height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo, metadata: Metadata, palette: None }` with `new` / `from_rgb8` / `from_rgba8` / `from_yuv420` (each `Result`, refusing a zero dimension or planes that do not fit the layout with `InvalidData`), `as_bytes` (packed layouts), `into_raw`, `to_rgb8`, `to_rgba8` |
@@ -98,9 +98,9 @@ is, a still from either encoder becomes a full-canvas `ANMF` with
 blending off, packet durations become `Frame Duration`s, `ANIM` comes
 from the first packet or from the stream's `loop_count` /
 `background_color` options (`0` / `#00000000` by default), and `ICCP` /
-`EXIF` / `XMP ` from the first packet. Lossy (`webp_vp8`) and mixed
-frames therefore mux fine even though `encode_animation` refuses a
-`quality`. `demux(mux(frames)) == frames` for full-canvas `Rgba`
+`EXIF` / `XMP ` from the first packet. Lossy (`webp_vp8`), lossless and
+mixed frames therefore mux as they are (`encode_animation` codes every
+frame from RGBA, all lossless or all lossy). `demux(mux(frames)) == frames` for full-canvas `Rgba`
 frames; demux → mux → demux of any file reproduces its composited
 frames, delays, loop count and background.
 
@@ -231,8 +231,11 @@ profile is carried, not applied.
 * Animation frames are composited onto a full canvas; each `Frame.image`
   is a canvas-sized `Rgba` snapshot (`width × height × 4` bytes per
   frame).
-* Lossy animation *encode* is not implemented (`Error::Unsupported`);
-  lossy animation *decode* is.
+* An animation is coded all lossless or all lossy (`quality`); frames
+  of both kinds in one file come from the container muxer, which merges
+  existing bitstreams. Lossy frames are key frames (`VP8 ` has no
+  inter-frame prediction inside WebP); what they save between frames is
+  the dirty rectangle.
 * Hostile input never panics: every entry point returns `Error`; the
   fuzz targets below cover `probe` / `info` / `decode` / `decode_all` and
   both encode paths.

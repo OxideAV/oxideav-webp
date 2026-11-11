@@ -1,6 +1,7 @@
-//! Still-image timing matrix: size x effort x threads -> milliseconds
-//! and bytes, for lossy and lossless encode and decode through the
-//! public entry points (`encode_rgb8`, `decode_rgba8`).
+//! Timing matrix: size x effort x threads -> milliseconds and bytes,
+//! for lossy and lossless still encode and decode through the public
+//! entry points (`encode_rgb8`, `decode_rgba8`), plus an eight-frame
+//! animation (`encode_animation`).
 //!
 //! A plain `main` (no statistics harness): each cell is the median of a
 //! few runs, printed as one Markdown table row, so the README table can
@@ -16,8 +17,8 @@
 //!   `800x533,2400x1600`).
 //! * `STILL_MATRIX_RUNS` — runs per cell (default 5; cells slower than
 //!   two seconds run once).
-//! * `STILL_MATRIX_SECTIONS` — any of `lossy`, `lossless`, `decode`
-//!   (default all three).
+//! * `STILL_MATRIX_SECTIONS` — any of `lossy`, `lossless`, `decode`,
+//!   `animation` (default all four).
 //! * `STILL_MATRIX_HASH` — when set, each encode row ends with the
 //!   64-bit FNV-1a of the file, to compare outputs between builds.
 //!
@@ -26,7 +27,9 @@
 
 use std::time::{Duration, Instant};
 
-use oxideav_webp::{EncodeOptions, decode_rgba8, encode_rgb8};
+use oxideav_webp::{
+    EncodeOptions, Frame, WebpImage, decode_all, decode_rgba8, encode_animation, encode_rgb8,
+};
 
 /// Deterministic photo-like RGB picture: seven octaves of smooth lattice
 /// noise per channel (correlated between channels, like a photograph's
@@ -207,6 +210,75 @@ fn decode_section(sizes: &[(u32, u32)], runs: usize) {
     }
 }
 
+/// Eight frames of the photo-like picture with a bright square moving
+/// across it: most of each frame repeats the previous one.
+fn animation_frames(w: u32, h: u32) -> Vec<Frame> {
+    let rgb = photo_rgb(w, h);
+    let side = (h / 6).max(2);
+    (0..8u32)
+        .map(|i| {
+            let mut rgba: Vec<u8> = rgb
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|px| [px[0], px[1], px[2], 0xff])
+                .collect();
+            let (x0, y0) = ((w - side) * i / 8, (h - side) * i / 8);
+            for y in y0..y0 + side {
+                for x in x0..x0 + side {
+                    let at = ((y * w + x) * 4) as usize;
+                    rgba[at..at + 3].copy_from_slice(&[250, 240, 40]);
+                }
+            }
+            let image = WebpImage::from_rgba8(w, h, rgba).expect("frame");
+            Frame::new(image, Some(Duration::from_millis(40)))
+        })
+        .collect()
+}
+
+fn animation_section(sizes: &[(u32, u32)], threads: &[usize], runs: usize) {
+    println!("\n### Animation encode, 8 frames (`encode_animation`)\n");
+    print!("| size | frames |");
+    for t in threads {
+        print!(" {t} thread{} ms |", if *t == 1 { "" } else { "s" });
+    }
+    println!(" bytes |");
+    println!("|---|---|{}---:|", "---:|".repeat(threads.len()));
+    for &(w, h) in sizes {
+        let frames = animation_frames(w, h);
+        for (name, base) in [
+            (
+                "lossless, effort 2",
+                EncodeOptions::default().with_method(2),
+            ),
+            (
+                "lossy, quality 80, effort 4",
+                EncodeOptions::default().with_quality(80.0),
+            ),
+            (
+                "lossy, quality 80, effort 1",
+                EncodeOptions::default().with_quality(80.0).with_method(1),
+            ),
+        ] {
+            print!("| {w}x{h} | {name} |");
+            let mut reference: Option<Vec<u8>> = None;
+            for &t in threads {
+                let opts = base.clone().with_threads(t);
+                let (d, file) =
+                    time_median(runs, || encode_animation(&frames, &opts).expect("encode"));
+                match &reference {
+                    None => reference = Some(file),
+                    Some(first) => assert!(*first == file, "thread budget changed the output"),
+                }
+                print!(" {} |", ms(d));
+            }
+            let file = reference.unwrap_or_default();
+            assert_eq!(decode_all(&file).expect("decode").len(), frames.len());
+            println!(" {} |", file.len());
+        }
+    }
+}
+
 fn main() {
     if !std::env::args().any(|a| a == "--bench") {
         // Smoke pass for `cargo test --benches`.
@@ -234,8 +306,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    let sections =
-        std::env::var("STILL_MATRIX_SECTIONS").unwrap_or_else(|_| "lossy,lossless,decode".into());
+    let sections = std::env::var("STILL_MATRIX_SECTIONS")
+        .unwrap_or_else(|_| "lossy,lossless,decode,animation".into());
     let wants = |name: &str| sections.split(',').any(|s| s.trim() == name);
     if wants("lossy") {
         encode_section(
@@ -259,5 +331,8 @@ fn main() {
     }
     if wants("decode") {
         decode_section(&sizes, runs);
+    }
+    if wants("animation") {
+        animation_section(&sizes, &[1, 4, 8], runs.min(3));
     }
 }

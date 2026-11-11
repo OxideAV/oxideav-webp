@@ -473,9 +473,10 @@ fn muxer_merges_lossless_packets_into_an_animation_with_delays_and_loop() {
 
 #[test]
 fn muxer_accepts_lossy_packets_at_the_chunk_level() {
-    // Layer 1 `encode_animation` refuses a quality (it re-encodes from
-    // RGBA); the muxer only re-frames existing bitstreams, so a `webp_vp8`
-    // packet becomes a lossy ANMF frame as RFC 9649 §2.7.1.1 allows.
+    // Layer 1 `encode_animation` codes every frame from RGBA, all
+    // lossless or all lossy; the muxer only re-frames existing
+    // bitstreams, so a `webp_vp8` packet becomes a lossy ANMF frame next
+    // to a lossless one, as RFC 9649 §2.7.1.1 allows.
     let ctx = ctx();
     let lossy = decode(LOSSY_1X1).unwrap();
     let mut params = CodecParameters::video(CodecId::new(CODEC_ID_VP8));

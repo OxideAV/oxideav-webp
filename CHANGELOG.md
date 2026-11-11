@@ -35,6 +35,14 @@ All notable changes to `oxideav-webp` are recorded here.
   opaque RGBA picture is recognised by a scan that allocates nothing;
   `Yuv420P` / `Yuva420P` planes go to the VP8 encoder in place at their
   strides instead of through tight copies.
+- **Animation frames are encoded concurrently.** The canvas a decoder
+  holds before each frame follows from the caller's pixels alone, so the
+  encoder snapshots it per frame and encodes up to `threads` frames at
+  once (snapshots capped at 256 MiB per window), writing the `ANMF`
+  chunks in frame order — the same bytes for every budget, lossless and
+  lossy, every frame mode (`tests/anim_coding.rs`). Eight 800 x 533
+  frames, lossless effort 2: 8 threads 648 ms to 217 ms (1 thread
+  unchanged; the budget used to reach only the stages inside one frame).
 - Decode. `PrefixCode::read_symbol` resolves every code from one peeked
   word: the primary table for codes up to 8 bits, then a range compare
   per remaining code length on the same bits — the per-bit reader walk
@@ -78,6 +86,16 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Added
 
+- **Lossy animation encode.** `encode_animation` / `encode_all` /
+  `encode_animation_frames` with a `quality` write `VP8 ` key frames
+  (with an `ALPH` chunk for a frame that has alpha — carried exactly)
+  inside the `ANMF` chunks; they used to return `Unsupported`. Every
+  `AnimFrameMode` applies: the dirty rectangle is found on the caller's
+  pixels and coded as an overwriting sub-frame, so a moving-square
+  sequence costs a fraction of whole frames. `method` / `threads` apply
+  as for stills. `tests/anim_coding.rs` (round trip by PSNR, exact
+  alpha, positioned alpha-blended sub-frames, the 16383 px frame limit,
+  and a black-box container tool listing the frames).
 - Registry encoder options. `webp_vp8`: `effort` (`0..=6`, default `4`),
   `threads` (`0` = follow the `ExecutionContext`), `qindex`, `quality`
   — typed as `encoder_vp8::WebpVp8EncoderOptions`, with

@@ -310,6 +310,19 @@ impl EncodeOptions {
         }
     }
 
+    /// How an animation's frames are coded under these options.
+    fn frame_coding(&self) -> crate::anim_encode::FrameCoding {
+        match self.quality {
+            None => crate::anim_encode::FrameCoding::Lossless {
+                method: self.method,
+            },
+            Some(quality) => crate::anim_encode::FrameCoding::Lossy(LossyTuning::for_quality(
+                quality,
+                self.method,
+            )),
+        }
+    }
+
     /// `true` when the lossy `VP8 ` path is selected.
     pub fn is_lossy(&self) -> bool {
         self.quality.is_some()
@@ -1372,30 +1385,7 @@ pub(crate) fn encode_lossy_planes(
     tuning: LossyTuning,
 ) -> Result<Vec<u8>, WebpError> {
     let (width, height) = (frame.width, frame.height);
-    let pixels = width as usize * height as usize;
-    let budget = vp8l_encode::thread_budget();
-    let method = tuning.method;
-    // The `ALPH` plane is an independent lossless encode: on images large
-    // enough to pay for a thread it runs next to the VP8 encode (same
-    // bytes either way); otherwise, or when no thread can be spawned, it
-    // runs after it.
-    let (vp8, alph_payload) = std::thread::scope(|scope| {
-        let alpha_job = alpha
-            .filter(|_| pixels >= LOSSY_ALPHA_THREAD_MIN_PIXELS && budget >= 2)
-            .and_then(|a| {
-                std::thread::Builder::new()
-                    .spawn_scoped(scope, move || build_alph_payload(a, width, height, method))
-                    .ok()
-            });
-        let vp8_threads = budget - usize::from(alpha_job.is_some());
-        let vp8 = encode_vp8_keyframe(frame, tuning, vp8_threads);
-        let alph = match alpha_job {
-            Some(job) => Some(job.join().unwrap_or_else(|p| std::panic::resume_unwind(p))),
-            None => alpha.map(|a| build_alph_payload(a, width, height, method)),
-        };
-        (vp8, alph)
-    });
-    let vp8 = vp8?;
+    let (vp8, alph_payload) = encode_lossy_parts(frame, alpha, tuning)?;
 
     // Simple-lossy layout when there is nothing to declare in a VP8X.
     if alpha.is_none() && meta.is_empty() {
@@ -1436,6 +1426,58 @@ pub(crate) fn encode_lossy_planes(
         }
     }
     file.finish()
+}
+
+/// The two bitstreams of a lossy picture held as packed RGBA: the `VP8 `
+/// key frame and, when any pixel is not opaque, the `ALPH` payload — the
+/// "Frame Data" of a lossy animation frame.
+pub(crate) fn encode_lossy_rgba_parts(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    tuning: LossyTuning,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), WebpError> {
+    check_lossy_dimensions(width, height)?;
+    let (w, h) = (width as usize, height as usize);
+    let (y, u, v) = yuv::rgb_to_yuv420(w, h, rgba, w * 4, 4, vp8l_encode::thread_budget());
+    let alpha = packed_alpha_plane(w, h, rgba, w * 4);
+    let frame = oxideav_vp8::I420Frame::packed(width, height, &y, &u, &v);
+    encode_lossy_parts(&frame, alpha.as_deref(), tuning)
+}
+
+/// The `VP8 ` key frame of `frame` and the `ALPH` payload of `alpha` (a
+/// tight `width × height` plane), coded side by side on the thread
+/// budget.
+fn encode_lossy_parts(
+    frame: &oxideav_vp8::I420Frame<'_>,
+    alpha: Option<&[u8]>,
+    tuning: LossyTuning,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), WebpError> {
+    let (width, height) = (frame.width, frame.height);
+    let pixels = width as usize * height as usize;
+    let budget = vp8l_encode::thread_budget();
+    let method = tuning.method;
+    // The `ALPH` plane is an independent lossless encode: on images large
+    // enough to pay for a thread it runs next to the VP8 encode (same
+    // bytes either way); otherwise, or when no thread can be spawned, it
+    // runs after it.
+    let (vp8, alph_payload) = std::thread::scope(|scope| {
+        let alpha_job = alpha
+            .filter(|_| pixels >= LOSSY_ALPHA_THREAD_MIN_PIXELS && budget >= 2)
+            .and_then(|a| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, move || build_alph_payload(a, width, height, method))
+                    .ok()
+            });
+        let vp8_threads = budget - usize::from(alpha_job.is_some());
+        let vp8 = encode_vp8_keyframe(frame, tuning, vp8_threads);
+        let alph = match alpha_job {
+            Some(job) => Some(job.join().unwrap_or_else(|p| std::panic::resume_unwind(p))),
+            None => alpha.map(|a| build_alph_payload(a, width, height, method)),
+        };
+        (vp8, alph)
+    });
+    Ok((vp8?, alph_payload))
 }
 
 /// Lowest `EncodeOptions::method` that fits the RFC 6386 §13.4
@@ -1573,12 +1615,12 @@ pub(crate) fn build_alph_payload(alpha: &[u8], width: u32, height: u32, method: 
 
 /// Encode `frames` as one file — the mirror of [`decode_all`]. A single
 /// frame with no delay is written as a still ([`encode`]); anything else
-/// as an animation via [`encode_animation`] (lossless `VP8L` sub-frames,
-/// so a `quality` option is [`WebpError::Unsupported`]). Every frame is
+/// as an animation via [`encode_animation`]. Every frame is
 /// composited full-canvas as `Rgba` — the layout [`decode_all`] returns
-/// — so `decode_all(encode_all(frames)) == frames` holds for `Rgba`
-/// frames whose metadata matches the first frame's (the file carries one
-/// metadata set) and whose delays are whole milliseconds.
+/// — so without a `quality` `decode_all(encode_all(frames)) == frames`
+/// holds for `Rgba` frames whose metadata matches the first frame's (the
+/// file carries one metadata set) and whose delays are whole
+/// milliseconds; with a `quality` the frames are lossy.
 pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>, WebpError> {
     match frames {
         [] => Err(WebpError::invalid("encode_all needs at least one frame")),
@@ -1593,20 +1635,19 @@ pub fn encode_all(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>, Web
 /// Each frame's image is composited as a full-canvas RGBA picture (any
 /// layout is accepted — [`WebpImage::to_rgba8`] runs first) placed at the
 /// canvas origin; the canvas is the largest frame. Frames are coded
-/// losslessly as `VP8L` sub-frames per `opts.frame_mode` (`Auto` picks the
-/// smaller of a full keyframe and a dirty-rectangle delta). `delay` is the
-/// §2.7.1.1 frame duration (`None` → 0 ms). `loop_count`,
-/// `background_rgba` and the metadata of the first frame's image feed the
-/// `ANIM` / `ICCP` / `EXIF` / `XMP ` chunks. A lossy (`quality`) option is
-/// [`WebpError::Unsupported`] for animations in this release.
+/// losslessly as `VP8L` sub-frames — or, with a `quality`, as lossy
+/// `VP8 ` key frames with an `ALPH` chunk where a frame has alpha — per
+/// `opts.frame_mode` (`Auto` picks the smaller of a full keyframe and a
+/// dirty-rectangle delta). `delay` is the §2.7.1.1 frame duration
+/// (`None` → 0 ms). `loop_count`, `background_rgba` and the metadata of
+/// the first frame's image feed the `ANIM` / `ICCP` / `EXIF` / `XMP `
+/// chunks. `opts.method` is the effort of every frame and
+/// `opts.threads` the number of frames (and, within a frame, stages)
+/// encoded at once; the bytes do not depend on it. A lossy frame is at
+/// most 16383 pixels per side.
 pub fn encode_animation(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8>, WebpError> {
     if frames.is_empty() {
         return Err(WebpError::invalid("animation needs at least one frame"));
-    }
-    if opts.quality.is_some() {
-        return Err(WebpError::unsupported(
-            "lossy animation frames are not implemented; use the lossless default",
-        ));
     }
     let anim_frames: Vec<crate::anim_encode::AnimFrame> = frames
         .iter()
@@ -1634,7 +1675,7 @@ pub fn encode_animation(frames: &[Frame], opts: &EncodeOptions) -> Result<Vec<u8
             opts.background_rgba,
             &meta,
             &opts.delta,
-            opts.method,
+            opts.frame_coding(),
         )
     })
 }
@@ -1651,11 +1692,6 @@ pub fn encode_animation_frames(
     metadata: &Metadata,
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    if opts.quality.is_some() {
-        return Err(WebpError::unsupported(
-            "lossy animation frames are not implemented; use the lossless default",
-        ));
-    }
     let meta = opts.filtered_metadata(metadata);
     vp8l_encode::with_thread_budget(opts.worker_budget(), || {
         crate::anim_encode::build_animation(
@@ -1664,7 +1700,7 @@ pub fn encode_animation_frames(
             opts.background_rgba,
             &meta,
             &opts.delta,
-            opts.method,
+            opts.frame_coding(),
         )
     })
 }
@@ -1972,10 +2008,12 @@ mod tests {
             encode_all(&[], &EncodeOptions::default()),
             Err(WebpError::InvalidData(_))
         ));
-        assert!(matches!(
-            encode_all(&frames, &EncodeOptions::default().with_quality(50.0)),
-            Err(WebpError::Unsupported(_))
-        ));
+        // With a quality the frames are lossy key frames.
+        let lossy = encode_all(&frames, &EncodeOptions::default().with_quality(50.0)).unwrap();
+        let header = info(&lossy).unwrap();
+        assert!(header.is_animated && header.is_lossy);
+        assert_eq!(header.frames, 3);
+        assert_eq!(decode_all(&lossy).unwrap().len(), 3);
     }
 
     #[test]

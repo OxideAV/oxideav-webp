@@ -1,6 +1,7 @@
-//! Animation *encoder* — the published-0.1.5 `build_animated_webp` surface,
-//! rebuilt clean-room on top of the in-crate §3.7 VP8L lossless encoder and
-//! the §2.7.1.1 `ANIM` / `ANMF` container framing.
+//! Animation *encoder*: the §2.7.1.1 `ANIM` / `ANMF` container framing
+//! around frames coded by the in-crate §3.7 VP8L lossless encoder or,
+//! under a quality, by the `oxideav-vp8` key-frame encoder (with an `ALPH`
+//! chunk for frames that carry alpha).
 //!
 //! Where [`crate::anim`] / [`crate::anmf`] *parse* the global and per-frame
 //! animation headers, and [`crate::build`] frames a single still image, this
@@ -13,16 +14,15 @@
 //!
 //! Each `ANMF` carries the §2.7.1.1 Figure 9 16-byte header (frame X / Y /
 //! width / height / duration plus the `Reserved|B|D` info byte) followed by
-//! its "Frame Data" — a padded §2.3 sub-RIFF holding a single §2.6 `VP8L`
-//! chunk for the [`AnimFrameMode::Lossless`] path. The bitstream itself is
-//! produced by [`crate::vp8l_encode::encode_vp8l_argb_with`], so the encoded
+//! its "Frame Data": a single §2.6 `VP8L` chunk for a lossless frame, or
+//! an optional `ALPH` chunk and a `VP8 ` chunk for a lossy one. A lossless
 //! file decodes back through [`crate::decode_all`] (animation path) to the
 //! exact input pixels.
 //!
-//! ## Auto / Delta encoding (round 127)
+//! ## Frame modes
 //!
 //! [`AnimFrameMode::Lossless`] always emits the full caller-supplied frame
-//! at its `(x, y)` offset as a single VP8L keyframe. [`AnimFrameMode::Delta`]
+//! at its `(x, y)` offset as one bitstream. [`AnimFrameMode::Delta`]
 //! and [`AnimFrameMode::Auto`] take advantage of the §2.7.1.1
 //! `B = 1` (overwrite) / `D = 0` (no dispose) ANMF semantics to encode only
 //! the **dirty rectangle** of each frame against the previous canvas:
@@ -37,16 +37,22 @@
 //!   previous canvas to diff against) and any frame with
 //!   `dispose == Background` (the §2.7.1.1 clear applies to the frame's
 //!   declared rect, which a smaller dirty-rect ANMF cannot express).
-//! * `Auto` evaluates both the dirty-rect sub-frame and the full-canvas
-//!   keyframe and emits whichever produces a smaller VP8L bitstream
+//! * `Auto` evaluates both the dirty-rect sub-frame and the full-frame
+//!   keyframe and emits whichever produces the smaller frame data
 //!   (subject to the same two full-keyframe fallbacks).
 //!
-//! Both modes are **lossless** — every encoded byte round-trips through
-//! [`crate::decode_all`] to the exact caller-provided pixels, the same as
-//! `Lossless`. The [`DeltaConfig`] / [`DownsampleKernel`] knobs are
-//! preserved for API-shape compatibility but the dirty-rect algorithm
-//! does not consult them yet (they were originally intended for a
-//! lossy-aware MS-SSIM quality gate).
+//! The dirty rectangle is found on the caller's pixels, so it is the same
+//! for lossless and lossy coding; a lossy sub-frame overwrites its
+//! rectangle with freshly coded pixels and leaves the rest of the canvas
+//! as the earlier frames decoded.
+//!
+//! ## Threads
+//!
+//! The canvas the decoder holds before each frame is known from the
+//! caller's pixels alone, so frames are independent encodes: up to the
+//! thread budget of them run at once (each given the previous canvas it
+//! is diffed against), and their `ANMF` chunks are written in frame
+//! order. The bytes are the same for every budget.
 
 use crate::anmf::{BlendingMethod, DisposalMethod};
 use crate::build::{self, Vp8xFlags};
@@ -60,28 +66,25 @@ const ANMF_HEADER_LEN: usize = 16;
 /// §2.7.1.1 Figure 8 fixed `ANIM` payload length (uint32 bg + uint16 loop).
 const ANIM_PAYLOAD_LEN: usize = 6;
 
-/// How a single animation frame's pixels are compressed into its `ANMF`
-/// "Frame Data" bitstream subchunk.
-///
-/// Reproduces the published-0.1.5 variant set. All three modes are wired
-/// in this build; the round-127 `Auto` and `Delta` paths encode the
-/// caller's full-canvas frame as a **lossless dirty-rect sub-frame**
-/// against the previous canvas (the original lossy keyframe vs. inter-frame
-/// delta choice is deferred until the `oxideav-vp8` lossy encoder is ready,
-/// at which point `Auto` will also evaluate a lossy candidate).
+/// How much of a single animation frame goes into its `ANMF` "Frame
+/// Data": the whole frame rectangle or only what changed. The bitstream
+/// kind follows [`EncodeOptions::quality`](crate::EncodeOptions::quality)
+/// — `VP8L` without one, `VP8 ` (+ `ALPH`) with one — for every mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum AnimFrameMode {
-    /// Evaluate both the full-canvas VP8L keyframe and the dirty-rect VP8L
+    /// Evaluate both the full-frame keyframe and the dirty-rectangle
     /// sub-frame and emit whichever is smaller. Falls back to the
-    /// full-canvas keyframe for the first frame and for frames whose
-    /// dirty rect happens to cover the whole canvas.
+    /// full frame for the first frame and for frames whose dirty rect
+    /// happens to cover the whole frame.
     #[default]
     Auto,
     /// Always emit the dirty-rect sub-frame (the §2.7.1.1 `B = 1` / `D = 0`
-    /// overwrite-no-dispose path). First frame is always the full canvas.
+    /// overwrite-no-dispose path). First frame is always the full frame.
     Delta,
-    /// Encode the frame as a standalone §2.6 `VP8L` lossless keyframe.
+    /// Always emit the whole frame rectangle as one standalone bitstream
+    /// (the name dates from when every frame was `VP8L`; under a quality
+    /// the frame is a lossy key frame).
     Lossless,
 }
 
@@ -290,7 +293,9 @@ pub fn build_animated_webp(frames: &[AnimFrame]) -> Result<Vec<u8>, WebpError> {
         [0, 0, 0, 0],
         &WebpMetadata::default(),
         &DeltaConfig::default(),
-        vp8l_encode::MAX_LOSSLESS_METHOD,
+        FrameCoding::Lossless {
+            method: vp8l_encode::MAX_LOSSLESS_METHOD,
+        },
     )
 }
 
@@ -339,7 +344,9 @@ pub fn build_animated_webp_with_options(
         opts.background_rgba,
         &opts.metadata,
         &opts.delta,
-        vp8l_encode::MAX_LOSSLESS_METHOD,
+        FrameCoding::Lossless {
+            method: vp8l_encode::MAX_LOSSLESS_METHOD,
+        },
     )
 }
 
@@ -352,7 +359,7 @@ pub(crate) fn build_animation(
     background_rgba: [u8; 4],
     meta: &WebpMetadata<'_>,
     _delta: &DeltaConfig,
-    method: u8,
+    coding: FrameCoding,
 ) -> Result<Vec<u8>, WebpError> {
     if frames.is_empty() {
         return Err(WebpError::invalid("animation needs at least one frame"));
@@ -427,28 +434,53 @@ pub(crate) fn build_animation(
         &build_anim_payload(loop_count, background_rgba),
     )?;
 
-    // Track the canvas state the decoder will see right *before* this
-    // iteration's frame is drawn. Initialised to the ANIM bg colour to
-    // mirror the decoder's §2.7.1.1 "canvas is cleared at the start" rule.
+    // Track the canvas state the decoder will see right *before* each
+    // frame is drawn. Initialised to the ANIM bg colour to mirror the
+    // decoder's §2.7.1.1 "canvas is cleared at the start" rule. The
+    // tracker only needs the caller's pixels, so it runs ahead of the
+    // encodes: each window of frames gets its previous-canvas snapshots,
+    // is encoded on the thread budget, and is written in frame order.
     let mut prev_canvas = build_initial_canvas(canvas_width, canvas_height, background_rgba);
     let bg_rgba = background_rgba;
     // Per the decoder: before drawing each frame after the first, the
     // *previous* frame's dispose method is applied to *its* rect.
     let mut prev_disposal: Option<(u32, u32, u32, u32, DisposalMethod)> = None;
 
-    for (idx, f) in frames.iter().enumerate() {
-        // Apply previous frame's dispose to the predicted-canvas tracker.
-        if let Some((px, py, pw, ph, DisposalMethod::Background)) = prev_disposal {
-            fill_canvas_rect_in_place(&mut prev_canvas, canvas_width, px, py, pw, ph, bg_rgba);
+    let budget = vp8l_encode::thread_budget();
+    let window = budget
+        .min(SNAPSHOT_MEMORY_BUDGET / prev_canvas.len().max(1))
+        .max(1);
+    for (window_index, window_frames) in frames.chunks(window).enumerate() {
+        let mut jobs = Vec::with_capacity(window_frames.len());
+        for (offset, f) in window_frames.iter().enumerate() {
+            let is_first = window_index == 0 && offset == 0;
+            // Apply previous frame's dispose to the predicted-canvas tracker.
+            if let Some((px, py, pw, ph, DisposalMethod::Background)) = prev_disposal {
+                fill_canvas_rect_in_place(&mut prev_canvas, canvas_width, px, py, pw, ph, bg_rgba);
+            }
+            let prev = if !needs_previous_canvas(f, is_first) {
+                None
+            } else if window_frames.len() == 1 {
+                // A window of one encodes before the tracker moves on.
+                let payload =
+                    build_anmf_payload_with_prev(f, canvas_width, &prev_canvas, is_first, coding)?;
+                push(fourcc::ANMF, &payload)?;
+                composite_frame_onto_canvas(&mut prev_canvas, canvas_width, f);
+                prev_disposal = Some((f.x, f.y, f.width, f.height, f.dispose));
+                continue;
+            } else {
+                Some(prev_canvas.clone())
+            };
+            jobs.push((f, prev, is_first));
+            // Update the canvas tracker with this frame's drawn pixels
+            // (matching the decoder's blend method).
+            composite_frame_onto_canvas(&mut prev_canvas, canvas_width, f);
+            // Remember this frame's rect + dispose for the next iteration.
+            prev_disposal = Some((f.x, f.y, f.width, f.height, f.dispose));
         }
-        let anmf_payload =
-            build_anmf_payload_with_prev(f, canvas_width, &prev_canvas, idx == 0, method)?;
-        push(fourcc::ANMF, &anmf_payload)?;
-        // Update the canvas tracker with this frame's drawn pixels
-        // (matching the decoder's blend method).
-        composite_frame_onto_canvas(&mut prev_canvas, canvas_width, f);
-        // Remember this frame's rect + dispose for the next iteration.
-        prev_disposal = Some((f.x, f.y, f.width, f.height, f.dispose));
+        for payload in encode_window(&jobs, canvas_width, coding, budget) {
+            push(fourcc::ANMF, &payload?)?;
+        }
     }
 
     if let Some(exif) = meta.exif {
@@ -460,6 +492,121 @@ pub(crate) fn build_animation(
 
     // §2.4 file framing: "RIFF" | File Size (= body + 4 for "WEBP") | "WEBP".
     crate::api::frame_riff(body)
+}
+
+/// How a frame's pixels become its "Frame Data" bitstream.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FrameCoding {
+    /// One `VP8L` chunk at lossless effort `method`.
+    Lossless {
+        /// [`EncodeOptions::method`](crate::EncodeOptions::method).
+        method: u8,
+    },
+    /// A `VP8 ` key frame, preceded by an `ALPH` chunk when the frame
+    /// has a pixel that is not opaque.
+    Lossy(crate::api::LossyTuning),
+}
+
+/// Bytes of previous-canvas snapshots one window of concurrently encoded
+/// frames may hold.
+const SNAPSHOT_MEMORY_BUDGET: usize = 256 << 20;
+
+/// `true` when [`build_anmf_payload_with_prev`] reads the previous canvas
+/// for `f`: a dirty-rectangle mode on a frame that can be diffed.
+fn needs_previous_canvas(f: &AnimFrame, is_first_frame: bool) -> bool {
+    f.mode != AnimFrameMode::Lossless && !is_first_frame && f.dispose != DisposalMethod::Background
+}
+
+/// Encode one window of frames — each with the previous canvas it is
+/// diffed against, when it needs one — on up to `budget` threads, and
+/// return their `ANMF` payloads in frame order. Every worker passes its
+/// share of the budget on to the encodes it runs; a worker that cannot be
+/// started only leaves more frames to the others.
+fn encode_window(
+    jobs: &[(&AnimFrame, Option<Vec<u8>>, bool)],
+    canvas_w: u32,
+    coding: FrameCoding,
+    budget: usize,
+) -> Vec<Result<Vec<u8>, WebpError>> {
+    let encode = |&(f, ref prev, is_first): &(&AnimFrame, Option<Vec<u8>>, bool)| {
+        build_anmf_payload_with_prev(
+            f,
+            canvas_w,
+            prev.as_deref().unwrap_or(&[]),
+            is_first,
+            coding,
+        )
+    };
+    let workers = budget.min(jobs.len());
+    if workers <= 1 {
+        return jobs.iter().map(encode).collect();
+    }
+    let inner_budget = (budget / workers).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        vp8l_encode::with_thread_budget(inner_budget, || {
+            let mut done = Vec::new();
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(job) = jobs.get(index) else { break };
+                done.push((index, encode(job)));
+            }
+            done
+        })
+    };
+    let mut results: Vec<Option<Result<Vec<u8>, WebpError>>> = jobs.iter().map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..workers)
+            .filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, work).ok())
+            .collect();
+        let mut done = work();
+        for handle in handles {
+            done.extend(
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        for (index, result) in done {
+            results[index] = Some(result);
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|| Err(WebpError::invalid("animation frame not encoded")))
+        })
+        .collect()
+}
+
+/// Encode `pixels` (`w * h * 4` flat RGBA) as the §2.7.1.1 "Frame Data"
+/// of one `ANMF`: the bitstream chunk(s) `coding` asks for.
+fn encode_frame_data(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    coding: FrameCoding,
+) -> Result<Vec<u8>, WebpError> {
+    match coding {
+        FrameCoding::Lossless { method } => {
+            let argb = rgba_to_argb(pixels);
+            let has_alpha = pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0xff);
+            let bitstream =
+                vp8l_encode::encode_vp8l_argb_with_method(&argb, w, h, has_alpha, method)
+                    .map_err(WebpError::from)?;
+            build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)
+        }
+        FrameCoding::Lossy(tuning) => {
+            let (vp8, alph) = crate::api::encode_lossy_rgba_parts(pixels, w, h, tuning)?;
+            let mut data =
+                Vec::with_capacity(vp8.len() + alph.as_ref().map_or(0, |a| a.len() + 9) + 9);
+            if let Some(alph) = alph {
+                data.extend_from_slice(&build::build_chunk(fourcc::ALPH, &alph).map_err(to_w)?);
+            }
+            data.extend_from_slice(&build::build_chunk(fourcc::VP8, &vp8).map_err(to_w)?);
+            Ok(data)
+        }
+    }
 }
 
 /// Build a fresh canvas filled with `bg` per §2.7.1.1 — what the decoder
@@ -705,15 +852,15 @@ fn build_anmf_payload_with_prev(
     canvas_w: u32,
     prev: &[u8],
     is_first_frame: bool,
-    method: u8,
+    coding: FrameCoding,
 ) -> Result<Vec<u8>, WebpError> {
     match f.mode {
         AnimFrameMode::Lossless => {
-            emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, method)
+            emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, coding)
         }
         AnimFrameMode::Delta => {
             if is_first_frame || f.dispose == DisposalMethod::Background {
-                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, method)
+                emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, coding)
             } else {
                 let drawn = drawn_canvas(prev, canvas_w, f);
                 let rect =
@@ -729,13 +876,13 @@ fn build_anmf_payload_with_prev(
                         h: 2.min(f.height),
                     });
                 let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, rect);
-                emit_dirty_anmf(f, rect, &sub_rgba, method)
+                emit_dirty_anmf(f, rect, &sub_rgba, coding)
             }
         }
         AnimFrameMode::Auto => {
             // Always evaluate the full-frame candidate (and use it for the
             // first frame / Background-dispose fallbacks regardless).
-            let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, method)?;
+            let full = emit_full_anmf(f, f.x, f.y, f.width, f.height, &f.pixels, coding)?;
             if is_first_frame || f.dispose == DisposalMethod::Background {
                 return Ok(full);
             }
@@ -750,7 +897,7 @@ fn build_anmf_payload_with_prev(
                     h: 2.min(f.height),
                 };
                 let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, degen_rect);
-                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba, method)?;
+                let delta = emit_dirty_anmf(f, degen_rect, &sub_rgba, coding)?;
                 return Ok(if delta.len() < full.len() {
                     delta
                 } else {
@@ -769,7 +916,7 @@ fn build_anmf_payload_with_prev(
                 return Ok(full);
             }
             let sub_rgba = extract_subrect_from_canvas(&drawn, canvas_w, rect);
-            let delta = emit_dirty_anmf(f, rect, &sub_rgba, method)?;
+            let delta = emit_dirty_anmf(f, rect, &sub_rgba, coding)?;
             Ok(if delta.len() < full.len() {
                 delta
             } else {
@@ -787,8 +934,8 @@ fn drawn_canvas(prev: &[u8], canvas_w: u32, f: &AnimFrame) -> Vec<u8> {
     drawn
 }
 
-/// Encode `pixels` (`w*h*4` flat RGBA) as a §2.6 `VP8L` chunk wrapped in
-/// the §2.7.1.1 Figure 9 16-byte ANMF header at `(x, y, w, h)` with the
+/// Encode `pixels` (`w*h*4` flat RGBA) per `coding` and wrap the frame
+/// data in the §2.7.1.1 Figure 9 16-byte ANMF header at `(x, y, w, h)` with the
 /// caller's blend/dispose/duration. Used by both the full-keyframe and
 /// dirty-rect emission paths.
 fn emit_full_anmf(
@@ -798,13 +945,9 @@ fn emit_full_anmf(
     w: u32,
     h: u32,
     pixels: &[u8],
-    method: u8,
+    coding: FrameCoding,
 ) -> Result<Vec<u8>, WebpError> {
-    let argb = rgba_to_argb(pixels);
-    let has_alpha = pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0xff);
-    let bitstream = vp8l_encode::encode_vp8l_argb_with_method(&argb, w, h, has_alpha, method)
-        .map_err(WebpError::from)?;
-    let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
+    let frame_data = encode_frame_data(pixels, w, h, coding)?;
     Ok(build_anmf_header_then_data(
         x,
         y,
@@ -829,14 +972,9 @@ fn emit_dirty_anmf(
     f: &AnimFrame,
     rect: DirtyRect,
     sub_rgba: &[u8],
-    method: u8,
+    coding: FrameCoding,
 ) -> Result<Vec<u8>, WebpError> {
-    let argb = rgba_to_argb(sub_rgba);
-    let has_alpha = sub_rgba.as_chunks::<4>().0.iter().any(|px| px[3] != 0xff);
-    let bitstream =
-        vp8l_encode::encode_vp8l_argb_with_method(&argb, rect.w, rect.h, has_alpha, method)
-            .map_err(WebpError::from)?;
-    let frame_data = build::build_chunk(fourcc::VP8L, &bitstream).map_err(to_w)?;
+    let frame_data = encode_frame_data(sub_rgba, rect.w, rect.h, coding)?;
     Ok(build_anmf_header_then_data(
         rect.x,
         rect.y,

@@ -572,9 +572,11 @@ fn encode_animation_round_trips_through_decode_all() {
         );
     }
     assert!(encode_animation(&[], &opts).unwrap_err().is_invalid_data());
-    assert!(
-        encode_animation(&frames, &opts.clone().with_quality(50.0))
-            .unwrap_err()
-            .is_unsupported()
-    );
+    // With a quality the frames are lossy; the shape reads back the same.
+    let lossy = encode_animation(&frames, &opts.clone().with_quality(50.0)).unwrap();
+    let i = info(&lossy).unwrap();
+    assert!(i.is_animated && i.is_lossy);
+    assert_eq!(i.frames, 3);
+    assert_eq!(i.loop_count, Some(2));
+    assert_eq!(decode_all(&lossy).unwrap().len(), 3);
 }
