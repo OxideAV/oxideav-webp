@@ -355,6 +355,13 @@ impl Decoder for WebpDecoder {
         &self.params.codec_id
     }
 
+    /// The announced thread budget becomes [`DecodeOptions::threads`]:
+    /// with two or more, a lossy picture's alpha plane is decoded next
+    /// to its `VP8 ` frame. The frames do not depend on it.
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.opts = self.opts.with_threads(ctx.threads.max(1));
+    }
+
     fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
         if self.anim.is_some() {
             return self.decode_animation_packet(packet);

@@ -79,6 +79,13 @@ All notable changes to `oxideav-webp` are recorded here.
   lossy, every frame mode (`tests/anim_coding.rs`). Eight 800 x 533
   frames, lossless effort 2: 8 threads 648 ms to 217 ms (1 thread
   unchanged; the budget used to reach only the stages inside one frame).
+- Decode: a §5.2.2 backward reference is copied as slices (a run of one
+  colour as a fill, an overlapping run in doubling pieces) instead of
+  pixel by pixel through `Vec::push`. Same pixels (unit tests and the
+  `backward_reference` fuzz target's reference model). With the
+  `DecodeOptions::threads` item below, a 2400 x 1600 lossy picture with
+  an alpha plane decodes in 28 ms on one thread and 15 ms on two (was
+  42 ms).
 - Decode. `PrefixCode::read_symbol` resolves every code from one peeked
   word: the primary table for codes up to 8 bits, then a range compare
   per remaining code length on the same bits — the per-bit reader walk
@@ -132,6 +139,11 @@ All notable changes to `oxideav-webp` are recorded here.
   as for stills. `tests/anim_coding.rs` (round trip by PSNR, exact
   alpha, positioned alpha-blended sub-frames, the 16383 px frame limit,
   and a black-box container tool listing the frames).
+- `DecodeOptions::threads` / `with_threads` (default `1`: the calling
+  thread only; `0` = the host's parallelism): with two or more, the
+  `ALPH` plane of a lossy picture is decoded next to its `VP8 ` frame —
+  same pixels, same errors. The framework decoder takes the budget from
+  `Decoder::set_execution_context`.
 - `EncodeOptions::alpha_method` / `with_alpha_method` (alias
   `with_alpha_effort`; registry option `alpha_effort` on `webp_vp8`,
   `WebpVp8EncoderOptions::with_alpha_effort`): the effort of a lossy

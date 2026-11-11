@@ -653,9 +653,28 @@ pub fn apply_backward_reference(
         });
     }
     let src_start = position - dist;
-    for i in 0..length {
-        let argb = pixels[src_start + i];
-        pixels.push(argb);
+    if length == 0 {
+        return Ok(position..position);
+    }
+    if dist <= 1 {
+        // A run of one colour. (`dist == 0` is outside the precondition
+        // and panics on this read, as the pixel walk would.)
+        let argb = pixels[src_start];
+        pixels.resize(position + length, argb);
+    } else {
+        // The pixel walk reads `pixels[src_start + k]` for the run's
+        // `k`-th pixel, after the earlier ones were appended: from
+        // `src_start` on, the buffer is periodic with period `dist`.
+        // Copying whole slices from `src_start` is that walk as long as
+        // every slice starts a multiple of `dist` into the run — true
+        // here, each slice being as long as everything before it
+        // (`dist`, `2 dist`, `4 dist`, …) until the last.
+        let mut copied = 0;
+        while copied < length {
+            let step = (length - copied).min(dist + copied);
+            pixels.extend_from_within(src_start..src_start + step);
+            copied += step;
+        }
     }
     Ok(position..position + length)
 }

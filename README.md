@@ -165,8 +165,11 @@ unlimited): `max_width` / `max_height` (default `Some(16384)`, the VP8L
 `max_bytes` (default `None`), `strict` (default off — on,
 a `VP8X` canvas disagreeing with its bitstream, `VP8X` reserved bits, an
 `ALPH` chunk next to `VP8L`, or an `ANMF` rectangle disagreeing with its
-frame bitstream are refused). Limits are checked against the headers
-before any pixel buffer is allocated; a hit is `Error::LimitExceeded`.
+frame bitstream are refused), `threads` (default `1`; with two or more
+the alpha plane of a lossy picture is decoded next to its `VP8 ` frame;
+the framework decoder takes it from the `ExecutionContext`). Limits are
+checked against the headers before any pixel buffer is allocated; a hit
+is `Error::LimitExceeded`.
 
 `EncodeOptions` (`Default` + `with_*`): `quality: Option<f32>` (`None` =
 lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis

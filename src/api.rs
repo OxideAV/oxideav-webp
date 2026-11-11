@@ -53,6 +53,11 @@ pub struct DecodeOptions {
     /// `VP8L` image, or an `ANMF` frame whose declared rectangle differs
     /// from its bitstream.
     pub strict: bool,
+    /// Threads a decode may use: with two or more, the `ALPH` plane of a
+    /// lossy picture is decoded next to its `VP8 ` frame. `1` (the
+    /// default) decodes on the calling thread only; `0` means the host's
+    /// available parallelism. The pixels are the same for every value.
+    pub threads: usize,
 }
 
 impl Default for DecodeOptions {
@@ -63,6 +68,7 @@ impl Default for DecodeOptions {
             max_pixels: Some((MAX_DIMENSION as u64) * (MAX_DIMENSION as u64)),
             max_bytes: None,
             strict: false,
+            threads: 1,
         }
     }
 }
@@ -101,6 +107,23 @@ impl DecodeOptions {
     pub fn with_strict(mut self, v: bool) -> Self {
         self.strict = v;
         self
+    }
+
+    /// Builder: threads a decode may use (`1` = the calling thread only,
+    /// the default; `0` = the host's available parallelism); see
+    /// [`threads`](Self::threads). Never changes the pixels.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// The thread budget [`threads`](Self::threads) resolves to (at
+    /// least 1).
+    fn worker_budget(&self) -> usize {
+        match self.threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        }
     }
 
     /// The pixel cap handed to the VP8 decoder (`u64::MAX` when unlimited).
@@ -651,6 +674,10 @@ fn decode_still(
     Ok(img)
 }
 
+/// Alpha planes at least this many pixels are decoded on their own
+/// thread next to the VP8 frame when [`DecodeOptions::threads`] allows.
+const ALPHA_THREAD_MIN_PIXELS: usize = 128 * 128;
+
 /// Decode one bitstream (still or `ANMF` sub-frame) plus its optional
 /// `ALPH` payload to the native layout. Dimensions are already checked.
 fn decode_bitstream(
@@ -682,8 +709,27 @@ fn decode_bitstream(
             WebpImage::from_rgba8(w, h, argb_to_rgba(image.pixels()))
         }
         Kind::Lossy(chunk) => {
-            let frame =
-                oxideav_vp8::decode_vp8_with_max_pixels(chunk.bitstream(), opts.pixel_cap())?;
+            // The alpha plane is an independent stream: with a second
+            // thread to spare, and a picture large enough to pay for it,
+            // it is decoded while the VP8 frame is. The header's size is
+            // the frame's, or the decode fails below either way.
+            let alongside = alph.filter(|_| {
+                opts.worker_budget() >= 2
+                    && (w as usize).saturating_mul(h as usize) >= ALPHA_THREAD_MIN_PIXELS
+            });
+            let (frame, early_alpha) = std::thread::scope(|scope| {
+                let job = alongside.and_then(|payload| {
+                    std::thread::Builder::new()
+                        .spawn_scoped(scope, move || alph::decode_alpha(payload, w, h))
+                        .ok()
+                });
+                let frame =
+                    oxideav_vp8::decode_vp8_with_max_pixels(chunk.bitstream(), opts.pixel_cap());
+                let alpha =
+                    job.map(|job| job.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+                (frame, alpha)
+            });
+            let frame = frame?;
             let (fw, fh) = (frame.width, frame.height);
             if (fw, fh) != (w, h) {
                 return Err(WebpError::invalid(format!(
@@ -702,7 +748,10 @@ fn decode_bitstream(
                 ],
             );
             if let Some(payload) = alph {
-                let plane = alph::decode_alpha(payload, fw, fh)?;
+                let plane = match early_alpha {
+                    Some(decoded) => decoded?,
+                    None => alph::decode_alpha(payload, fw, fh)?,
+                };
                 if plane.len() == (fw as usize) * (fh as usize) {
                     img.format = WebpPixelFormat::Yuva420P;
                     img.planes.push(Plane::packed(fw as usize, plane));
@@ -1408,21 +1457,13 @@ fn encode_lossy(
             };
             let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
             let (y, u, v) = (&image.planes[0], &image.planes[1], &image.planes[2]);
-            // (A plane may also stop right after its last row's samples,
-            // short of a whole stride; the VP8 encoder wants whole rows.)
-            let whole_rows = |p: &Plane, rows: usize| p.data.len() / p.stride.max(1) >= rows;
-            let repacked_luma = (!whole_rows(y, h)).then(|| tight(y, w, h));
-            let (y_data, y_stride) = match &repacked_luma {
-                Some(y) => (&y[..], w),
-                None => (&y.data[..], y.stride),
-            };
             let repacked_chroma =
-                (u.stride != v.stride || !whole_rows(u, ch) || !whole_rows(v, ch))
-                    .then(|| (tight(u, cw, ch), tight(v, cw, ch)));
+                (u.stride != v.stride).then(|| (tight(u, cw, ch), tight(v, cw, ch)));
             let (u_data, v_data, uv_stride) = match &repacked_chroma {
                 Some((u, v)) => (&u[..], &v[..], cw),
                 None => (&u.data[..], &v.data[..], u.stride),
             };
+            let (y_data, y_stride) = (&y.data[..], y.stride);
             let frame = oxideav_vp8::I420Frame {
                 width: image.width,
                 height: image.height,

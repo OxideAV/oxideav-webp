@@ -14,7 +14,7 @@
 
 mod common;
 
-use oxideav_webp::{EncodeOptions, decode, encode_rgba8};
+use oxideav_webp::{DecodeOptions, EncodeOptions, decode, decode_with, encode_rgba8};
 
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let mse = a
@@ -250,4 +250,40 @@ fn alpha_method_is_independent_of_the_picture_method() {
         encode(&lossless.clone().with_alpha_method(0)),
         encode(&lossless)
     );
+}
+
+/// `DecodeOptions::threads`: the alpha plane decoded next to the VP8
+/// frame gives the image the serial decode gives, and a damaged `ALPH`
+/// chunk the same error.
+#[test]
+fn threaded_decode_matches_the_serial_decode() {
+    let (w, h) = (176u32, 144u32);
+    let mut rgba = common::photo_rgba(w, h);
+    for (i, px) in rgba.chunks_mut(4).enumerate() {
+        let (x, y) = (i as u32 % w, i as u32 / w);
+        px[3] = (x * 3 / 2) as u8 ^ (y / 4) as u8;
+    }
+    for method in [0u8, 4] {
+        let opts = EncodeOptions::default()
+            .with_quality(80.0)
+            .with_method(method);
+        let mut file = encode_rgba8(w, h, &rgba, &opts).expect("encode");
+        let serial = decode(&file).expect("decode");
+        assert_eq!(serial.format, oxideav_webp::PixelFormat::Yuva420P);
+        for threads in [2usize, 8, 0] {
+            let threaded = decode_with(&file, &DecodeOptions::default().with_threads(threads))
+                .expect("threaded decode");
+            assert!(threaded == serial, "method {method}, {threads} threads");
+        }
+        // An `ALPH` info byte naming a reserved compression method.
+        let at = file
+            .windows(4)
+            .position(|c| c == b"ALPH")
+            .expect("ALPH chunk");
+        file[at + 8] = (file[at + 8] & !3) | 2;
+        let serial_error = decode(&file).expect_err("reserved compression");
+        let threaded_error = decode_with(&file, &DecodeOptions::default().with_threads(4))
+            .expect_err("reserved compression");
+        assert_eq!(serial_error.to_string(), threaded_error.to_string());
+    }
 }

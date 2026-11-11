@@ -403,6 +403,25 @@ fn lossy_encoder_takes_rgb_and_alpha_layouts() {
     bad.options = bad.options.set("alpha_effort", "7");
     assert!(ctx.codecs.first_encoder(&bad).is_err(), "alpha_effort 7");
 
+    // The registered decoder gives the same frame whatever thread budget
+    // the framework announces.
+    let frame_with = |threads: Option<usize>| {
+        let mut decoder =
+            oxideav_webp::make_decoder(&params(CODEC_ID_VP8, w, h, PixelFormat::Rgba))
+                .expect("decoder");
+        if let Some(threads) = threads {
+            decoder.set_execution_context(&ExecutionContext::with_threads(threads));
+        }
+        let packet =
+            oxideav_core::Packet::new(0, oxideav_core::time::TimeBase::new(1, 1000), file.clone());
+        decoder.send_packet(&packet).expect("send_packet");
+        match decoder.receive_frame().expect("frame") {
+            Frame::Video(video) => video.planes.into_iter().map(|p| p.data).collect::<Vec<_>>(),
+            other => panic!("not a video frame: {other:?}"),
+        }
+    };
+    assert!(frame_with(None) == frame_with(Some(4)));
+
     // RGB: the simple lossy layout.
     let file = one_packet(
         ctx.codecs
