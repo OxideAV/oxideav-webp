@@ -1,30 +1,40 @@
 //! Timing matrix: size x effort x threads -> milliseconds and bytes,
 //! for lossy and lossless still encode and decode through the public
-//! entry points (`encode_rgb8`, `decode_rgba8`), plus an eight-frame
-//! animation (`encode_animation`).
+//! entry points (`encode_rgb8`, `encode_rgba8`, `decode_rgba8`), plus an
+//! eight-frame animation (`encode_animation`).
 //!
-//! A plain `main` (no statistics harness): each cell is the median of a
-//! few runs, printed as one Markdown table row, so the README table can
-//! be regenerated with
+//! A plain `main` (no statistics harness) that prints the README's
+//! Markdown tables:
 //!
 //! ```text
 //! cargo bench --bench still_matrix
 //! ```
 //!
+//! Every cell is timed once per *pass* over the whole matrix, so a
+//! cell's samples are spread over the run rather than taken back to
+//! back; the figure printed is their median. A cell that takes two
+//! seconds or more is sampled on the first two passes only.
+//!
 //! Environment:
 //!
 //! * `STILL_MATRIX_SIZES` — comma-separated `WxH` list (default
 //!   `800x533,2400x1600`).
-//! * `STILL_MATRIX_RUNS` — runs per cell (default 5; cells slower than
-//!   two seconds run once).
+//! * `STILL_MATRIX_RUNS` — passes over the matrix (default 5).
+//! * `STILL_MATRIX_THREADS` — thread budgets, one column each (default
+//!   `1,4,8`).
 //! * `STILL_MATRIX_SECTIONS` — any of `lossy`, `alpha`, `lossless`,
 //!   `decode`, `animation` (default all five).
-//! * `STILL_MATRIX_HASH` — when set, each encode row ends with the
-//!   64-bit FNV-1a of the file, to compare outputs between builds.
+//! * `STILL_MATRIX_HASH` — when set, each row ends with the 64-bit
+//!   FNV-1a of the file, to compare outputs between builds.
+//! * `STILL_MATRIX_STAT` — `median` (default), `min`, or `both`
+//!   (`median (min)`): which of a cell's samples is printed. The
+//!   minimum is the steadier figure on a machine that is also doing
+//!   something else.
 //!
 //! Without `--bench` on the command line (what `cargo test --benches`
 //! does) it runs one tiny smoke pass instead of the matrix.
 
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use oxideav_webp::{
@@ -115,43 +125,6 @@ fn photo_rgb(width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-/// Median wall time of `runs` calls (one call when the first takes two
-/// seconds or more), with the last result.
-fn time_median<T>(runs: usize, mut f: impl FnMut() -> T) -> (Duration, T) {
-    let start = Instant::now();
-    let mut result = f();
-    let first = start.elapsed();
-    if runs <= 1 || first >= Duration::from_secs(2) {
-        return (first, result);
-    }
-    let mut samples = vec![first];
-    for _ in 1..runs {
-        let start = Instant::now();
-        result = f();
-        samples.push(start.elapsed());
-    }
-    samples.sort();
-    (samples[samples.len() / 2], result)
-}
-
-/// 64-bit FNV-1a.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
-        (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
-fn ms(d: Duration) -> String {
-    let v = d.as_secs_f64() * 1e3;
-    if v >= 100.0 {
-        format!("{v:.0}")
-    } else if v >= 10.0 {
-        format!("{v:.1}")
-    } else {
-        format!("{v:.2}")
-    }
-}
-
 /// The photo-like picture with an alpha channel: an opaque disc with a
 /// soft edge on a transparent ground, a quarter of it at half opacity.
 fn photo_rgba_with_alpha(width: u32, height: u32) -> Vec<u8> {
@@ -174,90 +147,210 @@ fn photo_rgba_with_alpha(width: u32, height: u32) -> Vec<u8> {
         .collect()
 }
 
-fn encode_section(
-    title: &str,
-    base: &EncodeOptions,
-    methods: &[u8],
-    threads: &[usize],
-    sizes: &[(u32, u32)],
-    runs: usize,
-) {
-    let rows: Vec<(String, EncodeOptions)> = methods
-        .iter()
-        .map(|&m| (m.to_string(), base.clone().with_method(m)))
-        .collect();
-    encode_rows(title, &rows, threads, sizes, runs, false);
+/// 64-bit FNV-1a.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
+        (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
-/// One table: a row per `(effort label, options)` and size, a column
-/// per thread budget. With `alpha` the input is RGBA with an alpha
-/// plane, else RGB.
-fn encode_rows(
+/// One timed operation of the matrix. `run` performs it once and
+/// returns the size and hash of what it produced.
+struct Cell {
+    run: Box<dyn FnMut() -> (usize, u64)>,
+    samples: Vec<Duration>,
+    output: (usize, u64),
+}
+
+impl Cell {
+    fn new(run: impl FnMut() -> (usize, u64) + 'static) -> Self {
+        Self {
+            run: Box::new(run),
+            samples: Vec::new(),
+            output: (0, 0),
+        }
+    }
+
+    /// Take one more sample, unless this cell has shown itself slow and
+    /// has two already.
+    fn sample(&mut self) {
+        if self.samples.len() >= 2 && self.samples[0] >= Duration::from_secs(2) {
+            return;
+        }
+        let start = Instant::now();
+        self.output = (self.run)();
+        self.samples.push(start.elapsed());
+    }
+
+    /// The cell's figure as table text: the statistic
+    /// `STILL_MATRIX_STAT` selects, in milliseconds.
+    fn figure(&self) -> String {
+        fn fmt(d: Duration) -> String {
+            let v = d.as_secs_f64() * 1e3;
+            if v >= 100.0 {
+                format!("{v:.0}")
+            } else if v >= 10.0 {
+                format!("{v:.1}")
+            } else {
+                format!("{v:.2}")
+            }
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort();
+        let (median, min) = (sorted[sorted.len() / 2], sorted[0]);
+        match std::env::var("STILL_MATRIX_STAT").as_deref() {
+            Ok("min") => fmt(min),
+            Ok("both") => format!("{} ({})", fmt(median), fmt(min)),
+            _ => fmt(median),
+        }
+    }
+}
+
+/// One table row: its leading labels and one cell per timing column.
+struct Row {
+    labels: Vec<String>,
+    cells: Vec<Cell>,
+}
+
+/// One table of the matrix.
+struct Table {
+    title: String,
+    label_heads: Vec<&'static str>,
+    column_heads: Vec<String>,
+    /// Rows end with the produced size (and, on request, hash); all the
+    /// cells of a row must then produce the same bytes.
+    output_head: Option<&'static str>,
+    rows: Vec<Row>,
+}
+
+impl Table {
+    fn print(&self) {
+        println!("\n### {}\n", self.title);
+        let mut head: Vec<String> = self.label_heads.iter().map(|h| h.to_string()).collect();
+        head.extend(self.column_heads.iter().cloned());
+        head.extend(self.output_head.map(str::to_string));
+        println!("| {} |", head.join(" | "));
+        let mut rule = vec!["---"; self.label_heads.len()];
+        rule.extend(vec!["---:"; head.len() - self.label_heads.len()]);
+        println!("|{}|", rule.join("|"));
+        for row in &self.rows {
+            let mut fields = row.labels.clone();
+            fields.extend(row.cells.iter().map(Cell::figure));
+            if self.output_head.is_some() {
+                let (bytes, hash) = row.cells[0].output;
+                for cell in &row.cells {
+                    assert_eq!(
+                        cell.output,
+                        (bytes, hash),
+                        "thread budget changed the output"
+                    );
+                }
+                fields.push(bytes.to_string());
+                if std::env::var_os("STILL_MATRIX_HASH").is_some() {
+                    fields.push(format!("{hash:016x}"));
+                }
+            }
+            println!("| {} |", fields.join(" | "));
+        }
+    }
+}
+
+fn thread_heads(threads: &[usize]) -> Vec<String> {
+    threads
+        .iter()
+        .map(|t| format!("{t} thread{} ms", if *t == 1 { "" } else { "s" }))
+        .collect()
+}
+
+/// A still-encode table: a row per size and `(effort label, options)`,
+/// a column per thread budget. With `alpha` the input is RGBA with an
+/// alpha plane, else RGB.
+fn encode_table(
     title: &str,
     rows: &[(String, EncodeOptions)],
     threads: &[usize],
     sizes: &[(u32, u32)],
-    runs: usize,
     alpha: bool,
-) {
-    println!("\n### {title}\n");
-    print!("| size | effort |");
-    for t in threads {
-        print!(" {t} thread{} ms |", if *t == 1 { "" } else { "s" });
-    }
-    println!(" bytes |");
-    println!("|---|---|{}---:|", "---:|".repeat(threads.len()));
+) -> Table {
+    let mut table = Table {
+        title: title.to_string(),
+        label_heads: vec!["size", "effort"],
+        column_heads: thread_heads(threads),
+        output_head: Some("bytes"),
+        rows: Vec::new(),
+    };
     for &(w, h) in sizes {
-        let pixels = if alpha {
+        let pixels = Rc::new(if alpha {
             photo_rgba_with_alpha(w, h)
         } else {
             photo_rgb(w, h)
-        };
+        });
         for (label, options) in rows {
-            print!("| {w}x{h} | {label} |");
-            let mut bytes = None;
-            let mut hash = 0u64;
-            for &t in threads {
-                let opts = options.clone().with_threads(t);
-                let (d, out) = time_median(runs, || {
-                    if alpha {
-                        encode_rgba8(w, h, &pixels, &opts).expect("encode")
-                    } else {
-                        encode_rgb8(w, h, &pixels, &opts).expect("encode")
-                    }
-                });
-                let this = fnv1a64(&out);
-                match bytes {
-                    None => (bytes, hash) = (Some(out.len()), this),
-                    Some(_) => assert_eq!(hash, this, "thread budget changed the output"),
-                }
-                print!(" {} |", ms(d));
-            }
-            if std::env::var_os("STILL_MATRIX_HASH").is_some() {
-                println!(" {} | {hash:016x} |", bytes.unwrap_or(0));
-            } else {
-                println!(" {} |", bytes.unwrap_or(0));
-            }
+            let cells = threads
+                .iter()
+                .map(|&t| {
+                    let (pixels, opts) = (Rc::clone(&pixels), options.clone().with_threads(t));
+                    Cell::new(move || {
+                        let file = if alpha {
+                            encode_rgba8(w, h, &pixels, &opts)
+                        } else {
+                            encode_rgb8(w, h, &pixels, &opts)
+                        }
+                        .expect("encode");
+                        (file.len(), fnv1a64(&file))
+                    })
+                })
+                .collect();
+            table.rows.push(Row {
+                labels: vec![format!("{w}x{h}"), label.clone()],
+                cells,
+            });
         }
     }
+    table
 }
 
-fn decode_section(sizes: &[(u32, u32)], runs: usize) {
-    println!("\n### Decode to RGBA (`decode_rgba8`)\n");
-    println!("| size | file | ms | file bytes |");
-    println!("|---|---|---:|---:|");
+fn decode_table(sizes: &[(u32, u32)]) -> Table {
+    let mut table = Table {
+        title: "Decode to RGBA (`decode_rgba8`)".to_string(),
+        label_heads: vec!["size", "file"],
+        column_heads: vec!["ms".to_string()],
+        output_head: None,
+        rows: Vec::new(),
+    };
     for &(w, h) in sizes {
         let rgb = photo_rgb(w, h);
-        let lossy = encode_rgb8(w, h, &rgb, &EncodeOptions::default().with_quality(80.0))
-            .expect("lossy encode");
-        let lossless = encode_rgb8(w, h, &rgb, &EncodeOptions::default().with_method(2))
-            .expect("lossless encode");
-        for (name, file) in [("lossy, quality 80", &lossy), ("lossless", &lossless)] {
-            let (d, image) = time_median(runs, || decode_rgba8(file).expect("decode"));
-            assert_eq!((image.width, image.height), (w, h));
-            println!("| {w}x{h} | {name} | {} | {} |", ms(d), file.len());
+        let rgba = photo_rgba_with_alpha(w, h);
+        let lossy = EncodeOptions::default().with_quality(80.0);
+        let files = [
+            (
+                "lossy, quality 80",
+                encode_rgb8(w, h, &rgb, &lossy).expect("lossy encode"),
+            ),
+            (
+                "lossy with alpha, quality 80",
+                encode_rgba8(w, h, &rgba, &lossy.clone().with_method(2)).expect("lossy encode"),
+            ),
+            (
+                "lossless",
+                encode_rgb8(w, h, &rgb, &EncodeOptions::default().with_method(2))
+                    .expect("lossless encode"),
+            ),
+        ];
+        for (name, file) in files {
+            let label = format!("{name} ({} bytes)", file.len());
+            let cell = Cell::new(move || {
+                let image = decode_rgba8(&file).expect("decode");
+                assert_eq!((image.width, image.height), (w, h));
+                (image.data.len(), 0)
+            });
+            table.rows.push(Row {
+                labels: vec![format!("{w}x{h}"), label],
+                cells: vec![cell],
+            });
         }
     }
+    table
 }
 
 /// Eight frames of the photo-like picture with a bright square moving
@@ -286,47 +379,38 @@ fn animation_frames(w: u32, h: u32) -> Vec<Frame> {
         .collect()
 }
 
-fn animation_section(sizes: &[(u32, u32)], threads: &[usize], runs: usize) {
-    println!("\n### Animation encode, 8 frames (`encode_animation`)\n");
-    print!("| size | frames |");
-    for t in threads {
-        print!(" {t} thread{} ms |", if *t == 1 { "" } else { "s" });
-    }
-    println!(" bytes |");
-    println!("|---|---|{}---:|", "---:|".repeat(threads.len()));
+fn animation_table(
+    rows: &[(String, EncodeOptions)],
+    threads: &[usize],
+    sizes: &[(u32, u32)],
+) -> Table {
+    let mut table = Table {
+        title: "Animation encode, 8 frames (`encode_animation`)".to_string(),
+        label_heads: vec!["size", "frames"],
+        column_heads: thread_heads(threads),
+        output_head: Some("bytes"),
+        rows: Vec::new(),
+    };
     for &(w, h) in sizes {
-        let frames = animation_frames(w, h);
-        for (name, base) in [
-            (
-                "lossless, effort 2",
-                EncodeOptions::default().with_method(2),
-            ),
-            (
-                "lossy, quality 80, effort 4",
-                EncodeOptions::default().with_quality(80.0),
-            ),
-            (
-                "lossy, quality 80, effort 1",
-                EncodeOptions::default().with_quality(80.0).with_method(1),
-            ),
-        ] {
-            print!("| {w}x{h} | {name} |");
-            let mut reference: Option<Vec<u8>> = None;
-            for &t in threads {
-                let opts = base.clone().with_threads(t);
-                let (d, file) =
-                    time_median(runs, || encode_animation(&frames, &opts).expect("encode"));
-                match &reference {
-                    None => reference = Some(file),
-                    Some(first) => assert!(*first == file, "thread budget changed the output"),
-                }
-                print!(" {} |", ms(d));
-            }
-            let file = reference.unwrap_or_default();
-            assert_eq!(decode_all(&file).expect("decode").len(), frames.len());
-            println!(" {} |", file.len());
+        let frames = Rc::new(animation_frames(w, h));
+        for (label, options) in rows {
+            let cells = threads
+                .iter()
+                .map(|&t| {
+                    let (frames, opts) = (Rc::clone(&frames), options.clone().with_threads(t));
+                    Cell::new(move || {
+                        let file = encode_animation(&frames, &opts).expect("encode");
+                        (file.len(), fnv1a64(&file))
+                    })
+                })
+                .collect();
+            table.rows.push(Row {
+                labels: vec![format!("{w}x{h}"), label.clone()],
+                cells,
+            });
         }
     }
+    table
 }
 
 fn main() {
@@ -342,6 +426,9 @@ fn main() {
             let image = decode_rgba8(&file).expect("decode");
             assert_eq!((image.width, image.height), (w, h));
         }
+        let frames = animation_frames(w, h);
+        let file = encode_animation(&frames, &EncodeOptions::default()).expect("encode");
+        assert_eq!(decode_all(&file).expect("decode").len(), frames.len());
         return;
     }
     let sizes: Vec<(u32, u32)> = std::env::var("STILL_MATRIX_SIZES")
@@ -352,53 +439,93 @@ fn main() {
             Some((w.parse().ok()?, h.parse().ok()?))
         })
         .collect();
-    let runs: usize = std::env::var("STILL_MATRIX_RUNS")
+    let passes: usize = std::env::var("STILL_MATRIX_RUNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    let threads: Vec<usize> = std::env::var("STILL_MATRIX_THREADS")
+        .unwrap_or_else(|_| "1,4,8".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
     let sections = std::env::var("STILL_MATRIX_SECTIONS")
         .unwrap_or_else(|_| "lossy,alpha,lossless,decode,animation".into());
     let wants = |name: &str| sections.split(',').any(|s| s.trim() == name);
+    let efforts = |base: &EncodeOptions, levels: &[u8]| -> Vec<(String, EncodeOptions)> {
+        levels
+            .iter()
+            .map(|&m| (m.to_string(), base.clone().with_method(m)))
+            .collect()
+    };
+    let lossy = EncodeOptions::default().with_quality(80.0);
+    let lossless = EncodeOptions::default();
+
+    let mut tables = Vec::new();
     if wants("lossy") {
-        encode_section(
+        tables.push(encode_table(
             "Lossy encode, quality 80 (`encode_rgb8`)",
-            &EncodeOptions::default().with_quality(80.0),
-            &[0, 1, 2, 4, 5, 6],
-            &[1, 4, 8],
+            &efforts(&lossy, &[0, 1, 2, 4, 5, 6]),
+            &threads,
             &sizes,
-            runs,
-        );
+            false,
+        ));
     }
     if wants("alpha") {
-        let lossy = EncodeOptions::default().with_quality(80.0);
-        encode_rows(
+        tables.push(encode_table(
             "Lossy encode with an alpha plane, quality 80 (`encode_rgba8`)",
-            &[
-                ("0".into(), lossy.clone().with_method(0)),
-                ("2".into(), lossy.clone().with_method(2)),
-                ("4, alpha 2".into(), lossy.clone().with_alpha_method(2)),
-                ("4".into(), lossy),
-            ],
-            &[1, 4, 8],
+            &alpha_rows(&lossy),
+            &threads,
             &sizes,
-            runs,
             true,
-        );
+        ));
     }
     if wants("lossless") {
-        encode_section(
+        tables.push(encode_table(
             "Lossless encode (`encode_rgb8`)",
-            &EncodeOptions::default(),
-            &[0, 2, 4, 6],
-            &[1, 4, 8],
+            &efforts(&lossless, &[0, 2, 4, 6]),
+            &threads,
             &sizes,
-            runs,
-        );
+            false,
+        ));
     }
     if wants("decode") {
-        decode_section(&sizes, runs);
+        tables.push(decode_table(&sizes));
     }
     if wants("animation") {
-        animation_section(&sizes, &[1, 4, 8], runs.min(3));
+        tables.push(animation_table(
+            &[
+                ("lossless, effort 2".into(), lossless.clone().with_method(2)),
+                ("lossy, quality 80, effort 4".into(), lossy.clone()),
+                (
+                    "lossy, quality 80, effort 1".into(),
+                    lossy.clone().with_method(1),
+                ),
+            ],
+            &threads,
+            &sizes,
+        ));
     }
+    for _ in 0..passes.max(1) {
+        for table in &mut tables {
+            for row in &mut table.rows {
+                for cell in &mut row.cells {
+                    cell.sample();
+                }
+            }
+        }
+    }
+    for table in &tables {
+        table.print();
+    }
+}
+
+/// The rows of the alpha table: the picture's effort, and the default
+/// picture with the quick alpha coder.
+fn alpha_rows(lossy: &EncodeOptions) -> Vec<(String, EncodeOptions)> {
+    vec![
+        ("0".into(), lossy.clone().with_method(0)),
+        ("2".into(), lossy.clone().with_method(2)),
+        ("4, alpha 2".into(), lossy.clone().with_alpha_method(2)),
+        ("4".into(), lossy.clone()),
+    ]
 }

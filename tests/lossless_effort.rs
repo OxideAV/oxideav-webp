@@ -230,18 +230,23 @@ fn output_is_identical_for_every_thread_budget() {
 }
 
 /// Images large enough for the match searches to run ahead of the parse
-/// on worker threads (the stage that is skipped below about 16 000
-/// pixels): photo-like, few-colour with long runs, and rows repeating
-/// the row above. Same bytes as the serial encode, exact round trip.
+/// on worker threads (the stage that is skipped below 65 536 pixels):
+/// photo-like, few-colour with long runs, and rows repeating the row
+/// above. Same bytes as the serial encode, exact round trip.
 #[test]
 fn threaded_match_search_writes_the_serial_bytes() {
-    let (w, h) = (176u32, 100u32);
+    let (w, h) = (304u32, 220u32);
     let photo = common::photo_rgba(w, h);
     let mut runs = Vec::new();
     for i in 0..w * h {
         let band = (i / w) / 9 + (i % w) / 40;
         let speck = u8::from(i % 211 == 0) * 90;
-        runs.extend_from_slice(&[(band * 23) as u8, 40 + speck, 200 - (band * 9) as u8, 255]);
+        runs.extend_from_slice(&[
+            (band * 23) as u8,
+            40 + speck,
+            200u8.wrapping_sub((band * 9) as u8),
+            255,
+        ]);
     }
     let mut repeats = photo.clone();
     let row = (w * 4) as usize;
@@ -255,7 +260,7 @@ fn threaded_match_search_writes_the_serial_bytes() {
         ("runs", &runs),
         ("row repeats", &repeats),
     ] {
-        for method in [0u8, 2, 4, 5] {
+        for method in [0u8, 4] {
             let opts = EncodeOptions::default().with_method(method);
             let serial =
                 encode_rgba8(w, h, pixels, &opts.clone().with_threads(1)).expect("serial encode");

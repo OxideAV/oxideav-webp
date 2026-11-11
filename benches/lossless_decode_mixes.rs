@@ -130,8 +130,13 @@ fn fixture_none() -> Vec<u8> {
 /// stops at the first §5-encoded transform body, so the leading entry
 /// is exactly what it reports for every body-bearing mix; the
 /// subtract-green and empty lists are read to the terminating bit.
+///
+/// The fixtures are built with the exhaustive search (`method` 6): it
+/// weighs every transform, so each fixture elects the mix it was
+/// designed for (the screened default settles for another list on the
+/// color-transform fixture).
 fn encode_expecting(rgba: &[u8], expect: Option<TransformType>) -> Vec<u8> {
-    let webp = encode_rgba8(W, H, rgba, &EncodeOptions::default()).expect("encode");
+    let webp = encode_rgba8(W, H, rgba, &EncodeOptions::default().with_method(6)).expect("encode");
     let list = read_vp8l_transform_list(&webp)
         .expect("transform list")
         .expect("VP8L chunk");

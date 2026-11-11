@@ -61,7 +61,10 @@ All notable changes to `oxideav-webp` are recorded here.
   thread whatever the budget. Same tokens, same bytes (unit tests
   compare the threaded parse and its DP table with the serial ones on
   five kinds of content at every lazy depth; debug builds check every
-  replayed search against the incremental matcher). 2400 x 1600 photo,
+  replayed search against the incremental matcher). The searches run
+  ahead only where the parse will resume (after a match, not inside
+  it), so run-heavy pictures gain as photos do, and buffers under
+  65 536 pixels are parsed as before. 2400 x 1600 photo,
   8 threads: method 0 0.59 s to 0.39 s, method 2 1.02 s to 0.78 s,
   method 4 1.85 s to 1.49 s (one thread unchanged).
 - Lossless: the palette lookup of the §4.4 color-indexing candidates is
@@ -159,7 +162,12 @@ All notable changes to `oxideav-webp` are recorded here.
   `with_method`); `Vp8LossyEncoder::with_effort` / `with_threads` /
   `effort` / `threads`; `encoder_vp8::DEFAULT_EFFORT` / `MAX_EFFORT`.
 - `benches/still_matrix.rs`: size x effort x threads -> ms and bytes for
-  lossy and lossless encode and decode (prints the README tables).
+  lossy (with and without alpha) and lossless encode, decode, and an
+  eight-frame animation; it prints the README tables. Each cell is
+  sampled once per pass over the whole matrix and the median printed.
+- `benches/lossless_decode_mixes.rs` builds its fixtures with the
+  exhaustive search they were designed for (its transform-mix assertion
+  failed at the screened default).
 - `AnimFrame::with_position` / `with_duration` / `with_blend` /
   `with_dispose` / `with_mode`; `DeltaConfig::with_max_components` /
   `with_auto_inner_threshold_bytes` / `with_msssim_downsample_kernel`;

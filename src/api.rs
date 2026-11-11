@@ -1057,18 +1057,26 @@ pub(crate) fn packed_to_argb(
     bpp: usize,
 ) -> (Vec<u32>, bool) {
     let mut pixels = Vec::with_capacity(width * height);
-    let mut alpha_is_used = false;
+    // The AND of every alpha byte: `0xff` exactly when all are opaque.
+    let mut all_alpha = 0xffu8;
     for y in 0..height {
         let row = &data[y * stride..y * stride + width * bpp];
-        for p in row.chunks_exact(bpp) {
-            let a = if bpp == 4 { p[3] as u32 } else { 0xff };
-            if a != 0xff {
-                alpha_is_used = true;
-            }
-            pixels.push((a << 24) | ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32);
+        if bpp == 4 {
+            let (quads, _) = row.as_chunks::<4>();
+            all_alpha = quads.iter().fold(all_alpha, |all, p| all & p[3]);
+            pixels.extend(quads.iter().map(|p| {
+                (u32::from(p[3]) << 24)
+                    | (u32::from(p[0]) << 16)
+                    | (u32::from(p[1]) << 8)
+                    | u32::from(p[2])
+            }));
+        } else {
+            pixels.extend(row.as_chunks::<3>().0.iter().map(|p| {
+                0xff00_0000 | (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2])
+            }));
         }
     }
-    (pixels, alpha_is_used)
+    (pixels, all_alpha != 0xff)
 }
 
 // ───────────────────────────────── encode ────────────────────────────────

@@ -1583,10 +1583,14 @@ impl<'a> ChainIndex<'a> {
     /// Search the positions of `first..first + probes.len()` a
     /// front-to-back pass is likely to ask for, on up to `workers`
     /// threads, into `probes` (entries it does not search are left as
-    /// they are). Inside a match of [`DP_LONG_MATCH_INHERIT`] pixels or
-    /// more the positions the DP match table inherits are skipped; a
-    /// consumer that does want one of them searches it itself.
-    fn fill(&self, first: usize, probes: &mut [FindProbe], workers: usize) {
+    /// they are; a consumer that does want one of them searches it
+    /// itself). `for_dp` chooses whose positions those are: the DP match
+    /// table's — every position but the ones it inherits inside a match
+    /// of [`DP_LONG_MATCH_INHERIT`] pixels or more — or the greedy
+    /// parse's, which resumes where a match ends. (Searching inside a
+    /// match costs a walk along it per position, so a pass that searched
+    /// everything would spend far longer on runs than the parse does.)
+    fn fill(&self, first: usize, probes: &mut [FindProbe], workers: usize, for_dp: bool) {
         let chunks = std::sync::Mutex::new(probes.chunks_mut(PROBE_CHUNK).enumerate());
         let work = || {
             loop {
@@ -1598,6 +1602,7 @@ impl<'a> ChainIndex<'a> {
                     let found = self.find(base + offset);
                     chunk[offset] = FindProbe::record(found);
                     offset += match found {
+                        Some((len, _)) if !for_dp => len,
                         Some((len, _)) if len >= DP_LONG_MATCH_INHERIT => {
                             len - DP_LONG_MATCH_INHERIT + 1
                         }
@@ -1616,6 +1621,10 @@ impl<'a> ChainIndex<'a> {
         });
     }
 }
+
+/// Smallest buffer whose parse spreads its searches over threads: below
+/// it the whole parse takes less than starting them.
+const THREADED_PARSE_MIN_PIXELS: usize = 1 << 16;
 
 /// Positions one worker searches per turn in [`ChainIndex::fill`].
 const PROBE_CHUNK: usize = 1 << 13;
@@ -1652,7 +1661,8 @@ impl MatchSource for ProbedSource<'_, '_> {
             let len = self.table.len().min(self.chain.pixels.len() - pos);
             self.table.fill(FindProbe::NOT_PROBED);
             self.start = pos;
-            self.chain.fill(pos, &mut self.table[..len], self.workers);
+            self.chain
+                .fill(pos, &mut self.table[..len], self.workers, false);
         }
         let slot = &mut self.table[pos - self.start];
         if slot.len == u32::MAX {
@@ -1677,7 +1687,7 @@ fn lz77_parse_on(
     mut probes: Option<&mut [FindProbe]>,
     emit: impl FnMut(Token),
 ) {
-    if workers <= 1 || pixels.len() < 2 * PROBE_CHUNK {
+    if workers <= 1 || pixels.len() < THREADED_PARSE_MIN_PIXELS {
         let mut matcher = Lz77Matcher::with_shape(pixels, shape);
         lz77_parse(
             pixels,
@@ -1695,7 +1705,7 @@ fn lz77_parse_on(
     let chain = ChainIndex::build(pixels, shape);
     match probes {
         Some(table) => {
-            chain.fill(0, table, workers);
+            chain.fill(0, table, workers, true);
             let mut source = ProbedSource {
                 chain: &chain,
                 table,
@@ -1707,7 +1717,7 @@ fn lz77_parse_on(
         }
         None => {
             let mut window = vec![FindProbe::NOT_PROBED; PROBE_WINDOW.min(pixels.len())];
-            chain.fill(0, &mut window, workers);
+            chain.fill(0, &mut window, workers, false);
             let mut source = ProbedSource {
                 chain: &chain,
                 table: &mut window,
@@ -12574,7 +12584,7 @@ mod tests {
     #[test]
     fn threaded_parse_matches_the_single_threaded_parse() {
         let width = 160usize;
-        let n = width * 260;
+        let n = THREADED_PARSE_MIN_PIXELS + 3 * width + 7;
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut rng = move || {
             state ^= state << 13;
