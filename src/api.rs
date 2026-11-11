@@ -1083,7 +1083,15 @@ pub fn encode_rgb8(
     rgb: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    encode_packed(width, height, rgb, 3, opts)
+    encode_packed(
+        width,
+        height,
+        rgb,
+        width as usize * 3,
+        3,
+        &Metadata::default(),
+        opts,
+    )
 }
 
 /// Encode packed 8-bit RGBA (4 bytes per pixel, `width × height × 4`).
@@ -1093,19 +1101,29 @@ pub fn encode_rgba8(
     rgba: &[u8],
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
-    encode_packed(width, height, rgba, 4, opts)
+    encode_packed(
+        width,
+        height,
+        rgba,
+        width as usize * 4,
+        4,
+        &Metadata::default(),
+        opts,
+    )
 }
 
-/// [`encode_rgb8`] / [`encode_rgba8`]: the caller's buffer is read in
-/// place instead of being copied into a [`WebpImage`] first (a 12 MP
-/// RGBA image saves 48 MB). The checks and errors are the ones
-/// [`WebpImage::new`] and [`encode`] apply, in the same order; there is
-/// no metadata to embed.
-fn encode_packed(
+/// [`encode_rgb8`] / [`encode_rgba8`], and the framework encoder's
+/// frames: packed RGB(A) rows (`bpp` 3 or 4, `stride` bytes apart) are
+/// read in place instead of being copied into a [`WebpImage`] first (a
+/// 12 MP RGBA image saves 48 MB). The checks and errors are the ones
+/// [`WebpImage::new`] and [`encode`] apply, in the same order.
+pub(crate) fn encode_packed(
     width: u32,
     height: u32,
     data: &[u8],
+    stride: usize,
     bpp: usize,
+    metadata: &Metadata,
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, WebpError> {
     if width == 0 || height == 0 {
@@ -1114,7 +1132,12 @@ fn encode_packed(
         )));
     }
     let row_bytes = width as usize * bpp;
-    let need = row_bytes
+    if stride < row_bytes {
+        return Err(WebpError::invalid(format!(
+            "plane 0: stride {stride} < row width {row_bytes}"
+        )));
+    }
+    let need = stride
         .checked_mul(height as usize - 1)
         .and_then(|v| v.checked_add(row_bytes))
         .ok_or_else(|| WebpError::invalid("plane geometry overflows"))?;
@@ -1129,14 +1152,13 @@ fn encode_packed(
             "{width}x{height} exceeds the WebP {MAX_DIMENSION} per-side ceiling"
         )));
     }
-    let no_metadata = Metadata::default();
-    let meta = opts.filtered_metadata(&no_metadata);
+    let meta = opts.filtered_metadata(metadata);
     vp8l_encode::with_thread_budget(opts.worker_budget(), || match opts.quality {
-        None => encode_lossless_packed(width, height, data, row_bytes, bpp, &meta, opts.method),
+        None => encode_lossless_packed(width, height, data, stride, bpp, &meta, opts.method),
         Some(q) => {
             check_lossy_dimensions(width, height)?;
             let tuning = LossyTuning::for_quality(q, opts.method);
-            encode_lossy_packed(width, height, data, row_bytes, bpp, &meta, tuning)
+            encode_lossy_packed(width, height, data, stride, bpp, &meta, tuning)
         }
     })
 }
@@ -1274,7 +1296,7 @@ fn packed_alpha_plane(width: usize, height: usize, data: &[u8], stride: usize) -
 /// The lossy encode of packed RGB(A) rows (`bpp` 3 or 4, geometry
 /// already checked): limited-range BT.601 4:2:0 conversion, then
 /// [`encode_lossy_planes`].
-fn encode_lossy_packed(
+pub(crate) fn encode_lossy_packed(
     width: u32,
     height: u32,
     data: &[u8],

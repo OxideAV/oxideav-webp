@@ -622,8 +622,6 @@ impl Encoder for WebpVp8lEncoder {
         let Frame::Video(v) = frame else {
             return Err(CoreError::invalid("webp_vp8l encoder: video frames only"));
         };
-        let img = WebpImage::from_video_frame_parts(v, self.width, self.height, self.pix)?
-            .with_metadata(self.metadata.clone());
         let threads = match self.option_threads {
             0 => self.context_threads,
             n => n,
@@ -631,7 +629,24 @@ impl Encoder for WebpVp8lEncoder {
         let opts = EncodeOptions::default()
             .with_method(self.effort)
             .with_threads(threads);
-        let bytes = crate::encode(&img, &opts)?;
+        // The frame's plane is read in place.
+        let bpp = if self.pix == PixelFormat::Rgb24 { 3 } else { 4 };
+        let [plane] = v.image_planes() else {
+            return Err(CoreError::invalid(format!(
+                "webp_vp8l encoder: a {:?} frame has one plane, not {}",
+                self.pix,
+                v.image_planes().len()
+            )));
+        };
+        let bytes = crate::api::encode_packed(
+            self.width,
+            self.height,
+            &plane.data,
+            plane.stride,
+            bpp,
+            &self.metadata,
+            &opts,
+        )?;
         let mut pkt = Packet::new(0, TimeBase::new(1, 1000), bytes);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
@@ -722,7 +737,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     let vp8_caps = CodecCapabilities::video("webp_vp8_sw")
         .with_intra_only(true)
         .with_max_size(crate::MAX_DIMENSION - 1, crate::MAX_DIMENSION - 1)
-        .with_pixel_formats(vec![PixelFormat::Yuv420P]);
+        .with_pixel_formats(crate::encoder_vp8::INPUT_FORMATS.to_vec());
     reg.register(
         CodecInfo::new(CodecId::new(crate::CODEC_ID_VP8))
             .capabilities(vp8_caps)

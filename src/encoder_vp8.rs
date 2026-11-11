@@ -191,6 +191,7 @@ impl Vp8LossyEncoder {
             (y, y_stride),
             (u, uv_stride),
             (v, uv_stride),
+            None,
             crate::api::LossyTuning::for_qindex(self.qindex, self.effort),
             self.threads,
         )
@@ -204,15 +205,20 @@ pub const DEFAULT_EFFORT: u8 = 4;
 /// Highest effort level.
 pub const MAX_EFFORT: u8 = 6;
 
-/// Encode three 4:2:0 planes, each `(samples, stride)`, to a simple-lossy
-/// `.webp` under `tuning` on up to `threads` threads. The planes are read
-/// in place; only a chroma pair with two different strides is repacked.
+/// Encode three 4:2:0 planes, each `(samples, stride)`, and an optional
+/// full-resolution alpha plane to a lossy `.webp` under `tuning` on up to
+/// `threads` threads: the simple layout without alpha, `VP8X` + `ALPH` +
+/// `VP8 ` with it. The colour planes are read in place; only a chroma
+/// pair with two different strides, or a padded alpha plane, is
+/// repacked.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_yuv420_planes(
     width: u32,
     height: u32,
     (y, y_stride): (&[u8], usize),
     (u, u_stride): (&[u8], usize),
     (v, v_stride): (&[u8], usize),
+    alpha: Option<(&[u8], usize)>,
     tuning: crate::api::LossyTuning,
     threads: usize,
 ) -> Result<Vec<u8>, WebpError> {
@@ -249,8 +255,57 @@ pub(crate) fn encode_yuv420_planes(
         y_stride,
         uv_stride,
     };
+    let repacked_alpha;
+    let alpha = match alpha {
+        None => None,
+        Some((a, stride)) => {
+            check_plane("alpha", a, stride, w, h)?;
+            if stride == w {
+                Some(&a[..w * h])
+            } else {
+                let mut tight = Vec::with_capacity(w * h);
+                for row in 0..h {
+                    tight.extend_from_slice(&a[row * stride..row * stride + w]);
+                }
+                repacked_alpha = tight;
+                Some(&repacked_alpha[..])
+            }
+        }
+    };
     crate::vp8l_encode::with_thread_budget(threads, || {
-        crate::api::encode_lossy_planes(&frame, None, &crate::WebpMetadata::default(), tuning)
+        crate::api::encode_lossy_planes(&frame, alpha, &crate::WebpMetadata::default(), tuning)
+    })
+}
+
+/// Encode packed RGB (`bpp` 3) or RGBA (`bpp` 4) rows, `stride` bytes
+/// apart, to a lossy `.webp` under `tuning` on up to `threads` threads —
+/// the bytes of [`encode_rgb8`](crate::encode_rgb8) /
+/// [`encode_rgba8`](crate::encode_rgba8) at the same tuning.
+#[cfg(feature = "registry")]
+fn encode_packed_rows(
+    width: u32,
+    height: u32,
+    (data, stride): (&[u8], usize),
+    bpp: usize,
+    tuning: crate::api::LossyTuning,
+    threads: usize,
+) -> Result<Vec<u8>, WebpError> {
+    if width == 0 || height == 0 || width > MAX_VP8_DIMENSION || height > MAX_VP8_DIMENSION {
+        return Err(WebpError::invalid(format!(
+            "VP8 picture {width}x{height} is outside 1..={MAX_VP8_DIMENSION} per side"
+        )));
+    }
+    check_plane("RGB", data, stride, width as usize * bpp, height as usize)?;
+    crate::vp8l_encode::with_thread_budget(threads, || {
+        crate::api::encode_lossy_packed(
+            width,
+            height,
+            data,
+            stride,
+            bpp,
+            &crate::WebpMetadata::default(),
+            tuning,
+        )
     })
 }
 
@@ -438,8 +493,9 @@ impl oxideav_core::CodecOptionsStruct for WebpVp8EncoderOptions {
 }
 
 /// Build a `Box<dyn Encoder>` for the published `"webp_vp8"` codec id at
-/// the default quantiser index (`32`): `Yuv420P` frames in, one
-/// simple-lossy `.webp` packet per frame out.
+/// the default quantiser index (`32`): frames in one of the
+/// [`INPUT_FORMATS`] in (`Yuv420P` when the parameters name none), one
+/// lossy `.webp` packet per frame out.
 #[cfg(feature = "registry")]
 pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     make_encoder_with_qindex(params, DEFAULT_QINDEX)
@@ -503,13 +559,11 @@ pub fn make_encoder_with_options(
             "webp_vp8 encoder: width/height exceed the VP8 14-bit size fields (max {MAX_VP8_DIMENSION})"
         )));
     }
-    if params
-        .pixel_format
-        .is_some_and(|format| format != PixelFormat::Yuv420P)
-    {
-        return Err(CoreError::unsupported(
-            "webp_vp8 encoder: only PixelFormat::Yuv420P is supported",
-        ));
+    let format = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+    if !INPUT_FORMATS.contains(&format) {
+        return Err(CoreError::unsupported(format!(
+            "webp_vp8 encoder: input pixel format {format:?} is not one of {INPUT_FORMATS:?}"
+        )));
     }
     if options.qindex > 127 {
         return Err(CoreError::invalid(
@@ -532,6 +586,7 @@ pub fn make_encoder_with_options(
     Ok(Box::new(WebpVp8LossyEncoder {
         width,
         height,
+        format,
         tuning,
         option_threads: options.threads,
         context_threads: 1,
@@ -571,12 +626,28 @@ pub fn make_encoder_with_quality_and_freq_deltas(
     make_encoder_with_quality(params, quality)
 }
 
-/// The `webp_vp8` framework encoder: each `Yuv420P` frame becomes one
-/// simple-lossy `.webp` packet, encoded from the frame's planes in place.
+/// Frame layouts the `webp_vp8` framework encoder takes: limited-range
+/// BT.601 4:2:0 planes as they are, with or without an alpha plane, and
+/// packed RGB(A), which it converts as [`encode`](crate::encode) does.
+#[cfg(feature = "registry")]
+pub const INPUT_FORMATS: [PixelFormat; 4] = [
+    PixelFormat::Yuv420P,
+    PixelFormat::Yuva420P,
+    PixelFormat::Rgb24,
+    PixelFormat::Rgba,
+];
+
+/// The `webp_vp8` framework encoder: each frame becomes one lossy `.webp`
+/// packet, encoded from the frame's planes in place — the simple layout
+/// for an opaque picture, `VP8X` + `ALPH` + `VP8 ` for one with alpha (a
+/// `Yuva420P` frame, or an `Rgba` frame with a pixel that is not
+/// opaque).
 #[cfg(feature = "registry")]
 pub(crate) struct WebpVp8LossyEncoder {
     width: u32,
     height: u32,
+    /// Layout of the frames it is fed, one of [`INPUT_FORMATS`].
+    format: PixelFormat,
     tuning: crate::api::LossyTuning,
     /// Explicit thread budget from the options (`0` = none given).
     option_threads: usize,
@@ -595,6 +666,7 @@ impl std::fmt::Debug for WebpVp8LossyEncoder {
         f.debug_struct("WebpVp8LossyEncoder")
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("format", &self.format)
             .field("tuning", &self.tuning)
             .field("pending", &self.pending.len())
             .field("flushed", &self.flushed)
@@ -605,22 +677,21 @@ impl std::fmt::Debug for WebpVp8LossyEncoder {
 #[cfg(feature = "registry")]
 impl WebpVp8LossyEncoder {
     /// Follow a [`Frame::StreamParams`] event. Every packet is a key
-    /// frame restating its size, so a new size simply applies from the
-    /// next frame; a description that is not `Yuv420P` video inside the
-    /// RFC 6386 §9.1 size fields cannot be followed.
+    /// frame restating its size, so a new size or input layout simply
+    /// applies from the next frame; a description that is not video in
+    /// one of the [`INPUT_FORMATS`] inside the RFC 6386 §9.1 size fields
+    /// cannot be followed.
     fn reconfigure(&mut self, params: &CodecParameters) -> CoreResult<()> {
         if params.media_type != MediaType::Video {
             return Err(CoreError::unsupported(
                 "webp_vp8 encoder: stream-params event does not describe video",
             ));
         }
-        if params
-            .pixel_format
-            .is_some_and(|format| format != PixelFormat::Yuv420P)
-        {
-            return Err(CoreError::unsupported(
-                "webp_vp8 encoder: cannot switch away from PixelFormat::Yuv420P mid-stream",
-            ));
+        let format = params.pixel_format.unwrap_or(self.format);
+        if !INPUT_FORMATS.contains(&format) {
+            return Err(CoreError::unsupported(format!(
+                "webp_vp8 encoder: cannot switch to pixel format {format:?} mid-stream"
+            )));
         }
         let width = params.width.unwrap_or(self.width);
         let height = params.height.unwrap_or(self.height);
@@ -629,7 +700,10 @@ impl WebpVp8LossyEncoder {
                 "webp_vp8 encoder: stream-params size outside 1..={MAX_VP8_DIMENSION} per side"
             )));
         }
-        (self.width, self.height) = (width, height);
+        (self.width, self.height, self.format) = (width, height, format);
+        if self.output_params.pixel_format.is_some() {
+            self.output_params.pixel_format = Some(format);
+        }
         self.output_params.width = Some(width);
         self.output_params.height = Some(height);
         Ok(())
@@ -652,25 +726,57 @@ impl Encoder for WebpVp8LossyEncoder {
             Frame::StreamParams(params) => return self.reconfigure(params),
             _ => return Err(CoreError::invalid("webp_vp8 encoder: video frames only")),
         };
-        let [y, u, v, ..] = video.image_planes() else {
-            return Err(CoreError::invalid(
-                "webp_vp8 encoder: a frame must carry 3 planes (Y/U/V)",
-            ));
-        };
         let threads = match self.option_threads {
             0 => self.context_threads,
             n => n,
         };
-        let webp_bytes = encode_yuv420_planes(
-            self.width,
-            self.height,
-            (&y.data, y.stride),
-            (&u.data, u.stride),
-            (&v.data, v.stride),
-            self.tuning,
-            threads,
-        )
-        .map_err(|e| CoreError::invalid(format!("webp_vp8 encoder: {e}")))?;
+        let (width, height) = (self.width, self.height);
+        let encoded = match (self.format, video.image_planes()) {
+            (PixelFormat::Yuv420P, [y, u, v, ..]) => encode_yuv420_planes(
+                width,
+                height,
+                (&y.data, y.stride),
+                (&u.data, u.stride),
+                (&v.data, v.stride),
+                None,
+                self.tuning,
+                threads,
+            ),
+            (PixelFormat::Yuva420P, [y, u, v, a, ..]) => encode_yuv420_planes(
+                width,
+                height,
+                (&y.data, y.stride),
+                (&u.data, u.stride),
+                (&v.data, v.stride),
+                Some((&a.data, a.stride)),
+                self.tuning,
+                threads,
+            ),
+            (PixelFormat::Rgb24, [plane, ..]) => encode_packed_rows(
+                width,
+                height,
+                (&plane.data, plane.stride),
+                3,
+                self.tuning,
+                threads,
+            ),
+            (PixelFormat::Rgba, [plane, ..]) => encode_packed_rows(
+                width,
+                height,
+                (&plane.data, plane.stride),
+                4,
+                self.tuning,
+                threads,
+            ),
+            (format, planes) => {
+                return Err(CoreError::invalid(format!(
+                    "webp_vp8 encoder: a {format:?} frame cannot have {} plane(s)",
+                    planes.len()
+                )));
+            }
+        };
+        let webp_bytes =
+            encoded.map_err(|e| CoreError::invalid(format!("webp_vp8 encoder: {e}")))?;
         let mut pkt = Packet::new(0, self.time_base, webp_bytes);
         pkt.pts = video.pts;
         pkt.dts = video.pts;

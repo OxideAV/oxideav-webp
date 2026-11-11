@@ -129,6 +129,14 @@ All notable changes to `oxideav-webp` are recorded here.
   as for stills. `tests/anim_coding.rs` (round trip by PSNR, exact
   alpha, positioned alpha-blended sub-frames, the 16383 px frame limit,
   and a black-box container tool listing the frames).
+- The `webp_vp8` framework encoder takes `Yuva420P`, `Rgb24` and `Rgba`
+  frames besides `Yuv420P` (`encoder_vp8::INPUT_FORMATS`, also its
+  registered capabilities): an alpha plane, or an `Rgba` frame with a
+  pixel that is not opaque, gives a `VP8X` + `ALPH` + `VP8 ` packet — the
+  bytes of `encode` / `encode_rgb8` / `encode_rgba8` on the same pixels
+  with the `quality` option. A lossy WebP with alpha could not be
+  written through the registry before. A `Frame::StreamParams` event may
+  switch between these layouts.
 - Registry encoder options. `webp_vp8`: `effort` (`0..=6`, default `4`),
   `threads` (`0` = follow the `ExecutionContext`), `qindex`, `quality`
   — typed as `encoder_vp8::WebpVp8EncoderOptions`, with

@@ -336,12 +336,106 @@ fn lossy_encoder_follows_a_size_change() {
 
     // A layout the encoder cannot take is refused, and the old size
     // stays.
-    let rgba = params(CODEC_ID_VP8, 64, 40, PixelFormat::Rgba);
+    let gray = params(CODEC_ID_VP8, 64, 40, PixelFormat::Gray8);
     assert!(
         encoder
-            .send_frame(&Frame::StreamParams(Box::new(rgba)))
+            .send_frame(&Frame::StreamParams(Box::new(gray)))
             .is_err()
     );
     // A frame smaller than the configured size is an error, not a panic.
     assert!(encoder.send_frame(&yuv_frame(32, &small)).is_err());
+}
+
+/// The lossy encoder takes packed RGB(A) and 4:2:0 planes with an alpha
+/// plane too, and writes what Layer 1 writes for the same pixels.
+#[test]
+fn lossy_encoder_takes_rgb_and_alpha_layouts() {
+    let ctx = ctx();
+    let (w, h) = (72u32, 56u32);
+    let mut rgba = common::photo_rgba(w, h);
+    for (i, px) in rgba.chunks_mut(4).enumerate() {
+        px[3] = if i % 72 < 30 { 255 } else { (i % 251) as u8 };
+    }
+    let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let layer1 = EncodeOptions::default().with_quality(70.0).with_effort(2);
+    let with_options = |format| {
+        let mut p = params(CODEC_ID_VP8, w, h, format);
+        p.options = p.options.set("quality", "70").set("effort", "2");
+        p
+    };
+    let packed = |stride: usize, row: usize, data: &[u8]| {
+        // A padded plane: `stride` bytes per row, `row` of them used.
+        let mut out = vec![0x5au8; stride * h as usize];
+        for y in 0..h as usize {
+            out[y * stride..y * stride + row].copy_from_slice(&data[y * row..(y + 1) * row]);
+        }
+        Frame::Video(VideoFrame {
+            pts: Some(7),
+            planes: vec![VideoPlane { stride, data: out }],
+        })
+    };
+
+    // RGBA with alpha: VP8X + ALPH + VP8, alpha exact.
+    let file = one_packet(
+        ctx.codecs
+            .first_encoder(&with_options(PixelFormat::Rgba))
+            .expect("encoder"),
+        &packed(w as usize * 4 + 8, w as usize * 4, &rgba),
+    );
+    assert!(file == oxideav_webp::encode_rgba8(w, h, &rgba, &layer1).expect("encode"));
+    let decoded = oxideav_webp::decode(&file).expect("decode");
+    assert_eq!(decoded.format, oxideav_webp::PixelFormat::Yuva420P);
+    let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
+    assert_eq!(decoded.planes[3].data, alpha);
+
+    // RGB: the simple lossy layout.
+    let file = one_packet(
+        ctx.codecs
+            .first_encoder(&with_options(PixelFormat::Rgb24))
+            .expect("encoder"),
+        &packed(w as usize * 3 + 1, w as usize * 3, &rgb),
+    );
+    assert!(file == oxideav_webp::encode_rgb8(w, h, &rgb, &layer1).expect("encode"));
+
+    // 4:2:0 planes with an alpha plane: what `encode` writes for the
+    // same image; the planes of the decode above serve as input.
+    let frame = Frame::Video(VideoFrame {
+        pts: Some(7),
+        planes: decoded
+            .planes
+            .iter()
+            .map(|p| VideoPlane {
+                stride: p.stride,
+                data: p.data.clone(),
+            })
+            .collect(),
+    });
+    let file = one_packet(
+        ctx.codecs
+            .first_encoder(&with_options(PixelFormat::Yuva420P))
+            .expect("encoder"),
+        &frame,
+    );
+    assert!(file == oxideav_webp::encode(&decoded, &layer1).expect("encode"));
+    assert_eq!(
+        oxideav_webp::decode(&file).expect("decode").planes[3].data,
+        alpha
+    );
+
+    // A frame with too few planes for its layout is an error.
+    let mut encoder = ctx
+        .codecs
+        .first_encoder(&with_options(PixelFormat::Yuva420P))
+        .expect("encoder");
+    assert!(
+        encoder
+            .send_frame(&yuv_frame(w, &yuv_planes(w, h)))
+            .is_err()
+    );
+    // A layout outside the list is refused at construction.
+    assert!(
+        ctx.codecs
+            .first_encoder(&params(CODEC_ID_VP8, w, h, PixelFormat::Gray8))
+            .is_err()
+    );
 }

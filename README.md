@@ -197,6 +197,13 @@ lossless search of the same level — several times slower than the `VP8 `
 encode itself on a large picture, for an `ALPH` chunk that is usually
 within a few percent either way. Measured times and sizes: [Performance](#performance).
 
+The `webp_vp8l` encoder takes `Rgba` / `Rgb24` frames; the `webp_vp8`
+encoder takes `Yuv420P` (limited-range BT.601, coded as given),
+`Yuva420P` (the fourth plane becomes the `ALPH` chunk), and `Rgb24` /
+`Rgba` (converted as `encode` does; an `Rgba` frame with a pixel that is
+not opaque gets an `ALPH` chunk). Each frame is read in place at its
+strides and becomes one `.webp` packet.
+
 The registered encoders take the same controls as options
 (`CodecParameters::options`, schemas published through the codec
 registry): `webp_vp8` — `effort`, `threads`, `qindex`, `quality`
@@ -298,7 +305,7 @@ CARGO_TARGET_DIR=/tmp/oxideav-webp-bench-target \
 
 ## Fuzzing
 
-Thirty-nine [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+Forty-one [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets live under [`fuzz/fuzz_targets/`](./fuzz/fuzz_targets). They
 fall into three groups:
 
@@ -349,6 +356,12 @@ fall into three groups:
   and a raw-bytes `ALPH` overlay — and asserts the §2.7.1.1 flat-canvas
   carrier invariant, the §2.7.1.1 field carry (durations, loop count,
   background colour) and decode determinism on every survivor.
+* **Effort and thread oracles** — `encode_effort_threads` (lossless) and
+  `lossy_effort_threads` (lossy, with and without alpha) encode a
+  fuzz-controlled image at a fuzz-chosen effort once on one thread and
+  once on a fuzz-chosen budget: the two files must be identical, the
+  lossless one must decode to the input and the lossy one to the input's
+  size with its alpha plane exact.
 * **Parameterised encoder oracle** — `encode_params_roundtrip` makes the
   encoder *parameters* fuzz input (caller-fixed §3.4 `alpha_is_used`,
   forced subtract-green, forced §5.2.3 `cache_code_bits ∈ [1, 11]`,

@@ -17,8 +17,8 @@
 //!   `800x533,2400x1600`).
 //! * `STILL_MATRIX_RUNS` — runs per cell (default 5; cells slower than
 //!   two seconds run once).
-//! * `STILL_MATRIX_SECTIONS` — any of `lossy`, `lossless`, `decode`,
-//!   `animation` (default all four).
+//! * `STILL_MATRIX_SECTIONS` — any of `lossy`, `alpha`, `lossless`,
+//!   `decode`, `animation` (default all five).
 //! * `STILL_MATRIX_HASH` — when set, each encode row ends with the
 //!   64-bit FNV-1a of the file, to compare outputs between builds.
 //!
@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use oxideav_webp::{
     EncodeOptions, Frame, WebpImage, decode_all, decode_rgba8, encode_animation, encode_rgb8,
+    encode_rgba8,
 };
 
 /// Deterministic photo-like RGB picture: seven octaves of smooth lattice
@@ -151,6 +152,28 @@ fn ms(d: Duration) -> String {
     }
 }
 
+/// The photo-like picture with an alpha channel: an opaque disc with a
+/// soft edge on a transparent ground, a quarter of it at half opacity.
+fn photo_rgba_with_alpha(width: u32, height: u32) -> Vec<u8> {
+    let rgb = photo_rgb(width, height);
+    let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+    let radius = width.min(height) as f32 * 0.42;
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
+        .enumerate()
+        .flat_map(|(i, px)| {
+            let (x, y) = ((i as u32 % width) as f32, (i as u32 / width) as f32);
+            let distance = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+            let mut alpha = ((radius - distance) * 12.0).clamp(0.0, 255.0);
+            if x > cx && y > cy {
+                alpha *= 0.5;
+            }
+            [px[0], px[1], px[2], alpha as u8]
+        })
+        .collect()
+}
+
 fn encode_section(
     title: &str,
     base: &EncodeOptions,
@@ -158,6 +181,18 @@ fn encode_section(
     threads: &[usize],
     sizes: &[(u32, u32)],
     runs: usize,
+) {
+    encode_section_with(title, base, methods, threads, sizes, runs, false);
+}
+
+fn encode_section_with(
+    title: &str,
+    base: &EncodeOptions,
+    methods: &[u8],
+    threads: &[usize],
+    sizes: &[(u32, u32)],
+    runs: usize,
+    alpha: bool,
 ) {
     println!("\n### {title}\n");
     print!("| size | effort |");
@@ -167,15 +202,24 @@ fn encode_section(
     println!(" bytes |");
     println!("|---|---|{}---:|", "---:|".repeat(threads.len()));
     for &(w, h) in sizes {
-        let rgb = photo_rgb(w, h);
+        let pixels = if alpha {
+            photo_rgba_with_alpha(w, h)
+        } else {
+            photo_rgb(w, h)
+        };
         for &method in methods {
             print!("| {w}x{h} | {method} |");
             let mut bytes = None;
             let mut hash = 0u64;
             for &t in threads {
                 let opts = base.clone().with_method(method).with_threads(t);
-                let (d, out) =
-                    time_median(runs, || encode_rgb8(w, h, &rgb, &opts).expect("encode"));
+                let (d, out) = time_median(runs, || {
+                    if alpha {
+                        encode_rgba8(w, h, &pixels, &opts).expect("encode")
+                    } else {
+                        encode_rgb8(w, h, &pixels, &opts).expect("encode")
+                    }
+                });
                 let this = fnv1a64(&out);
                 match bytes {
                     None => (bytes, hash) = (Some(out.len()), this),
@@ -307,7 +351,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     let sections = std::env::var("STILL_MATRIX_SECTIONS")
-        .unwrap_or_else(|_| "lossy,lossless,decode,animation".into());
+        .unwrap_or_else(|_| "lossy,alpha,lossless,decode,animation".into());
     let wants = |name: &str| sections.split(',').any(|s| s.trim() == name);
     if wants("lossy") {
         encode_section(
@@ -317,6 +361,17 @@ fn main() {
             &[1, 4, 8],
             &sizes,
             runs,
+        );
+    }
+    if wants("alpha") {
+        encode_section_with(
+            "Lossy encode with an alpha plane, quality 80 (`encode_rgba8`)",
+            &EncodeOptions::default().with_quality(80.0),
+            &[0, 2, 4],
+            &[1, 4, 8],
+            &sizes,
+            runs,
+            true,
         );
     }
     if wants("lossless") {
