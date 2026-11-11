@@ -9216,8 +9216,16 @@ impl ParseCounts {
 
 /// Peak bytes per pixel one screened candidate holds: its residuals and
 /// transform scratch, and the matcher's chains while it is parsed (the
-/// parse itself is only counted).
+/// parse itself is counted; see [`SCREEN_KEEPS_PARSE_MAX_PIXELS`] for
+/// when it is also kept).
 const EFFORT_SCREEN_BYTES_PER_PIXEL: usize = 16;
+
+/// Largest image whose screening workers each keep their candidate's
+/// parse (up to one 8-byte token per pixel), so the elected candidate is
+/// not parsed a second time. Above it the parses are only counted and the
+/// winner is parsed again, as a 12 Mpx image's screening would otherwise
+/// hold close to 100 MB more per worker.
+const SCREEN_KEEPS_PARSE_MAX_PIXELS: usize = 4 << 20;
 
 /// The §5.2.3 cache choices a screening pass prices per candidate; the
 /// elected candidate then sweeps every choice.
@@ -9368,36 +9376,49 @@ fn encode_candidates_with_effort(
     let run_dp = params.dp && pixel_count <= EFFORT_DP_MAX_PIXELS;
 
     // 1. Screening: one reduced-effort parse per candidate.
-    /// A screened candidate: its residuals and the smallest size its
-    /// parse priced at. The parse itself is counted as it is produced
-    /// and dropped; the elected candidate is parsed again below (the
-    /// parse is deterministic), so a screening worker never holds a
-    /// token stream.
-    type Screened = (PreparedTransform, usize);
+    /// A screened candidate: its residuals, the smallest size its parse
+    /// priced at, and — when kept — the parse.
+    type Screened = (PreparedTransform, usize, Option<Vec<Token>>);
+    // The parse is counted as it is produced. Where the elected
+    // candidate would only be parsed again the same way (no DP stage,
+    // which wants its searches recorded, and an image small enough for
+    // every worker to hold a token stream), each worker also keeps its
+    // parse and the winner's is used as it is; otherwise the parses are
+    // dropped and the winner is parsed again below.
+    let keep_parse = !run_dp && pixel_count <= SCREEN_KEEPS_PARSE_MAX_PIXELS;
+    let bytes_per_pixel = EFFORT_SCREEN_BYTES_PER_PIXEL
+        + if keep_parse {
+            std::mem::size_of::<Token>()
+        } else {
+            0
+        };
     // Candidates are screened side by side; with fewer candidates than
     // threads each parse spreads its match searches over its share.
-    let workers = budgeted_workers(
-        builds.len(),
-        pixel_count.saturating_mul(EFFORT_SCREEN_BYTES_PER_PIXEL),
-    );
+    let workers = budgeted_workers(builds.len(), pixel_count.saturating_mul(bytes_per_pixel));
     let search_workers = thread_budget() / workers;
     let screen = |i: usize| -> Option<Screened> {
         let prep = builds[i]()?;
         let mut counts = ParseCounts::new(prep.residuals.len(), prep.stream_width);
+        let mut kept = keep_parse.then(|| Vec::with_capacity(prep.residuals.len() / 4));
         lz77_parse_on(
             &prep.residuals,
             params.shape(prep.residuals.len()),
             params.lazy,
             search_workers,
             None,
-            |tok| counts.add(tok),
+            |tok| {
+                counts.add(tok);
+                if let Some(tokens) = kept.as_mut() {
+                    tokens.push(tok);
+                }
+            },
         );
         let bytes = counts
             .stream_bytes(&prep, &EFFORT_SCREEN_CACHES)
             .into_iter()
             .min()
             .expect("non-empty cache list");
-        Some((prep, bytes))
+        Some((prep, bytes, kept))
     };
     // Candidates are screened in waves of up to `workers` at a time;
     // folding each wave in submission order with "strictly smaller
@@ -9415,13 +9436,19 @@ fn encode_candidates_with_effort(
         }
     }
     drop(builds);
-    let (prep, _) = best.expect("at least one candidate builds");
-    let (tokens, probes) = effort_greedy_tokens(
-        &prep.residuals,
-        params.shape(prep.residuals.len()),
-        params.lazy,
-        run_dp,
-    );
+    let (prep, _, kept) = best.expect("at least one candidate builds");
+    let (tokens, probes) = match kept {
+        Some(mut tokens) => {
+            tokens.shrink_to_fit();
+            (tokens, Vec::new())
+        }
+        None => effort_greedy_tokens(
+            &prep.residuals,
+            params.shape(prep.residuals.len()),
+            params.lazy,
+            run_dp,
+        ),
+    };
 
     // 2. Full §5.2.3 sweep on the elected candidate's parse.
     let sweep_caches = |tokens: &[Token]| -> (Option<u32>, usize) {
