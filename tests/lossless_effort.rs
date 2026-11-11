@@ -229,6 +229,47 @@ fn output_is_identical_for_every_thread_budget() {
     assert_eq!(lossy(1), lossy(2));
 }
 
+/// Images large enough for the match searches to run ahead of the parse
+/// on worker threads (the stage that is skipped below about 16 000
+/// pixels): photo-like, few-colour with long runs, and rows repeating
+/// the row above. Same bytes as the serial encode, exact round trip.
+#[test]
+fn threaded_match_search_writes_the_serial_bytes() {
+    let (w, h) = (176u32, 100u32);
+    let photo = common::photo_rgba(w, h);
+    let mut runs = Vec::new();
+    for i in 0..w * h {
+        let band = (i / w) / 9 + (i % w) / 40;
+        let speck = u8::from(i % 211 == 0) * 90;
+        runs.extend_from_slice(&[(band * 23) as u8, 40 + speck, 200 - (band * 9) as u8, 255]);
+    }
+    let mut repeats = photo.clone();
+    let row = (w * 4) as usize;
+    for i in row..repeats.len() {
+        if (i / 4) % 17 != 0 {
+            repeats[i] = repeats[i - row];
+        }
+    }
+    for (name, pixels) in [
+        ("photo", &photo),
+        ("runs", &runs),
+        ("row repeats", &repeats),
+    ] {
+        for method in [0u8, 2, 4, 5] {
+            let opts = EncodeOptions::default().with_method(method);
+            let serial =
+                encode_rgba8(w, h, pixels, &opts.clone().with_threads(1)).expect("serial encode");
+            let threaded =
+                encode_rgba8(w, h, pixels, &opts.with_threads(4)).expect("threaded encode");
+            assert!(serial == threaded, "{name}, method {method}: bytes differ");
+            assert!(
+                decode(&serial).expect("decode").to_rgba8() == *pixels,
+                "{name}, method {method}: not exact"
+            );
+        }
+    }
+}
+
 /// `encode_rgb8` / `encode_rgba8` read the caller's buffer in place on
 /// the lossless path: the bytes and every rejection match encoding the
 /// equivalent `WebpImage` (zero dimension, short buffer, oversize side;

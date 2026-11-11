@@ -1366,12 +1366,7 @@ impl<'a> Lz77Matcher<'a> {
     /// `pos + 4 <= pixels.len()`). A simple multiplicative mix over the
     /// four ARGB words, folded into `HASH_BITS` bits.
     fn hash(&self, pos: usize) -> usize {
-        let p = self.pixels;
-        let mut h = 0u32;
-        for k in 0..4 {
-            h = h.wrapping_mul(0x9e37_79b1).wrapping_add(p[pos + k]);
-        }
-        (h >> (32 - self.hash_bits)) as usize
+        window_hash(self.pixels, pos, self.hash_bits)
     }
 
     /// Insert `pos` at the head of its hash bucket's chain.
@@ -1392,95 +1387,335 @@ impl<'a> Lz77Matcher<'a> {
     /// `pos + 4 <= pixels.len()`. The tail of the image (fewer than 4
     /// pixels remaining) is always emitted as literals.
     fn find(&self, pos: usize) -> Option<(usize, usize)> {
-        let p = self.pixels;
-        let n = p.len();
-        if pos + 4 > n {
+        if pos + 4 > self.pixels.len() {
             return None;
         }
-        let max_len = (n - pos).min(MAX_MATCH);
-        let h = self.hash(pos);
-        let mut cand = self.head[h];
-        // The running best starts just below `MIN_MATCH`: a candidate
-        // shorter than that is never returned, and the result is the
-        // first chain candidate reaching the longest length, so skipping
-        // the short ones changes nothing — but the quick reject below
-        // then needs a match at offset `MIN_MATCH - 1` before walking a
-        // candidate, which turns away hash-collision candidates (most of
-        // a long chain on noisy content) with one compare.
-        // `MIN_MATCH - 1 < 4 <= max_len`, so the probe stays in bounds.
-        let mut best_len = MIN_MATCH - 1;
-        let mut best_dist = 0usize;
-        let mut steps = 0usize;
-        while cand >= 0 && steps < self.max_chain {
-            let c = cand as usize;
-            // Chain candidates are strictly older as the walk
-            // proceeds, so once one is past the largest encodable
-            // distance every later one is too.
-            if pos - c > MAX_ENCODABLE_DISTANCE {
-                break;
-            }
-            // Candidates were all inserted at positions < pos.
-            //
-            // Round 409 quick-reject: only a strictly longer match can
-            // displace the running best, so a candidate that mismatches
-            // at offset `best_len` extends to at most `best_len` pixels
-            // and can be skipped without the full extension walk. The
-            // probe is in-bounds (`best_len < max_len <= n - pos`, and
-            // `c < pos`), and skipped candidates could never update
-            // `best_len`/`best_dist` or trigger the `len >= max_len`
-            // early break, so the walk's result — and the emitted
-            // byte stream — is unchanged.
-            if p[c + best_len] == p[pos + best_len] {
-                // Round 440: block-compare extension walk. XOR-fold four
-                // pixel pairs per step so the loop carries no
-                // per-pixel data-dependent branch (ILP-friendly, and the
-                // compiler can merge the adjacent 32-bit loads); on a
-                // block mismatch, locate the first differing lane and
-                // stop. The computed length is exactly the per-pixel
-                // walk's: the first mismatching offset is found either
-                // by the lane scan or the per-pixel tail below.
-                let mut len = 0usize;
-                let mut mismatched = false;
-                while len + 4 <= max_len {
-                    let x0 = p[c + len] ^ p[pos + len];
-                    let x1 = p[c + len + 1] ^ p[pos + len + 1];
-                    let x2 = p[c + len + 2] ^ p[pos + len + 2];
-                    let x3 = p[c + len + 3] ^ p[pos + len + 3];
-                    if (x0 | x1 | x2 | x3) != 0 {
-                        len += if x0 != 0 {
-                            0
-                        } else if x1 != 0 {
-                            1
-                        } else if x2 != 0 {
-                            2
-                        } else {
-                            3
-                        };
-                        mismatched = true;
-                        break;
-                    }
-                    len += 4;
-                }
-                if !mismatched {
-                    while len < max_len && p[c + len] == p[pos + len] {
-                        len += 1;
-                    }
-                }
-                if len > best_len {
-                    best_len = len;
-                    best_dist = pos - c;
-                    if len >= max_len || len >= self.nice_len {
-                        break;
-                    }
-                }
-            }
-            cand = self.prev[c];
-            steps += 1;
+        chain_find(
+            self.pixels,
+            &self.prev,
+            pos,
+            self.head[self.hash(pos)],
+            self.max_chain,
+            self.nice_len,
+        )
+    }
+}
+
+/// The hash of the 4-pixel window at `pos` in a `hash_bits`-bit table
+/// (callers guarantee `pos + 4 <= pixels.len()`).
+#[inline]
+fn window_hash(pixels: &[u32], pos: usize, hash_bits: u32) -> usize {
+    let mut h = 0u32;
+    for &pixel in &pixels[pos..pos + 4] {
+        h = h.wrapping_mul(0x9e37_79b1).wrapping_add(pixel);
+    }
+    (h >> (32 - hash_bits)) as usize
+}
+
+/// The chain walk behind [`Lz77Matcher::find`]: the longest match for
+/// the window at `pos` (`pos + 4 <= p.len()`) among the chain candidates
+/// starting at `first_candidate` and linked through `prev` (`-1` ends a
+/// chain), walking at most `max_chain` links and stopping at a match of
+/// `nice_len` pixels.
+#[inline]
+fn chain_find(
+    p: &[u32],
+    prev: &[i32],
+    pos: usize,
+    first_candidate: i32,
+    max_chain: usize,
+    nice_len: usize,
+) -> Option<(usize, usize)> {
+    let n = p.len();
+    let max_len = (n - pos).min(MAX_MATCH);
+    let mut cand = first_candidate;
+    // The running best starts just below `MIN_MATCH`: a candidate
+    // shorter than that is never returned, and the result is the
+    // first chain candidate reaching the longest length, so skipping
+    // the short ones changes nothing — but the quick reject below
+    // then needs a match at offset `MIN_MATCH - 1` before walking a
+    // candidate, which turns away hash-collision candidates (most of
+    // a long chain on noisy content) with one compare.
+    // `MIN_MATCH - 1 < 4 <= max_len`, so the probe stays in bounds.
+    let mut best_len = MIN_MATCH - 1;
+    let mut best_dist = 0usize;
+    let mut steps = 0usize;
+    while cand >= 0 && steps < max_chain {
+        let c = cand as usize;
+        // Chain candidates are strictly older as the walk
+        // proceeds, so once one is past the largest encodable
+        // distance every later one is too.
+        if pos - c > MAX_ENCODABLE_DISTANCE {
+            break;
         }
-        if best_len >= MIN_MATCH {
-            Some((best_len, best_dist))
-        } else {
-            None
+        // Candidates were all inserted at positions < pos.
+        //
+        // Round 409 quick-reject: only a strictly longer match can
+        // displace the running best, so a candidate that mismatches
+        // at offset `best_len` extends to at most `best_len` pixels
+        // and can be skipped without the full extension walk. The
+        // probe is in-bounds (`best_len < max_len <= n - pos`, and
+        // `c < pos`), and skipped candidates could never update
+        // `best_len`/`best_dist` or trigger the `len >= max_len`
+        // early break, so the walk's result — and the emitted
+        // byte stream — is unchanged.
+        if p[c + best_len] == p[pos + best_len] {
+            // Round 440: block-compare extension walk. XOR-fold four
+            // pixel pairs per step so the loop carries no
+            // per-pixel data-dependent branch (ILP-friendly, and the
+            // compiler can merge the adjacent 32-bit loads); on a
+            // block mismatch, locate the first differing lane and
+            // stop. The computed length is exactly the per-pixel
+            // walk's: the first mismatching offset is found either
+            // by the lane scan or the per-pixel tail below.
+            let mut len = 0usize;
+            let mut mismatched = false;
+            while len + 4 <= max_len {
+                let x0 = p[c + len] ^ p[pos + len];
+                let x1 = p[c + len + 1] ^ p[pos + len + 1];
+                let x2 = p[c + len + 2] ^ p[pos + len + 2];
+                let x3 = p[c + len + 3] ^ p[pos + len + 3];
+                if (x0 | x1 | x2 | x3) != 0 {
+                    len += if x0 != 0 {
+                        0
+                    } else if x1 != 0 {
+                        1
+                    } else if x2 != 0 {
+                        2
+                    } else {
+                        3
+                    };
+                    mismatched = true;
+                    break;
+                }
+                len += 4;
+            }
+            if !mismatched {
+                while len < max_len && p[c + len] == p[pos + len] {
+                    len += 1;
+                }
+            }
+            if len > best_len {
+                best_len = len;
+                best_dist = pos - c;
+                if len >= max_len || len >= nice_len {
+                    break;
+                }
+            }
+        }
+        cand = prev[c];
+        steps += 1;
+    }
+    if best_len >= MIN_MATCH {
+        Some((best_len, best_dist))
+    } else {
+        None
+    }
+}
+
+/// What the greedy parse ([`lz77_parse`]) asks of a match searcher.
+trait MatchSource {
+    /// The longest match for the window at `pos` among positions before
+    /// it, as [`Lz77Matcher::find`] reports it.
+    fn find(&mut self, pos: usize) -> Option<(usize, usize)>;
+    /// Make `pos` a candidate for later searches.
+    fn insert(&mut self, pos: usize);
+}
+
+impl MatchSource for Lz77Matcher<'_> {
+    fn find(&mut self, pos: usize) -> Option<(usize, usize)> {
+        Lz77Matcher::find(self, pos)
+    }
+
+    fn insert(&mut self, pos: usize) {
+        Lz77Matcher::insert(self, pos);
+    }
+}
+
+/// The hash chains of a whole pixel buffer, built up front: `prev[p]` is
+/// the latest position before `p` whose 4-pixel window hashes like
+/// `p`'s — the head of `p`'s bucket at the moment an incremental
+/// [`Lz77Matcher`] that has inserted every position below `p` is asked
+/// for `find(p)`. Under that discipline (the one the greedy parse and
+/// the DP match table keep, see [`FindProbe`]) `find(p)` depends on the
+/// pixels and `p` alone, so [`ChainIndex::find`] returns the incremental
+/// matcher's answer for any position, in any order, from any thread.
+struct ChainIndex<'a> {
+    pixels: &'a [u32],
+    prev: Vec<i32>,
+    max_chain: usize,
+    nice_len: usize,
+}
+
+impl<'a> ChainIndex<'a> {
+    fn build(pixels: &'a [u32], shape: MatcherShape) -> Self {
+        let hash_bits = shape.hash_bits.clamp(1, 31);
+        let mut head = vec![-1i32; 1 << hash_bits];
+        let mut prev = vec![-1i32; pixels.len()];
+        for pos in 0..pixels.len().saturating_sub(3) {
+            let slot = &mut head[window_hash(pixels, pos, hash_bits)];
+            prev[pos] = *slot;
+            *slot = pos as i32;
+        }
+        Self {
+            pixels,
+            prev,
+            max_chain: shape.max_chain.max(1),
+            nice_len: shape.nice_len.max(MIN_MATCH),
+        }
+    }
+
+    #[inline]
+    fn find(&self, pos: usize) -> Option<(usize, usize)> {
+        if pos + 4 > self.pixels.len() {
+            return None;
+        }
+        chain_find(
+            self.pixels,
+            &self.prev,
+            pos,
+            self.prev[pos],
+            self.max_chain,
+            self.nice_len,
+        )
+    }
+
+    /// Search the positions of `first..first + probes.len()` a
+    /// front-to-back pass is likely to ask for, on up to `workers`
+    /// threads, into `probes` (entries it does not search are left as
+    /// they are). Inside a match of [`DP_LONG_MATCH_INHERIT`] pixels or
+    /// more the positions the DP match table inherits are skipped; a
+    /// consumer that does want one of them searches it itself.
+    fn fill(&self, first: usize, probes: &mut [FindProbe], workers: usize) {
+        let chunks = std::sync::Mutex::new(probes.chunks_mut(PROBE_CHUNK).enumerate());
+        let work = || {
+            loop {
+                let next = chunks.lock().unwrap_or_else(|e| e.into_inner()).next();
+                let Some((index, chunk)) = next else { break };
+                let base = first + index * PROBE_CHUNK;
+                let mut offset = 0;
+                while offset < chunk.len() {
+                    let found = self.find(base + offset);
+                    chunk[offset] = FindProbe::record(found);
+                    offset += match found {
+                        Some((len, _)) if len >= DP_LONG_MATCH_INHERIT => {
+                            len - DP_LONG_MATCH_INHERIT + 1
+                        }
+                        _ => 1,
+                    };
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..workers {
+                // A thread that does not start leaves its chunks to the
+                // others.
+                let _ = std::thread::Builder::new().spawn_scoped(scope, work);
+            }
+            work();
+        });
+    }
+}
+
+/// Positions one worker searches per turn in [`ChainIndex::fill`].
+const PROBE_CHUNK: usize = 1 << 13;
+
+/// Positions searched ahead of the parse per refill when the probes are
+/// not kept ([`ProbedSource`] over a scratch window).
+const PROBE_WINDOW: usize = 1 << 20;
+
+/// A [`MatchSource`] over a [`ChainIndex`] whose searches run ahead of
+/// the parse on several threads: `table` holds the probes of positions
+/// `start..start + table.len()`; a position the fill skipped is searched
+/// when the parse asks for it. With `whole` the table covers the buffer
+/// and keeps every probe (the DP match table replays it); otherwise it
+/// is a window, refilled from the parse position when the parse runs
+/// off its end.
+struct ProbedSource<'a, 'c> {
+    chain: &'c ChainIndex<'a>,
+    table: &'c mut [FindProbe],
+    start: usize,
+    whole: bool,
+    workers: usize,
+}
+
+impl MatchSource for ProbedSource<'_, '_> {
+    fn find(&mut self, pos: usize) -> Option<(usize, usize)> {
+        if pos < self.start {
+            // The parse only moves forward; answer anyway.
+            return self.chain.find(pos);
+        }
+        if pos - self.start >= self.table.len() {
+            if self.whole {
+                return self.chain.find(pos);
+            }
+            let len = self.table.len().min(self.chain.pixels.len() - pos);
+            self.table.fill(FindProbe::NOT_PROBED);
+            self.start = pos;
+            self.chain.fill(pos, &mut self.table[..len], self.workers);
+        }
+        let slot = &mut self.table[pos - self.start];
+        if slot.len == u32::MAX {
+            *slot = FindProbe::record(self.chain.find(pos));
+        }
+        slot.replay()
+    }
+
+    fn insert(&mut self, _pos: usize) {}
+}
+
+/// [`lz77_parse`] of `pixels` with a matcher of `shape`, its match
+/// searches spread over `workers` threads when there are several: the
+/// tokens (and probes) are those of the single-threaded parse, which
+/// `workers <= 1` runs as it always did. With `probes` (one entry per
+/// pixel, all [`FindProbe::NOT_PROBED`]) every search made is recorded.
+fn lz77_parse_on(
+    pixels: &[u32],
+    shape: MatcherShape,
+    lazy_depth: u32,
+    workers: usize,
+    mut probes: Option<&mut [FindProbe]>,
+    emit: impl FnMut(Token),
+) {
+    if workers <= 1 || pixels.len() < 2 * PROBE_CHUNK {
+        let mut matcher = Lz77Matcher::with_shape(pixels, shape);
+        lz77_parse(
+            pixels,
+            &mut matcher,
+            lazy_depth,
+            |pos, found| {
+                if let Some(slot) = probes.as_deref_mut().and_then(|p| p.get_mut(pos)) {
+                    *slot = FindProbe::record(found);
+                }
+            },
+            emit,
+        );
+        return;
+    }
+    let chain = ChainIndex::build(pixels, shape);
+    match probes {
+        Some(table) => {
+            chain.fill(0, table, workers);
+            let mut source = ProbedSource {
+                chain: &chain,
+                table,
+                start: 0,
+                whole: true,
+                workers,
+            };
+            lz77_parse(pixels, &mut source, lazy_depth, |_, _| {}, emit);
+        }
+        None => {
+            let mut window = vec![FindProbe::NOT_PROBED; PROBE_WINDOW.min(pixels.len())];
+            chain.fill(0, &mut window, workers);
+            let mut source = ProbedSource {
+                chain: &chain,
+                table: &mut window,
+                start: 0,
+                whole: false,
+                workers,
+            };
+            lz77_parse(pixels, &mut source, lazy_depth, |_, _| {}, emit);
         }
     }
 }
@@ -1643,6 +1878,7 @@ fn tokenize_lz77_impl(
     let mut matcher = Lz77Matcher::new(pixels);
     let mut tokens = Vec::new();
     lz77_parse(
+        pixels,
         &mut matcher,
         lazy_depth,
         |pos, found| {
@@ -1666,13 +1902,13 @@ fn tokenize_lz77_impl(
 /// The parse, its matcher bookkeeping, and the emitted tokens are
 /// exactly [`tokenize_lz77_impl`]'s; a caller can stream the tokens into
 /// histograms or a compact parse instead of a `Vec<Token>`.
-fn lz77_parse(
-    matcher: &mut Lz77Matcher<'_>,
+fn lz77_parse<M: MatchSource>(
+    pixels: &[u32],
+    matcher: &mut M,
     lazy_depth: u32,
     mut on_probe: impl FnMut(usize, Option<(usize, usize)>),
     mut emit: impl FnMut(Token),
 ) {
-    let pixels = matcher.pixels;
     let n = pixels.len();
     let mut pos = 0usize;
     let depth = lazy_depth.min(4);
@@ -8773,31 +9009,28 @@ fn effort_hash_bits(pixel_count: usize) -> u32 {
 }
 
 /// The greedy §3.6.2.2 parse of `pixels` at a reduced effort: a matcher
-/// of `shape` and `lazy` positions of lazy look-ahead. With `record`,
-/// every `find` result is kept (see [`FindProbe`]) so the DP match table
-/// can replay it instead of searching again; otherwise the probe list is
-/// empty.
+/// of `shape` and `lazy` positions of lazy look-ahead, its searches on
+/// this thread's worker budget. With `record`, every `find` result is
+/// kept (see [`FindProbe`]) so the DP match table can replay it instead
+/// of searching again; otherwise the probe list is empty.
 fn effort_greedy_tokens(
     pixels: &[u32],
     shape: MatcherShape,
     lazy: u32,
     record: bool,
 ) -> (Vec<Token>, Vec<FindProbe>) {
-    let mut matcher = Lz77Matcher::with_shape(pixels, shape);
     let mut tokens = Vec::with_capacity(pixels.len() / 4);
     let mut probes = if record {
         vec![FindProbe::NOT_PROBED; pixels.len()]
     } else {
         Vec::new()
     };
-    lz77_parse(
-        &mut matcher,
+    lz77_parse_on(
+        pixels,
+        shape,
         lazy,
-        |pos, found| {
-            if let Some(slot) = probes.get_mut(pos) {
-                *slot = FindProbe::record(found);
-            }
-        },
+        thread_budget(),
+        record.then_some(&mut probes[..]),
         |tok| tokens.push(tok),
     );
     tokens.shrink_to_fit();
@@ -9131,13 +9364,24 @@ fn encode_candidates_with_effort(
     /// parse is deterministic), so a screening worker never holds a
     /// token stream.
     type Screened = (PreparedTransform, usize);
+    // Candidates are screened side by side; with fewer candidates than
+    // threads each parse spreads its match searches over its share.
+    let workers = budgeted_workers(
+        builds.len(),
+        pixel_count.saturating_mul(EFFORT_SCREEN_BYTES_PER_PIXEL),
+    );
+    let search_workers = thread_budget() / workers;
     let screen = |i: usize| -> Option<Screened> {
         let prep = builds[i]()?;
         let mut counts = ParseCounts::new(prep.residuals.len(), prep.stream_width);
-        let mut matcher =
-            Lz77Matcher::with_shape(&prep.residuals, params.shape(prep.residuals.len()));
-        lz77_parse(&mut matcher, params.lazy, |_, _| {}, |tok| counts.add(tok));
-        drop(matcher);
+        lz77_parse_on(
+            &prep.residuals,
+            params.shape(prep.residuals.len()),
+            params.lazy,
+            search_workers,
+            None,
+            |tok| counts.add(tok),
+        );
         let bytes = counts
             .stream_bytes(&prep, &EFFORT_SCREEN_CACHES)
             .into_iter()
@@ -9148,10 +9392,6 @@ fn encode_candidates_with_effort(
     // Candidates are screened in waves of up to `workers` at a time;
     // folding each wave in submission order with "strictly smaller
     // replaces" elects exactly the candidate a one-by-one pass would.
-    let workers = budgeted_workers(
-        builds.len(),
-        pixel_count.saturating_mul(EFFORT_SCREEN_BYTES_PER_PIXEL),
-    );
     let mut best: Option<Screened> = None;
     for wave in (0..builds.len()).step_by(workers) {
         let wave_len = workers.min(builds.len() - wave);
@@ -12326,6 +12566,142 @@ mod tests {
     /// (`dist = 1`, including a > [`DP_LONG_MATCH_INHERIT`] run so the
     /// inherit path skips fresh searches), row-period repeats
     /// (`dist = width`), and lazy-probe swap opportunities.
+    /// The threaded parse ([`lz77_parse_on`] with several workers) — match
+    /// searches against prebuilt chains, run ahead of the parse — emits
+    /// the single-threaded parse's tokens, and its probe table gives the
+    /// same DP match table, for every lazy depth and matcher shape, on
+    /// noise, long runs, row repeats and a mix.
+    #[test]
+    fn threaded_parse_matches_the_single_threaded_parse() {
+        let width = 160usize;
+        let n = width * 260;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u32
+        };
+        let noise: Vec<u32> = (0..n)
+            .map(|_| 0xff00_0000 | (rng() & 0x00ff_ffff))
+            .collect();
+        // Few colours: every window repeats many times (deep chains).
+        let few: Vec<u32> = (0..n).map(|_| 0xff00_0000 | (rng() & 3)).collect();
+        // Long flat runs broken by single pixels.
+        let runs: Vec<u32> = (0..n)
+            .map(|i| {
+                if i % 997 == 0 {
+                    0xff12_3456
+                } else {
+                    0xff00_0000 | ((i / 5000) as u32)
+                }
+            })
+            .collect();
+        // Each row repeats the row above with a few changed pixels.
+        let mut rows = noise.clone();
+        for i in width..n {
+            if rng() % 13 != 0 {
+                rows[i] = rows[i - width];
+            }
+        }
+        // A mix: thirds of the above.
+        let mut mix = noise[..n / 3].to_vec();
+        mix.extend_from_slice(&runs[..n / 3]);
+        mix.extend_from_slice(&rows[..n - 2 * (n / 3)]);
+        let shapes = [
+            MatcherShape {
+                max_chain: 8,
+                hash_bits: 14,
+                nice_len: 32,
+            },
+            MatcherShape {
+                max_chain: 48,
+                hash_bits: 16,
+                nice_len: 512,
+            },
+            MatcherShape {
+                max_chain: MAX_CHAIN,
+                hash_bits: HASH_BITS as u32,
+                nice_len: MAX_MATCH,
+            },
+        ];
+        for (name, pixels) in [
+            ("noise", &noise),
+            ("few colours", &few),
+            ("runs", &runs),
+            ("row repeats", &rows),
+            ("mix", &mix),
+        ] {
+            for shape in shapes {
+                for lazy in 0..=4u32 {
+                    let parse = |workers: usize, record: bool| {
+                        let mut tokens = Vec::new();
+                        let mut probes = vec![FindProbe::NOT_PROBED; pixels.len()];
+                        lz77_parse_on(
+                            pixels,
+                            shape,
+                            lazy,
+                            workers,
+                            record.then_some(&mut probes[..]),
+                            |tok| tokens.push(tok),
+                        );
+                        (tokens, probes)
+                    };
+                    let (serial, serial_probes) = parse(1, true);
+                    for workers in [2usize, 5] {
+                        let (windowed, _) = parse(workers, false);
+                        assert!(
+                            windowed == serial,
+                            "{name}, {shape:?}, lazy {lazy}, {workers} workers: tokens"
+                        );
+                        let (recorded, probes) = parse(workers, true);
+                        assert!(
+                            recorded == serial,
+                            "{name}, {shape:?}, lazy {lazy}, {workers} workers: recorded tokens"
+                        );
+                        let table = |probes: &[FindProbe]| {
+                            compute_dp_matches_with_probes_chain(
+                                pixels,
+                                width as u32,
+                                probes,
+                                shape,
+                            )
+                        };
+                        assert!(
+                            table(&probes) == table(&serial_probes),
+                            "{name}, {shape:?}, lazy {lazy}, {workers} workers: DP match table"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`ChainIndex::find`] is the incremental matcher's `find` at every
+    /// position when the matcher has inserted every earlier one.
+    #[test]
+    fn prebuilt_chains_answer_like_the_incremental_matcher() {
+        let mut state = 0x1357_9bdfu32;
+        let mut rng = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 24
+        };
+        for n in [0usize, 1, 3, 4, 5, 64, 3000] {
+            let pixels: Vec<u32> = (0..n).map(|_| 0xff00_0000 | (rng() & 7)).collect();
+            let shape = MatcherShape {
+                max_chain: 16,
+                hash_bits: 10,
+                nice_len: 64,
+            };
+            let chain = ChainIndex::build(&pixels, shape);
+            let mut matcher = Lz77Matcher::with_shape(&pixels, shape);
+            for pos in 0..n {
+                assert_eq!(chain.find(pos), matcher.find(pos), "n {n}, position {pos}");
+                matcher.insert(pos);
+            }
+        }
+    }
+
     #[test]
     fn recorded_probes_reproduce_fresh_dp_match_table() {
         let width = 32u32;

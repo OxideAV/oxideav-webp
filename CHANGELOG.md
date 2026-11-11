@@ -49,6 +49,21 @@ All notable changes to `oxideav-webp` are recorded here.
   their bytes, but the search now runs on the larger half of the thread
   budget (it used to run on one thread next to the VP8 encode): the same
   encode at method 4, 8 threads, 1.4-4.2 s to 0.8-2.8 s.
+- **Lossless: match searches on the thread budget.** The greedy parse
+  of the screened search asks for one hash-chain search per position, in
+  order; the chains of the whole buffer are now built up front
+  (`find(p)` only ever sees positions before `p`, so its answer does not
+  depend on when it is asked) and the searches run ahead of the parse on
+  the worker threads, a million positions at a time. That covers the
+  elected candidate's parse, the screening parses when there are fewer
+  candidates than threads, and — at methods 4 and up — the searches of
+  the DP match table, which replays them: the two stages that ran on one
+  thread whatever the budget. Same tokens, same bytes (unit tests
+  compare the threaded parse and its DP table with the serial ones on
+  five kinds of content at every lazy depth; debug builds check every
+  replayed search against the incremental matcher). 2400 x 1600 photo,
+  8 threads: method 0 0.59 s to 0.39 s, method 2 1.02 s to 0.78 s,
+  method 4 1.85 s to 1.49 s (one thread unchanged).
 - Lossless: the palette lookup of the §4.4 color-indexing candidates is
   an open-addressed table probed from a multiplicative hash, consulted
   only where a pixel differs from its predecessor (it was a `HashMap`
