@@ -287,14 +287,25 @@ fn black_box_tool_reads_a_lossy_animation() {
         text.contains("Number of frames: 3"),
         "container tool output:\n{text}"
     );
-    // One row per frame: lossy, with alpha, at the written duration.
-    for duration in [70, 80, 90] {
+    // One row per frame at the written duration; where the tool prints a
+    // compression column, it says lossy for each of them.
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    for duration in ["70", "80", "90"] {
+        let row = rows
+            .iter()
+            .find(|fields| {
+                fields
+                    .first()
+                    .is_some_and(|f| f.trim_end_matches(':').parse::<u32>().is_ok())
+                    && fields.contains(&duration)
+            })
+            .unwrap_or_else(|| panic!("no frame row with duration {duration}:\n{text}"));
         assert!(
-            text.lines().any(|line| {
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                fields.contains(&"lossy") && fields.contains(&duration.to_string().as_str())
-            }),
-            "no lossy frame row with duration {duration}:\n{text}"
+            !row.contains(&"lossless"),
+            "frame with duration {duration} listed as lossless:\n{text}"
         );
     }
 }

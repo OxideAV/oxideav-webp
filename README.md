@@ -30,6 +30,11 @@ if oxideav_webp::probe(&bytes) {
 
     let lossy = oxideav_webp::EncodeOptions::default().with_quality(80.0); // lossy (VP8 + ALPH)
     let small = oxideav_webp::encode_rgba8(w, h, &rgba, &lossy)?;
+
+    // Faster for a few percent more bytes, on at most four threads
+    // (the bytes never depend on the thread count).
+    let quick = lossy.clone().with_effort(1).with_threads(4);
+    let small_fast = oxideav_webp::encode_rgba8(w, h, &rgba, &quick)?;
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
