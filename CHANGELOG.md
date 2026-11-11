@@ -19,6 +19,12 @@ All notable changes to `oxideav-webp` are recorded here.
   for methods `0..=2` and `5..=6`.) Timings and sizes: the README's
   performance tables. Oracle direction H runs methods 0, 4, 5, 6 at
   quality 70 and 0, 6 at 95 through a black-box decoder.
+- **Measured** (README, Performance; minimum of interleaved passes on a
+  shared 18-core machine): lossy `encode_rgb8` at quality 80, default
+  effort, 800 x 533: 46.5 ms to 45.8 / 12.9 / 8.2 ms on 1 / 4 / 8
+  threads, same bytes; effort 0: 11.6 / 3.6 / 2.6 ms for 17 % more
+  bytes. 2400 x 1600: 413 ms to 384 / 101 / 62 ms; effort 0:
+  100 / 29 / 19 ms.
 - **The lossy encode uses the thread budget.** `EncodeOptions::threads`
   (and the registry encoders' budget) now reaches the RGB to Y′CbCr
   conversion (bands of row pairs) and the VP8 key-frame encode
@@ -42,13 +48,14 @@ All notable changes to `oxideav-webp` are recorded here.
   (through color indexing when it holds at most 16 values) — instead of
   the lossless transform search, which at those levels screens
   candidates built for three-channel pictures. The plane stays exact.
-  2400 x 1600, 8 threads, whole RGBA encode at method 2: 70-190 ms
-  against 0.8-2.8 s at method 4, with `ALPH` chunks from 85 % smaller to
-  23 % larger than the search's (five synthetic planes: soft disc, ramp,
-  wide falloff, sinusoid, blocks). Methods `3..=6` keep the search and
-  their bytes, but the search now runs on the larger half of the thread
-  budget (it used to run on one thread next to the VP8 encode): the same
-  encode at method 4, 8 threads, 1.4-4.2 s to 0.8-2.8 s.
+  2400 x 1600 RGBA, 8 threads: 74 ms at method 2 against 586 ms at
+  method 4 (README, Performance); on five synthetic planes (soft disc,
+  ramp, wide falloff, sinusoid, blocks) the quick coder's `ALPH` chunk
+  ranged from 85 % smaller to 23 % larger than the method-4 search's.
+  Methods `3..=6` keep the search and their bytes, but the search now
+  runs on the larger half of the thread budget (it used to run on one
+  thread next to the VP8 encode): the same encode at method 4,
+  8 threads, 1352 ms to 586 ms.
 - **Lossless: match searches on the thread budget.** The greedy parse
   of the screened search asks for one hash-chain search per position, in
   order; the chains of the whole buffer are now built up front
@@ -64,9 +71,10 @@ All notable changes to `oxideav-webp` are recorded here.
   replayed search against the incremental matcher). The searches run
   ahead only where the parse will resume (after a match, not inside
   it), so run-heavy pictures gain as photos do, and buffers under
-  65 536 pixels are parsed as before. 2400 x 1600 photo,
-  8 threads: method 0 0.59 s to 0.39 s, method 2 1.02 s to 0.78 s,
-  method 4 1.85 s to 1.49 s (one thread unchanged).
+  65 536 pixels are parsed as before. 2400 x 1600 photo, 4 threads:
+  method 0 402 ms to 278 ms, method 2 800 ms to 689 ms, method 4
+  942 ms to 890 ms; 8 threads: 431 to 265, 535 to 498, 748 to 662 (one
+  thread unchanged).
 - Lossless: the palette lookup of the §4.4 color-indexing candidates is
   an open-addressed table probed from a multiplicative hash, consulted
   only where a pixel differs from its predecessor (it was a `HashMap`
@@ -77,8 +85,9 @@ All notable changes to `oxideav-webp` are recorded here.
   once (snapshots capped at 256 MiB per window), writing the `ANMF`
   chunks in frame order — the same bytes for every budget, lossless and
   lossy, every frame mode (`tests/anim_coding.rs`). Eight 800 x 533
-  frames, lossless effort 2: 8 threads 648 ms to 217 ms (1 thread
-  unchanged; the budget used to reach only the stages inside one frame).
+  frames, lossless effort 2: 8 threads 470 ms to 157 ms, 4 threads
+  612 ms to 271 ms (1 thread unchanged; the budget used to reach only
+  the stages inside one frame).
 - Decode: a §5.2.2 backward reference is copied as slices (a run of one
   colour as a fill, an overlapping run in doubling pieces) instead of
   pixel by pixel through `Vec::push`. Same pixels (unit tests and the
@@ -99,9 +108,8 @@ All notable changes to `oxideav-webp` are recorded here.
   output byte once (row copies for the packed layouts; a two-pixel
   fixed-size kernel per chroma sample for Y′CbCr, range and pixel size
   resolved outside the loop). Same pixels: every fixture, pin and oracle
-  test is unchanged. 2400 x 1600: lossless `decode_rgba8` 73 ms to
-  47 ms, lossy 27 ms to 17 ms (of which the Y′CbCr to RGBA pass 7.8 ms
-  to 1.8 ms).
+  test is unchanged. 2400 x 1600 `decode_rgba8`: lossless 75.7 ms to
+  47.8 ms, lossy 24.7 ms to 21.3 ms (README, Performance).
 - The `webp_vp8` framework encoder is the same implementation as
   `encode` / `Vp8LossyEncoder` (planes read in place from the frame; it
   used to copy them twice through a wrapped VP8 framework encoder), and

@@ -290,6 +290,106 @@ profile is carried, not applied.
   decodes. See [`BENCHMARKS.md`](./BENCHMARKS.md) for the
   optimisation log.
 
+## Performance
+
+Times in milliseconds for one call through the public entry points, on
+a generated photo-like picture (smooth multi-octave noise, three shaded
+discs, light sensor noise) at 800 x 533 and 2400 x 1600. "Before" is
+0.3.2 plus the commits up to the API-hygiene pass; "after" is this
+tree. Both were built in release mode and run on the same 18-core Apple
+M-series machine, in alternating passes over the whole matrix; each
+figure is the **minimum** over the passes (20 before / 10 after for the
+lossy and decode tables, 9 / 4 for the lossless and animation tables,
+2 for cells that take two seconds or more). The machine was shared
+with other builds, which is why the minimum and not the median is
+shown: single-thread timings of the same cell varied up to threefold
+between passes. `cargo bench --bench still_matrix` prints these tables
+(the "after" half) on your machine.
+
+The `threads` columns are `EncodeOptions::with_threads(1 / 4 / 8)`;
+the bytes are the same in every column of a row.
+
+**Lossy encode**, `encode_rgb8`, quality 80. Before, `method` `0..=4`
+were one encode and nothing but an alpha plane used a second thread.
+The default (`4`) writes the same bytes as before.
+
+| size | effort | before: 1 / 4 / 8 threads ms | bytes | after: 1 / 4 / 8 threads ms | bytes |
+|---|---|---:|---:|---:|---:|
+| 800x533 | 0 | 46.8 / 46.6 / 47.2 | 28 872 | 11.6 / 3.61 / 2.64 | 33 770 |
+| 800x533 | 1 | 46.7 / 46.7 / 46.7 | 28 872 | 21.7 / 6.31 / 4.33 | 30 792 |
+| 800x533 | 2 | 46.8 / 46.2 / 46.5 | 28 872 | 26.9 / 7.67 / 5.27 | 30 372 |
+| 800x533 | 4 | 46.5 / 46.7 / 46.7 | 28 872 | 45.8 / 12.9 / 8.15 | 28 872 |
+| 800x533 | 5 | 93.2 / 93.6 / 93.0 | 27 262 | 92.5 / 26.6 / 16.8 | 27 262 |
+| 800x533 | 6 | 151 / 152 / 152 | 27 262 | 151 / 83.7 / 73.7 | 27 262 |
+| 2400x1600 | 0 | 400 / 407 / 410 | 237 368 | 99.8 / 29.1 / 19.3 | 280 154 |
+| 2400x1600 | 1 | 405 / 400 / 396 | 237 368 | 184 / 54.3 / 32.8 | 254 652 |
+| 2400x1600 | 2 | 407 / 402 / 418 | 237 368 | 235 / 64.3 / 40.2 | 251 034 |
+| 2400x1600 | 4 | 413 / 406 / 396 | 237 368 | 384 / 101 / 62.1 | 237 368 |
+| 2400x1600 | 5 | 801 / 807 / 803 | 222 538 | 780 / 222 / 132 | 222 538 |
+| 2400x1600 | 6 | 1283 / 1273 / 1274 | 222 538 | 1276 / 705 / 642 | 222 538 |
+
+Effort `6` spends most of its time in the loop-filter level search,
+which runs on one thread.
+
+**Lossy encode with an alpha plane**, `encode_rgba8`, quality 80 (a
+soft-edged disc, a quarter of it at half opacity). `4, alpha 2` is the
+default picture effort with `with_alpha_method(2)`.
+
+| size | effort | before: 1 / 4 / 8 threads ms | bytes | after: 1 / 4 / 8 threads ms | bytes |
+|---|---|---:|---:|---:|---:|
+| 800x533 | 0 | 65.4 / 46.7 / 46.3 | 39 112 | 16.6 / 6.74 / 4.73 | 42 728 |
+| 800x533 | 2 | 100 / 55.4 / 55.7 | 37 750 | 41.6 / 15.1 / 9.46 | 38 710 |
+| 800x533 | 4, alpha 2 | — | — | 59.9 / 25.5 / 14.0 | 37 210 |
+| 800x533 | 4 | 213 / 168 / 167 | 36 486 | 199 / 119 / 75.4 | 36 486 |
+| 2400x1600 | 0 | 547 / 394 / 401 | 269 132 | 144 / 58.1 / 36.1 | 305 932 |
+| 2400x1600 | 2 | 835 / 453 / 451 | 264 790 | 361 / 132 / 73.9 | 274 750 |
+| 2400x1600 | 4, alpha 2 | — | — | 523 / 207 / 115 | 261 084 |
+| 2400x1600 | 4 | 1719 / 1349 / 1352 | 261 070 | 1567 / 916 / 586 | 261 070 |
+
+**Lossless encode**, `encode_rgb8`. Same bytes as before at every
+level; on one thread nothing changed, the gains are stages that now use
+the thread budget.
+
+| size | effort | before: 1 / 4 / 8 threads ms | bytes | after: 1 / 4 / 8 threads ms | bytes |
+|---|---|---:|---:|---:|---:|
+| 800x533 | 0 | 47.9 / 38.7 / 38.3 | 714 474 | 50.7 / 30.6 / 28.4 | 714 474 |
+| 800x533 | 2 | 115 / 72.5 / 55.7 | 680 274 | 118 / 73.9 / 52.0 | 680 274 |
+| 800x533 | 4 | 217 / 90.9 / 74.9 | 680 274 | 227 / 95.1 / 72.4 | 680 274 |
+| 800x533 | 6 | 7940 / 2648 / 1729 | 669 092 | 8433 / 2743 / 1772 | 669 092 |
+| 2400x1600 | 0 | 514 / 402 / 431 | 6 415 350 | 477 / 278 / 265 | 6 415 350 |
+| 2400x1600 | 2 | 1258 / 800 / 535 | 6 031 110 | 1132 / 689 / 498 | 6 031 110 |
+| 2400x1600 | 4 | 2229 / 942 / 748 | 5 994 720 | 2106 / 890 / 662 | 5 994 720 |
+| 2400x1600 | 6 | 3162 / 1491 / 1296 | 5 994 720 | 3110 / 1381 / 1143 | 5 994 720 |
+
+**Decode**, `decode_rgba8`, one thread. Each build decodes the file it
+wrote (the same bytes for the lossy and lossless rows; the "before"
+alpha file has its own `ALPH` chunk).
+
+| size | file | before ms | after ms |
+|---|---|---:|---:|
+| 800x533 | lossy, quality 80, 28 872 bytes | 3.02 | 2.61 |
+| 800x533 | lossy with alpha, quality 80, 38 710 bytes | 4.76 | 4.03 |
+| 800x533 | lossless, 680 274 bytes | 8.45 | 5.22 |
+| 2400x1600 | lossy, quality 80, 237 368 bytes | 24.7 | 21.3 |
+| 2400x1600 | lossy with alpha, quality 80, 274 750 bytes | 39.4 | 33.9 |
+| 2400x1600 | lossless, 6 031 110 bytes | 75.7 | 47.8 |
+
+With `DecodeOptions::with_threads(2)` the 2400 x 1600 lossy picture
+with alpha decodes to its native planes in 15 ms instead of 28 ms
+(measured separately, minimum of nine runs).
+
+**Animation encode**, `encode_animation`, eight frames of the same
+picture with a square moving across it. Lossy animations are new.
+
+| size | frames | before: 1 / 4 / 8 threads ms | bytes | after: 1 / 4 / 8 threads ms | bytes |
+|---|---|---:|---:|---:|---:|
+| 800x533 | lossless, effort 2 | 946 / 612 / 470 | 861 144 | 966 / 271 / 157 | 861 144 |
+| 800x533 | lossy, quality 80, effort 4 | — | — | 402 / 111 / 57.3 | 36 672 |
+| 800x533 | lossy, quality 80, effort 1 | — | — | 185 / 53.1 / 28.9 | 38 912 |
+| 2400x1600 | lossless, effort 2 | 9042 / 6015 / 4663 | 7 626 936 | 9216 / 2984 / 1924 | 7 626 936 |
+| 2400x1600 | lossy, quality 80, effort 4 | — | — | 3292 / 880 / 487 | 286 802 |
+| 2400x1600 | lossy, quality 80, effort 1 | — | — | 1558 / 429 / 236 | 307 362 |
+
 ## Benchmarks
 
 The crate ships a Criterion suite under `benches/` covering the
