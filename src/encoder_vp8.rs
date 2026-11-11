@@ -355,7 +355,7 @@ use std::collections::VecDeque;
 /// | `effort` | u32 | `4` | encoder effort `0` (fastest) ..= `6` (smallest); see [`EncodeOptions::with_method`](crate::EncodeOptions::with_method) |
 /// | `threads` | u32 | `0` | thread budget; `0` follows the `ExecutionContext` (serial when none is announced) |
 /// | `qindex` | u32 | `32` | RFC 6386 §9.6 quantiser index `0..=127`, lower is better |
-/// | `alpha_effort` | i32 | `-1` | effort `0..=6` of the alpha plane's coder (`Yuva420P` / `Rgba` input); negative follows `effort` — see [`EncodeOptions::with_alpha_method`](crate::EncodeOptions::with_alpha_method) |
+/// | `alpha_effort` | i32 | `-1` | effort `0..=6` of the alpha plane's coder (`Yuva420P` / `Rgba` input); negative follows `effort` — see [`EncodeOptions::with_alpha_effort`](crate::EncodeOptions::with_alpha_effort) |
 /// | `quality` | f32 | `-1` | `0..=100`, higher is better; when ≥ 0 it replaces `qindex` and also sets the trellis strength, giving the bytes of [`EncodeOptions::with_quality`](crate::EncodeOptions::with_quality) on the same planes |
 ///
 /// The output bytes never depend on `threads`.
@@ -601,7 +601,7 @@ pub fn make_encoder_with_options(
         Some(quality) => crate::api::LossyTuning::for_quality(quality, effort),
         None => crate::api::LossyTuning::for_qindex(options.qindex, effort),
     }
-    .with_alpha_method(options.alpha_effort);
+    .with_alpha_effort(options.alpha_effort);
     let mut output_params = params.clone();
     output_params.media_type = MediaType::Video;
     output_params.codec_id = CodecId::new(crate::CODEC_ID_VP8);

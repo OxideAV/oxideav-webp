@@ -179,7 +179,7 @@ is `Error::LimitExceeded`.
 `EncodeOptions` (`Default` + `with_*`): `quality: Option<f32>` (`None` =
 lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
 strength), `method` / `with_effort` (`0..=6`, default `4`: encoder
-effort, see the table below), `alpha_method` (lossy only: the alpha
+effort, see the table below), `alpha_effort` (lossy only: the alpha
 plane's effort when it should differ from `method`), `threads` (default `0` = the host's
 parallelism, `1` = serial; never changes the output bytes),
 `embed_icc` / `embed_exif` / `embed_xmp` (default on — the image's
@@ -204,7 +204,7 @@ at efforts `0..=2` it is coded quickly (the §2.7.1.2 filter with the
 cheapest residuals, then one lossless stream), at `3..=6` by the
 lossless search of the same level — several times slower than the `VP8 `
 encode itself on a large picture, for an `ALPH` chunk that is usually
-within a few percent either way. `with_alpha_method(2)` picks the quick
+within a few percent either way. `with_alpha_effort(2)` picks the quick
 coder for the plane and leaves the picture at its effort. Measured times and sizes: [Performance](#performance).
 
 The `webp_vp8l` encoder takes `Rgba` / `Rgb24` frames; the `webp_vp8`
@@ -338,7 +338,7 @@ which runs on one thread.
 
 **Lossy encode with an alpha plane**, `encode_rgba8`, quality 80 (a
 soft-edged disc, a quarter of it at half opacity). `4, alpha 2` is the
-default picture effort with `with_alpha_method(2)`.
+default picture effort with `with_alpha_effort(2)`.
 
 | size | effort | before: 1 / 4 / 8 threads ms | bytes | after: 1 / 4 / 8 threads ms | bytes |
 |---|---|---:|---:|---:|---:|

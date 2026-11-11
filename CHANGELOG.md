@@ -152,10 +152,10 @@ All notable changes to `oxideav-webp` are recorded here.
   `ALPH` plane of a lossy picture is decoded next to its `VP8 ` frame —
   same pixels, same errors. The framework decoder takes the budget from
   `Decoder::set_execution_context`.
-- `EncodeOptions::alpha_method` / `with_alpha_method` (alias
-  `with_alpha_effort`; registry option `alpha_effort` on `webp_vp8`,
+- `EncodeOptions::alpha_effort` / `with_alpha_effort` (registry option
+  `alpha_effort` on `webp_vp8`,
   `WebpVp8EncoderOptions::with_alpha_effort`): the effort of a lossy
-  encode's alpha plane on its own. `with_alpha_method(2)` at the default
+  encode's alpha plane on its own. `with_alpha_effort(2)` at the default
   `method` keeps the default `VP8 ` bytes and codes the plane with the
   quick `ALPH` coder. Default `None`: the plane follows `method`, as
   before.

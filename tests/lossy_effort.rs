@@ -189,11 +189,11 @@ fn effort_alias_and_entry_points_agree() {
     }
 }
 
-/// `with_alpha_method` sets the alpha plane's effort alone: the `VP8 `
+/// `with_alpha_effort` sets the alpha plane's effort alone: the `VP8 `
 /// chunk is the one `method` writes, the `ALPH` chunk the one the alpha
 /// level writes, and the plane is exact.
 #[test]
-fn alpha_method_is_independent_of_the_picture_method() {
+fn alpha_effort_is_independent_of_the_picture_method() {
     let (w, h) = (120u32, 88u32);
     let mut rgba = common::photo_rgba(w, h);
     for (i, px) in rgba.chunks_mut(4).enumerate() {
@@ -213,7 +213,7 @@ fn alpha_method_is_independent_of_the_picture_method() {
     let base = EncodeOptions::default().with_quality(80.0);
     let default = encode(&base);
     let quick_everything = encode(&base.clone().with_method(2));
-    let quick_alpha = encode(&base.clone().with_alpha_method(2));
+    let quick_alpha = encode(&base.clone().with_alpha_effort(2));
     assert_eq!(
         chunk(&quick_alpha, b"VP8 "),
         chunk(&default, b"VP8 "),
@@ -233,7 +233,7 @@ fn alpha_method_is_independent_of_the_picture_method() {
         chunk(&quick_everything, b"VP8 ")
     );
     // Naming the level `method` already implies changes nothing.
-    assert_eq!(encode(&base.clone().with_alpha_method(4)), default);
+    assert_eq!(encode(&base.clone().with_alpha_effort(4)), default);
     let alpha: Vec<u8> = rgba.chunks(4).map(|p| p[3]).collect();
     for file in [&default, &quick_alpha, &searched_alpha] {
         let back: Vec<u8> = decode(file)
@@ -247,7 +247,7 @@ fn alpha_method_is_independent_of_the_picture_method() {
     // A lossless encode has no separate alpha plane to tune.
     let lossless = EncodeOptions::default();
     assert_eq!(
-        encode(&lossless.clone().with_alpha_method(0)),
+        encode(&lossless.clone().with_alpha_effort(0)),
         encode(&lossless)
     );
 }

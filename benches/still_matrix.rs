@@ -525,7 +525,7 @@ fn alpha_rows(lossy: &EncodeOptions) -> Vec<(String, EncodeOptions)> {
     vec![
         ("0".into(), lossy.clone().with_method(0)),
         ("2".into(), lossy.clone().with_method(2)),
-        ("4, alpha 2".into(), lossy.clone().with_alpha_method(2)),
+        ("4, alpha 2".into(), lossy.clone().with_alpha_effort(2)),
         ("4".into(), lossy.clone()),
     ]
 }

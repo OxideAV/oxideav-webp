@@ -208,9 +208,9 @@ pub struct EncodeOptions {
     pub method: u8,
     /// Lossy only — effort of the alpha plane's coder when it should
     /// differ from [`method`](Self::method); see
-    /// [`with_alpha_method`](Self::with_alpha_method). Default `None`:
+    /// [`with_alpha_effort`](Self::with_alpha_effort). Default `None`:
     /// the alpha plane follows `method`.
-    pub alpha_method: Option<u8>,
+    pub alpha_effort: Option<u8>,
     /// Worker threads the encoder may use: the lossless search's
     /// candidate evaluations; on a lossy encode the RGB to Y′CbCr
     /// conversion, the `VP8 ` macroblock rows and, with alpha, the
@@ -232,7 +232,7 @@ impl Default for EncodeOptions {
             frame_mode: AnimFrameMode::Auto,
             delta: DeltaConfig::default(),
             method: vp8l_encode::DEFAULT_LOSSLESS_METHOD,
-            alpha_method: None,
+            alpha_effort: None,
             threads: 0,
         }
     }
@@ -329,20 +329,13 @@ impl EncodeOptions {
     /// residuals, then one lossless stream — and `3..=6` the lossless
     /// search at that level, which on a large picture takes several
     /// times as long as the default `VP8 ` encode for an `ALPH` chunk of
-    /// much the same size. `with_alpha_method(2)` at the default `method`
+    /// much the same size. `with_alpha_effort(2)` at the default `method`
     /// keeps the default `VP8 ` bytes and takes the alpha plane's time
     /// out of the encode. The plane is exact at every level. Ignored by
     /// a lossless encode, where alpha is part of the picture.
-    pub fn with_alpha_method(mut self, method: u8) -> Self {
-        self.alpha_method = Some(method.min(vp8l_encode::MAX_LOSSLESS_METHOD));
+    pub fn with_alpha_effort(mut self, effort: u8) -> Self {
+        self.alpha_effort = Some(effort.min(vp8l_encode::MAX_LOSSLESS_METHOD));
         self
-    }
-
-    /// Builder: another name for
-    /// [`with_alpha_method`](Self::with_alpha_method), matching the
-    /// registry encoder's `alpha_effort` option.
-    pub fn with_alpha_effort(self, effort: u8) -> Self {
-        self.with_alpha_method(effort)
     }
 
     /// Builder: at most `threads` worker threads (`0` = the host's
@@ -364,7 +357,7 @@ impl EncodeOptions {
 
     /// The lossy tuning of these options at `quality`.
     fn lossy_tuning(&self, quality: f32) -> LossyTuning {
-        LossyTuning::for_quality(quality, self.method).with_alpha_method(self.alpha_method)
+        LossyTuning::for_quality(quality, self.method).with_alpha_effort(self.alpha_effort)
     }
 
     /// How an animation's frames are coded under these options.
@@ -1327,8 +1320,8 @@ pub(crate) struct LossyTuning {
     /// [`EncodeOptions::method`], `0..=6`.
     pub(crate) method: u8,
     /// Effort of the alpha plane's coder, `0..=6`
-    /// ([`EncodeOptions::alpha_method`], else `method`).
-    pub(crate) alpha_method: u8,
+    /// ([`EncodeOptions::alpha_effort`], else `method`).
+    pub(crate) alpha_effort: u8,
 }
 
 impl LossyTuning {
@@ -1338,7 +1331,7 @@ impl LossyTuning {
             qindex: oxideav_vp8::encoder::quality_to_qindex(quality),
             trellis: oxideav_vp8::encoder::quality_to_trellis_strength(quality),
             method,
-            alpha_method: method,
+            alpha_effort: method,
         }
     }
 
@@ -1348,14 +1341,14 @@ impl LossyTuning {
             qindex: qindex.min(127),
             trellis: oxideav_vp8::TrellisStrength::DEFAULT,
             method,
-            alpha_method: method,
+            alpha_effort: method,
         }
     }
 
     /// Code the alpha plane at its own effort (`None` keeps `method`).
-    pub(crate) fn with_alpha_method(mut self, alpha_method: Option<u8>) -> Self {
-        if let Some(level) = alpha_method {
-            self.alpha_method = level.min(vp8l_encode::MAX_LOSSLESS_METHOD);
+    pub(crate) fn with_alpha_effort(mut self, alpha_effort: Option<u8>) -> Self {
+        if let Some(level) = alpha_effort {
+            self.alpha_effort = level.min(vp8l_encode::MAX_LOSSLESS_METHOD);
         }
         self
     }
@@ -1571,7 +1564,7 @@ fn encode_lossy_parts(
     let (width, height) = (frame.width, frame.height);
     let pixels = width as usize * height as usize;
     let budget = vp8l_encode::thread_budget();
-    let method = tuning.alpha_method;
+    let method = tuning.alpha_effort;
     // The `ALPH` plane is an independent lossless encode: on images large
     // enough to pay for a thread it runs next to the VP8 encode (same
     // bytes either way); otherwise, or when no thread can be spawned, it
