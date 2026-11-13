@@ -4,6 +4,28 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/OxideAV/oxideav-webp/compare/v0.3.2...v0.4.0) - 2026-11-13
+
+### Other
+
+- EncodeOptions::threads defaults to 1 (serial); callers grant a budget explicitly
+- lossless methods 0..=3 keep the elected candidate's screening parse; README tables from the final build
+- lossy Auto frames take a small dirty rectangle without coding the whole frame; a window's threads follow each frame's expected work
+- the alpha plane's effort option is alpha_effort everywhere (EncodeOptions, registry)
+- container-tool check reads frame rows by duration; README example with effort and threads
+- README performance tables (before / after, size x effort x threads -> ms, bytes); CHANGELOG figures from the same run
+- DecodeOptions::threads — the ALPH plane decoded beside the VP8 frame; slice-wise backward-reference copy
+- searches ahead of the parse resume after a match; threaded parse from 65 536 pixels; pass-based timing matrix
+- EncodeOptions::alpha_method — the alpha plane's effort on its own; registry option alpha_effort
+- the webp_vp8 framework encoder takes Yuva420P / Rgb24 / Rgba frames; framework encoders read frame planes in place
+- lossless match searches run ahead of the parse on the thread budget
+- quick ALPH coder (filter + single-candidate stream) at lossy efforts 0..=2; alpha search on the thread budget; deterministic palette index
+- lossy animation encode; animation frames encoded concurrently on the thread budget
+- decode — symbols from one peeked word, group lookup per block, no second pass in decode_rgba8, fixed-size Y'CbCr row kernel
+- lossy effort levels reach the VP8 mode search; lossy encode on the thread budget; registry encoder options
+- API hygiene — non_exhaustive anim/metadata records and enums with builders
+- lossy method ladder with fitted probabilities and loop filter; #33 / #34 issue-shape tests; matcher quick reject
+
 ### Changed
 
 - **`EncodeOptions::threads` defaults to `1` (serial)**, for lossy and
