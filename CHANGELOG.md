@@ -6,6 +6,12 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- **`EncodeOptions::threads` defaults to `1` (serial)**, for lossy and
+  lossless alike; it was `0` (the host's available parallelism). An
+  encode now stays on the calling thread unless the caller grants a
+  budget with `with_threads(n)` (`0` still means every core) or, on the
+  framework path, an `ExecutionContext`. Output bytes are unaffected.
+
 - **Lossy `EncodeOptions::method` ladder** (#47). `0`, `1` and `2` are
   the VP8 encoder's three reduced macroblock mode searches (`2` compares
   every prediction mode with a cost model and codes only the winners,

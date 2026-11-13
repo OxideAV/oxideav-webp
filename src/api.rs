@@ -214,8 +214,8 @@ pub struct EncodeOptions {
     /// Worker threads the encoder may use: the lossless search's
     /// candidate evaluations; on a lossy encode the RGB to Y′CbCr
     /// conversion, the `VP8 ` macroblock rows and, with alpha, the
-    /// `ALPH` plane next to them. `0` (the default) uses the host's
-    /// available parallelism, `1` runs strictly on the calling thread.
+    /// `ALPH` plane next to them. `1` (the default) runs strictly on
+    /// the calling thread, `0` uses the host's available parallelism.
     /// The output bytes are the same for every value.
     pub threads: usize,
 }
@@ -233,7 +233,7 @@ impl Default for EncodeOptions {
             delta: DeltaConfig::default(),
             method: vp8l_encode::DEFAULT_LOSSLESS_METHOD,
             alpha_effort: None,
-            threads: 0,
+            threads: 1,
         }
     }
 }
@@ -338,8 +338,8 @@ impl EncodeOptions {
         self
     }
 
-    /// Builder: at most `threads` worker threads (`0` = the host's
-    /// available parallelism, `1` = serial); see
+    /// Builder: at most `threads` worker threads (`1` = serial, the
+    /// default; `0` = the host's available parallelism); see
     /// [`threads`](Self::threads). Never changes the output bytes.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads;

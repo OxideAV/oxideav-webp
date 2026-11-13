@@ -180,8 +180,8 @@ is `Error::LimitExceeded`.
 lossless; `0..=100`, `100` best, mapped to the VP8 qindex and trellis
 strength), `method` / `with_effort` (`0..=6`, default `4`: encoder
 effort, see the table below), `alpha_effort` (lossy only: the alpha
-plane's effort when it should differ from `method`), `threads` (default `0` = the host's
-parallelism, `1` = serial; never changes the output bytes),
+plane's effort when it should differ from `method`), `threads` (default `1` = serial; `0` = the host's
+parallelism; never changes the output bytes),
 `embed_icc` / `embed_exif` / `embed_xmp` (default on — the image's
 metadata is written when present), and for animations `loop_count`
 (`0` = forever), `background_rgba`, `frame_mode` (`Auto` / `Delta` /
