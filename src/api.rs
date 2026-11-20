@@ -327,9 +327,9 @@ impl EncodeOptions {
     /// [`method`](Self::method) the `VP8 ` picture gets. `0..=2` use the
     /// quick coder — the RFC 9649 §2.7.1.2 filter with the cheapest
     /// residuals, then one lossless stream — and `3..=6` the lossless
-    /// search at that level, which on a large picture takes several
-    /// times as long as the default `VP8 ` encode for an `ALPH` chunk of
-    /// much the same size. `with_alpha_effort(2)` at the default `method`
+    /// search at that level, which at the default takes about as long
+    /// again as the `VP8 ` encode for an `ALPH` chunk of much the same
+    /// size. `with_alpha_effort(2)` at the default `method`
     /// keeps the default `VP8 ` bytes and takes the alpha plane's time
     /// out of the encode. The plane is exact at every level. Ignored by
     /// a lossless encode, where alpha is part of the picture.

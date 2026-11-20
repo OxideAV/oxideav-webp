@@ -202,10 +202,12 @@ Every lossless level is exactly lossless; every lossy level writes a
 conformant key frame. The alpha plane of a lossy encode is always exact:
 at efforts `0..=2` it is coded quickly (the §2.7.1.2 filter with the
 cheapest residuals, then one lossless stream), at `3..=6` by the
-lossless search of the same level — several times slower than the `VP8 `
-encode itself on a large picture, for an `ALPH` chunk that is usually
-within a few percent either way. `with_alpha_effort(2)` picks the quick
-coder for the plane and leaves the picture at its effort. Measured times and sizes: [Performance](#performance).
+lossless search of the same level — at the default effort about as
+long again as the `VP8 ` encode itself (it was nearly three times as
+long before the search stopped screening colour-decorrelating candidates on
+a one-channel plane), for an `ALPH` chunk that is usually within a few
+percent either way. `with_alpha_effort(2)` picks the quick coder for
+the plane and leaves the picture at its effort. Measured times and sizes: [Performance](#performance).
 
 The `webp_vp8l` encoder takes `Rgba` / `Rgb24` frames; the `webp_vp8`
 encoder takes `Yuv420P` (limited-range BT.601, coded as given),
@@ -395,6 +397,63 @@ the first frame only the square's rectangle is coded.
 | 2400x1600 | lossless, effort 2 | 9042 / 6015 / 4663 | 7 626 936 | 9127 / 2826 / 1808 | 7 626 936 |
 | 2400x1600 | lossy, quality 80, effort 4 | — | — | 515 / 168 / 120 | 286 802 |
 | 2400x1600 | lossy, quality 80, effort 1 | — | — | 262 / 91.9 / 66.8 | 307 362 |
+
+### Search waste removed (same bytes)
+
+The tables above were measured on a quiet machine; the rows below
+replace their "after" figures for the lossy encode with an alpha plane
+at efforts `4` and `5` and for the lossless encode at efforts `3..=5`.
+"Before" is the tree those tables call "after". Both builds wrote the
+same bytes in every row. The machine was running other builds this
+time (load average 13 to 40 on 18 cores), so two figures are given per
+build: the instructions retired by one call (`/usr/bin/time -l`, the
+difference between a process making `n + 1` calls and one making one;
+it does not depend on the load) and the smallest wall-clock time over
+interleaved runs of the two builds (three to five runs of one to seven
+calls each), which on this day is 20-30 % above a quiet machine's.
+One thread.
+
+| encode | size | effort | before: 10⁹ instructions | ms | after: 10⁹ instructions | ms | bytes |
+|---|---|---|---:|---:|---:|---:|---:|
+| lossy + alpha, quality 80 | 800x533 | 4 | 4.75 | 213 | 2.55 | 117 | 36 486 |
+| lossy + alpha, quality 80 | 800x533 | 5 | 8.13 | 371 | 3.87 | 199 | 34 932 |
+| lossy + alpha, quality 80 | 2400x1600 | 4 | 38.6 | 1750 | 21.0 | 992 | 261 070 |
+| lossy + alpha, quality 80 | 4000x3000 | 4 | 102 | 4378 | 48.8 | 2109 | 760 104 |
+| lossless | 800x533 | 3 | 3.87 | 265 | 3.24 | 224 | 680 274 |
+| lossless | 800x533 | 4 | 4.51 | 294 | 3.88 | 240 | 680 274 |
+| lossless | 800x533 | 5 | 6.43 | 415 | 5.20 | 353 | 680 274 |
+| lossless | 2400x1600 | 3 | 34.3 | 2237 | 28.8 | 2014 | 5 994 720 |
+| lossless | 2400x1600 | 4 | 39.9 | 1968 | 34.4 | 1722 | 5 994 720 |
+| lossless | 2400x1600 | 5 | 56.8 | 3199 | 46.0 | 2409 | 5 994 720 |
+| lossless | 4000x3000 | 4 | — | 6166 | — | 5499 | 18 556 994 |
+
+What changed: an `ALPH` plane (any image whose red and blue are zero
+everywhere) is no longer screened through the subtract-green and
+color-transform candidates — seven candidates instead of thirteen at
+the default effort; the two entropy-driven predictor candidates of a
+pair share one table of per-block, per-mode residual entropies, summed
+over the occupied histogram bins only; and the elected candidate's
+screening parse is kept for the cost-priced re-plan instead of being
+run again.
+
+### Where a lossy encode spends its time
+
+Sampled at 800 x 533, quality 80, one thread: at the default effort
+99.8 % of `encode_rgb8` is the VP8 key-frame encoder of `oxideav-vp8`
+(the coefficient trellis 50 %, token-cost estimates 14 %, the
+exhaustive mode loop 8 %, prediction, transforms and reconstruction
+the rest) and 0.2 % the RGB to 4:2:0 conversion of this crate; at
+effort `0`, 98.4 % and 1.6 %. The effort levels of this crate are
+that encoder's, passed through. A 4000 x 3000 picture of the same
+kind (quiet machine, one thread): 303 ms at effort `0`, 1146 ms at
+the default, against 12.0 ms and 45.7 ms at 800 x 533 — time is
+roughly proportional to the pixel count at every level.
+
+Decoding the 4000 x 3000 files (`decode_rgba8`, one thread, smallest
+run): lossy 58 ms — 87 % in the VP8 decoder, 9 % in this crate's
+Y′CbCr to RGBA rows; lossy with alpha 110 ms (measured under load);
+lossless 154 ms, of which reading the prefix-coded symbols is 69 % and
+the inverse predictor 21 %.
 
 ## Benchmarks
 
