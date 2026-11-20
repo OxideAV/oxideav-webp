@@ -402,16 +402,16 @@ the first frame only the square's rectangle is coded.
 
 The tables above were measured on a quiet machine; the rows below
 replace their "after" figures for the lossy encode with an alpha plane
-at efforts `4` and `5` and for the lossless encode at efforts `3..=5`.
-"Before" is the tree those tables call "after". Both builds wrote the
-same bytes in every row. The machine was running other builds this
-time (load average 13 to 40 on 18 cores), so two figures are given per
-build: the instructions retired by one call (`/usr/bin/time -l`, the
-difference between a process making `n + 1` calls and one making one;
-it does not depend on the load) and the smallest wall-clock time over
-interleaved runs of the two builds (three to five runs of one to seven
-calls each), which on this day is 20-30 % above a quiet machine's.
-One thread.
+at efforts `4` and `5` and for the lossless encode. "Before" is the
+tree those tables call "after". Both builds wrote the same bytes in
+every row. The machine was running other builds this time (load
+average 13 to 40 on 18 cores), so the figure to compare is the
+instructions retired by one call (`/usr/bin/time -l`, the difference
+between a process making `n + 1` calls and one making one; it does not
+depend on the load). The milliseconds are the smallest wall-clock time
+over interleaved runs of the two builds — on that day 20-30 % above a
+quiet machine's, and left out where they varied more between runs than
+the two builds differ. One thread.
 
 | encode | size | effort | before: 10⁹ instructions | ms | after: 10⁹ instructions | ms | bytes |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -419,22 +419,26 @@ One thread.
 | lossy + alpha, quality 80 | 800x533 | 5 | 8.13 | 371 | 3.87 | 199 | 34 932 |
 | lossy + alpha, quality 80 | 2400x1600 | 4 | 38.6 | 1750 | 21.0 | 992 | 261 070 |
 | lossy + alpha, quality 80 | 4000x3000 | 4 | 102 | 4378 | 48.8 | 2109 | 760 104 |
-| lossless | 800x533 | 3 | 3.87 | 265 | 3.24 | 224 | 680 274 |
-| lossless | 800x533 | 4 | 4.51 | 294 | 3.88 | 240 | 680 274 |
-| lossless | 800x533 | 5 | 6.43 | 415 | 5.20 | 353 | 680 274 |
-| lossless | 2400x1600 | 3 | 34.3 | 2237 | 28.8 | 2014 | 5 994 720 |
-| lossless | 2400x1600 | 4 | 39.9 | 1968 | 34.4 | 1722 | 5 994 720 |
-| lossless | 2400x1600 | 5 | 56.8 | 3199 | 46.0 | 2409 | 5 994 720 |
-| lossless | 4000x3000 | 4 | — | 6166 | — | 5499 | 18 556 994 |
+| lossless | 800x533 | 0 | 0.80 | 55.7 | 0.68 | 50.3 | 714 474 |
+| lossless | 800x533 | 2 | 2.19 | 153 | 2.08 | 146 | 680 274 |
+| lossless | 800x533 | 3 | 3.87 | 265 | 3.13 | 213 | 680 274 |
+| lossless | 800x533 | 4 | 4.51 | 287 | 3.77 | 210 | 680 274 |
+| lossless | 800x533 | 5 | 6.43 | 332 | 5.09 | 255 | 680 274 |
+| lossless | 2400x1600 | 0 | 7.03 | 446 | 5.99 | 380 | 6 415 350 |
+| lossless | 2400x1600 | 2 | 19.5 | — | 18.5 | — | 6 031 110 |
+| lossless | 2400x1600 | 3 | 34.3 | — | 27.8 | — | 5 994 720 |
+| lossless | 2400x1600 | 4 | 39.9 | — | 33.5 | — | 5 994 720 |
+| lossless | 2400x1600 | 5 | 56.8 | — | 45.1 | — | 5 994 720 |
 
 What changed: an `ALPH` plane (any image whose red and blue are zero
 everywhere) is no longer screened through the subtract-green and
 color-transform candidates — seven candidates instead of thirteen at
 the default effort; the two entropy-driven predictor candidates of a
 pair share one table of per-block, per-mode residual entropies, summed
-over the occupied histogram bins only; and the elected candidate's
+over the occupied histogram bins only; the elected candidate's
 screening parse is kept for the cost-priced re-plan instead of being
-run again.
+run again; and the bit writer takes a whole prefix code (or field) per
+call instead of one bit.
 
 ### Where a lossy encode spends its time
 

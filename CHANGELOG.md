@@ -19,14 +19,17 @@ All notable changes to `oxideav-webp` are recorded here.
   without the subtract-green and color-transform candidates, which can
   only add bits to it: at the default effort an 800 x 533 `ALPH` plane
   went from thirteen screened candidates to seven.
+  The lossless bit writer keeps its last bits in a word and takes a
+  whole prefix code or field per call; it wrote one bit per call.
   Measured (README, Performance, "Search waste removed"; one thread,
   instructions retired per call, which do not depend on machine load):
   `encode_rgba8` at quality 80, default effort, 800 x 533: 4.75 to
   2.55 x 10⁹ (smallest wall-clock time of interleaved runs on a shared
   machine 213 to 117 ms); 4000 x 3000: 102 to 48.8 x 10⁹ (4378 to
-  2109 ms). Lossless `encode_rgb8`, default effort: 800 x 533 4.51 to
-  3.88 x 10⁹ (294 to 240 ms), 2400 x 1600 39.9 to 34.4 x 10⁹ (1968 to
-  1722 ms); effort 5: 56.8 to 46.0 x 10⁹ at 2400 x 1600.
+  2109 ms). Lossless `encode_rgb8`, 800 x 533: effort 0, 0.80 to
+  0.68 x 10⁹; default effort, 4.51 to 3.77 x 10⁹ (287 to 210 ms);
+  2400 x 1600: default 39.9 to 33.5 x 10⁹, effort 5 56.8 to
+  45.1 x 10⁹.
 - **`EncodeOptions::threads` defaults to `1` (serial)**, for lossy and
   lossless alike; it was `0` (the host's available parallelism). An
   encode now stays on the calling thread unless the caller grants a

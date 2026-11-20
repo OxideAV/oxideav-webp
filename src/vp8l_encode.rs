@@ -319,8 +319,13 @@ const MAX_DIMENSION: u32 = 1 << 14;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub struct BitWriter {
+    /// The whole bytes written so far, less the ones still in `pending`.
     bytes: Vec<u8>,
-    bit_pos: usize,
+    /// The bits not yet moved to `bytes`, the oldest in bit 0.
+    pending: u64,
+    /// How many bits `pending` holds: below 32 between calls, so that a
+    /// write of up to 32 more always fits.
+    pending_bits: usize,
 }
 
 impl BitWriter {
@@ -331,24 +336,23 @@ impl BitWriter {
 
     /// The number of bits written so far.
     pub fn bit_position(&self) -> usize {
-        self.bit_pos
+        self.bytes.len() * 8 + self.pending_bits
     }
 
     /// Write the low `n` bits of `value` (0 ≤ `n` ≤ 32) LSB-first.
     ///
     /// Writing 0 bits is a no-op (mirrors the reader's `read_bits(0)`).
+    #[inline]
     pub fn write_bits(&mut self, value: u32, n: usize) {
         debug_assert!(n <= 32, "write_bits supports up to 32 bits");
-        let mut value = value;
-        for _ in 0..n {
-            let byte_idx = self.bit_pos >> 3;
-            if byte_idx >= self.bytes.len() {
-                self.bytes.push(0);
-            }
-            let bit = (value & 1) as u8;
-            self.bytes[byte_idx] |= bit << (self.bit_pos & 7);
-            self.bit_pos += 1;
-            value >>= 1;
+        let field = u64::from(value) & ((1u64 << n) - 1);
+        self.pending |= field << self.pending_bits;
+        self.pending_bits += n;
+        if self.pending_bits >= 32 {
+            self.bytes
+                .extend_from_slice(&(self.pending as u32).to_le_bytes());
+            self.pending >>= 32;
+            self.pending_bits -= 32;
         }
     }
 
@@ -359,7 +363,10 @@ impl BitWriter {
 
     /// Consume the writer and return the packed bytes (the final partial
     /// byte is zero-padded in its high bits).
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        let tail = self.pending_bits.div_ceil(8);
+        self.bytes
+            .extend_from_slice(&self.pending.to_le_bytes()[..tail]);
         self.bytes
     }
 }
@@ -846,13 +853,13 @@ impl WriteCode {
             return; // single-leaf code: 0 bits.
         }
         let len = self.lengths[symbol] as usize;
-        let code = self.codes[symbol];
-        // The decoder reads MSB-first within the code, so emit the high bit
-        // first. write_bits is LSB-first, so reverse the `len` low bits.
-        for i in 0..len {
-            let bit = (code >> (len - 1 - i)) & 1;
-            w.write_bits(bit, 1);
+        if len == 0 {
+            return;
         }
+        // The decoder reads MSB-first within the code, so the high bit
+        // goes out first. write_bits is LSB-first: the `len` low bits of
+        // the code, reversed, in one write.
+        w.write_bits(self.codes[symbol].reverse_bits() >> (32 - len), len);
     }
 
     /// Write this code's per-symbol lengths to `w`, picking the cheaper
@@ -10672,6 +10679,58 @@ pub fn encode_vp8l_argb_with_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Multi-bit writes lay down exactly the bits a bit-at-a-time writer
+    /// does, for every width `0..=32`, at every cursor alignment, with
+    /// set bits above the width ignored.
+    #[test]
+    fn write_bits_matches_a_bit_at_a_time_writer() {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut writer = BitWriter::new();
+        let mut reference: Vec<u8> = Vec::new();
+        let mut reference_bits = 0usize;
+        for _ in 0..20_000 {
+            let word = next();
+            let (value, n) = (word as u32, (word >> 40) as usize % 33);
+            writer.write_bits(value, n);
+            for i in 0..n {
+                if reference_bits / 8 == reference.len() {
+                    reference.push(0);
+                }
+                reference[reference_bits / 8] |= (((value >> i) & 1) as u8) << (reference_bits % 8);
+                reference_bits += 1;
+            }
+            assert_eq!(writer.bit_position(), reference_bits);
+        }
+        assert_eq!(writer.into_bytes(), reference);
+    }
+
+    /// A symbol's code goes out most significant bit first.
+    #[test]
+    fn write_symbol_emits_each_code_msb_first() {
+        let freqs: Vec<u32> = (0..40u32)
+            .map(|s| 1 + (s * s) % 97 + (1 << (s % 11)))
+            .collect();
+        let code = WriteCode::from_freqs(&freqs);
+        let mut writer = BitWriter::new();
+        let mut reference = BitWriter::new();
+        for symbol in (0..freqs.len()).chain((0..freqs.len()).rev()) {
+            code.write_symbol(&mut writer, symbol);
+            let len = usize::from(code.lengths[symbol]);
+            for i in 0..len {
+                reference.write_bit((code.codes[symbol] >> (len - 1 - i)) & 1 == 1);
+            }
+        }
+        assert!(code.lengths.iter().any(|&len| len > 8));
+        assert_eq!(writer.bit_position(), reference.bit_position());
+        assert_eq!(writer.into_bytes(), reference.into_bytes());
+    }
 
     /// The entropy-driven predictor sub-images built from one block cost
     /// table are the ones a block-by-block election computes, pricing
