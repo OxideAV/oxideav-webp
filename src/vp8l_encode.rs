@@ -4361,32 +4361,30 @@ fn block_entropy_cost_table(
     let tw = predictor_div_round_up(width, block) as usize;
     let th = predictor_div_round_up(height, block) as usize;
     let (w, h, bsz) = (width as usize, height as usize, block as usize);
-    let row_costs = |by: usize| -> Vec<[u64; 14]> {
-        let mut sink = ResidualHistogramSink::new();
-        (0..tw)
-            .map(|bx| {
-                let mut costs = [0u64; 14];
-                for (mode, cost) in costs.iter_mut().enumerate() {
-                    *cost = block_mode_entropy_cost_in(
-                        &mut sink,
-                        pixels,
-                        w,
-                        h,
-                        bx * bsz,
-                        by * bsz,
-                        bsz,
-                        bsz,
-                        mode as u8,
-                    );
-                }
-                costs
-            })
-            .collect()
-    };
-    parallel_map(th, thread_budget(), row_costs)
-        .into_iter()
-        .flatten()
-        .collect()
+    // One pass on the calling thread: the candidates that need a table
+    // are already screened side by side on the thread budget.
+    let mut sink = ResidualHistogramSink::new();
+    let mut table = Vec::with_capacity(tw * th);
+    for by in 0..th {
+        for bx in 0..tw {
+            let mut costs = [0u64; 14];
+            for (mode, cost) in costs.iter_mut().enumerate() {
+                *cost = block_mode_entropy_cost_in(
+                    &mut sink,
+                    pixels,
+                    w,
+                    h,
+                    bx * bsz,
+                    by * bsz,
+                    bsz,
+                    bsz,
+                    mode as u8,
+                );
+            }
+            table.push(costs);
+        }
+    }
+    table
 }
 
 /// The mode of lowest `cost` (the lowest-numbered one on a tie), or
