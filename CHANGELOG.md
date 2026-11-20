@@ -6,6 +6,19 @@ All notable changes to `oxideav-webp` are recorded here.
 
 ### Changed
 
+- **Lossless screened search (methods `0..=5`, and the `ALPH` plane of
+  a lossy encode at alpha efforts `3..=6`), same bytes, less work.**
+  The two entropy-driven predictor candidates of a pair weigh one
+  table of per-block, per-mode residual entropies instead of each
+  pricing all fourteen RFC 9649 §4.1 modes of every block; the entropy
+  of a block's residual histogram is summed over its occupied bins
+  only; ahead of the cost-priced re-plan (methods `4..=5`) the elected
+  candidate's screening parse and its match searches are kept instead
+  of being run a second time. An image with one live colour channel
+  (red and blue zero everywhere — every `ALPH` plane) is screened
+  without the subtract-green and color-transform candidates, which can
+  only add bits to it: at the default effort an 800 x 533 `ALPH` plane
+  went from thirteen screened candidates to seven.
 - **`EncodeOptions::threads` defaults to `1` (serial)**, for lossy and
   lossless alike; it was `0` (the host's available parallelism). An
   encode now stays on the calling thread unless the caller grants a

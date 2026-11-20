@@ -3856,18 +3856,60 @@ impl ResidualSink for MagnitudeCostSink {
 /// [`ResidualSink`] filling the per-channel residual byte histograms
 /// [`block_mode_entropy_cost`] feeds its Shannon sum. Never prunes:
 /// the histograms must be complete before the entropy is meaningful.
+///
+/// `seen` holds one bit per histogram bin that has been counted, so the
+/// Shannon sum visits the occupied bins only (a block of a few hundred
+/// pixels leaves most of the 1024 empty) and the same visit clears them
+/// for the next block.
 struct ResidualHistogramSink {
     hist: [[u32; 256]; 4],
+    seen: [[u64; 4]; 4],
     n: u32,
+}
+
+impl ResidualHistogramSink {
+    fn new() -> Self {
+        Self {
+            hist: [[0; 256]; 4],
+            seen: [[0; 4]; 4],
+            n: 0,
+        }
+    }
+
+    /// `Σ c · log2(n / c)` over the occupied bins, in milli-bits rounded
+    /// to nearest — channels in alpha, red, green, blue order and bins
+    /// in ascending order within a channel — leaving the sink empty.
+    fn take_cost(&mut self) -> u64 {
+        let n = std::mem::take(&mut self.n);
+        if n == 0 {
+            return 0;
+        }
+        // c·log2(N/c) = c·(log2(N) − log2(c)): the per-bin operand is
+        // non-negative, zero when c = N.
+        let log2_n = log2_int(u64::from(n));
+        let mut milli_bits: f64 = 0.0;
+        for (hist, seen) in self.hist.iter_mut().zip(&mut self.seen) {
+            for (word_index, word) in seen.iter_mut().enumerate() {
+                let mut bits = std::mem::take(word);
+                while bits != 0 {
+                    let bin = word_index * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let count = std::mem::take(&mut hist[bin]);
+                    milli_bits += f64::from(count) * (log2_n - log2_int(u64::from(count)));
+                }
+            }
+        }
+        (milli_bits * 1000.0 + 0.5) as u64
+    }
 }
 
 impl ResidualSink for ResidualHistogramSink {
     #[inline]
     fn pixel(&mut self, residual: u32) {
-        self.hist[0][((residual >> 24) & 0xff) as usize] += 1;
-        self.hist[1][((residual >> 16) & 0xff) as usize] += 1;
-        self.hist[2][((residual >> 8) & 0xff) as usize] += 1;
-        self.hist[3][(residual & 0xff) as usize] += 1;
+        for (channel, &value) in residual.to_be_bytes().iter().enumerate() {
+            self.hist[channel][usize::from(value)] += 1;
+            self.seen[channel][usize::from(value >> 6)] |= 1u64 << (value & 63);
+        }
         self.n += 1;
     }
     #[inline]
@@ -4246,6 +4288,7 @@ fn log2_int(v: u64) -> f64 {
 /// [`block_mode_cost`]'s magnitude proxy which can prune): the
 /// per-channel histograms must be complete before the entropy
 /// sum is meaningful.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn block_mode_entropy_cost(
     pixels: &[u32],
@@ -4257,38 +4300,163 @@ fn block_mode_entropy_cost(
     bh: usize,
     mode: u8,
 ) -> u64 {
-    let mut sink = ResidualHistogramSink {
-        hist: [[0u32; 256]; 4],
-        n: 0,
+    block_mode_entropy_cost_in(
+        &mut ResidualHistogramSink::new(),
+        pixels,
+        width,
+        height,
+        x0,
+        y0,
+        bw,
+        bh,
+        mode,
+    )
+}
+
+/// [`block_mode_entropy_cost`] on a caller-held (empty) histogram sink,
+/// which is empty again on return.
+#[allow(clippy::too_many_arguments)]
+fn block_mode_entropy_cost_in(
+    sink: &mut ResidualHistogramSink,
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    mode: u8,
+) -> u64 {
+    for_each_block_residual(pixels, width, height, x0, y0, bw, bh, mode, sink);
+    // Float arithmetic is fine here: the sum is rounded to the nearest
+    // milli-bit before the integer cast, and it is always taken over
+    // the same bins in the same order.
+    sink.take_cost()
+}
+
+/// [`block_mode_entropy_cost`] of every §4.1 mode `0..=13` for every
+/// `(1 << size_bits)`-pixel block of the image, in block raster order.
+/// The entropy-driven predictor choosers differ only in how they weigh
+/// these figures, so one table serves all of them over the same pixels.
+type BlockModeCosts = Vec<[u64; 14]>;
+
+/// A [`BlockModeCosts`] table computed by the first candidate that needs
+/// it and read by the others built over the same pixels.
+type SharedBlockModeCosts = std::sync::OnceLock<BlockModeCosts>;
+
+fn block_entropy_cost_table(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+) -> BlockModeCosts {
+    let block = 1u32 << size_bits;
+    let tw = predictor_div_round_up(width, block) as usize;
+    let th = predictor_div_round_up(height, block) as usize;
+    let (w, h, bsz) = (width as usize, height as usize, block as usize);
+    let row_costs = |by: usize| -> Vec<[u64; 14]> {
+        let mut sink = ResidualHistogramSink::new();
+        (0..tw)
+            .map(|bx| {
+                let mut costs = [0u64; 14];
+                for (mode, cost) in costs.iter_mut().enumerate() {
+                    *cost = block_mode_entropy_cost_in(
+                        &mut sink,
+                        pixels,
+                        w,
+                        h,
+                        bx * bsz,
+                        by * bsz,
+                        bsz,
+                        bsz,
+                        mode as u8,
+                    );
+                }
+                costs
+            })
+            .collect()
     };
-    for_each_block_residual(pixels, width, height, x0, y0, bw, bh, mode, &mut sink);
-    let hist = sink.hist;
-    let n = sink.n;
-    if n == 0 {
-        return 0;
-    }
-    // Σ_channels Σ_b c·log2(N/c) milli-bits, with c·log2(N/c) =
-    // c·(log2(N) − log2(c)). Float arithmetic is fine here: the
-    // result is rounded to nearest milli-bit before u64 cast, so
-    // bit-for-bit determinism holds across platforms with IEEE-754
-    // ln(). The Shannon expansion picks `log2(N/c)` rather than
-    // `−log2(c/N)` to keep the per-bin operand non-negative (zero
-    // when c = N, growing as c shrinks) which is friendly to the
-    // accumulator.
-    let log2_n = log2_int(n as u64);
-    let mut milli_bits: f64 = 0.0;
-    for channel_hist in &hist {
-        for &count in channel_hist.iter() {
-            if count == 0 {
-                continue;
-            }
-            let c_f = count as f64;
-            // Per-bin contribution to N·H: c·log2(N/c).
-            milli_bits += c_f * (log2_n - log2_int(u64::from(count)));
+    parallel_map(th, thread_budget(), row_costs)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The mode of lowest `cost` (the lowest-numbered one on a tie), or
+/// `prefer_mode` when its cost equals that minimum — the tie-break that
+/// keeps runs of one mode in the predictor sub-image.
+fn pick_mode_by_cost(prefer_mode: Option<u8>, cost: impl Fn(u8) -> u64) -> u8 {
+    let mut best_mode: u8 = 0;
+    let mut best_cost = u64::MAX;
+    for mode in 0u8..=13 {
+        let c = cost(mode);
+        if c < best_cost {
+            best_cost = c;
+            best_mode = mode;
         }
     }
-    // Scale to milli-bits and round to nearest.
-    (milli_bits * 1000.0 + 0.5) as u64
+    match prefer_mode {
+        Some(m) if m != best_mode && cost(m) == best_cost => m,
+        _ => best_mode,
+    }
+}
+
+/// The joint cost the sub-image-aware chooser minimises: the block's
+/// residual entropy plus `lambda_milli` thousandths of the marginal
+/// §7.2 sub-image cost of recording `mode` (both in milli-bits).
+fn subaware_mode_cost(
+    residual_cost: u64,
+    sub_image_hist: &[u32; 14],
+    sub_image_total: u32,
+    mode: u8,
+    lambda_milli: u64,
+) -> u64 {
+    let sub_delta = sub_image_mode_cost_delta_milli(sub_image_hist, sub_image_total, mode);
+    residual_cost.saturating_add(sub_delta.saturating_mul(lambda_milli) / 1000)
+}
+
+/// The §4.1 predictor sub-image an entropy-driven `strategy` builds from
+/// the block cost table of its pixels ([`block_entropy_cost_table`]):
+/// what [`build_predictor_image_entropy`] /
+/// [`build_predictor_image_entropy_subaware`] return for those pixels.
+/// `strategy` must not be [`PredictorSubImageStrategy::L1`], which does
+/// not use the table.
+fn predictor_image_from_costs(
+    costs: &BlockModeCosts,
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    strategy: PredictorSubImageStrategy,
+) -> (Vec<u32>, u32, u32) {
+    let block = 1u32 << size_bits;
+    let tw = predictor_div_round_up(width, block);
+    let th = predictor_div_round_up(height, block);
+    let lambda_milli = match strategy {
+        PredictorSubImageStrategy::EntropySubaware { lambda_milli } => Some(lambda_milli),
+        _ => None,
+    };
+    let mut img = Vec::with_capacity(costs.len());
+    let mut prev_row: Vec<Option<u8>> = vec![None; tw as usize];
+    let mut hist = [0u32; 14];
+    let mut total: u32 = 0;
+    for row in costs.chunks(tw.max(1) as usize) {
+        let mut left_mode: Option<u8> = None;
+        for (block_costs, top_slot) in row.iter().zip(prev_row.iter_mut()) {
+            let prefer = left_mode.or(*top_slot);
+            let mode = match lambda_milli {
+                None => pick_mode_by_cost(prefer, |m| block_costs[usize::from(m)]),
+                Some(lambda) => pick_mode_by_cost(prefer, |m| {
+                    subaware_mode_cost(block_costs[usize::from(m)], &hist, total, m, lambda)
+                }),
+            };
+            img.push(0xff00_0000 | (u32::from(mode) << 8));
+            left_mode = Some(mode);
+            *top_slot = Some(mode);
+            hist[usize::from(mode)] += 1;
+            total += 1;
+        }
+    }
+    (img, tw, th)
 }
 
 /// Round 161 *Shannon-entropy bit-cost* variant of
@@ -4317,6 +4485,7 @@ fn block_mode_entropy_cost(
 /// both the L1-proxy and entropy-cost candidates and keeps the
 /// shortest stream, so the entropy candidate cannot regress
 /// against the L1 path — see [`encode_argb_with_predictor_chooser`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn pick_block_mode_with_hint_entropy(
     pixels: &[u32],
@@ -4328,25 +4497,9 @@ fn pick_block_mode_with_hint_entropy(
     bh: usize,
     prefer_mode: Option<u8>,
 ) -> u8 {
-    let mut best_mode: u8 = 0;
-    let mut best_cost = u64::MAX;
-    for mode in 0u8..=13 {
-        let cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, mode);
-        if cost < best_cost {
-            best_cost = cost;
-            best_mode = mode;
-        }
-    }
-    // Round-159-style strict tie-break under the entropy cost.
-    if let Some(m) = prefer_mode
-        && m != best_mode
-    {
-        let cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, m);
-        if cost == best_cost {
-            best_mode = m;
-        }
-    }
-    best_mode
+    pick_mode_by_cost(prefer_mode, |mode| {
+        block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, mode)
+    })
 }
 
 /// Round 161 *Shannon-entropy bit-cost* variant of
@@ -4374,27 +4527,13 @@ fn build_predictor_image_entropy(
     height: u32,
     size_bits: u8,
 ) -> (Vec<u32>, u32, u32) {
-    let block = 1u32 << size_bits;
-    let tw = predictor_div_round_up(width, block);
-    let th = predictor_div_round_up(height, block);
-    let mut img = Vec::with_capacity((tw * th) as usize);
-    let w = width as usize;
-    let h = height as usize;
-    let bsz = block as usize;
-    let mut prev_row: Vec<Option<u8>> = vec![None; tw as usize];
-    for by in 0..th as usize {
-        let mut left_mode: Option<u8> = None;
-        for (bx, top_slot) in prev_row.iter_mut().enumerate() {
-            let x0 = bx * bsz;
-            let y0 = by * bsz;
-            let prefer = left_mode.or(*top_slot);
-            let mode = pick_block_mode_with_hint_entropy(pixels, w, h, x0, y0, bsz, bsz, prefer);
-            img.push(0xff00_0000 | ((mode as u32) << 8));
-            left_mode = Some(mode);
-            *top_slot = Some(mode);
-        }
-    }
-    (img, tw, th)
+    predictor_image_from_costs(
+        &block_entropy_cost_table(pixels, width, height, size_bits),
+        width,
+        height,
+        size_bits,
+        PredictorSubImageStrategy::Entropy,
+    )
 }
 
 /// Round 162 — milli-bit Shannon delta for adding one occurrence of
@@ -4496,6 +4635,7 @@ fn sub_image_mode_cost_delta_milli(hist: &[u32; 14], total: u32, mode: u8) -> u6
 /// multiple lambda values) predictor candidates and keeping the
 /// shortest stream — so a fixture on which the sub-image weighting
 /// hurts overall byte cost is simply not chosen.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn pick_block_mode_with_hint_entropy_subaware(
     pixels: &[u32],
@@ -4510,33 +4650,15 @@ fn pick_block_mode_with_hint_entropy_subaware(
     sub_image_total: u32,
     lambda_milli: u64,
 ) -> u8 {
-    let mut best_mode: u8 = 0;
-    let mut best_cost = u64::MAX;
-    for mode in 0u8..=13 {
-        let residual_cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, mode);
-        let sub_delta = sub_image_mode_cost_delta_milli(sub_image_hist, sub_image_total, mode);
-        // lambda_milli is "per-sub-image-bit weight in milli-units".
-        // sub_delta is already in milli-bits. Multiply and divide by
-        // 1000 to keep the whole expression in milli-bit units.
-        let weighted_sub = sub_delta.saturating_mul(lambda_milli) / 1000;
-        let cost = residual_cost.saturating_add(weighted_sub);
-        if cost < best_cost {
-            best_cost = cost;
-            best_mode = mode;
-        }
-    }
-    if let Some(m) = prefer_mode
-        && m != best_mode
-    {
-        let residual_cost = block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, m);
-        let sub_delta = sub_image_mode_cost_delta_milli(sub_image_hist, sub_image_total, m);
-        let weighted_sub = sub_delta.saturating_mul(lambda_milli) / 1000;
-        let cost = residual_cost.saturating_add(weighted_sub);
-        if cost == best_cost {
-            best_mode = m;
-        }
-    }
-    best_mode
+    pick_mode_by_cost(prefer_mode, |mode| {
+        subaware_mode_cost(
+            block_mode_entropy_cost(pixels, width, height, x0, y0, bw, bh, mode),
+            sub_image_hist,
+            sub_image_total,
+            mode,
+            lambda_milli,
+        )
+    })
 }
 
 /// Round 162 *sub-image-aware* variant of
@@ -4570,43 +4692,13 @@ fn build_predictor_image_entropy_subaware(
     size_bits: u8,
     lambda_milli: u64,
 ) -> (Vec<u32>, u32, u32) {
-    let block = 1u32 << size_bits;
-    let tw = predictor_div_round_up(width, block);
-    let th = predictor_div_round_up(height, block);
-    let mut img = Vec::with_capacity((tw * th) as usize);
-    let w = width as usize;
-    let h = height as usize;
-    let bsz = block as usize;
-    let mut prev_row: Vec<Option<u8>> = vec![None; tw as usize];
-    let mut hist = [0u32; 14];
-    let mut total: u32 = 0;
-    for by in 0..th as usize {
-        let mut left_mode: Option<u8> = None;
-        for (bx, top_slot) in prev_row.iter_mut().enumerate() {
-            let x0 = bx * bsz;
-            let y0 = by * bsz;
-            let prefer = left_mode.or(*top_slot);
-            let mode = pick_block_mode_with_hint_entropy_subaware(
-                pixels,
-                w,
-                h,
-                x0,
-                y0,
-                bsz,
-                bsz,
-                prefer,
-                &hist,
-                total,
-                lambda_milli,
-            );
-            img.push(0xff00_0000 | ((mode as u32) << 8));
-            left_mode = Some(mode);
-            *top_slot = Some(mode);
-            hist[mode as usize] += 1;
-            total += 1;
-        }
-    }
-    (img, tw, th)
+    predictor_image_from_costs(
+        &block_entropy_cost_table(pixels, width, height, size_bits),
+        width,
+        height,
+        size_bits,
+        PredictorSubImageStrategy::EntropySubaware { lambda_milli },
+    )
 }
 
 /// Round 305 — per-block predictor-mode selection strategy for the §4.1
@@ -6568,6 +6660,28 @@ fn prepare_with_color_transform_subtract_green_predictor(
     size_bits: u8,
     pred_strategy: PredictorSubImageStrategy,
 ) -> PreparedTransform {
+    prepare_with_color_transform_subtract_green_predictor_sharing(
+        pixels,
+        width,
+        height,
+        size_bits,
+        pred_strategy,
+        &SharedBlockModeCosts::new(),
+    )
+}
+
+/// [`prepare_with_color_transform_subtract_green_predictor`] with the block cost table of
+/// its entropy-driven predictor choosers kept in `entropy_costs`: calls
+/// that differ only in an entropy-driven `pred_strategy` (the pixels and
+/// `size_bits` being the same) compute the table once between them.
+fn prepare_with_color_transform_subtract_green_predictor_sharing(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    pred_strategy: PredictorSubImageStrategy,
+    entropy_costs: &SharedBlockModeCosts,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     // ---- Transform #1 (read first): §4.2 color-tx -------------------
@@ -6608,8 +6722,19 @@ fn prepare_with_color_transform_subtract_green_predictor(
     w.write_bit(true);
     w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
     w.write_bits((size_bits - 2) as u32, 3);
-    let (predictor_image, ptw, _pth) =
-        build_predictor_image_strategy(&transformed, width, height, size_bits, pred_strategy);
+    let (predictor_image, ptw, _pth) = match pred_strategy {
+        PredictorSubImageStrategy::L1 => {
+            build_predictor_image(&transformed, width, height, size_bits)
+        }
+        _ => predictor_image_from_costs(
+            entropy_costs
+                .get_or_init(|| block_entropy_cost_table(&transformed, width, height, size_bits)),
+            width,
+            height,
+            size_bits,
+            pred_strategy,
+        ),
+    };
     write_entropy_coded_image_literals(&mut w, &predictor_image);
 
     // End of optional-transform list (`%b0`).
@@ -6695,6 +6820,28 @@ fn prepare_with_subtract_green_predictor(
     size_bits: u8,
     pred_strategy: PredictorSubImageStrategy,
 ) -> PreparedTransform {
+    prepare_with_subtract_green_predictor_sharing(
+        pixels,
+        width,
+        height,
+        size_bits,
+        pred_strategy,
+        &SharedBlockModeCosts::new(),
+    )
+}
+
+/// [`prepare_with_subtract_green_predictor`] with the block cost table of
+/// its entropy-driven predictor choosers kept in `entropy_costs`: calls
+/// that differ only in an entropy-driven `pred_strategy` (the pixels and
+/// `size_bits` being the same) compute the table once between them.
+fn prepare_with_subtract_green_predictor_sharing(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    size_bits: u8,
+    pred_strategy: PredictorSubImageStrategy,
+    entropy_costs: &SharedBlockModeCosts,
+) -> PreparedTransform {
     let mut w = BitWriter::new();
 
     // ---- Transform #1 (read first): §4.3 subtract-green -------------
@@ -6713,8 +6860,19 @@ fn prepare_with_subtract_green_predictor(
     w.write_bits(crate::vp8l_stream::TransformType::Predictor as u32, 2);
     debug_assert!((2..=9).contains(&size_bits));
     w.write_bits((size_bits - 2) as u32, 3);
-    let (predictor_image, ptw, _pth) =
-        build_predictor_image_strategy(&transformed, width, height, size_bits, pred_strategy);
+    let (predictor_image, ptw, _pth) = match pred_strategy {
+        PredictorSubImageStrategy::L1 => {
+            build_predictor_image(&transformed, width, height, size_bits)
+        }
+        _ => predictor_image_from_costs(
+            entropy_costs
+                .get_or_init(|| block_entropy_cost_table(&transformed, width, height, size_bits)),
+            width,
+            height,
+            size_bits,
+            pred_strategy,
+        ),
+    };
     write_entropy_coded_image_literals(&mut w, &predictor_image);
 
     // End of optional-transform list (`%b0`).
@@ -9263,19 +9421,35 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
     let block = 1usize << pred_bits;
     let blocks_fit = w >= block && h >= block;
     let l1 = PredictorSubImageStrategy::L1;
+    // Candidates that differ only in an entropy-driven predictor chooser
+    // weigh one block cost table, computed by whichever is built first:
+    // one for the subtract-green pair, one for the color-transform +
+    // subtract-green pair.
+    let (green_costs, color_green_costs) =
+        (&SharedBlockModeCosts::new(), &SharedBlockModeCosts::new());
+
+    // An image whose red and blue are zero everywhere (an `ALPH` plane,
+    // a grey ramp held in green) has one live colour channel. Subtract
+    // green would turn the two constant channels into copies of the
+    // negated green one, and the color transform has nothing to predict
+    // them from, so every candidate built on either is the same
+    // candidate without it plus bits: only the plain ones are screened.
+    let one_channel = pixels.iter().all(|&p| p & 0x00ff_00ff == 0);
 
     // Candidate builders, cheapest-first; later ones only at higher
     // efforts. Each yields the forward-transformed residuals + prelude.
     let mut builds: Vec<EffortBuild<'_>> = Vec::new();
-    builds.push(Box::new(|| Some(prepare_literals(pixels, true, width))));
-    if blocks_fit {
-        builds.push(Box::new(move || {
-            Some(prepare_with_subtract_green_predictor(
-                pixels, width, height, pred_bits, l1,
-            ))
-        }));
+    if !one_channel {
+        builds.push(Box::new(|| Some(prepare_literals(pixels, true, width))));
+        if blocks_fit {
+            builds.push(Box::new(move || {
+                Some(prepare_with_subtract_green_predictor(
+                    pixels, width, height, pred_bits, l1,
+                ))
+            }));
+        }
     }
-    if method >= 1 {
+    if method >= 1 || one_channel {
         builds.push(Box::new(|| Some(prepare_literals(pixels, false, width))));
         if blocks_fit {
             builds.push(Box::new(|| {
@@ -9285,14 +9459,14 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
             }));
         }
     }
-    if method >= 2 && blocks_fit {
+    if method >= 2 && blocks_fit && !one_channel {
         builds.push(Box::new(move || {
             Some(prepare_with_color_transform_subtract_green_predictor(
                 pixels, width, height, pred_bits, l1,
             ))
         }));
     }
-    if method >= 3 && blocks_fit {
+    if method >= 3 && blocks_fit && !one_channel {
         for strategy in [
             PredictorSubImageStrategy::Entropy,
             PredictorSubImageStrategy::EntropySubaware {
@@ -9300,20 +9474,25 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
             },
         ] {
             builds.push(Box::new(move || {
-                Some(prepare_with_subtract_green_predictor(
-                    pixels, width, height, pred_bits, strategy,
+                Some(prepare_with_subtract_green_predictor_sharing(
+                    pixels,
+                    width,
+                    height,
+                    pred_bits,
+                    strategy,
+                    green_costs,
                 ))
             }));
         }
     }
-    if method >= 4 && blocks_fit {
+    if method >= 4 && blocks_fit && !one_channel {
         builds.push(Box::new(move || {
             Some(prepare_with_color_transform_predictor(
                 pixels, width, height, pred_bits, l1,
             ))
         }));
     }
-    if method >= 5 && blocks_fit {
+    if method >= 5 && blocks_fit && !one_channel {
         for strategy in [
             PredictorSubImageStrategy::Entropy,
             PredictorSubImageStrategy::EntropySubaware {
@@ -9321,9 +9500,16 @@ fn encode_argb_with_effort(pixels: &[u32], width: u32, height: u32, method: u8) 
             },
         ] {
             builds.push(Box::new(move || {
-                Some(prepare_with_color_transform_subtract_green_predictor(
-                    pixels, width, height, pred_bits, strategy,
-                ))
+                Some(
+                    prepare_with_color_transform_subtract_green_predictor_sharing(
+                        pixels,
+                        width,
+                        height,
+                        pred_bits,
+                        strategy,
+                        color_green_costs,
+                    ),
+                )
             }));
         }
     }
@@ -9377,18 +9563,26 @@ fn encode_candidates_with_effort(
 
     // 1. Screening: one reduced-effort parse per candidate.
     /// A screened candidate: its residuals, the smallest size its parse
-    /// priced at, and — when kept — the parse.
-    type Screened = (PreparedTransform, usize, Option<Vec<Token>>);
-    // The parse is counted as it is produced. Where the elected
-    // candidate would only be parsed again the same way (no DP stage,
-    // which wants its searches recorded, and an image small enough for
-    // every worker to hold a token stream), each worker also keeps its
+    /// priced at, and — when kept — the parse and its recorded searches.
+    type Screened = (
+        PreparedTransform,
+        usize,
+        Option<(Vec<Token>, Vec<FindProbe>)>,
+    );
+    // The parse is counted as it is produced. On an image small enough
+    // for every worker to hold a token stream (and, ahead of the DP
+    // stage, the searches the parse made), each worker also keeps its
     // parse and the winner's is used as it is; otherwise the parses are
     // dropped and the winner is parsed again below.
-    let keep_parse = !run_dp && pixel_count <= SCREEN_KEEPS_PARSE_MAX_PIXELS;
+    let keep_parse = pixel_count <= SCREEN_KEEPS_PARSE_MAX_PIXELS;
     let bytes_per_pixel = EFFORT_SCREEN_BYTES_PER_PIXEL
         + if keep_parse {
             std::mem::size_of::<Token>()
+                + if run_dp {
+                    std::mem::size_of::<FindProbe>()
+                } else {
+                    0
+                }
         } else {
             0
         };
@@ -9399,16 +9593,29 @@ fn encode_candidates_with_effort(
     let screen = |i: usize| -> Option<Screened> {
         let prep = builds[i]()?;
         let mut counts = ParseCounts::new(prep.residuals.len(), prep.stream_width);
-        let mut kept = keep_parse.then(|| Vec::with_capacity(prep.residuals.len() / 4));
+        let mut kept = keep_parse.then(|| {
+            (
+                Vec::with_capacity(prep.residuals.len() / 4),
+                if run_dp {
+                    vec![FindProbe::NOT_PROBED; prep.residuals.len()]
+                } else {
+                    Vec::new()
+                },
+            )
+        });
+        let (mut tokens, probes) = match kept.as_mut() {
+            Some((tokens, probes)) => (Some(tokens), run_dp.then_some(&mut probes[..])),
+            None => (None, None),
+        };
         lz77_parse_on(
             &prep.residuals,
             params.shape(prep.residuals.len()),
             params.lazy,
             search_workers,
-            None,
+            probes,
             |tok| {
                 counts.add(tok);
-                if let Some(tokens) = kept.as_mut() {
+                if let Some(tokens) = tokens.as_mut() {
                     tokens.push(tok);
                 }
             },
@@ -9438,9 +9645,9 @@ fn encode_candidates_with_effort(
     drop(builds);
     let (prep, _, kept) = best.expect("at least one candidate builds");
     let (tokens, probes) = match kept {
-        Some(mut tokens) => {
+        Some((mut tokens, probes)) => {
             tokens.shrink_to_fit();
-            (tokens, Vec::new())
+            (tokens, probes)
         }
         None => effort_greedy_tokens(
             &prep.residuals,
@@ -9465,6 +9672,7 @@ fn encode_candidates_with_effort(
         best
     };
     let (best_cache, mut best_len) = sweep_caches(&tokens);
+
     // 3. Cost-priced DP re-plan of the winner at its cache choice, over
     //    match tables built from the same reduced-effort parse.
     let mut stream: Option<Vec<Token>> = None;
@@ -10464,6 +10672,102 @@ pub fn encode_vp8l_argb_with_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The entropy-driven predictor sub-images built from one block cost
+    /// table are the ones a block-by-block election computes, pricing
+    /// every mode of every block afresh for each strategy.
+    #[test]
+    fn predictor_images_from_the_cost_table_match_block_by_block_election() {
+        let mut s = 0x1357_9bdfu32;
+        let mut next = move || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            s
+        };
+        for (width, height, size_bits) in [(37u32, 29u32, 2u8), (64, 48, 3), (50, 70, 4), (5, 3, 4)]
+        {
+            let (w, h, bsz) = (width as usize, height as usize, 1usize << size_bits);
+            // Smooth ramps with a little noise, so that modes tie in
+            // places and the neighbour preference matters.
+            let pixels: Vec<u32> = (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as u32, (i / w) as u32);
+                    let noise = next() >> 30;
+                    0xff00_0000 | ((x * 3) & 0xff) << 16 | ((y * 2 + noise) & 0xff) << 8 | (x / 4)
+                })
+                .collect();
+            let (tw, th) = (w.div_ceil(bsz), h.div_ceil(bsz));
+            for lambda_milli in [None, Some(0u64), Some(4_000), Some(256_000)] {
+                let mut want = Vec::with_capacity(tw * th);
+                let mut prev_row: Vec<Option<u8>> = vec![None; tw];
+                let mut hist = [0u32; 14];
+                for by in 0..th {
+                    let mut left: Option<u8> = None;
+                    for (bx, top) in prev_row.iter_mut().enumerate() {
+                        let prefer = left.or(*top);
+                        let (x0, y0) = (bx * bsz, by * bsz);
+                        let mode = match lambda_milli {
+                            None => pick_block_mode_with_hint_entropy(
+                                &pixels, w, h, x0, y0, bsz, bsz, prefer,
+                            ),
+                            Some(lambda) => pick_block_mode_with_hint_entropy_subaware(
+                                &pixels,
+                                w,
+                                h,
+                                x0,
+                                y0,
+                                bsz,
+                                bsz,
+                                prefer,
+                                &hist,
+                                hist.iter().sum(),
+                                lambda,
+                            ),
+                        };
+                        want.push(0xff00_0000 | (u32::from(mode) << 8));
+                        left = Some(mode);
+                        *top = Some(mode);
+                        hist[usize::from(mode)] += 1;
+                    }
+                }
+                let got = match lambda_milli {
+                    None => build_predictor_image_entropy(&pixels, width, height, size_bits),
+                    Some(lambda) => build_predictor_image_entropy_subaware(
+                        &pixels, width, height, size_bits, lambda,
+                    ),
+                };
+                assert_eq!(
+                    got,
+                    (want, tw as u32, th as u32),
+                    "{width}x{height} bits {size_bits} lambda {lambda_milli:?}"
+                );
+            }
+        }
+    }
+
+    /// An image with one live colour channel is screened without the
+    /// subtract-green and color-transform candidates; the stream still
+    /// decodes to the image at every screened effort.
+    #[test]
+    fn one_channel_images_round_trip_at_every_screened_effort() {
+        let (width, height) = (96u32, 80u32);
+        let pixels: Vec<u32> = (0..width * height)
+            .map(|i| {
+                let (x, y) = (i % width, i / width);
+                let value = if (x / 24 + y / 20) % 2 == 0 {
+                    (x * 2 + y) & 0xff
+                } else {
+                    0xff
+                };
+                0xff00_0000 | (value << 8)
+            })
+            .collect();
+        for method in 0..MAX_LOSSLESS_METHOD {
+            let payload =
+                encode_vp8l_argb_with_method(&pixels, width, height, false, method).unwrap();
+            let decoded = crate::vp8l_transform::decode_lossless(&payload, width, height).unwrap();
+            assert_eq!(decoded.pixels(), pixels.as_slice(), "method {method}");
+        }
+    }
 
     /// #33: RFC 9649 §4.1 — on the rightmost column the leftmost pixel of
     /// the same row is TR. For every mode on a 17 x 121 image (4-pixel
@@ -13286,10 +13590,7 @@ mod tests {
                     "block_mode_cost diverges at {width}x{height} block \
                      ({x0},{y0},{bw},{bh}) mode {mode}"
                 );
-                let mut sink = ResidualHistogramSink {
-                    hist: [[0u32; 256]; 4],
-                    n: 0,
-                };
+                let mut sink = ResidualHistogramSink::new();
                 for_each_block_residual(&pixels, width, height, x0, y0, bw, bh, mode, &mut sink);
                 let (hist, n) = ref_hist(&pixels, width, height, x0, y0, bw, bh, mode);
                 assert_eq!(
@@ -13297,6 +13598,24 @@ mod tests {
                     (hist, n),
                     "residual histogram diverges at {width}x{height} block \
                      ({x0},{y0},{bw},{bh}) mode {mode}"
+                );
+                // The sum over the occupied bins is the sum over all
+                // 1024 with the empty ones skipped, and it leaves the
+                // sink ready for the next block.
+                let mut dense: f64 = 0.0;
+                for &count in hist.iter().flatten().filter(|&&count| count != 0) {
+                    dense +=
+                        f64::from(count) * (log2_int(u64::from(n)) - log2_int(u64::from(count)));
+                }
+                let dense = if n == 0 {
+                    0
+                } else {
+                    (dense * 1000.0 + 0.5) as u64
+                };
+                assert_eq!(sink.take_cost(), dense);
+                assert_eq!(
+                    (sink.hist, sink.seen, sink.n),
+                    ([[0u32; 256]; 4], [[0u64; 4]; 4], 0)
                 );
             }
             // Pick equivalence: the row-granular capped walk must
